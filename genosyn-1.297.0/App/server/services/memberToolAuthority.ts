@@ -1,0 +1,620 @@
+/**
+ * Explicit interactive-Member policy for every built-in Genosyn tool.
+ *
+ * This registry is deliberately literal rather than name-prefix based. A new
+ * tool therefore starts unclassified and is denied to interactive Members
+ * until its human-route equivalent and resource model have been reviewed.
+ * Routine Runs and explicitly authenticated external MCP sessions continue to
+ * use the AI Employee's Grants without a Member intersection.
+ */
+export type MemberToolPolicy =
+  | "member"
+  | "admin"
+  | "finance.read"
+  | "finance.write"
+  | "project"
+  | "attachment"
+  | "channel";
+
+const MEMBER_TOOLS = [
+  "get_self",
+  "list_employees",
+  "list_members",
+  "list_skills",
+  "list_routines",
+  "get_routine",
+  "list_routine_triggers",
+  // Reading run history is member-level on the human route too:
+  // `routes/routines.ts` admin-gates the mutations and leaves
+  // `GET /routines/:rid/runs` and the run log open to every Member. These two
+  // tools are strictly narrower — they read the same rows, and neither writes.
+  "list_runs",
+  "get_run_report",
+  // Goals are the company's shared direction — the human route lists them at
+  // member level for the same reason.
+  "list_goals",
+  "get_goal",
+  // Reading a Pipeline is member-level on the human route too — every Member
+  // may open Pipelines and inspect a Run. Writing one is not; see ADMIN_TOOLS.
+  "list_pipelines",
+  "get_pipeline",
+  "list_pipeline_node_types",
+  "list_pipeline_runs",
+  "get_pipeline_run",
+  "create_project",
+  "list_bases",
+  "get_base",
+  "create_base",
+  "create_base_table",
+  "update_base_table",
+  "delete_base_table",
+  "add_base_field",
+  "update_base_field",
+  "delete_base_field",
+  "list_base_rows",
+  "create_base_row",
+  "update_base_row",
+  "delete_base_row",
+  "get_base_record",
+  "list_record_comments",
+  "create_record_comment",
+  "delete_record_comment",
+  "list_record_attachments",
+  "attach_file_to_record",
+  "read_record_attachment",
+  "delete_record_attachment",
+  "list_teams",
+  // A Member may chat with any AI Employee directly. Asking one through a
+  // colleague is no wider: the answer runs read-only, under this same Member's
+  // access intersected with the colleague's own Grants.
+  "ask_colleague",
+  "list_handoffs",
+  "create_handoff",
+  "complete_handoff",
+  "decline_handoff",
+  "cancel_handoff",
+  // The Decision Stack is member-level on the human route too, and every row is
+  // company-scoped. A Member driving a turn can raise, read back, and retract a
+  // question exactly as they could from the Decisions page.
+  "request_decision",
+  "request_work_review",
+  "request_mail_review",
+  "list_decisions",
+  "get_decision",
+  "cancel_decision",
+  // Answering an unassigned decision is member-level on the human route; the
+  // tool additionally requires the acting employee to be the routed decider,
+  // which is strictly narrower.
+  "decide_decision",
+  // Workstreams are the employee's own working state — a Member-driven turn
+  // updating them is bookkeeping on work the Member already directed, and
+  // cancelling a wakeup only narrows future work.
+  "create_workstream",
+  "update_workstream",
+  "list_workstreams",
+  "get_workstream",
+  "list_initiatives",
+  "get_initiative",
+  "cancel_wakeup",
+  // Starting a session is member-level because its human route is: any company
+  // Member may send an employee at a repository from the Repository page, for
+  // the reason `routes/repositoryContent.ts` gives — editing a document and
+  // committing it is the same class of act as writing a Note. The tool is
+  // strictly narrower than that route. It can only send the employee whose
+  // turn this is, only at a repository that employee already holds a Grant
+  // for, and only onto a branch the same Member-only review step governs.
+  "start_repository_work_session",
+  "revise_repository_work_session",
+  "get_repository_work_session",
+  // The repository work-session tools are bounded by the session on the turn's
+  // MCP token, not by their arguments: they act on one worktree, they have no
+  // parameter for reaching another repository, and outside a session they
+  // refuse to run at all. The authority decision was already made when the
+  // session was started — from the Repository page, or by the line above,
+  // which applies this same policy — so intersecting it a second time here
+  // would only mean the tools fail mid-turn. Repository *configuration* stays
+  // admin-only, and nothing here can reach the remote.
+  "repository_list_files",
+  "repository_read_file",
+  "repository_write_file",
+  "repository_edit_file",
+  "repository_delete_file",
+  "repository_search",
+  "repository_glob",
+  "repository_status",
+  "repository_diff",
+  "repository_update_steps",
+  // Running a command is member-level for the same reason, plus one of its
+  // own: what may run is a repository setting an owner or admin made, not an
+  // argument this turn chose. A Member cannot widen it from here, and the
+  // command is confined to the session's own worktree either way.
+  "repository_run_command",
+  "repository_commit",
+  "list_notebooks",
+  "list_notes",
+  "search_notes",
+  "get_note",
+  "create_note",
+  "update_note",
+  "delete_note",
+  "list_resources",
+  "search_resources",
+  "get_resource",
+  "export_resource",
+  "create_resource",
+  "update_resource",
+  "delete_resource",
+  "list_signature_envelopes",
+  "get_signature_envelope",
+  "draft_signature_envelope",
+  "update_signature_envelope_draft",
+  "send_signature_envelope",
+  "remind_signature_recipient",
+  "void_signature_envelope",
+  "list_mail_accounts",
+  "search_mail",
+  "get_mail_thread",
+  "get_mail_message",
+  "read_mail_attachment",
+  "create_mail_draft",
+  "edit_mail_draft",
+  "update_mail_thread",
+  "mail_block_sender",
+  "mail_unsubscribe",
+  "send_mail",
+  "list_scheduling_calendars",
+  "check_calendar_availability",
+  "schedule_meeting",
+  "suggest_mail_actions",
+  // Meetings (M44): every Member may read meetings and manually start the
+  // notetaker from the human route. Calendar Record Grants still govern which
+  // AI Employees may act, so delegated chat intersects that existing Grant
+  // with the same member-level authority as the meeting page.
+  "list_meetings",
+  "get_meeting",
+  "get_meeting_transcript",
+  "start_notetaker",
+  "list_contacts",
+  "search_contacts",
+  "get_contact",
+  "lookup_suppression",
+  "verify_email",
+  "find_contact_email",
+  "get_contact_timeline",
+  "list_activities",
+  "get_activity",
+  "update_activity",
+  "delete_activity",
+  "export_activities",
+  "list_deals",
+  "get_deal",
+  "get_deal_board",
+  "list_deal_stages",
+  "create_deal_stage",
+  "update_deal_stage",
+  "reorder_deal_stages",
+  "archive_deal_stage",
+  "list_sequences",
+  "get_sequence",
+  "list_sequence_enrollments",
+  "stop_sequence_enrollment",
+  "create_sequence",
+  "update_sequence",
+  "replace_sequence_steps",
+  "archive_sequence",
+  "list_signals",
+  "get_signal",
+  "create_signal",
+  "update_signal",
+  "list_signal_events",
+  "test_signal",
+  "archive_signal",
+  "restore_signal",
+  "get_revenue_report",
+  "list_follow_ups",
+  "list_follow_up_views",
+  "create_follow_up_view",
+  "update_follow_up_view",
+  "delete_follow_up_view",
+  "create_follow_up",
+  "update_follow_up",
+  "list_revenue_accounts",
+  "create_revenue_account",
+  "get_revenue_account",
+  "update_revenue_account",
+  "archive_revenue_account",
+  "merge_revenue_accounts",
+  "list_revenue_classifications",
+  "create_revenue_classification",
+  "update_revenue_classification",
+  "list_revenue_custom_fields",
+  "create_revenue_custom_field",
+  "update_revenue_custom_field",
+  "install_base_migration_custom_fields",
+  "set_revenue_custom_fields",
+  "list_partnerships",
+  "get_partnership",
+  "create_partnership",
+  "update_partnership",
+  "add_partnership_contact",
+  "list_revenue_documents",
+  "link_revenue_document",
+  "get_revenue_document",
+  "update_revenue_document",
+  "delete_revenue_document",
+  "download_revenue_document",
+  "preview_revenue_record_merge",
+  "merge_revenue_records",
+  "resolve_revenue_record_redirect",
+  "list_revenue_operations",
+  "get_revenue_operation",
+  "undo_revenue_operation",
+  "preview_revenue_bulk_operation",
+  "start_revenue_bulk_job",
+  "get_revenue_bulk_job",
+  "export_revenue_bulk_reconciliation",
+  "preview_historical_deal_import",
+  "run_historical_deal_import",
+  "list_deal_history",
+  "backfill_deal_history",
+  "list_deal_history_coverage",
+  "preview_deal_history_backfill",
+  "export_revenue_snapshot",
+  "propose_revenue_account_domains",
+  "scan_revenue_duplicates",
+  "list_revenue_duplicate_candidates",
+  "dismiss_revenue_duplicate_candidate",
+  "scan_revenue_mail_documents",
+  "list_revenue_document_candidates",
+  "review_revenue_document_candidate",
+  "list_revenue_imports",
+  "get_revenue_import",
+  "list_revenue_import_rows",
+  "export_revenue_import_reconciliation",
+  "preview_base_revenue_import",
+  "run_base_revenue_import",
+  "preview_linked_base_revenue_import",
+  "run_linked_base_revenue_import",
+  "preview_revenue_rows_import",
+  "run_revenue_rows_import",
+  "preview_linked_revenue_rows_import",
+  "run_linked_revenue_rows_import",
+  "migrate_base_revenue_attachments",
+  "rollback_revenue_import",
+  "create_contact",
+  "update_contact",
+  "create_deal",
+  "update_deal",
+  "move_deal_stage",
+  "log_activity",
+  "add_deal_contact",
+  "enroll_in_sequence",
+  "suppress_email",
+  "get_marketing_overview",
+  "list_marketing_campaigns",
+  "get_marketing_campaign",
+  "create_marketing_campaign",
+  "update_marketing_campaign",
+  "list_marketing_creatives",
+  "create_marketing_creative",
+  "update_marketing_creative",
+  "list_marketing_experiments",
+  "create_marketing_experiment",
+  "update_marketing_experiment",
+  "record_marketing_performance",
+  // Recruiting is Member-level on the human route: any Member may post and
+  // edit Openings and work Applications (routes/recruiting.ts). The admin-only
+  // parts — the careers site, the screener, AI access, erasing an
+  // Application — have no tool at all.
+  "list_openings",
+  "get_opening",
+  "create_opening",
+  "update_opening",
+  "publish_opening",
+  "close_opening",
+  "list_applications",
+  "get_application",
+  "score_application",
+  "move_application",
+  "add_application_note",
+  "add_candidate",
+  // Support is Member-level on the human route: any Member may read and answer
+  // tickets and write Articles (routes/support.ts). The admin-only parts — Support
+  // inboxes, the appointed AI Employee and AI access — have no tool at all.
+  "list_support_tickets",
+  "get_support_ticket",
+  "search_support_articles",
+  "get_support_article",
+  "get_support_overview",
+  "add_support_note",
+  "update_support_ticket",
+  "draft_support_reply",
+  "create_support_article",
+  "update_support_article",
+  "reply_to_support_ticket",
+] as const;
+
+const ADMIN_TOOLS = [
+  // Review plans can contain the same restricted details as the Approvals inbox.
+  "list_work_reviews",
+  // Approving in Entry review is owner/admin on the human route
+  // (`canApproveFinance`), and an AI Employee's approval is just as final.
+  "review_finance_transaction",
+  "review_finance_transactions",
+  // External delivery requires the same Member authority as a forge Connection.
+  "open_repository_work_session_pull_request",
+  "push_repository_work_session",
+  "create_skill",
+  "update_skill",
+  "delete_skill",
+  "create_routine",
+  "update_routine",
+  "delete_routine",
+  // Run now is a Routine mutation on the human route, admin-gated with the rest.
+  "run_routine_now",
+  // Trigger writes are admin-only on the human route (routes/reactivity.ts).
+  "create_routine_trigger",
+  "update_routine_trigger",
+  "delete_routine_trigger",
+  // Progress reports mutate a Goal, and every Goal mutation on the human
+  // route is admin-gated (`routes/goals.ts`).
+  "update_goal_progress",
+  // Proposing a revision performs no privileged effect, but it stages an edit
+  // to a Soul/Skill/Routine — surfaces whose human mutations are admin-gated
+  // — and pages the owners. A Member-driven turn gets it at the same rank as
+  // editing those surfaces directly.
+  "propose_revision",
+  // The packet includes Connection-backed work; match that delegation boundary.
+  "get_own_work_review",
+  "get_proactive_work",
+  "get_participating_routine",
+  // Both create future employee-authority work — a wakeup is a deferred
+  // session, an initiative pages owners toward a new Routine. The same class
+  // of act as creating a Routine, which sits in this bucket.
+  "schedule_wakeup",
+  "propose_initiative",
+  // Every mutation on the human Pipelines route requires the admin company
+  // role (`routes/pipelines.ts`), and a Pipeline runs as the company once
+  // saved — so a delegated Member gets exactly the authority they already
+  // have in the builder. `run_pipeline` sits here with the writers because
+  // firing one executes company-authority steps, not because it edits.
+  "create_pipeline",
+  "update_pipeline",
+  "delete_pipeline",
+  "run_pipeline",
+  "rotate_pipeline_webhook_token",
+  // Memory and Journal can contain material learned under broader Grants.
+  // Until entries carry resource provenance, regular delegated Members do not
+  // receive them through an AI Employee.
+  "list_journal",
+  "get_journal_entry",
+  "add_journal_entry",
+  "list_memory",
+  "add_memory",
+  "update_memory",
+  "delete_memory",
+  // Vault tools act with an AI Employee's item Grants. Until the delegated
+  // Member's per-item View/Edit access is intersected in every handler, keep
+  // interactive use owner/admin-only so a Member cannot borrow broader AI
+  // access from chat. Routine Runs still use the EmployeeVaultGrant directly.
+  "list_vault_items",
+  "create_vault_login",
+  "update_vault_login",
+  // Code workspaces, raw data-source access, and generated files have no
+  // Member-level Grant model. Their human management surfaces are privileged.
+  "list_repositories",
+  "send_chat_attachment",
+  "list_explore_connections",
+  "get_explore_schema",
+  "run_explore_query",
+  "list_charts",
+  "get_chart",
+  "run_chart",
+  "create_chart",
+  "update_chart",
+  "delete_chart",
+  "list_dashboards",
+  "get_dashboard",
+  "create_dashboard",
+  "add_dashboard_card",
+  "update_dashboard_card",
+  "remove_dashboard_card",
+  // These Revenue enrichment tools can expose Connection-, mailbox-, or
+  // Finance-derived evidence selected at runtime. There is no single
+  // Member-resource ACL to intersect before inspecting the payload.
+  "propose_stripe_commercial_values",
+  "create_commercial_value_proposal",
+  "list_revenue_field_evidence",
+  "review_revenue_field_evidence",
+  // Phone numbers. A number's texts carry the verification codes for the
+  // accounts its AI Employee signs into, and its calls carry what strangers
+  // said — the human routes are owner/admin for both reads and writes, and
+  // sending or calling spends company money from a company number.
+  "list_phone_numbers",
+  "send_text_message",
+  "list_text_messages",
+  "wait_for_text_message",
+  "place_phone_call",
+  "get_phone_call",
+  "list_phone_calls",
+  // Data rooms. The human routes are owner/admin for reads and writes alike —
+  // a room holds the company's most sensitive documents and often news the
+  // rest of the company has not heard — so a Member cannot reach one through
+  // an AI Employee either.
+  "list_data_rooms",
+  "get_data_room",
+  "read_data_room_document",
+  "list_data_room_questions",
+  "get_data_room_activity",
+  "create_data_room",
+  "add_data_room_document",
+  "update_data_room_document",
+  "remove_data_room_document",
+  "draft_data_room_answer",
+  "answer_data_room_question",
+  "invite_data_room_guest",
+] as const;
+
+/**
+ * Tools retained for trusted employee work but never delegated through the
+ * ordinary Member registry. Decision-stack review conversations receive
+ * narrower, locally bound editors that supply the Approval id and CAS
+ * revision themselves; exposing these argument-driven MCP tools as well would
+ * let an unrelated admin chat choose a different review by id.
+ */
+export const INTERACTIVE_MEMBER_DENIED_TOOLS = new Set([
+  "revise_work_review",
+  "revise_mail_review",
+  // Failure reporting belongs only to the server-bound current Routine Run.
+  "mark_run_failed",
+  "save_run_checkpoint",
+] as const);
+
+const FINANCE_READ_TOOLS = [
+  "list_subsidiaries",
+  "list_finance_accounts",
+  "list_finance_transactions",
+  "get_finance_transaction",
+  "get_finance_report",
+  "list_banking_accounts",
+  "list_banking_transactions",
+  "get_bank_transaction_matches",
+  "list_tax_rates",
+  "list_vendors",
+  "list_bills",
+  "get_bill",
+  "list_estimates",
+  "get_estimate",
+  "list_finance_products",
+  "list_invoices",
+  "get_invoice",
+  "list_recurring_invoices",
+  "get_recurring_invoice",
+  "list_customers",
+  "get_customer",
+  "list_commercial_value_backlog",
+] as const;
+
+const FINANCE_WRITE_TOOLS = [
+  "categorize_banking_transactions",
+  "mark_banking_transactions_reviewed",
+  "send_banking_transactions_to_review",
+  "match_bank_transaction",
+  "undo_bank_transaction",
+  "pay_invoices_from_bank_transaction",
+  "retry_card_transaction",
+  "sync_banking_account",
+  "update_invoice",
+  "issue_invoice",
+  "delete_invoice",
+  "convert_estimate_to_invoice",
+  "create_finance_transaction",
+  "create_finance_account",
+  "update_finance_account",
+  "create_vendor",
+  "update_vendor",
+  "create_bill",
+  "update_bill",
+  "issue_bill",
+  "void_bill",
+  "delete_bill",
+  "record_bill_payment",
+  "reverse_bill_payment",
+  "create_customer",
+  "update_customer",
+  "create_estimate",
+  "issue_estimate",
+  "send_estimate",
+  "create_invoice",
+  "create_recurring_invoice",
+  "update_recurring_invoice",
+  "send_invoice",
+  "record_payment",
+  "void_invoice",
+  "propose_finance_commercial_values",
+] as const;
+
+const PROJECT_TOOLS = [
+  "list_projects",
+  "list_todos",
+  "list_my_todos",
+  "get_todo",
+  "create_todo",
+  "update_todo",
+  "add_todo_comment",
+  "start_todo",
+  "wait_on_todo",
+  "link_todo",
+  "unlink_todo",
+] as const;
+/**
+ * The open web carries no company data in either direction, so it needs no
+ * Member intersection beyond an authenticated one. The risk these tools do
+ * carry — a hostile page trying to steer the model, or a URL aimed at the
+ * operator's internal network — is answered where it lives: the outbound
+ * guard in `lib/outboundUrl.ts` and the untrusted-content framing on every
+ * result, both of which apply to Routine Runs identically.
+ */
+const WEB_TOOLS = ["search_web", "fetch_web_page", "download_web_file"] as const;
+const ATTACHMENT_TOOLS = [
+  "read_pdf_fields",
+  "fill_pdf_form",
+  "read_pdf_layout",
+  "overlay_pdf_text",
+  "read_xlsx",
+  "edit_xlsx",
+  "read_docx",
+  "edit_docx",
+  "create_docx",
+  "convert_to_pdf",
+] as const;
+/**
+ * Workspace chat has its own per-channel participant model. Each handler must
+ * intersect the requesting Member's visibility with the acting AI Employee's
+ * visibility. Keeping the tools in a distinct policy bucket makes a newly
+ * added channel operation fail the exhaustive policy test until that
+ * intersection has been reviewed explicitly.
+ */
+const CHANNEL_TOOLS = [
+  "list_workspace_channels",
+  "list_workspace_messages",
+  "create_workspace_channel",
+  "rename_workspace_channel",
+  "archive_workspace_channel",
+  "send_workspace_message",
+] as const;
+
+const entries: Array<readonly [string, MemberToolPolicy]> = [
+  ...MEMBER_TOOLS.map((name) => [name, "member"] as const),
+  ...ADMIN_TOOLS.map((name) => [name, "admin"] as const),
+  ...FINANCE_READ_TOOLS.map((name) => [name, "finance.read"] as const),
+  ...FINANCE_WRITE_TOOLS.map((name) => [name, "finance.write"] as const),
+  ...PROJECT_TOOLS.map((name) => [name, "project"] as const),
+  ...WEB_TOOLS.map((name) => [name, "member"] as const),
+  ...ATTACHMENT_TOOLS.map((name) => [name, "attachment"] as const),
+  ...CHANNEL_TOOLS.map((name) => [name, "channel"] as const),
+];
+
+export const MEMBER_TOOL_AUTHORITY = new Map<string, MemberToolPolicy>();
+for (const [name, policy] of entries) {
+  if (MEMBER_TOOL_AUTHORITY.has(name)) {
+    throw new Error(`Duplicate interactive Member tool policy: ${name}`);
+  }
+  MEMBER_TOOL_AUTHORITY.set(name, policy);
+}
+
+export function memberToolPolicy(name: string): MemberToolPolicy | null {
+  return MEMBER_TOOL_AUTHORITY.get(name) ?? null;
+}
+
+/** Internal callbacks used only by the privileged browser bridge. */
+const MEMBER_INTERNAL_CALLBACK_AUTHORITY = new Map<string, MemberToolPolicy>([
+  ["queue_browser_approval", "admin"],
+  ["check_browser_approval", "admin"],
+  ["claim_browser_approval", "admin"],
+  ["finish_browser_approval", "admin"],
+]);
+
+export function memberInternalCallbackPolicy(name: string): MemberToolPolicy | null {
+  return MEMBER_INTERNAL_CALLBACK_AUTHORITY.get(name) ?? null;
+}

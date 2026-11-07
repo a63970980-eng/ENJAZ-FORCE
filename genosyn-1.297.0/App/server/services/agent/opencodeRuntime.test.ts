@@ -1,0 +1,1603 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createServer, type ServerResponse } from "node:http";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { AssistantMessage, Event, Part } from "@opencode-ai/sdk/v2";
+import type { AIModel } from "../../db/entities/AIModel.js";
+import { residentOnlyRegistry } from "./tools/toolRegistry.js";
+import {
+  buildOpenCodeConfig,
+  CUSTOM_MODEL_OUTPUT_LIMIT,
+  OPENCODE_REPAIR_TOOL,
+  openCodePromptParts,
+  SELF_HOSTED_RESPONSE_WAIT_MS,
+} from "./opencodeConfig.js";
+import { openCodeEnvironment, openCodeStartupError } from "./opencodeServer.js";
+import { OpenCodeEvents, openCodeActivityError, providerErrorDetail } from "./opencodeEvents.js";
+import { openCodeToolNames, serveOpenCodeTools } from "./opencodeMcp.js";
+import { runOpenCodeSession, type OpenCodeTurnParams } from "./opencodeRuntime.js";
+import { endOnUserTurn, serveOpenCodeModel } from "./opencodeProxy.js";
+import { ADAPTIVE_THINKING_OUTPUT_LIMIT, openCodeThinking } from "./thinkingParams.js";
+import { openCodeModelLimits } from "./opencodeModelLimits.js";
+import { OpenCodeToolGate } from "./opencodeToolGate.js";
+
+const model = {
+  id: "fixture",
+  provider: "custom" as const,
+  apiKey: "private-key",
+  baseURL: "http://127.0.0.1:1000/v1",
+  contextWindow: 32000,
+};
+const configuration = (nativeCoding = false) =>
+  buildOpenCodeConfig({
+    model,
+    maxSteps: 8,
+    nativeCoding,
+    mcp: { url: "http://127.0.0.1:1234/mcp", token: "bridge-secret" },
+  });
+
+test("long MCP tool names stay inside the provider limit without collisions", () => {
+  const names = ["short", `${"long_".repeat(13)}a`, `${"long_".repeat(13)}b`];
+  const mapped = openCodeToolNames(names);
+  assert.equal(mapped.get("short"), "short");
+  assert.equal(new Set(mapped.values()).size, 3);
+  assert.ok([...mapped.values()].every((name) => `genosyn_${name}`.length <= 64));
+  assert.deepEqual(openCodeToolNames(names), mapped);
+});
+
+test("OpenCode config confines scoped turns and keeps coding tools an explicit choice", () => {
+  const cfg = configuration();
+  assert.deepEqual(cfg.enabled_providers, ["genosyn-model"]);
+  assert.deepEqual(cfg.permission, {
+    "*": "deny",
+    invalid: "allow",
+    doom_loop: "allow",
+    "genosyn_*": "allow",
+  });
+  assert.equal(cfg.agent?.genosyn?.steps, 8);
+  assert.equal(cfg.agent?.general?.disable, true);
+  assert.equal(cfg.agent?.title?.disable, true);
+  assert.equal(cfg.lsp, false);
+  assert.equal(cfg.share, "disabled");
+  assert.equal(cfg.autoupdate, false);
+  assert.equal(cfg.provider?.["genosyn-model"].npm, "@ai-sdk/openai-compatible");
+  const native = configuration(true);
+  assert.equal((native.permission as Record<string, string>).bash, "ask");
+  assert.equal((native.permission as Record<string, string>).task, undefined);
+  assert.equal((native.permission as Record<string, string>).question, undefined);
+});
+
+/**
+ * OpenCode 1.18.31 drops a tool when the last permission rule matching its name
+ * is a `"*"` pattern with action `"deny"` (rules apply in insertion order and
+ * `*` matches any run of characters). Mirror that rule to prove its tool-call
+ * repair target stays registered while every unlisted tool stays removed.
+ */
+function openCodeDisablesTool(permission: Record<string, string>, tool: string): boolean {
+  const matches = (name: string, pattern: string) =>
+    new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(
+      name,
+    );
+  const rule = Object.entries(permission)
+    .reverse()
+    .find(([pattern]) => matches(tool, pattern));
+  return rule?.[1] === "deny";
+}
+
+test("OpenCode keeps its tool-call repair target while unlisted tools stay removed", () => {
+  for (const nativeCoding of [false, true]) {
+    const permission = configuration(nativeCoding).permission as Record<string, string>;
+    assert.equal(openCodeDisablesTool(permission, OPENCODE_REPAIR_TOOL), false);
+    assert.equal(openCodeDisablesTool(permission, "genosyn_find_tools"), false);
+    for (const tool of ["task", "question", "webfetch", "skill", "call_tool"])
+      assert.equal(openCodeDisablesTool(permission, tool), true, tool);
+    assert.equal(openCodeDisablesTool(permission, "bash"), !nativeCoding);
+  }
+});
+
+test("unlimited turns omit OpenCode's native step ceiling", () => {
+  const cfg = buildOpenCodeConfig({
+    model,
+    maxSteps: null,
+    nativeCoding: false,
+    mcp: { url: "http://localhost/mcp", token: "temporary" },
+  });
+  assert.ok(cfg.agent?.genosyn);
+  assert.equal(Object.hasOwn(cfg.agent.genosyn, "steps"), false);
+  assert.equal(Object.hasOwn(cfg.agent.genosyn, "maxSteps"), false);
+  assert.equal(cfg.compaction?.auto, true);
+});
+
+test("provider mapping preserves Responses, Anthropic thinking and endpoint model IDs", () => {
+  for (const [provider, id] of [
+    ["openai", "gpt-5.5"],
+    ["anthropic", "claude-opus-4-7"],
+  ] as const) {
+    const cfg = buildOpenCodeConfig({
+      model: { ...model, provider, id, contextWindow: 200_000 },
+      thinking: openCodeThinking({ provider, model: id }, "high"),
+      maxSteps: 4,
+      nativeCoding: false,
+      mcp: { url: "http://localhost/mcp", token: "secret" },
+    });
+    const mapped = cfg.provider?.[provider === "openai" ? "openai" : "genosyn-model"];
+    assert.equal(mapped?.npm, `@ai-sdk/${provider}`);
+    assert.equal(mapped?.models?.[id].id, id);
+    if (provider === "openai") {
+      assert.equal(mapped?.models?.[id].limit, undefined);
+      assert.deepEqual(mapped?.models?.[id].options, {
+        store: false,
+        reasoningEffort: "high",
+        reasoningSummary: "auto",
+      });
+    } else {
+      assert.deepEqual(mapped?.models?.[id].options, {
+        thinking: { type: "adaptive", display: "summarized" },
+        effort: "high",
+      });
+      // Thinking counts against max_tokens, so an adaptive level gets room.
+      assert.deepEqual(mapped?.models?.[id].limit, {
+        context: 200_000,
+        output: ADAPTIVE_THINKING_OUTPUT_LIMIT,
+      });
+    }
+  }
+  // A turn at the model's own default sends no thinking options and keeps 8K.
+  const plain = buildOpenCodeConfig({
+    model: { ...model, provider: "anthropic", id: "claude-opus-4-7", contextWindow: 200_000 },
+    maxSteps: 4,
+    nativeCoding: false,
+    mcp: { url: "http://localhost/mcp", token: "secret" },
+  }).provider?.["genosyn-model"].models?.["claude-opus-4-7"];
+  assert.deepEqual(plain?.options, {});
+  assert.deepEqual(plain?.limit, { context: 200_000, output: 8192 });
+  // A level for a model Genosyn cannot send one to is refused, never dropped.
+  assert.throws(
+    () => openCodeThinking({ provider: "custom", model: "fixture" }, "high"),
+    /doesn't offer thinking levels/,
+  );
+});
+
+// 2026-10-02: a saturated vLLM took over five minutes to start answering Routine
+// steps, and OpenCode abandoned each one at five minutes and sent it again.
+test("a custom endpoint gets longer to start answering than a hosted API", () => {
+  const options = (provider: "custom" | "anthropic") =>
+    buildOpenCodeConfig({
+      model: { ...model, provider },
+      maxSteps: 4,
+      nativeCoding: false,
+      mcp: { url: "http://localhost/mcp", token: "secret" },
+    }).provider?.["genosyn-model"]?.options;
+  assert.ok(SELF_HOSTED_RESPONSE_WAIT_MS > 5 * 60_000, "longer than OpenCode's own five minutes");
+  assert.equal(options("custom")?.headerTimeout, SELF_HOSTED_RESPONSE_WAIT_MS);
+  assert.equal(options("custom")?.chunkTimeout, SELF_HOSTED_RESPONSE_WAIT_MS);
+  assert.equal(options("anthropic")?.headerTimeout, undefined);
+  assert.equal(options("anthropic")?.chunkTimeout, undefined);
+});
+
+test("OpenAI limits inherit published output caps and reserve input for small windows", () => {
+  assert.deepEqual(openCodeModelLimits({ context: 128000, output: 16384 }, 128000), {
+    context: 128000,
+    input: 128000,
+    output: 16384,
+  });
+  assert.deepEqual(openCodeModelLimits({ context: 8192, output: 8192 }, 8192), {
+    context: 8192,
+    input: 8192,
+    output: 4096,
+  });
+  assert.deepEqual(
+    openCodeModelLimits({ context: 400000, input: 272000, output: 128000 }, 400000),
+    { context: 400000, input: 272000, output: 128000 },
+  );
+  assert.deepEqual(openCodeModelLimits({ context: 0, output: 0 }, null), { context: 0, output: 0 });
+});
+
+test("unknown context stays unknown and legacy Anthropic models keep their output ceiling", () => {
+  const cfg = buildOpenCodeConfig({
+    model: { ...model, id: "claude-3-haiku-20240307", provider: "anthropic", contextWindow: null },
+    maxSteps: 1,
+    nativeCoding: false,
+    mcp: { url: "", token: "" },
+  });
+  assert.deepEqual(cfg.provider?.["genosyn-model"].models?.["claude-3-haiku-20240307"].limit, {
+    context: 0,
+    output: 4096,
+  });
+});
+
+test("custom endpoints with a known window leave reasoning models room to think", () => {
+  const limitFor = (contextWindow: number | null, provider: "custom" | "anthropic" = "custom") =>
+    buildOpenCodeConfig({
+      model: { ...model, provider, id: "qwen", contextWindow },
+      maxSteps: null,
+      nativeCoding: false,
+      mcp: { url: "", token: "" },
+    }).provider?.["genosyn-model"].models?.qwen.limit;
+  assert.deepEqual(limitFor(262144), { context: 262144, output: CUSTOM_MODEL_OUTPUT_LIMIT });
+  assert.deepEqual(limitFor(65536), { context: 65536, output: 16384 }, "a quarter of the window");
+  assert.deepEqual(limitFor(32000), { context: 32000, output: 8000 });
+  assert.deepEqual(limitFor(null), { context: 0, output: 8192 }, "an unknown window stays small");
+  assert.deepEqual(limitFor(262144, "anthropic"), { context: 262144, output: 8192 });
+});
+
+test("child environment excludes ambient credentials and repository configuration", () => {
+  const env = openCodeEnvironment({
+    home: "/private/session",
+    password: "server-secret",
+    config: configuration(),
+    toolEnv: {
+      HOME: "/wrong",
+      OPENCODE_CONFIG: "/untrusted",
+      OPENAI_API_KEY: "ambient",
+      PATH: "/bin",
+      PROJECT_VALUE: "kept",
+    },
+  });
+  assert.equal(env.HOME, "/private/session");
+  assert.equal(env.PROJECT_VALUE, "kept");
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.OPENCODE_CONFIG, undefined);
+  assert.equal(env.OPENCODE_DISABLE_PROJECT_CONFIG, "true");
+  assert.equal(env.OPENCODE_DISABLE_DEFAULT_PLUGINS, "true");
+  assert.equal(env.OPENCODE_DISABLE_MODELS_FETCH, "true");
+});
+
+test("conversation history retains roles, tool evidence and actual image parts", () => {
+  const parts = openCodePromptParts([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Earlier report" },
+        { type: "tool_use", id: "old", name: "read_file", input: { path: "a.ts" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", toolUseId: "old", content: "failed read", isError: true },
+        { type: "text", text: "Fix this" },
+        { type: "image", mimeType: "image/png", data: "aGVsbG8=", sourceLabel: "screenshot.png" },
+      ],
+    },
+  ]);
+  assert.ok(
+    parts.some((part) => part.type === "text" && part.text.includes("history — assistant")),
+  );
+  assert.ok(
+    parts.some((part) => part.type === "text" && part.text.includes("(failed): failed read")),
+  );
+  assert.ok(
+    parts.some((part) => part.type === "file" && part.url === "data:image/png;base64,aGVsbG8="),
+  );
+});
+
+function assistant(id = "assistant"): AssistantMessage {
+  return {
+    id,
+    sessionID: "session",
+    role: "assistant",
+    time: { created: 1, completed: 2 },
+    parentID: "user",
+    modelID: "fixture",
+    providerID: "genosyn-model",
+    mode: "genosyn",
+    agent: "genosyn",
+    path: { cwd: "/tmp", root: "/tmp" },
+    cost: 0,
+    tokens: { input: 10, output: 3, reasoning: 1, cache: { read: 2, write: 1 } },
+    finish: "stop",
+  };
+}
+function updated(part: Part): Event {
+  return {
+    id: `event-${part.id}`,
+    type: "message.part.updated",
+    properties: { sessionID: "session", part, time: 1 },
+  };
+}
+
+test("events stream only assistant prose, deduplicate snapshots and preserve actual usage", () => {
+  const text: string[] = [];
+  const usage: unknown[] = [];
+  const events = new OpenCodeEvents(
+    "session",
+    { onText: (s) => text.push(s), onUsage: (u) => usage.push(u) },
+    100,
+  );
+  events.accept(
+    updated({
+      id: "user-part",
+      type: "text",
+      sessionID: "session",
+      messageID: "user",
+      text: "Do not echo this",
+    }),
+  );
+  events.accept({
+    id: "assistant-event",
+    type: "message.updated",
+    properties: { sessionID: "session", info: assistant() },
+  });
+  const part = {
+    id: "part",
+    type: "text" as const,
+    sessionID: "session",
+    messageID: "assistant",
+    text: "Hi",
+  };
+  events.accept(updated(part));
+  events.accept({
+    id: "delta",
+    type: "message.part.delta",
+    properties: {
+      sessionID: "session",
+      messageID: "assistant",
+      partID: "part",
+      field: "text",
+      delta: " there",
+    },
+  });
+  events.accept(updated({ ...part, text: "Hi there" }));
+  const finish: Part = {
+    id: "finish",
+    type: "step-finish",
+    sessionID: "session",
+    messageID: "assistant",
+    reason: "stop",
+    cost: 0,
+    tokens: assistant().tokens,
+  };
+  events.accept(updated(finish));
+  events.accept(updated(finish));
+  assert.equal(text.join(""), "Hi there");
+  assert.equal(events.finalText, "Hi there");
+  assert.equal(events.steps, 1);
+  assert.deepEqual(usage, [{ inputTokens: 13, outputTokens: 4 }]);
+});
+
+test("text callbacks wait for visible output and omit empty or unchanged updates", () => {
+  const chunks: string[] = [];
+  const interrupted = new AbortController();
+  const events = new OpenCodeEvents("session", {
+    onText: (chunk) => {
+      chunks.push(chunk);
+      interrupted.abort();
+    },
+  });
+  events.accept({
+    id: "message",
+    type: "message.updated",
+    properties: { sessionID: "session", info: assistant() },
+  });
+  const part: Part = {
+    id: "reply",
+    type: "text",
+    sessionID: "session",
+    messageID: "assistant",
+    text: "",
+  };
+  const delta = (text: string): Event => ({
+    id: "delta",
+    type: "message.part.delta",
+    properties: {
+      sessionID: "session",
+      messageID: "assistant",
+      partID: "reply",
+      field: "text",
+      delta: text,
+    },
+  });
+  events.accept(updated(part));
+  events.accept(updated(part));
+  events.accept(delta(""));
+  assert.deepEqual(chunks, []);
+  assert.equal(interrupted.signal.aborted, false);
+
+  events.accept(delta("Visible"));
+  assert.deepEqual(chunks, ["Visible"]);
+  assert.equal(interrupted.signal.aborted, true);
+  events.accept(updated({ ...part, text: "Visible" }));
+  events.accept(delta(""));
+  events.accept(updated({ ...part, text: "Visible reply." }));
+  events.accept(updated({ ...part, text: "Visible reply." }));
+  assert.deepEqual(chunks, ["Visible", " reply."]);
+  assert.equal(events.finalText, "Visible reply.");
+});
+
+test("tool execution waits for streamed ordering and text readiness is fixed for each message", async () => {
+  let wasRead = false;
+  const text: string[] = [];
+  const gate = new OpenCodeToolGate();
+  const events = new OpenCodeEvents(
+    "session",
+    { shouldStreamText: () => wasRead, onText: (value) => text.push(value) },
+    null,
+    (part) => gate.observe(part),
+  );
+  const waiting = gate.enter("read_decision").then(() => {
+    wasRead = true;
+  });
+  events.accept({
+    id: "first",
+    type: "message.updated",
+    properties: { sessionID: "session", info: assistant("first") },
+  });
+  events.part({
+    id: "before",
+    type: "text",
+    sessionID: "session",
+    messageID: "first",
+    text: "Before the read",
+  });
+  assert.equal(wasRead, false);
+  const tool: Part = {
+    id: "read",
+    type: "tool",
+    sessionID: "session",
+    messageID: "first",
+    callID: "read",
+    tool: "genosyn_read_decision",
+    state: { status: "running", input: {}, time: { start: 1 } },
+  };
+  events.part(tool);
+  events.part(tool);
+  await waiting;
+  events.part({
+    id: "late",
+    type: "text",
+    sessionID: "session",
+    messageID: "first",
+    text: "Still generated before seeing the read result",
+  });
+  events.accept({
+    id: "next",
+    type: "message.updated",
+    properties: { sessionID: "session", info: assistant("next") },
+  });
+  events.part({
+    id: "answer",
+    type: "text",
+    sessionID: "session",
+    messageID: "next",
+    text: "Grounded answer",
+  });
+  assert.deepEqual(text, ["Grounded answer"]);
+  const queued = gate.enter("read_decision");
+  gate.close();
+  await assert.rejects(queued, /turn has ended/);
+});
+
+test("retries are visible again in later steps and empty final replies do not reuse narration", () => {
+  let retries = 0;
+  const text: string[] = [];
+  const events = new OpenCodeEvents("session", {
+    onModelRetry: () => {
+      retries++;
+    },
+    onText: (value) => text.push(value),
+  });
+  for (const id of ["first", "final"]) {
+    events.accept({
+      id: `message-${id}`,
+      type: "message.updated",
+      properties: { sessionID: "session", info: assistant(id) },
+    });
+    const retry: Event = {
+      id: `retry-${id}`,
+      type: "session.status",
+      properties: {
+        sessionID: "session",
+        status: { type: "retry", attempt: 2, message: "Retrying", next: Date.now() + 1000 },
+      },
+    };
+    events.accept(retry);
+    events.accept(retry);
+    if (id === "first")
+      events.part({
+        id: "narration",
+        type: "text",
+        sessionID: "session",
+        messageID: id,
+        text: "I will read the evidence.",
+      });
+  }
+  events.accept({
+    id: "summary-message",
+    type: "message.updated",
+    properties: { sessionID: "session", info: { ...assistant("summary"), summary: true } },
+  });
+  events.part({
+    id: "summary-text",
+    type: "text",
+    sessionID: "session",
+    messageID: "summary",
+    text: "Private compaction summary",
+  });
+  assert.equal(retries, 2);
+  assert.equal(events.finalText, "");
+  assert.deepEqual(text, ["I will read the evidence."]);
+});
+
+test("MCP serves resident tools, dispatches deferred tools, and preserves images and failures", async () => {
+  const seen: unknown[] = [];
+  const registry = residentOnlyRegistry([
+    {
+      name: "observe",
+      description: "Read fixture",
+      inputSchema: { type: "object", properties: {} },
+      readOnly: true,
+      async run() {
+        return { content: "observed", images: [{ mimeType: "image/png", data: "aGVsbG8=" }] };
+      },
+    },
+  ]);
+  registry.all.set("failure", {
+    name: "failure",
+    description: "Failure",
+    inputSchema: { type: "object" },
+    async run() {
+      throw new Error("fixture failure");
+    },
+  });
+  const endpoint = await serveOpenCodeTools({
+    registry,
+    callbacks: {
+      onToolUse: (name) => seen.push(name),
+      onToolResult: (_name, result) => seen.push(result),
+    },
+  });
+  const client = new Client({ name: "fixture", version: "1" });
+  try {
+    assert.equal((await fetch(endpoint.url, { method: "POST" })).status, 401);
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(endpoint.url), {
+        requestInit: { headers: { Authorization: `Bearer ${endpoint.token}` } },
+      }),
+    );
+    assert.deepEqual(
+      (await client.listTools()).tools.map((tool) => tool.name),
+      ["observe"],
+    );
+    const result = await client.callTool({ name: "observe", arguments: {} });
+    assert.ok(
+      Array.isArray(result.content) &&
+        result.content.some((part) => (part as { type: string }).type === "image"),
+    );
+    const failure = await client.callTool({ name: "failure", arguments: {} });
+    assert.equal(failure.isError, true);
+    assert.equal(seen[0], "observe");
+    assert.equal(seen[2], "failure");
+  } finally {
+    await client.close();
+    await endpoint.close();
+  }
+});
+
+test("a Run's time check reaches the model beside the tool output, never inside it", async () => {
+  const checkpoint = JSON.stringify({ ok: true, state: "continue" });
+  const registry = residentOnlyRegistry([
+    {
+      name: "save_run_checkpoint",
+      description: "Save progress.",
+      inputSchema: { type: "object", properties: {} },
+      run: async () => ({ content: checkpoint }),
+    },
+  ]);
+  const notices = ["[Time check] About 9 minutes remain.", null];
+  registry.resultNotice = () => notices.shift() ?? null;
+  const recorded: string[] = [];
+  const endpoint = await serveOpenCodeTools({
+    registry,
+    callbacks: { onToolResult: (_name, result) => recorded.push(result.content) },
+  });
+  const client = new Client({ name: "fixture", version: "1" });
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(endpoint.url), {
+        requestInit: { headers: { Authorization: `Bearer ${endpoint.token}` } },
+      }),
+    );
+    const withNotice = await client.callTool({ name: "save_run_checkpoint", arguments: {} });
+    assert.deepEqual(withNotice.content, [
+      { type: "text", text: checkpoint },
+      { type: "text", text: "[Time check] About 9 minutes remain." },
+    ]);
+    const quiet = await client.callTool({ name: "save_run_checkpoint", arguments: {} });
+    assert.deepEqual(quiet.content, [{ type: "text", text: checkpoint }]);
+    assert.deepEqual(recorded, [checkpoint, checkpoint], "the runner parses the tool's own output");
+
+    registry.resultNotice = () => {
+      throw new Error("a broken note");
+    };
+    const unaffected = await client.callTool({ name: "save_run_checkpoint", arguments: {} });
+    assert.deepEqual(unaffected.content, [{ type: "text", text: checkpoint }]);
+  } finally {
+    await client.close();
+    await endpoint.close();
+  }
+});
+
+test("concurrent MCP calls preserve company write ordering and do not run queued calls after abort", async () => {
+  const sequence: string[] = [];
+  let finishWrite!: () => void;
+  const writing = new Promise<void>((resolve) => {
+    finishWrite = resolve;
+  });
+  const controller = new AbortController();
+  const endpoint = await serveOpenCodeTools({
+    signal: controller.signal,
+    registry: residentOnlyRegistry([
+      {
+        name: "write_record",
+        description: "Write",
+        inputSchema: { type: "object" },
+        async run() {
+          sequence.push("write:start");
+          await writing;
+          sequence.push("write:end");
+          return { content: "written" };
+        },
+      },
+      {
+        name: "read_record",
+        description: "Read",
+        inputSchema: { type: "object" },
+        readOnly: true,
+        async run() {
+          sequence.push("read");
+          return { content: "read" };
+        },
+      },
+      {
+        name: "abort_record",
+        description: "Stop",
+        inputSchema: { type: "object" },
+        async run() {
+          sequence.push("abort");
+          controller.abort();
+          return { content: "stopped" };
+        },
+      },
+    ]),
+  });
+  const client = new Client({ name: "ordering", version: "1" });
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(endpoint.url), {
+        requestInit: { headers: { Authorization: `Bearer ${endpoint.token}` } },
+      }),
+    );
+    const first = client.callTool({ name: "write_record", arguments: {} });
+    await waitFor(() => sequence.length === 1);
+    const second = client.callTool({ name: "read_record", arguments: {} });
+    finishWrite();
+    await Promise.all([first, second]);
+    assert.deepEqual(sequence, ["write:start", "write:end", "read"]);
+    const aborting = client.callTool({ name: "abort_record", arguments: {} });
+    const queued = client.callTool({ name: "read_record", arguments: {} });
+    const [stop, skipped] = await Promise.allSettled([aborting, queued]);
+    assert.equal(stop.status, "fulfilled");
+    assert.equal(skipped.status, "rejected");
+    assert.deepEqual(sequence, ["write:start", "write:end", "read", "abort"]);
+  } finally {
+    finishWrite();
+    await client.close();
+    await endpoint.close();
+  }
+});
+
+async function fakeOpenCode(
+  action: (
+    emit: (event: Event) => void,
+    body: Record<string, unknown>,
+  ) => Promise<{ info: AssistantMessage; parts: Part[] }>,
+  options: {
+    hangControl?: boolean;
+    openAiModel?: { id: string; limit: { context: number; output: number } };
+    unchangedConfig?: boolean;
+    losePromptResponse?: boolean;
+  } = {},
+) {
+  let stream: ServerResponse | undefined;
+  let configurationPending = false;
+  let disposal = Promise.resolve();
+  let disposals = 0;
+  const permissions: Record<string, unknown>[] = [];
+  const globalConfigs: Record<string, unknown>[] = [];
+  let aborts = 0;
+  let prompts = 0;
+  let statusReads = 0;
+  let messageReads = 0;
+  let promptPending = false;
+  let completed: { info: AssistantMessage; parts: Part[] } | undefined;
+  const server = createServer(async (req, res) => {
+    const pathname = new URL(req.url!, "http://localhost").pathname;
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = chunks.length
+      ? (JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>)
+      : {};
+    const emit = (event: Event) => stream?.write(`data: ${JSON.stringify(event)}\n\n`);
+    if (pathname === "/provider") {
+      const model = options.openAiModel;
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          all: model ? [{ id: "openai", models: { [model.id]: { limit: model.limit } } }] : [],
+          default: {},
+          connected: ["openai"],
+        }),
+      );
+      return;
+    }
+    if (pathname === "/global/config") {
+      globalConfigs.push(body);
+      configurationPending = !options.unchangedConfig;
+      if (configurationPending)
+        disposal = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            configurationPending = false;
+            resolve();
+          }, 100);
+        });
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(body));
+      // Deliberately emit no global.disposed: it can precede subscription
+      // registration, and an unchanged update emits no event at all.
+      return;
+    }
+    if (pathname === "/global/dispose") {
+      disposals++;
+      // The actual endpoint shares the update's in-flight disposer.
+      await disposal;
+      res.setHeader("Content-Type", "application/json");
+      res.end("true");
+      return;
+    }
+    if (pathname === "/event") {
+      stream = res;
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      emit({ id: "connected", type: "server.connected", properties: {} });
+      return;
+    }
+    if (pathname === "/session" && req.method === "POST") {
+      assert.equal(configurationPending, false, "session must wait for global config disposal");
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ id: "session" }));
+      return;
+    }
+    if (pathname === "/session/status" && req.method === "GET") {
+      statusReads++;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ session: { type: promptPending ? "busy" : "idle" } }));
+      return;
+    }
+    if (pathname === "/session/session/message" && req.method === "GET") {
+      messageReads++;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(completed ? [completed] : []));
+      return;
+    }
+    if (pathname === "/session/session/message" && req.method === "POST") {
+      prompts++;
+      promptPending = true;
+      // The server accepted the prompt and keeps working even though the
+      // caller lost the long-lived HTTP response. Its SSE stream stays open.
+      if (options.losePromptResponse) res.destroy();
+      completed = await action(emit, body);
+      promptPending = false;
+      if (res.destroyed) return;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify(completed));
+      return;
+    }
+    if (pathname.startsWith("/permission/")) {
+      permissions.push(body);
+      if (options.hangControl) return;
+    }
+    if (pathname.endsWith("/abort")) aborts++;
+    res.setHeader("Content-Type", "application/json");
+    res.end("true");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== "string");
+  return {
+    permissions,
+    globalConfigs,
+    get aborts() {
+      return aborts;
+    },
+    get disposals() {
+      return disposals;
+    },
+    get prompts() {
+      return prompts;
+    },
+    get statusReads() {
+      return statusReads;
+    },
+    get messageReads() {
+      return messageReads;
+    },
+    connection: {
+      url: `http://127.0.0.1:${addr.port}`,
+      directory: "/tmp",
+      authorization: "Basic fixture",
+      exited: new Promise<never>(() => {}),
+      close: async () => {},
+    },
+    close: async () => {
+      stream?.end();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+const turnParams = (): OpenCodeTurnParams => ({
+  model: { contextWindow: 32000 } as AIModel,
+  system: "Company policy",
+  messages: [{ role: "user", content: [{ type: "text", text: "Do the work" }] }],
+  registry: residentOnlyRegistry([]),
+  maxSteps: 4,
+});
+
+test("SDK session streams a completed turn and passes policy plus current request", async () => {
+  const seen: string[] = [];
+  const runtime = await fakeOpenCode(async (emit, body) => {
+    assert.match(String(body.system), /Company policy/);
+    assert.match(JSON.stringify(body.parts), /Do the work/);
+    emit({
+      id: "message",
+      type: "message.updated",
+      properties: { sessionID: "session", info: assistant() },
+    });
+    const part: Part = {
+      id: "reply",
+      sessionID: "session",
+      messageID: "assistant",
+      type: "text",
+      text: "Finished",
+    };
+    const finish: Part = {
+      id: "finish",
+      sessionID: "session",
+      messageID: "assistant",
+      type: "step-finish",
+      reason: "stop",
+      cost: 0,
+      tokens: assistant().tokens,
+    };
+    emit(updated(part));
+    emit(updated(finish));
+    return { info: assistant(), parts: [part, finish] };
+  });
+  try {
+    const result = await runOpenCodeSession(runtime.connection, "fixture", {
+      ...turnParams(),
+      callbacks: { onText: (s) => seen.push(s) },
+    });
+    assert.deepEqual(result, { finalText: "Finished", steps: 1, stopReason: "end_turn" });
+    assert.equal(seen.join(""), "Finished");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test(
+  "a lost prompt response recovers the same session without repeating work or streamed activity",
+  { timeout: 10_000 },
+  async () => {
+    const text: string[] = [];
+    const calls: unknown[] = [];
+    const results: unknown[] = [];
+    const usages: unknown[] = [];
+    const retries: number[] = [];
+    const runtime = await fakeOpenCode(
+      async (emit) => {
+        emit({
+          id: "message",
+          type: "message.updated",
+          properties: { sessionID: "session", info: assistant() },
+        });
+        const tool: Part = {
+          id: "write",
+          sessionID: "session",
+          messageID: "assistant",
+          type: "tool",
+          tool: "write",
+          callID: "write-result",
+          state: {
+            status: "completed",
+            input: { filePath: "report.md", content: "Finished" },
+            output: "File written",
+            title: "Write report",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        };
+        emit(updated(tool));
+        // Keep the accepted turn active through the first recovery poll.
+        await waitFor(() => runtime.statusReads > 0);
+        const part: Part = {
+          id: "reply",
+          sessionID: "session",
+          messageID: "assistant",
+          type: "text",
+          text: "Finished",
+        };
+        const finish: Part = {
+          id: "finish",
+          sessionID: "session",
+          messageID: "assistant",
+          type: "step-finish",
+          reason: "stop",
+          cost: 0,
+          tokens: assistant().tokens,
+        };
+        emit(updated(part));
+        emit(updated(finish));
+        return { info: assistant(), parts: [tool, part, finish] };
+      },
+      { losePromptResponse: true },
+    );
+    try {
+      const result = await runOpenCodeSession(runtime.connection, "fixture", {
+        ...turnParams(),
+        callbacks: {
+          onText: (value) => text.push(value),
+          onToolUse: (...args) => calls.push(args),
+          onToolResult: (...args) => results.push(args),
+          onUsage: (usage) => usages.push(usage),
+          onModelRetry: (retry) => retries.push(retry.delayMs),
+        },
+      });
+      assert.deepEqual(result, { finalText: "Finished", steps: 1, stopReason: "end_turn" });
+      assert.equal(runtime.prompts, 1);
+      assert.ok(runtime.statusReads >= 2);
+      assert.equal(runtime.messageReads, 1);
+      assert.deepEqual(text, ["Finished"]);
+      assert.deepEqual(calls, [
+        ["write", { filePath: "report.md", content: "Finished" }, "assistant:write-result"],
+      ]);
+      assert.deepEqual(results, [["write", { content: "File written" }, "assistant:write-result"]]);
+      assert.deepEqual(usages, [{ inputTokens: 13, outputTokens: 4 }]);
+      assert.equal(retries.length, 2);
+      assert.ok(retries[0] >= 750 && retries[0] <= 1000);
+      assert.ok(retries[1] >= 1500 && retries[1] <= 2000);
+    } finally {
+      await runtime.close();
+    }
+  },
+);
+
+test("cancellation during prompt recovery aborts the accepted turn without replaying it", async () => {
+  const controller = new AbortController();
+  let retries = 0;
+  const runtime = await fakeOpenCode(
+    async () => {
+      await waitFor(() => runtime.aborts === 1);
+      return { info: assistant(), parts: [] };
+    },
+    { losePromptResponse: true },
+  );
+  try {
+    const result = await runOpenCodeSession(runtime.connection, "fixture", {
+      ...turnParams(),
+      signal: controller.signal,
+      callbacks: {
+        onModelRetry: () => {
+          retries++;
+          controller.abort();
+        },
+      },
+    });
+    assert.equal(result.stopReason, "aborted");
+    assert.equal(runtime.prompts, 1);
+    assert.equal(runtime.aborts, 1);
+    assert.equal(retries, 1);
+    assert.equal(runtime.messageReads, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+for (const unchangedConfig of [false, true])
+  test(`OpenAI sessions await config disposal before prompting when the update is ${unchangedConfig ? "unchanged" : "still disposing without a lifecycle event"}`, async () => {
+    const runtime = await fakeOpenCode(
+      async (_emit, body) => {
+        assert.equal((body.model as { providerID: string }).providerID, "openai");
+        assert.equal(runtime.disposals, 1);
+        assert.deepEqual(runtime.globalConfigs, [
+          {
+            provider: {
+              openai: {
+                models: { "gpt-4": { limit: { context: 8192, input: 8192, output: 4096 } } },
+              },
+            },
+          },
+        ]);
+        return { info: assistant(), parts: [] };
+      },
+      { openAiModel: { id: "gpt-4", limit: { context: 8192, output: 8192 } }, unchangedConfig },
+    );
+    try {
+      await runOpenCodeSession(runtime.connection, "gpt-4", {
+        ...turnParams(),
+        model: { provider: "openai", contextWindow: 8192 } as AIModel,
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Fixture action did not arrive.");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test("native permissions recheck Member authority, and scoped turns deny them", async () => {
+  for (const { nativeCoding, denial, reply } of [
+    { nativeCoding: false, denial: null, reply: "reject" },
+    { nativeCoding: true, denial: "Member authority was removed.", reply: "reject" },
+    { nativeCoding: true, denial: null, reply: "once" },
+  ]) {
+    let checked = 0;
+    const runtime = await fakeOpenCode(async (emit) => {
+      emit({
+        id: "permission",
+        type: "permission.asked",
+        properties: {
+          id: "request",
+          sessionID: "session",
+          permission: "bash",
+          patterns: ["echo example"],
+          metadata: {},
+          always: [],
+        },
+      });
+      await waitFor(() => runtime.permissions.length === 1);
+      return { info: assistant(), parts: [] };
+    });
+    try {
+      await runOpenCodeSession(runtime.connection, "fixture", {
+        ...turnParams(),
+        nativeCoding,
+        authorizePrivilegedToolCall: async () => {
+          checked++;
+          return denial;
+        },
+      });
+      assert.equal(runtime.permissions[0].reply, reply);
+      assert.equal(checked, nativeCoding ? 1 : 0);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+for (const ending of ["cancelled", "completed"] as const) {
+  for (const lateResult of ["allow", "reject"] as const) {
+    test(
+      `a ${ending} session stops waiting for native authorization before its late ${lateResult}`,
+      { timeout: 15_000 },
+      async () => {
+        const controller = new AbortController();
+        let checked = false;
+        let settled = false;
+        let finishAuthorization!: () => void;
+        const authorization = new Promise<string | null>((resolve, reject) => {
+          finishAuthorization = () => {
+            settled = true;
+            if (lateResult === "allow") resolve(null);
+            else reject(new Error("The delayed authority check failed."));
+          };
+        });
+        const runtime = await fakeOpenCode(async (emit) => {
+          emit({
+            id: "permission",
+            type: "permission.asked",
+            properties: {
+              id: "request",
+              sessionID: "session",
+              permission: "bash",
+              patterns: ["echo example"],
+              metadata: {},
+              always: [],
+            },
+          });
+          await waitFor(() => checked);
+          if (ending === "cancelled") await waitFor(() => runtime.aborts === 1);
+          return { info: assistant(), parts: [] };
+        });
+        const turn = runOpenCodeSession(runtime.connection, "fixture", {
+          ...turnParams(),
+          signal: controller.signal,
+          nativeCoding: true,
+          authorizePrivilegedToolCall: () => {
+            checked = true;
+            return authorization;
+          },
+        });
+        void turn.catch(() => {});
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await waitFor(() => checked);
+          if (ending === "cancelled") controller.abort(new Error("Original Run deadline reached"));
+          const result = await Promise.race([
+            turn,
+            new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(
+                () => reject(new Error("Session teardown waited for the blocked authorizer.")),
+                3000,
+              );
+            }),
+          ]);
+          assert.equal(result.stopReason, ending === "cancelled" ? "aborted" : "end_turn");
+          assert.equal(settled, false, "cleanup must finish while the authority check is pending");
+          assert.equal(runtime.aborts, ending === "cancelled" ? 1 : 0);
+          assert.deepEqual(runtime.permissions, [], "pending authority must never grant access");
+          finishAuthorization();
+          await authorization.catch(() => null);
+          assert.deepEqual(runtime.permissions, [], "late authority cannot reopen the ended turn");
+        } finally {
+          clearTimeout(timer);
+          finishAuthorization();
+          await turn.catch(() => {});
+          await runtime.close();
+        }
+      },
+    );
+  }
+}
+
+test("step limit aborts the external session and reports unfinished work", async () => {
+  const runtime = await fakeOpenCode(async (emit) => {
+    emit(
+      updated({
+        id: "limit",
+        sessionID: "session",
+        messageID: "assistant",
+        type: "step-finish",
+        reason: "tool-calls",
+        cost: 0,
+        tokens: assistant().tokens,
+      }),
+    );
+    await waitFor(() => runtime.aborts === 1);
+    return { info: assistant(), parts: [] };
+  });
+  try {
+    const result = await runOpenCodeSession(runtime.connection, "fixture", {
+      ...turnParams(),
+      maxSteps: 1,
+    });
+    assert.equal(result.stopReason, "max_steps");
+    assert.equal(result.steps, 1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("unlimited external sessions continue beyond the former 100-step ceiling", async () => {
+  let observedSteps = 0;
+  const runtime = await fakeOpenCode(async (emit) => {
+    for (let step = 0; step < 125; step++) {
+      emit(
+        updated({
+          id: `step-${step}`,
+          sessionID: "session",
+          messageID: "assistant",
+          type: "step-finish",
+          reason: "tool-calls",
+          cost: 0,
+          tokens: assistant().tokens,
+        }),
+      );
+    }
+    await waitFor(() => observedSteps === 125);
+    const report: Part = {
+      id: "report",
+      sessionID: "session",
+      messageID: "assistant",
+      type: "text",
+      text: "Finished after 125 tool steps.",
+    };
+    const finish: Part = {
+      id: "finish",
+      sessionID: "session",
+      messageID: "assistant",
+      type: "step-finish",
+      reason: "stop",
+      cost: 0,
+      tokens: assistant().tokens,
+    };
+    return { info: assistant(), parts: [report, finish] };
+  });
+  try {
+    const result = await runOpenCodeSession(runtime.connection, "fixture", {
+      ...turnParams(),
+      maxSteps: null,
+      callbacks: { onUsage: () => observedSteps++ },
+    });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(result.steps, 126);
+    assert.equal(result.finalText, "Finished after 125 tool steps.");
+    assert.equal(runtime.prompts, 1, "a turn that reports is not asked again");
+    assert.equal(runtime.aborts, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("cancellation reaches an unlimited headless session and returns an aborted result", async () => {
+  const controller = new AbortController();
+  const runtime = await fakeOpenCode(async () => {
+    controller.abort();
+    await waitFor(() => runtime.aborts === 1);
+    return { info: assistant(), parts: [] };
+  });
+  try {
+    const result = await runOpenCodeSession(runtime.connection, "fixture", {
+      ...turnParams(),
+      maxSteps: null,
+      signal: controller.signal,
+    });
+    assert.equal(result.stopReason, "aborted");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test(
+  "cancellation also interrupts a native permission reply that never completes",
+  { timeout: 15_000 },
+  async () => {
+    const controller = new AbortController();
+    const runtime = await fakeOpenCode(
+      async (emit) => {
+        emit({
+          id: "permission",
+          type: "permission.asked",
+          properties: {
+            id: "request",
+            sessionID: "session",
+            permission: "bash",
+            patterns: ["echo example"],
+            metadata: {},
+            always: [],
+          },
+        });
+        await waitFor(() => runtime.permissions.length === 1);
+        controller.abort();
+        await waitFor(() => runtime.aborts === 1);
+        return { info: assistant(), parts: [] };
+      },
+      { hangControl: true },
+    );
+    try {
+      const result = await runOpenCodeSession(runtime.connection, "fixture", {
+        ...turnParams(),
+        signal: controller.signal,
+        nativeCoding: true,
+      });
+      assert.equal(result.stopReason, "aborted");
+    } finally {
+      await runtime.close();
+    }
+  },
+);
+
+test("context overflow can recover through compaction, while terminal overflow still fails", () => {
+  const events = new OpenCodeEvents("session");
+  const error = { name: "ContextOverflowError" as const, data: { message: "overflow" } };
+  events.accept({
+    id: "overflow",
+    type: "session.error",
+    properties: { sessionID: "session", error },
+  });
+  assert.equal(events.error, null);
+  events.accept({
+    id: "success",
+    type: "message.updated",
+    properties: { sessionID: "session", info: assistant("recovered") },
+  });
+  events.part({
+    id: "recovered-text",
+    type: "text",
+    sessionID: "session",
+    messageID: "recovered",
+    text: "Complete after compaction",
+  });
+  assert.equal(events.finalText, "Complete after compaction");
+  assert.equal(events.error, null);
+  events.accept({
+    id: "failure",
+    type: "message.updated",
+    properties: { sessionID: "session", info: { ...assistant("failed"), error } },
+  });
+  assert.match(events.error!.message, /context window/);
+});
+
+test("missing upstream usage stays unknown and provider errors preserve safe status", () => {
+  let usages = 0;
+  const events = new OpenCodeEvents("session", {
+    onUsage: () => {
+      usages++;
+    },
+  });
+  events.part({
+    id: "zero",
+    sessionID: "session",
+    messageID: "assistant",
+    type: "step-finish",
+    reason: "stop",
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  });
+  events.accept({
+    id: "failure",
+    type: "session.error",
+    properties: {
+      sessionID: "session",
+      error: {
+        name: "APIError",
+        data: {
+          message: "private response",
+          responseBody: "secret",
+          statusCode: 401,
+          isRetryable: false,
+        },
+      },
+    },
+  });
+  assert.equal(usages, 0);
+  assert.equal((events.error as Error & { status: number }).status, 401);
+  assert.doesNotMatch(events.error!.message, /private|secret/);
+});
+
+test("provider forwarding keeps the stored key out of child configuration and preserves retry headers", async () => {
+  const observed: string[] = [];
+  const upstream = createServer((req, res) => {
+    observed.push(req.headers.authorization ?? "");
+    req.resume();
+    res
+      .writeHead(503, { "Content-Type": "application/json", "Retry-After": "2" })
+      .end(JSON.stringify({ error: { message: "retry" } }));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  assert.ok(address && typeof address !== "string");
+  const proxy = await serveOpenCodeModel({
+    ...model,
+    apiKey: "stored-key-stays-in-genosyn",
+    baseURL: `http://127.0.0.1:${address.port}`,
+  });
+  try {
+    assert.notEqual(proxy.model.apiKey, "stored-key-stays-in-genosyn");
+    assert.doesNotMatch(
+      JSON.stringify(
+        buildOpenCodeConfig({
+          model: proxy.model,
+          maxSteps: 1,
+          nativeCoding: true,
+          mcp: { url: "http://localhost/mcp", token: "temporary" },
+        }),
+      ),
+      /stored-key-stays-in-genosyn/,
+    );
+    assert.equal(
+      (await fetch(`${proxy.model.baseURL}/chat/completions`, { method: "POST" })).status,
+      401,
+    );
+    const headers = {
+      Authorization: `Bearer ${proxy.model.apiKey}`,
+      "Content-Type": "application/json",
+    };
+    assert.equal(
+      (
+        await fetch(`${proxy.model.baseURL}/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: "another-model" }),
+        })
+      ).status,
+      403,
+    );
+    const response = await fetch(`${proxy.model.baseURL}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fixture" }),
+    });
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("retry-after"), "2");
+    await response.text();
+    assert.deepEqual(observed, ["Bearer stored-key-stays-in-genosyn"]);
+  } finally {
+    await proxy.close();
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+// 2026-10-23: connecting Claude Opus 5.5 failed every time. The connection test
+// allows two steps, and OpenCode ends a turn's last step with its "maximum steps
+// reached" instruction as an assistant message — a prefill, which Claude Opus
+// 4.6 and every later model reject with a 400.
+test("Claude requests end on the user's turn, so a step limit is never sent as a prefill", async () => {
+  const limit = { role: "assistant", content: [{ type: "text", text: "MAXIMUM STEPS REACHED" }] };
+  const toolResult = { role: "user", content: [{ type: "tool_result", tool_use_id: "t" }] };
+  assert.deepEqual(endOnUserTurn({ model: "m", messages: [toolResult, limit] }), {
+    model: "m",
+    messages: [toolResult, { ...limit, role: "user" }],
+  });
+  assert.deepEqual(endOnUserTurn({ messages: [{ role: "assistant", content: "Continue" }] }), {
+    messages: [{ role: "user", content: "Continue" }],
+  });
+  const toolCall = { role: "assistant", content: [{ type: "tool_use", id: "t" }] };
+  assert.equal(endOnUserTurn({ messages: [toolResult, toolCall] }), null);
+  assert.equal(endOnUserTurn({ messages: [toolResult] }), null);
+  assert.equal(endOnUserTurn({ prompt: "no messages" }), null);
+
+  const received: string[] = [];
+  const upstream = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    received.push(Buffer.concat(chunks).toString());
+    res.writeHead(200, { "Content-Type": "application/json" }).end("{}");
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  assert.ok(address && typeof address !== "string");
+  const proxy = await serveOpenCodeModel({
+    id: "claude-opus-5-5",
+    provider: "anthropic",
+    apiKey: "stored-key",
+    baseURL: `http://127.0.0.1:${address.port}`,
+    contextWindow: null,
+  });
+  const send = (body: string) =>
+    fetch(`${proxy.model.baseURL}/messages`, {
+      method: "POST",
+      headers: { "x-api-key": proxy.model.apiKey, "Content-Type": "application/json" },
+      body,
+    }).then((response) => response.text());
+  try {
+    await send(JSON.stringify({ model: "claude-opus-5-5", messages: [toolResult, limit] }));
+    const forwarded = JSON.parse(received[0]) as { messages: Array<{ role: string }> };
+    assert.deepEqual(
+      forwarded.messages.map((message) => message.role),
+      ["user", "user"],
+    );
+    const unchanged = JSON.stringify({ model: "claude-opus-5-5", messages: [toolResult] });
+    await send(unchanged);
+    assert.equal(received[1], unchanged, "a request already ending on the user is sent as is");
+  } finally {
+    await proxy.close();
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("an error body a provider sends back never carries the stored key to OpenCode", async () => {
+  // The way a provider quotes back the key it was sent.
+  const upstream = createServer((req, res) => {
+    req.resume();
+    const sent = req.headers.authorization?.replace(/^Bearer /, "");
+    res
+      .writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: { message: `Invalid key: ${sent}` } }));
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  assert.ok(address && typeof address !== "string");
+  const quoted = async (apiKey: string) => {
+    const proxy = await serveOpenCodeModel({
+      ...model,
+      apiKey,
+      baseURL: `http://127.0.0.1:${address.port}`,
+    });
+    try {
+      const response = await fetch(`${proxy.model.baseURL}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${proxy.model.apiKey}` },
+        body: JSON.stringify({ model: "fixture" }),
+      });
+      assert.equal(response.status, 401);
+      return ((await response.json()) as { error: { message: string } }).error.message;
+    } finally {
+      await proxy.close();
+    }
+  };
+  try {
+    assert.equal(await quoted("stored-key-stays-in-genosyn"), "Invalid key: [redacted]");
+    // A self-hosted server's placeholder is no secret; replacing it would garble the reply.
+    assert.equal(await quoted("EMPTY"), "Invalid key: EMPTY");
+  } finally {
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("a provider's explanation travels apart from the safe message, without key-shaped text", () => {
+  const events = new OpenCodeEvents("session");
+  events.accept({
+    id: "failure",
+    type: "session.error",
+    properties: {
+      sessionID: "session",
+      error: {
+        name: "APIError",
+        data: {
+          message: "This model does not support assistant message prefill.",
+          statusCode: 400,
+          isRetryable: false,
+          responseHeaders: { "set-cookie": "private-header" },
+          responseBody: JSON.stringify({
+            type: "error",
+            error: {
+              type: "invalid_request_error",
+              message: "This model does not support assistant message prefill.",
+            },
+            request_id: "req_fixture",
+          }),
+        },
+      },
+    },
+  });
+  const error = events.error as Error & { status: number; providerDetail: string };
+  assert.equal(error.message, "The AI Model request failed (HTTP 400).");
+  assert.equal(error.status, 400);
+  assert.equal(
+    error.providerDetail,
+    "HTTP 400 · invalid_request_error\nThis model does not support assistant message prefill.\nRequest ID: req_fixture",
+  );
+
+  const quoted = providerErrorDetail({
+    message: "Unauthorized",
+    statusCode: 401,
+    isRetryable: false,
+    responseBody: JSON.stringify({
+      error: {
+        message: "Incorrect API key provided: sk-proj-abc*********wxyz. Bearer abc.def",
+        code: "invalid_api_key",
+      },
+    }),
+  });
+  assert.equal(
+    quoted,
+    "HTTP 401 · invalid_api_key\nIncorrect API key provided: [redacted]. [redacted]",
+  );
+  assert.equal(
+    providerErrorDetail({ message: "", isRetryable: false, responseBody: "upstream timeout" }),
+    "upstream timeout",
+  );
+  assert.equal(providerErrorDetail({ message: "", isRetryable: false }), null);
+});
+
+test("startup diagnostics explain installation errors without exposing raw output", () => {
+  assert.match(
+    openCodeStartupError("Error: opencode-ai's postinstall script was not run. secret", 1),
+    /install scripts enabled/,
+  );
+  assert.doesNotMatch(openCodeStartupError("ConfigInvalidError secret", 1), /secret/);
+  // All OpenCode 1.18 prints when its port is already bound.
+  assert.match(
+    openCodeStartupError("\u001b[91m\u001b[1mError: \u001b[0mUnexpected error\n\nServeError\n", 1),
+    /port because it is already in use/,
+  );
+  assert.match(
+    openCodeActivityError({ message: "secret", cause: { code: "ECONNRESET" } }).message,
+    /ECONNRESET/,
+  );
+  assert.doesNotMatch(
+    openCodeActivityError({ message: "secret", cause: { code: "private-secret" } }).message,
+    /secret/,
+  );
+});

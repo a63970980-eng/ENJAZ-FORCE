@@ -1,0 +1,224 @@
+import { Router, urlencoded } from "express";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { Routine } from "../db/entities/Routine.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Approval } from "../db/entities/Approval.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { startRoutineRun } from "../services/runner.js";
+import { recordAudit } from "../services/audit.js";
+import { findPipelineByWebhook } from "../services/pipelines/index.js";
+import { runPipeline } from "../services/pipelines/executor.js";
+import { notifyApprovalPending } from "../services/notifications.js";
+import { constantTimeEqual } from "../lib/constantTime.js";
+import { findChannelByWebhookCredential } from "../services/channelWebhooks.js";
+import {
+  renderSlackIncomingWebhook,
+  slackIncomingWebhookSchema,
+  type RenderedSlackIncomingWebhook,
+} from "../services/slackIncomingWebhook.js";
+import { postIncomingWebhookMessage } from "../services/workspaceChat.js";
+import { StanddownError, workBlocked } from "../services/standdowns.js";
+
+/**
+ * Unauthenticated trigger surface. The URL itself is the credential — each
+ * routine has a random token in its path. We intentionally do NOT gate with
+ * session auth here; that's the whole point of a webhook.
+ *
+ * Body is captured into the journal for observability but is NOT injected
+ * into the CLI prompt in v1. Templating webhook payloads into prompts is a
+ * separate feature that deserves its own design (security, schema, etc.).
+ */
+export const webhooksRouter = Router();
+webhooksRouter.use(urlencoded({ extended: false, limit: "1mb" }));
+
+webhooksRouter.post("/r/:routineId/:token", async (req, res) => {
+  const { routineId, token } = req.params;
+  const routine = await AppDataSource.getRepository(Routine).findOneBy({
+    id: routineId,
+  });
+  if (
+    !routine ||
+    !routine.webhookEnabled ||
+    !routine.webhookToken ||
+    !constantTimeEqual(token, routine.webhookToken)
+  ) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (!routine.enabled) {
+    return res.status(409).json({ error: "Routine is disabled" });
+  }
+  const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: routine.employeeId,
+  });
+  if (!emp) return res.status(410).json({ error: "Employee gone" });
+
+  // Record the payload (truncated) so you can audit what was posted.
+  const payloadPreview = JSON.stringify(req.body ?? {}).slice(0, 1000);
+  await AppDataSource.getRepository(JournalEntry).save(
+    AppDataSource.getRepository(JournalEntry).create({
+      employeeId: emp.id,
+      kind: "system",
+      title: `Webhook triggered routine "${routine.name}"`,
+      body: payloadPreview ? `payload: ${payloadPreview}` : "",
+      routineId: routine.id,
+      runId: null,
+      authorUserId: null,
+    }),
+  );
+
+  await recordAudit({
+    companyId: emp.companyId,
+    actorKind: "webhook",
+    action: "routine.run.webhook",
+    targetType: "routine",
+    targetId: routine.id,
+    targetLabel: routine.name,
+    metadata: { payloadBytes: payloadPreview.length },
+  });
+
+  if (routine.requiresApproval) {
+    const approvalRepo = AppDataSource.getRepository(Approval);
+    const pending = approvalRepo.create({
+      companyId: emp.companyId,
+      routineId: routine.id,
+      employeeId: emp.id,
+      status: "pending",
+    });
+    const saved = await approvalRepo.save(pending);
+    void notifyApprovalPending(saved).catch((e) => {
+      // eslint-disable-next-line no-console
+      console.error("[webhook] notify approval pending failed:", e);
+    });
+    return res.json({ status: "pending_approval", approvalId: saved.id });
+  }
+
+  // A Standdown answers the caller rather than accepting work it will not do
+  // (M58). The runner would refuse this start anyway; checking here is what
+  // turns a silent no-op behind a `200 accepted` into an honest reply the
+  // sending system can act on.
+  const stopped = workBlocked(emp.companyId, { employeeId: emp.id, routineId: routine.id });
+  if (stopped.blocked) {
+    return res.status(409).json({ status: "stood_down", reason: stopped.reason });
+  }
+
+  // Acknowledge only after this occurrence is durable in the employee's queue.
+  try {
+    const { completion } = await startRoutineRun(routine, { triggerKind: "webhook" });
+    void completion.catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(`[webhook] routine ${routine.id} failed:`, err);
+    });
+    res.json({ status: "accepted" });
+  } catch (err) {
+    if (err instanceof StanddownError) {
+      return res.status(409).json({ status: "stood_down", reason: err.message });
+    }
+    // Express 4 does not forward a rejected async handler to its error middleware.
+    // eslint-disable-next-line no-console
+    console.error(`[webhook] could not queue routine ${routine.id}:`, err);
+    return res.status(500).json({ error: "Could not queue the Routine." });
+  }
+});
+
+function normalizeSlackWebhookBody(body: unknown): unknown {
+  if (
+    body &&
+    typeof body === "object" &&
+    "payload" in body &&
+    typeof (body as { payload?: unknown }).payload === "string"
+  ) {
+    try {
+      return JSON.parse((body as { payload: string }).payload);
+    } catch {
+      return null;
+    }
+  }
+  return body;
+}
+
+/**
+ * Slack-compatible incoming webhook for a Workspace channel. The URL is
+ * intentionally pinned to one channel; a payload's optional `channel`
+ * override is ignored so a leaked integration cannot address another room.
+ */
+webhooksRouter.post("/channels/:channelId/:token", async (req, res) => {
+  const params = z
+    .object({
+      channelId: z.string().uuid(),
+      token: z.string().regex(/^[a-f0-9]{48}$/),
+    })
+    .safeParse(req.params);
+  if (!params.success) return res.status(404).type("text").send("no_service");
+  const channel = await findChannelByWebhookCredential(params.data.channelId, params.data.token);
+  if (!channel) return res.status(404).type("text").send("no_service");
+
+  const parsed = slackIncomingWebhookSchema.safeParse(normalizeSlackWebhookBody(req.body));
+  if (!parsed.success) {
+    return res.status(400).type("text").send("invalid_payload");
+  }
+  let rendered: RenderedSlackIncomingWebhook;
+  try {
+    rendered = renderSlackIncomingWebhook(parsed.data);
+  } catch {
+    return res.status(400).type("text").send("no_text");
+  }
+  try {
+    const message = await postIncomingWebhookMessage({
+      channel,
+      authorName: rendered.authorName,
+      content: rendered.content,
+    });
+    await recordAudit({
+      companyId: channel.companyId,
+      actorKind: "webhook",
+      action: "channel.message.webhook",
+      targetType: "channel",
+      targetId: channel.id,
+      targetLabel: channel.name ?? channel.slug ?? "channel",
+      metadata: { messageId: message.id, payloadBytes: JSON.stringify(parsed.data).length },
+    });
+    res.type("text").send("ok");
+  } catch (error) {
+    if (error instanceof Error && error.message === "Channel not found") {
+      return res.status(404).type("text").send("no_service");
+    }
+    // eslint-disable-next-line no-console
+    console.error("[webhook] channel delivery failed:", error);
+    res.status(500).type("text").send("internal_error");
+  }
+});
+
+/**
+ * Pipeline webhook trigger. Each Webhook trigger node in a pipeline carries
+ * its own random token; the URL is the only credential. The request body is
+ * exposed to the rest of the pipeline as `trigger.payload`.
+ */
+webhooksRouter.post("/pipelines/:pipelineId/:token", async (req, res) => {
+  const { pipelineId, token } = req.params;
+  const found = await findPipelineByWebhook(pipelineId, token);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  const { pipeline, nodeId } = found;
+
+  await recordAudit({
+    companyId: pipeline.companyId,
+    actorKind: "webhook",
+    action: "pipeline.run.webhook",
+    targetType: "pipeline",
+    targetId: pipeline.id,
+    targetLabel: pipeline.name,
+    metadata: { nodeId },
+  });
+
+  // Fire-and-forget so external systems get a fast 202.
+  runPipeline({
+    pipeline,
+    triggerKind: "webhook",
+    triggerNodeId: nodeId,
+    payload: req.body ?? {},
+  }).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[webhook] pipeline ${pipeline.id} failed:`, err);
+  });
+  res.json({ status: "accepted" });
+});

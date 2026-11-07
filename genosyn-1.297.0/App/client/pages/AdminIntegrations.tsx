@@ -1,0 +1,332 @@
+import React from "react";
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  KeyRound,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+} from "lucide-react";
+import { api, OauthAppDescriptor } from "../lib/api";
+import { Button } from "../components/ui/Button";
+import { Disclosure } from "../components/ui/Disclosure";
+import { Spinner } from "../components/ui/Spinner";
+import { TopBar } from "../components/AppShell";
+import { FormError } from "../components/ui/FormError";
+import { useDialog } from "../components/ui/Dialog";
+import { clsx } from "../components/ui/clsx";
+import { errorMessage } from "../lib/errors";
+import { describeOauthApp } from "../lib/oauthAppSummary";
+
+/**
+ * Admin → Integrations. Register each provider's OAuth client **once** for the
+ * whole install, so nobody has to stand up a Google Cloud project just to
+ * connect their mailbox.
+ *
+ * Without one, Integrations Genosyn Connect supports sign in through it (set
+ * at Admin → Runtime). Registering an app here is how an installation opts
+ * out: a local registration always takes precedence.
+ *
+ * Secrets are write-only. The API returns whether one is on file, never the
+ * value, so the field renders blank with a placeholder that says a secret is
+ * stored; submitting it blank keeps what's there.
+ */
+
+const FIELD_CLASS =
+  "h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-slate-600 dark:bg-slate-900";
+const LABEL_CLASS = "mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300";
+
+export function AdminIntegrations() {
+  const [apps, setApps] = React.useState<OauthAppDescriptor[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [refreshing, setRefreshing] = React.useState(false);
+
+  const reload = React.useCallback(async () => {
+    try {
+      setApps(await api.get<OauthAppDescriptor[]>("/api/admin/oauth-apps"));
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the OAuth apps"));
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  if (!apps) {
+    return (
+      <>
+        <TopBar title="Integrations" />
+        {loadError ? (
+          <FormError message={loadError} />
+        ) : (
+          <div className="flex justify-center py-16">
+            <Spinner />
+          </div>
+        )}
+      </>
+    );
+  }
+
+  const configuredCount = apps.filter((a) => a.configured).length;
+
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await reload();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <>
+      <TopBar
+        title="Integrations"
+        right={
+          <Button variant="secondary" onClick={refresh} loading={refreshing}>
+            <RefreshCw size={14} /> Refresh
+          </Button>
+        }
+      />
+
+      <div className="flex flex-col gap-4">
+        <FormError message={loadError} />
+        <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          <div className="flex items-start gap-3">
+            <ShieldCheck
+              size={18}
+              className="mt-0.5 shrink-0 text-indigo-500 dark:text-indigo-400"
+            />
+            <div className="text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+              <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Register an OAuth app once, connect everywhere
+              </p>
+              <p className="mt-1">
+                Every company on this instance can then connect these
+                integrations with a single click. Nothing here is required for
+                Google: Genosyn Connect (Admin → Runtime → Hosted sign-in)
+                signs in to Gmail and the other Google products it offers
+                without an app of your own. Register one here to use your own
+                instead — for products Genosyn Connect does not offer, your own
+                consent screen, or your own API quota.
+              </p>
+              <p className="mt-1.5">
+                {configuredCount === 0
+                  ? "No local OAuth apps registered."
+                  : `${configuredCount} of ${apps.length} registered.`}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {apps.map((app) => (
+          <OauthAppCard key={app.app} app={app} onChanged={setApps} />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function OauthAppCard({
+  app,
+  onChanged,
+}: {
+  app: OauthAppDescriptor;
+  onChanged: (next: OauthAppDescriptor[]) => void;
+}) {
+  const [clientId, setClientId] = React.useState(app.clientId);
+  const [clientSecret, setClientSecret] = React.useState("");
+  const [saving, setSaving] = React.useState(false);
+  const [clearing, setClearing] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const dialog = useDialog();
+
+  // Re-seed when a sibling card's save returns a fresh list for every app.
+  React.useEffect(() => {
+    setClientId(app.clientId);
+    setClientSecret("");
+  }, [app.clientId, app.updatedAt]);
+
+  const dirty = clientId.trim() !== app.clientId || clientSecret.trim() !== "";
+  const canSave = clientId.trim() !== "" && (app.hasClientSecret || clientSecret.trim() !== "");
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await api.put<OauthAppDescriptor[]>(`/api/admin/oauth-apps/${app.app}`, {
+        clientId: clientId.trim(),
+        clientSecret: clientSecret.trim(),
+      });
+      onChanged(next);
+      setClientSecret("");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clear = async () => {
+    const ok = await dialog.confirm({
+      title: `Remove the ${app.label} OAuth app?`,
+      message:
+        "New connections will have to supply their own Client ID and Secret again. Connections that already exist keep working — each one stores the credentials it was created with.",
+      confirmLabel: "Remove",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setClearing(true);
+    setError(null);
+    try {
+      onChanged(await api.del<OauthAppDescriptor[]>(`/api/admin/oauth-apps/${app.app}`));
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const copyRedirect = async () => {
+    try {
+      await navigator.clipboard.writeText(app.redirectUri);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      void dialog.error(err, {
+        title: "Couldn’t copy the redirect URI",
+        message: "Select the URI and copy it manually.",
+      });
+    }
+  };
+
+  return (
+    // One line per provider until you open it: most installs register none of
+    // them, and six open forms buried the one someone came for.
+    <Disclosure
+      variant="card"
+      heading="h2"
+      title={app.label}
+      summary={describeOauthApp(app, dirty)}
+      keepMounted
+    >
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <p className="min-w-0 text-xs text-slate-500 dark:text-slate-400">
+            Unlocks {app.unlocks.join(", ")}.
+          </p>
+          <div className="flex items-center gap-2">
+            <a
+              className="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              href={app.consoleUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              Open console <ExternalLink size={11} />
+            </a>
+            {app.configured && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={clear}
+                loading={clearing}
+                disabled={saving}
+              >
+                <RotateCcw size={12} />
+                {clearing ? "Removing…" : "Remove"}
+              </Button>
+            )}
+          </div>
+        </div>
+        <form
+          className="flex flex-col gap-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (dirty && canSave) void save();
+          }}
+        >
+          <ol className="list-decimal space-y-1 rounded-lg bg-slate-50 py-2.5 pl-8 pr-3 text-xs text-slate-600 dark:bg-slate-800/60 dark:text-slate-300">
+            {app.steps.map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ol>
+
+          <div>
+            <label className={LABEL_CLASS} htmlFor={`redirect-${app.app}`}>
+              Redirect URI to allow-list
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id={`redirect-${app.app}`}
+                readOnly
+                className={clsx(FIELD_CLASS, "font-mono text-xs")}
+                value={app.redirectUri}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <Button type="button" size="sm" variant="secondary" onClick={copyRedirect}>
+                {copied ? <Check size={12} /> : <Copy size={12} />}
+                {copied ? "Copied" : "Copy"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className={LABEL_CLASS} htmlFor={`client-id-${app.app}`}>
+                Client ID
+              </label>
+              <input
+                id={`client-id-${app.app}`}
+                className={clsx(FIELD_CLASS, "font-mono text-xs")}
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder={app.app === "google" ? "…apps.googleusercontent.com" : "Client ID"}
+              />
+            </div>
+            <div>
+              <label className={LABEL_CLASS} htmlFor={`client-secret-${app.app}`}>
+                Client Secret
+              </label>
+              <input
+                id={`client-secret-${app.app}`}
+                type="password"
+                autoComplete="new-password"
+                className={clsx(FIELD_CLASS, "font-mono text-xs")}
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+                placeholder={
+                  app.hasClientSecret ? "Stored — leave blank to keep it" : "Client Secret"
+                }
+              />
+            </div>
+          </div>
+
+          <FormError message={error} />
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="submit" loading={saving} disabled={!dirty || !canSave}>
+              <KeyRound size={14} />
+              {saving ? "Saving…" : app.configured ? "Update" : "Register"}
+            </Button>
+            {app.configured && !dirty && (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Companies connect {app.label} with one click.
+              </p>
+            )}
+            {app.configured && dirty && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                {clientId.trim() === app.clientId
+                  ? "Existing connections move to the rotated secret when they are reconnected."
+                  : "A different Client ID is a different app: existing connections stay on the old one."}
+              </p>
+            )}
+          </div>
+        </form>
+      </div>
+    </Disclosure>
+  );
+}

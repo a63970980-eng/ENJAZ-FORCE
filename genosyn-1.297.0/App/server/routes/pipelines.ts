@@ -1,0 +1,434 @@
+import { Router } from "express";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { Pipeline } from "../db/entities/Pipeline.js";
+import { PipelineRun } from "../db/entities/PipelineRun.js";
+import { validateBody, validateQuery } from "../middleware/validate.js";
+import { ListQueryError } from "../services/listPaging.js";
+import {
+  pagePipelineRuns,
+  pipelineRunQuery,
+  pipelineRunsQuerySchema,
+} from "../services/pipelines/runHistory.js";
+import {
+  requireAuth,
+  requireCompanyMember,
+  requireCompanyRoleForMutations,
+  onRoutePaths,
+} from "../middleware/auth.js";
+import { toSlug } from "../lib/slug.js";
+import {
+  parseGraph,
+  preserveWebhookTokens,
+  serializeGraph,
+  syncScheduleFields,
+  fireManually,
+  regenerateWebhookToken,
+} from "../services/pipelines/index.js";
+import { NODE_CATALOG } from "../services/pipelines/catalog.js";
+import { PipelineGraph } from "../services/pipelines/types.js";
+import { recordAudit } from "../services/audit.js";
+import { UUID_RE } from "../services/bases.js";
+import { PIPELINE_LOG_MAX_BYTES } from "../services/pipelines/log.js";
+import { graphForStarter } from "../services/pipelines/starters.js";
+import { getProvider, listProviderIds } from "../integrations/index.js";
+import { deleteTagAssignments } from "../services/tags.js";
+import { pipelineCodeAllowed } from "../services/pipelines/codeRuntime.js";
+
+export const pipelinesRouter = Router({ mergeParams: true });
+pipelinesRouter.use(requireAuth);
+pipelinesRouter.use(requireCompanyMember);
+pipelinesRouter.use(
+  onRoutePaths(["/pipelines", "/pipeline-runs"], requireCompanyRoleForMutations("admin")),
+);
+
+async function uniqueSlug(companyId: string, base: string): Promise<string> {
+  const repo = AppDataSource.getRepository(Pipeline);
+  let slug = base || "pipeline";
+  let n = 1;
+  while (await repo.findOneBy({ companyId, slug })) {
+    n += 1;
+    slug = `${base}-${n}`;
+  }
+  return slug;
+}
+
+async function findByName(
+  companyId: string,
+  name: string,
+  excludeId?: string,
+): Promise<Pipeline | null> {
+  const qb = AppDataSource.getRepository(Pipeline)
+    .createQueryBuilder("p")
+    .where("p.companyId = :companyId", { companyId })
+    .andWhere("LOWER(p.name) = LOWER(:name)", { name: name.trim() });
+  if (excludeId) qb.andWhere("p.id != :excludeId", { excludeId });
+  return qb.getOne();
+}
+
+function dto(p: Pipeline) {
+  return {
+    id: p.id,
+    companyId: p.companyId,
+    name: p.name,
+    slug: p.slug,
+    description: p.description,
+    enabled: p.enabled,
+    graph: parseGraph(p.graphJson),
+    cronExpr: p.cronExpr,
+    nextRunAt: p.nextRunAt?.toISOString() ?? null,
+    lastRunAt: p.lastRunAt?.toISOString() ?? null,
+    createdAt: p.createdAt.toISOString(),
+    updatedAt: p.updatedAt.toISOString(),
+  };
+}
+
+function eventTriggerLabel(
+  pipeline: Pipeline,
+  run: Pick<PipelineRun, "triggerKind" | "triggerNodeId">,
+): string | null {
+  if (run.triggerKind !== "event" || !run.triggerNodeId) return null;
+  try {
+    const node = parseGraph(pipeline.graphJson).nodes.find(
+      (candidate) => candidate.id === run.triggerNodeId,
+    );
+    if (!node) return "Company event";
+    return (
+      node.label?.trim() ||
+      NODE_CATALOG.find((entry) => entry.type === node.type)?.label ||
+      "Company event"
+    );
+  } catch {
+    return "Company event";
+  }
+}
+
+// ─── Static catalog (drives the editor's node palette + per-node forms) ─────
+
+pipelinesRouter.get("/pipelines/catalog", (_req, res) => {
+  const integrationTools = Object.fromEntries(
+    listProviderIds().map((providerId) => {
+      const provider = getProvider(providerId);
+      return [
+        providerId,
+        (provider?.tools ?? []).map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        })),
+      ];
+    }),
+  );
+  // Shared SaaS refuses the code node at execution and at validation; not
+  // offering it in the palette is the third door, so a hosted author never
+  // builds a step that cannot run.
+  const catalog = pipelineCodeAllowed()
+    ? NODE_CATALOG
+    : NODE_CATALOG.filter((entry) => entry.type !== "logic.code");
+  res.json({ catalog, integrationTools });
+});
+
+// ─── List + create ──────────────────────────────────────────────────────────
+
+pipelinesRouter.get("/pipelines", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(Pipeline);
+  const rows = await repo.find({ where: { companyId: cid }, order: { createdAt: "ASC" } });
+  res.json(rows.map(dto));
+});
+
+const createSchema = z.object({
+  name: z.string().min(1).max(80),
+  description: z.string().max(500).optional(),
+  startWith: z
+    .enum(["manual", "schedule", "webhook", "emailReceived", "todoCreated"])
+    .default("manual"),
+});
+
+pipelinesRouter.post("/pipelines", validateBody(createSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof createSchema>;
+  if (await findByName(cid, body.name)) {
+    return res.status(409).json({ error: "A pipeline with that name already exists" });
+  }
+  const repo = AppDataSource.getRepository(Pipeline);
+  const slug = await uniqueSlug(cid, toSlug(body.name));
+  const p = repo.create({
+    companyId: cid,
+    name: body.name,
+    slug,
+    description: body.description ?? "",
+    enabled: true,
+    graphJson: serializeGraph(graphForStarter(body.startWith)),
+    cronExpr: null,
+    nextRunAt: null,
+    lastRunAt: null,
+    createdById: req.userId ?? null,
+  });
+  // Schedule metadata and webhook tokens must be ready immediately. The
+  // starter can be useful before the Member makes a second edit/save.
+  syncScheduleFields(p);
+  await repo.save(p);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "pipeline.create",
+    targetType: "pipeline",
+    targetId: p.id,
+    targetLabel: p.name,
+  });
+  res.json(dto(p));
+});
+
+// ─── Detail / patch / delete ────────────────────────────────────────────────
+
+async function loadPipeline(cid: string, idOrSlug: string): Promise<Pipeline | null> {
+  const repo = AppDataSource.getRepository(Pipeline);
+  // `id` is a uuid column: on Postgres a slug raises 22P02 rather than
+  // matching nothing, and the detail page opens a Pipeline by its slug. Only a
+  // uuid-shaped handle may reach the id lookup; `resolvePipeline` in
+  // mcpInternal.ts guards the same way.
+  return (
+    (UUID_RE.test(idOrSlug) ? await repo.findOneBy({ id: idOrSlug, companyId: cid }) : null) ??
+    (await repo.findOneBy({ slug: idOrSlug, companyId: cid }))
+  );
+}
+
+pipelinesRouter.get("/pipelines/:idOrSlug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const p = await loadPipeline(cid, req.params.idOrSlug);
+  if (!p) return res.status(404).json({ error: "Not found" });
+  res.json(dto(p));
+});
+
+const graphNodeSchema = z.object({
+  id: z.string().min(1),
+  type: z.string().min(1),
+  label: z.string().optional(),
+  x: z.number(),
+  y: z.number(),
+  config: z.record(z.any()).default({}),
+});
+const graphEdgeSchema = z.object({
+  id: z.string().min(1),
+  fromNodeId: z.string().min(1),
+  toNodeId: z.string().min(1),
+  fromHandle: z.string().optional(),
+});
+const graphSchema = z.object({
+  nodes: z.array(graphNodeSchema),
+  edges: z.array(graphEdgeSchema),
+});
+
+const patchSchema = z.object({
+  name: z.string().min(1).max(80).optional(),
+  description: z.string().max(500).optional(),
+  enabled: z.boolean().optional(),
+  graph: graphSchema.optional(),
+});
+
+pipelinesRouter.patch("/pipelines/:idOrSlug", validateBody(patchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const p = await loadPipeline(cid, req.params.idOrSlug);
+  if (!p) return res.status(404).json({ error: "Not found" });
+  const body = req.body as z.infer<typeof patchSchema>;
+  if (body.name !== undefined) {
+    if (await findByName(cid, body.name, p.id)) {
+      return res.status(409).json({ error: "A pipeline with that name already exists" });
+    }
+    p.name = body.name;
+  }
+  if (body.description !== undefined) p.description = body.description;
+  if (body.enabled !== undefined) p.enabled = body.enabled;
+  if (body.graph !== undefined) {
+    // Cast the validated graph back to the wider PipelineGraph type — zod's
+    // string `type` is what the executor will interpret at run time.
+    const graph = body.graph as unknown as PipelineGraph;
+    // The builder round-trips each Webhook token, so this is a no-op there.
+    // An API-key caller replacing the graph without echoing one would
+    // otherwise retire a live URL without being told.
+    preserveWebhookTokens(graph, parseGraph(p.graphJson));
+    p.graphJson = serializeGraph(graph);
+  }
+  syncScheduleFields(p);
+  await AppDataSource.getRepository(Pipeline).save(p);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "pipeline.update",
+    targetType: "pipeline",
+    targetId: p.id,
+    targetLabel: p.name,
+    metadata: { fields: Object.keys(body) },
+  });
+  res.json(dto(p));
+});
+
+pipelinesRouter.delete("/pipelines/:idOrSlug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const p = await loadPipeline(cid, req.params.idOrSlug);
+  if (!p) return res.status(404).json({ error: "Not found" });
+  await AppDataSource.getRepository(PipelineRun).delete({ pipelineId: p.id });
+  await deleteTagAssignments("pipeline", p.id);
+  await AppDataSource.getRepository(Pipeline).delete({ id: p.id });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "pipeline.delete",
+    targetType: "pipeline",
+    targetId: p.id,
+    targetLabel: p.name,
+  });
+  res.json({ ok: true });
+});
+
+// ─── Run now (manual trigger) ───────────────────────────────────────────────
+
+const runSchema = z.object({
+  payload: z.unknown().optional(),
+});
+
+pipelinesRouter.post("/pipelines/:idOrSlug/run", validateBody(runSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const p = await loadPipeline(cid, req.params.idOrSlug);
+  if (!p) return res.status(404).json({ error: "Not found" });
+  if (!p.enabled) {
+    return res.status(409).json({ error: "Pipeline is disabled" });
+  }
+  const body = req.body as z.infer<typeof runSchema>;
+  try {
+    const run = await fireManually(p, body.payload ?? {});
+    await recordAudit({
+      companyId: p.companyId,
+      actorUserId: req.userId ?? null,
+      action: "pipeline.run.manual",
+      targetType: "pipeline",
+      targetId: p.id,
+      targetLabel: p.name,
+      metadata: { pipelineRunId: run.id },
+    });
+    res.json({
+      id: run.id,
+      pipelineId: run.pipelineId,
+      status: run.status,
+      startedAt: run.startedAt.toISOString(),
+      finishedAt: run.finishedAt?.toISOString() ?? null,
+      triggerKind: run.triggerKind,
+      triggerLabel: eventTriggerLabel(p, run),
+      errorMessage: run.errorMessage,
+    });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// ─── Run history ────────────────────────────────────────────────────────────
+
+// The newest 50 Runs as a plain array, as the Pipelines page reads them; or,
+// when a page is asked for (limit or cursor), the whole history one page at a
+// time — the list the `list_pipeline_runs` AI tool reads.
+pipelinesRouter.get(
+  "/pipelines/:idOrSlug/runs",
+  validateQuery(pipelineRunsQuerySchema),
+  async (req, res, next) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const p = await loadPipeline(cid, req.params.idOrSlug);
+    if (!p) return res.status(404).json({ error: "Not found" });
+    const { limit, cursor, ...filter } = req.query as unknown as z.infer<
+      typeof pipelineRunsQuerySchema
+    >;
+    const present = (runs: PipelineRun[]) =>
+      runs.map((r) => ({
+        id: r.id,
+        pipelineId: r.pipelineId,
+        startedAt: r.startedAt.toISOString(),
+        finishedAt: r.finishedAt?.toISOString() ?? null,
+        status: r.status,
+        triggerKind: r.triggerKind,
+        triggerLabel: eventTriggerLabel(p, r),
+        triggerNodeId: r.triggerNodeId,
+        errorMessage: r.errorMessage,
+      }));
+    try {
+      if (limit !== undefined || cursor !== undefined) {
+        const { rows, ...info } = await pagePipelineRuns(cid, p.id, filter, { limit, cursor }, present);
+        return res.json({ ...info, runs: rows });
+      }
+      const runs = await pipelineRunQuery(p.id, filter)
+        .orderBy("run.startedAt", "DESC")
+        .addOrderBy("run.id", "DESC")
+        .take(50)
+        .getMany();
+      res.json(present(runs));
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+pipelinesRouter.get("/pipeline-runs/:runId", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const run = await AppDataSource.getRepository(PipelineRun).findOneBy({
+    id: req.params.runId,
+  });
+  if (!run) return res.status(404).json({ error: "Not found" });
+  const p = await AppDataSource.getRepository(Pipeline).findOneBy({
+    id: run.pipelineId,
+    companyId: cid,
+  });
+  if (!p) return res.status(404).json({ error: "Not found" });
+  const size = Buffer.byteLength(run.logContent ?? "", "utf8");
+  res.json({
+    id: run.id,
+    pipelineId: run.pipelineId,
+    startedAt: run.startedAt.toISOString(),
+    finishedAt: run.finishedAt?.toISOString() ?? null,
+    status: run.status,
+    triggerKind: run.triggerKind,
+    triggerLabel: eventTriggerLabel(p, run),
+    triggerNodeId: run.triggerNodeId,
+    inputJson: run.inputJson,
+    outputJson: run.outputJson,
+    logContent: run.logContent ?? "",
+    truncated: size >= PIPELINE_LOG_MAX_BYTES,
+    errorMessage: run.errorMessage,
+  });
+});
+
+// ─── Regenerate a Webhook node's token ──────────────────────────────────────
+
+const regenSchema = z.object({ nodeId: z.string().min(1) });
+
+pipelinesRouter.post(
+  "/pipelines/:idOrSlug/webhook-token",
+  validateBody(regenSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const p = await loadPipeline(cid, req.params.idOrSlug);
+    if (!p) return res.status(404).json({ error: "Not found" });
+    const body = req.body as z.infer<typeof regenSchema>;
+    const graph = parseGraph(p.graphJson);
+    let token: string;
+    try {
+      token = regenerateWebhookToken(graph, body.nodeId);
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+    p.graphJson = serializeGraph(graph);
+    syncScheduleFields(p);
+    await AppDataSource.getRepository(Pipeline).save(p);
+    await recordAudit({
+      companyId: p.companyId,
+      actorUserId: req.userId ?? null,
+      action: "pipeline.webhook.rotate",
+      targetType: "pipeline",
+      targetId: p.id,
+      targetLabel: p.name,
+      metadata: { nodeId: body.nodeId },
+    });
+    res.json({ token, graph });
+  },
+);

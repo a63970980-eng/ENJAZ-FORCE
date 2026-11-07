@@ -1,0 +1,70 @@
+import React from "react";
+import { Link, useParams } from "react-router-dom";
+import { api } from "../lib/api";
+import { AuthShell } from "./Login";
+import { Button } from "../components/ui/Button";
+import { FormError } from "../components/ui/FormError";
+import { invitationAuthPath, joinedCompanyPath } from "../lib/invitationNavigation";
+
+export default function Invite({ authenticated = true }: { authenticated?: boolean }) {
+  const { token } = useParams();
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function accept() {
+    if (!token) return;
+    setError(null);
+    setLoading(true);
+    try {
+      const joined = await api.post<{ companyId: string; companySlug?: string }>(
+        "/api/invitations/accept",
+        { token },
+      );
+      // The authenticated app caches the caller's memberships. A full
+      // navigation refreshes that state, and lands in the company just
+      // joined — not the onboarding screen, nor another company the invitee
+      // already belongs to.
+      window.location.assign(joinedCompanyPath(joined.companySlug));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <AuthShell title="Accept invitation">
+      <div className="flex flex-col gap-4 text-sm text-slate-600 dark:text-slate-300">
+        <FormError message={error} />
+        {error?.includes("two-factor authentication") ? (
+          <Link className="text-indigo-600 hover:underline" to="/security">
+            Enable two-factor authentication
+          </Link>
+        ) : null}
+        <p>You&apos;ve been invited to join a company on Genosyn.</p>
+        {!authenticated ? (
+          <>
+            <p>
+              Sign in or create an account with the email address that received this invitation.
+            </p>
+            <Link
+              className="text-indigo-600 hover:underline"
+              to={invitationAuthPath("login", token ?? null)}
+            >
+              Sign in
+            </Link>
+            <Link
+              className="text-indigo-600 hover:underline"
+              to={invitationAuthPath("signup", token ?? null)}
+            >
+              Create account
+            </Link>
+          </>
+        ) : (
+          <Button onClick={accept} loading={loading}>
+            {loading ? "Accepting…" : "Accept invitation"}
+          </Button>
+        )}
+      </div>
+    </AuthShell>
+  );
+}

@@ -1,0 +1,308 @@
+/** Common messages, tools, and activity callbacks shared by the OpenCode and Codex adapters. */
+
+import type { ContextUsage } from "./contextUsage.js";
+import type { ApiKeyFailover } from "./apiKeyRing.js";
+import type { ModelEffort } from "../../../shared/modelEffort.js";
+import type { ModelCallDetail, ModelPulse } from "../../../shared/chatActivity.js";
+
+export type { ContextUsage } from "./contextUsage.js";
+export type { ApiKeyFailover } from "./apiKeyRing.js";
+
+/** Supported AI Model services. */
+export type AgentProvider = "anthropic" | "openai" | "custom";
+
+// ---------- messages ----------
+
+export type TextBlock = { type: "text"; text: string };
+export type ToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+/** A base64 image supplied by a Member or returned by a tool. */
+export type ToolResultImage = {
+  mimeType: string;
+  data: string;
+  /** Attachment identity shown directly beside an uploaded image. */
+  sourceLabel?: string;
+};
+export type ToolResultBlock = {
+  type: "tool_result";
+  toolUseId: string;
+  content: string;
+  isError?: boolean;
+  /** Images to attach to the tool result (Anthropic carries these natively). */
+  images?: ToolResultImage[];
+};
+
+export type AssistantBlock = TextBlock | ToolUseBlock;
+export type ImageBlock = { type: "image" } & ToolResultImage;
+export type UserBlock = TextBlock | ImageBlock | ToolResultBlock;
+
+export type AgentMessage =
+  | { role: "user"; content: UserBlock[] }
+  | { role: "assistant"; content: AssistantBlock[] };
+
+// ---------- tools ----------
+
+/** A JSON-Schema object describing a tool's arguments. */
+export type ToolInputSchema = Record<string, unknown>;
+
+export type ToolDef = {
+  name: string;
+  description: string;
+  inputSchema: ToolInputSchema;
+};
+
+export type ToolResult = {
+  content: string;
+  isError?: boolean;
+  /** Base64 images the tool produced (e.g. browser screenshots). */
+  images?: ToolResultImage[];
+};
+
+/** A tool the model can call. `run` executes it and returns text for the model. */
+export type AgentTool = ToolDef & {
+  run(input: Record<string, unknown>): Promise<ToolResult>;
+  /** Server-owned orchestration waits do not hold the ordinary company write lane. */
+  executionLane?: "delegation";
+  /**
+   * The tool observes state and never changes it — a file read, a search, a
+   * listing, a diff.
+   *
+   * Exposed as an MCP annotation. Genosyn serializes its registry calls to
+   * preserve company write ordering; OpenCode owns native-tool scheduling.
+   * Unset means "assume it writes".
+   */
+  readOnly?: boolean;
+  /**
+   * What this call *really* is, for logs and the run transcript.
+   *
+   * Only dispatching tools implement it. `call_tool` runs every deferred tool
+   * in the catalogue, so without this every one of them would appear in the
+   * transcript as `call_tool` — turning the most useful column in a run log
+   * into a constant. Returning `{name, input}` lets the adapter report the target
+   * the model actually reached for.
+   */
+  describeCall?(input: Record<string, unknown>): {
+    name: string;
+    input: Record<string, unknown>;
+  };
+};
+
+// ---------- runtime activity ----------
+
+export type StreamCallbacks = {
+  /** Server-owned worker groups still running after a bounded tool response. */
+  onBackgroundWork?: (pendingGroups: number) => void;
+  /** Human-visible reply prose, streamed token-by-token. */
+  onText?: (delta: string) => void;
+  /**
+   * The AI Model's thinking, as the runtime exposes it — a reasoning summary
+   * on OpenAI models, thinking text on Anthropic ones — streamed as it
+   * arrives. `block` names one reasoning block, so a reader can join chunks.
+   * Never part of the reply.
+   */
+  onReasoning?: (delta: string, block: string) => void;
+  /** A reasoning block ended. */
+  onReasoningEnd?: (block: string) => void;
+  /**
+   * What the AI Model is doing right now, read off its own stream
+   * (`modelStream.ts`): waiting, thinking, writing the reply, writing a tool
+   * call's arguments. It holds no words, and a turn is never the worse for
+   * nobody listening. Not forwarded from a delegated worker: its requests are
+   * not the ones the Member is waiting on.
+   */
+  onModelPulse?: (pulse: ModelPulse) => void;
+  /** One request to the AI Model ended, and where its time went. */
+  onModelCall?: (call: ModelCallDetail) => void;
+  /**
+   * The turn is waiting on the runtime itself rather than working — today a
+   * ChatGPT-subscription AI Model's lock, which admits one turn at a time —
+   * and again when the wait ends.
+   */
+  onRuntimeWait?: (wait: RuntimeWait) => void;
+  /**
+   * Snapshot at the start of each assistant message to withhold prose generated
+   * before a required source read. Later tool execution cannot change that
+   * message's eligibility merely because its text arrives over a slower stream.
+   */
+  shouldStreamText?: () => boolean;
+  /** Ephemeral direct-chat progress, explicitly reported by the employee. */
+  onProgress?: (progress: AgentProgress) => void;
+  /** Fired before retrying a transient model-service or transport failure. */
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  /**
+   * Fired when a work turn starts waiting for a self-hosted AI Model's server
+   * that stopped answering, and again when it answers.
+   */
+  onModelOutage?: (outage: ModelOutage) => void;
+  /**
+   * Fired when a self-hosted server that serves a single model rejected the
+   * configured one — it was restarted with another — and the turn moved to the
+   * model it serves. The AI Model's card follows.
+   */
+  onServedModelChange?: (change: { from: string; to: string }) => void;
+  /**
+   * Fired once as a turn opens on an API-key AI Model that holds more than one
+   * key: the key the session took in turn, by preview only, and how many keys
+   * the model spreads its sessions across.
+   */
+  onApiKeySession?: (session: { preview: string; keys: number }) => void;
+  /**
+   * Fired the first time in a turn a provider refuses one of an API-key AI
+   * Model's keys and the request moves on to the next key — by preview only.
+   */
+  onApiKeyFailover?: (change: ApiKeyFailover) => void;
+  /**
+   * Fired once when the AI Model refused the thinking parameters the turn
+   * sent and the turn carried on without them, at the model's own default
+   * (`opencodeProxy.ts`, `codexRuntime.ts`). `level` is the thinking level
+   * that was sent, or null when only a thinking summary had been asked for.
+   */
+  onThinkingFallback?: (fallback: ThinkingFallback) => void;
+  /**
+   * Fired when a work turn stopped with no reply and no tool call, just before
+   * the runtime asks the model in the same session to continue or report.
+   */
+  onSilentStop?: () => void;
+  /**
+   * Fired when the model decides to call a tool (before we execute it).
+   *
+   * `callId` identifies this call within the turn, so recorded activity can
+   * pair it with {@link onToolResult} even when the runtime reports concurrent
+   * native calls out of order.
+   */
+  onToolUse?: (name: string, input: Record<string, unknown>, callId?: string) => void;
+  /**
+   * What a running tool has printed so far, whole each time, when the runtime
+   * shows it: OpenCode's native `bash`. Live only; its result is what is kept.
+   */
+  onToolOutput?: (name: string, output: string, callId?: string) => void;
+  /** Fired after a tool returns, before the result is fed back to the model. */
+  onToolResult?: (name: string, result: ToolResult, callId?: string) => void;
+  /** Fired once per turn with what the provider says the turn cost. */
+  onUsage?: (usage: TurnUsage) => void;
+  /**
+   * Fired once per turn with how full the model's context window now is —
+   * {@link onUsage}'s prompt count divided by `AIModel.contextWindow`.
+   *
+   * Separate from {@link onUsage} rather than derived at each consumer because
+   * the two have different audiences: `onUsage` is a cost line for the Run
+   * transcript, this is a human-facing gauge. Keeping it its own callback also
+   * lets the delegation seam forward one and withhold the other — a delegated
+   * worker runs its own short conversation, so its prompt size says nothing
+   * about how full the Member's chat is.
+   */
+  onContextUsage?: (usage: ContextUsage) => void;
+  /**
+   * Fired when the external runtime compacts the conversation to fit the
+   * model's context window. Counts remain null when it does not report them.
+   */
+  onCompact?: (info: CompactionInfo) => void;
+  /**
+   * Fired when tools were dropped to fit the provider's cap. Same reasoning as
+   * {@link onCompact}: an employee that silently lost a tool looks like an
+   * employee that inexplicably refuses to do its job.
+   */
+  onToolsTrimmed?: (info: ToolTrimInfo) => void;
+  /**
+   * Fired once per run with how the tool catalogue was split into the working
+   * set the model is shown and the tail it has to discover.
+   *
+   * Same reasoning as {@link onCompact} and {@link onToolsTrimmed}: deferral is
+   * invisible from the outside, and "the employee never used the tool" and "the
+   * employee was never shown the tool" look identical in a transcript unless
+   * something says which happened.
+   */
+  onToolsDeferred?: (info: ToolDeferralInfo) => void;
+};
+
+/** The thinking level an AI Model refused; see `StreamCallbacks.onThinkingFallback`. */
+export type ThinkingFallback = { level: ModelEffort | null };
+
+/**
+ * A wait outside the employee's control. `cause` is open-ended so a new kind
+ * of wait reaches the chat without a new callback; `label` words a cause the
+ * chat has no copy for.
+ */
+export type RuntimeWait = {
+  cause: string;
+  state: "waiting" | "done";
+  label?: string;
+};
+
+export type AgentProgress = {
+  /** Honest completed-work estimate. The final reply owns 100%. */
+  percent: number;
+  /** Short description of the activity happening now. */
+  label: string;
+};
+
+/** How the run's tools were split between the working set and the catalogue. */
+export type ToolDeferralInfo = {
+  /** Tools sent on every request this run. */
+  resident: number;
+  /** Tools reachable only via `find_tools` / `call_tool`. */
+  deferred: number;
+  /** Domains represented in the deferred catalogue, for the run log. */
+  domains: string[];
+  /** Names made resident because a Skill's declared toolset asked for them. */
+  fromSkills: string[];
+};
+
+/** What the tool trim dropped, and what forced it. */
+export type ToolTrimInfo = {
+  /** How many tools the employee had before trimming. */
+  offered: number;
+  /** The provider's ceiling we trimmed to. */
+  limit: number;
+  /** Model-facing names of the tools that were dropped. */
+  dropped: string[];
+};
+
+/** What one round of compaction did, and what forced it. */
+export type CompactionInfo = {
+  /** How many tool results were emptied, or null when not reported. */
+  evicted: number | null;
+  /** Runtime-reported estimate of freed tokens, or null when not reported. */
+  freedTokens: number | null;
+  /** "budget" = proactive compaction. "overflow" = provider context rejection. */
+  reason: "budget" | "overflow";
+};
+
+/**
+ * What a turn actually cost, as counted by the provider's own tokenizer.
+ *
+ * This is the only trustworthy measure of how full the context is: model ids are
+ * free text and a custom endpoint can serve any weights, so we can't know the
+ * tokenizer and any local estimate would be a guess.
+ *
+ * `inputTokens` is the whole prompt the provider billed for — on Anthropic that
+ * means summing the cached spans back in, since `input_tokens` there counts only
+ * the uncached remainder.
+ */
+export type TurnUsage = {
+  inputTokens: number;
+  outputTokens: number;
+};
+
+/** One transparent retry of the current model turn. */
+export type ModelOutage = {
+  /** `waiting` when the server stops answering; `answered` once it does again. */
+  state: "waiting" | "answered";
+  /** How long the turn waited, measured when the server answers. */
+  waitedMs: number;
+};
+
+export type ModelRetryInfo = {
+  /** The provider call about to start, counting the original as attempt 1. */
+  attempt: number;
+  /** Total provider calls allowed, or null when the runtime does not report it. */
+  maxAttempts: number | null;
+  /** Backoff before the next provider call. */
+  delayMs: number;
+  /** Safe summary such as `HTTP 500`; never the provider response body. */
+  reason: string;
+};

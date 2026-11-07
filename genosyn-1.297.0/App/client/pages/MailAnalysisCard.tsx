@@ -1,0 +1,473 @@
+import React from "react";
+import { Link, useNavigate } from "react-router-dom";
+import {
+  Archive,
+  Ban,
+  Bot,
+  CalendarPlus,
+  Check,
+  CircleAlert,
+  Clock,
+  FileText,
+  Lock,
+  MailCheck,
+  MailX,
+  Receipt,
+  RefreshCw,
+  Reply,
+  Sparkles,
+  Star,
+  Tag,
+  Undo2,
+} from "lucide-react";
+
+import { MailAnalysis, MailAnalysisAction, MailAnalysisAutoAction, mailApi } from "../lib/mail";
+import type { FinanceAccess } from "../lib/api";
+import {
+  CATEGORY_TONE_CLASSES,
+  analysisActionBlockedReason,
+  analysisActionConfirm,
+  analysisActionDetail,
+  analysisActionHint,
+  analysisCategoryLabel,
+  analysisCategoryTone,
+  automaticActionNote,
+  automaticActionTitle,
+  automaticActionTone,
+  automaticActionUndoable,
+} from "../lib/mailAnalysis";
+import { clsx } from "../components/ui/clsx";
+import { useDialog } from "../components/ui/Dialog";
+import { FormSuccess } from "../components/ui/FormError";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import type { ScheduleMeetingPrefill } from "./MailScheduleMeeting";
+import type { MailIntakeOutcome } from "../../shared/projectIntake";
+
+/**
+ * What the AI made of this email, and the buttons it earned.
+ *
+ * The card sits above the conversation because triage is the first thing a
+ * Member does with a new email and the last thing they should have to hunt
+ * for. It is deliberately quiet when there is nothing to say: an email that
+ * needs no action shows its summary and no button row at all.
+ *
+ * Every button runs server-side with the Member's own authority. The label is
+ * the employee's words; the line under it is what the server verified, so the
+ * thing being approved is the checked one.
+ */
+
+const ACTION_ICONS: Record<MailAnalysisAction["kind"], React.ReactNode> = {
+  draft_reply: <Reply size={13} />,
+  create_invoice: <Receipt size={13} />,
+  create_estimate: <FileText size={13} />,
+  unsubscribe: <MailX size={13} />,
+  thread_action: <Tag size={13} />,
+  hand_over: <Bot size={13} />,
+  schedule_meeting: <CalendarPlus size={13} />,
+};
+
+function iconFor(action: MailAnalysisAction): React.ReactNode {
+  if (action.kind === "thread_action") {
+    if (action.action === "archive") return <Archive size={13} />;
+    if (action.action === "star") return <Star size={13} />;
+  }
+  return ACTION_ICONS[action.kind] ?? <Sparkles size={13} />;
+}
+
+const AUTO_ICONS: Record<MailAnalysisAutoAction["action"], React.ReactNode> = {
+  star: <Star size={13} />,
+  markRead: <MailCheck size={13} />,
+  archive: <Archive size={13} />,
+  applyLabel: <Tag size={13} />,
+  unsubscribe: <MailX size={13} />,
+  other: <Ban size={13} />,
+};
+
+/**
+ * What the mailbox's instructions did to this email on their own.
+ *
+ * Shown above the buttons because it already happened: a thread that left the
+ * inbox, or a sender that was unsubscribed from, has to say so where the
+ * person is looking, in their own instruction's words, with the way back.
+ */
+function AutomaticSteps({
+  steps,
+  undoingId,
+  disabled,
+  onUndo,
+}: {
+  steps: MailAnalysisAutoAction[];
+  undoingId: string | null;
+  disabled: boolean;
+  onUndo: (step: MailAnalysisAutoAction) => void;
+}) {
+  return (
+    <div className="mt-3 rounded-lg border border-violet-200/80 bg-white/70 px-3 py-2 dark:border-violet-500/20 dark:bg-slate-950/40">
+      <p className="text-xs font-medium text-violet-500/80 dark:text-violet-300/70">
+        Your instructions
+      </p>
+      <ul className="mt-1 divide-y divide-violet-100 dark:divide-violet-500/10">
+        {steps.map((step) => {
+          const tone = automaticActionTone(step);
+          const note = automaticActionNote(step);
+          return (
+            <li key={step.id} className="flex items-start gap-2 py-1.5 text-xs">
+              <span
+                className={clsx(
+                  "mt-0.5 shrink-0",
+                  tone === "done" && "text-emerald-600 dark:text-emerald-400",
+                  tone === "working" && "text-violet-500 dark:text-violet-300",
+                  tone === "failed" && "text-red-600 dark:text-red-400",
+                  tone === "muted" && "text-slate-400 dark:text-slate-500",
+                )}
+              >
+                {tone === "working" ? (
+                  <Spinner size={13} />
+                ) : tone === "failed" ? (
+                  <CircleAlert size={13} />
+                ) : (
+                  (AUTO_ICONS[step.action] ?? <Sparkles size={13} />)
+                )}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p
+                  className={clsx(
+                    "font-medium",
+                    tone === "muted"
+                      ? "text-slate-500 dark:text-slate-400"
+                      : "text-slate-800 dark:text-slate-100",
+                  )}
+                >
+                  {automaticActionTitle(step)}
+                </p>
+                {step.reason && step.status !== "skipped" && (
+                  <p className="text-slate-500 dark:text-slate-400">{step.reason}</p>
+                )}
+                {note && (
+                  <p
+                    className={clsx(
+                      tone === "failed"
+                        ? "text-red-700 dark:text-red-300"
+                        : "text-slate-500 dark:text-slate-400",
+                    )}
+                  >
+                    {note}
+                  </p>
+                )}
+                {step.instruction && (
+                  <p className="break-words text-[11px] text-slate-400 dark:text-slate-500">
+                    Your instruction: &ldquo;{step.instruction}&rdquo;
+                  </p>
+                )}
+              </div>
+              {automaticActionUndoable(step) && (
+                <button
+                  type="button"
+                  onClick={() => onUndo(step)}
+                  disabled={disabled}
+                  aria-busy={undoingId === step.id || undefined}
+                  aria-label={`Undo: ${automaticActionTitle(step)}`}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-violet-700 hover:bg-violet-100 disabled:opacity-50 dark:text-violet-200 dark:hover:bg-violet-500/15"
+                >
+                  {undoingId === step.id ? <ButtonSpinner size={12} /> : <Undo2 size={12} />}
+                  Undo
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+/** What a Project's email intake did with this email. Nothing to say while it's filing. */
+function IntakeOutcome({
+  outcome,
+  companySlug,
+}: {
+  outcome: MailIntakeOutcome;
+  companySlug: string;
+}) {
+  if (outcome.status === "proposed") return null;
+  if (outcome.status === "filed") {
+    return (
+      <p className="mt-2 flex flex-wrap items-baseline gap-x-1 text-xs text-slate-600 dark:text-slate-300">
+        <span>Filed to</span>
+        <Link
+          to={`/c/${companySlug}/tasks/p/${outcome.projectSlug}?todo=${encodeURIComponent(outcome.todoId ?? "")}`}
+          className="font-medium text-indigo-600 hover:underline dark:text-indigo-300"
+        >
+          {outcome.todoKey}
+        </Link>
+        <span>: {outcome.reason}</span>
+      </p>
+    );
+  }
+  return (
+    <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+      {outcome.status === "failed" ? "Couldn't file this as a task: " : "Not filed as a task: "}
+      {outcome.detail}
+    </p>
+  );
+}
+
+export function MailAnalysisCard({
+  analysis,
+  companyId,
+  companySlug,
+  financeAccess,
+  onChanged,
+  onArchived,
+  onScheduleMeeting,
+}: {
+  analysis: MailAnalysis;
+  companyId: string;
+  companySlug: string;
+  /** This Member's finance level — the money buttons are offered against it. */
+  financeAccess: FinanceAccess;
+  /** Reload the thread after a proposed action changes its surrounding state. */
+  onChanged: () => void;
+  /** The suggested Archive went through: the thread view returns to its list. */
+  onArchived?: () => void;
+  /**
+   * A Schedule button opens the scheduler with what the email proposed —
+   * nothing runs server-side until the Member sends the invitation there.
+   */
+  onScheduleMeeting?: (prefill: ScheduleMeetingPrefill) => void;
+}) {
+  const dialog = useDialog();
+  const navigate = useNavigate();
+  const [row, setRow] = React.useState(analysis);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [retrying, setRetrying] = React.useState(false);
+  const [undoingId, setUndoingId] = React.useState<string | null>(null);
+  const [notice, setNotice] = React.useState<string | null>(null);
+
+  React.useEffect(() => setRow(analysis), [analysis]);
+
+  const undo = async (step: MailAnalysisAutoAction) => {
+    if (undoingId || busyId || retrying) return;
+    setUndoingId(step.id);
+    setNotice(null);
+    try {
+      const result = await mailApi.undoAutomaticAction(companyId, row.id, step.id);
+      // The step reading "— undone" is the confirmation; the thread reloads
+      // so the star, the label or the inbox reflects it too.
+      setRow(result.analysis);
+      onChanged();
+    } catch (err) {
+      void dialog.error(err, { title: `Couldn’t undo “${automaticActionTitle(step)}”` });
+    } finally {
+      setUndoingId(null);
+    }
+  };
+
+  const run = async (action: MailAnalysisAction) => {
+    if (busyId || retrying || undoingId || action.executedAt) return;
+    if (analysisActionBlockedReason(action, financeAccess)) return;
+    if (action.kind === "schedule_meeting") {
+      onScheduleMeeting?.({ analysisId: row.id, actionId: action.id, action });
+      return;
+    }
+    const confirmation = analysisActionConfirm(action);
+    if (confirmation) {
+      const ok = await dialog.confirm({
+        title: confirmation.title,
+        // A handover's instruction is a paragraph, so newlines have to survive.
+        message: <span className="block whitespace-pre-wrap">{confirmation.message}</span>,
+        confirmLabel: confirmation.confirmLabel,
+      });
+      if (!ok) return;
+    }
+    setBusyId(action.id);
+    setNotice(null);
+    try {
+      const result = await mailApi.runAnalysisAction(companyId, row.id, action.id);
+      // The button going struck-through is the confirmation; review actions
+      // then open the exact in-stack reply without touching mailbox Drafts.
+      setRow(result.analysis);
+      setNotice(!result.navigateTo && action.kind === "draft_reply" ? result.message : null);
+      onChanged();
+      if (result.navigateTo) navigate(`/c/${companySlug}${result.navigateTo}`);
+      else if (action.kind === "thread_action" && action.action === "archive") onArchived?.();
+    } catch (err) {
+      void dialog.error(err, { title: `Couldn\u2019t run \u201C${action.label}\u201D` });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const retry = async () => {
+    if (retrying || busyId || undoingId) return;
+    setRetrying(true);
+    setNotice(null);
+    try {
+      const result = await mailApi.analyzeMessage(companyId, row.messageId);
+      // A second failure shows in the card itself, where the first one is.
+      setRow(result.analysis);
+      onChanged();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn\u2019t read this email again" });
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  if (row.status === "running") {
+    return (
+      <div className="mb-3 flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
+        <Spinner size={13} />
+        Reading this email…
+      </div>
+    );
+  }
+
+  if (row.status === "waiting") {
+    // An arrival read whose AI Model is unavailable. It is read — and the
+    // mailbox's instructions applied — by itself once the model is back, so
+    // there is nothing to retry from here.
+    return (
+      <div
+        role="status"
+        className="mb-3 flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400"
+      >
+        <Clock size={13} className="shrink-0" />
+        Waiting for the AI Model to come back. This email is read as soon as it is, just as it
+        would have been on arrival.
+      </div>
+    );
+  }
+
+  if (row.status === "failed") {
+    return (
+      <div className="mb-3 flex items-start gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <Sparkles size={14} className="mt-0.5 shrink-0 text-slate-300 dark:text-slate-600" />
+        <div className="min-w-0 flex-1">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {row.errorMessage || "This email couldn’t be analysed."}
+          </p>
+        </div>
+        <button
+          onClick={() => void retry()}
+          disabled={retrying}
+          aria-busy={retrying || undefined}
+          className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-700 disabled:opacity-50 dark:text-indigo-400"
+        >
+          {retrying ? <ButtonSpinner size={12} /> : <RefreshCw size={12} />} Try again
+        </button>
+      </div>
+    );
+  }
+
+  const tone = CATEGORY_TONE_CLASSES[analysisCategoryTone(row.category)];
+  // A row written before instructions existed (or by an older server) has none.
+  const automaticSteps = row.automaticActions ?? [];
+
+  return (
+    <div className="mb-3 rounded-xl border border-violet-200 bg-violet-50/50 p-4 shadow-sm dark:border-violet-500/25 dark:bg-violet-500/5">
+      <div className="flex items-start gap-2.5">
+        <Sparkles size={14} className="mt-0.5 shrink-0 text-violet-500 dark:text-violet-300" />
+        <div className="min-w-0 flex-1">
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            {row.category && (
+              <span
+                className={clsx(
+                  "rounded-full border px-2 py-0.5 text-xs font-medium inline-block first-letter:uppercase",
+                  tone,
+                )}
+              >
+                {analysisCategoryLabel(row.category)}
+              </span>
+            )}
+            <span className="text-xs font-medium text-violet-500/80 dark:text-violet-300/70">
+              AI summary
+            </span>
+            <button
+              onClick={() => void retry()}
+              disabled={retrying || busyId !== null || undoingId !== null}
+              aria-busy={retrying || undefined}
+              title="Read this email again"
+              className="ml-auto rounded p-1 text-violet-400 hover:bg-violet-100 hover:text-violet-600 disabled:opacity-50 dark:hover:bg-violet-500/15 dark:hover:text-violet-200"
+            >
+              {retrying ? <ButtonSpinner size={12} /> : <RefreshCw size={12} />}
+            </button>
+          </div>
+          <p className="text-sm text-slate-700 dark:text-slate-200">{row.summary}</p>
+
+          {automaticSteps.length > 0 && (
+            <AutomaticSteps
+              steps={automaticSteps}
+              undoingId={undoingId}
+              disabled={undoingId !== null || busyId !== null || retrying}
+              onUndo={(step) => void undo(step)}
+            />
+          )}
+
+          {row.intake && <IntakeOutcome outcome={row.intake} companySlug={companySlug} />}
+
+          <FormSuccess message={notice} className="mt-2 text-xs" />
+
+          {row.actions.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {row.actions.map((action) => {
+                const spent = Boolean(action.executedAt);
+                // Shown rather than hidden: the AI did read this email as one
+                // to bill for, and that is worth knowing even by someone who
+                // has to ask a colleague to raise it.
+                const blocked = analysisActionBlockedReason(action, financeAccess);
+                const detail = blocked ?? analysisActionDetail(action);
+                return (
+                  <button
+                    key={action.id}
+                    disabled={
+                      spent || Boolean(blocked) || busyId !== null || retrying || undoingId !== null
+                    }
+                    aria-busy={busyId === action.id || undefined}
+                    onClick={() => void run(action)}
+                    title={spent ? "Already done" : (blocked ?? analysisActionHint(action))}
+                    className={clsx(
+                      "inline-flex items-start gap-1.5 rounded-lg border px-2.5 py-1.5 text-left text-xs font-medium transition-colors",
+                      spent
+                        ? "cursor-default border-slate-200 text-slate-400 line-through dark:border-slate-800 dark:text-slate-600"
+                        : blocked
+                          ? "cursor-not-allowed border-slate-200 text-slate-400 dark:border-slate-800 dark:text-slate-500"
+                          : "border-violet-200 bg-white text-violet-700 hover:bg-violet-100 disabled:opacity-60 dark:border-violet-500/30 dark:bg-slate-950 dark:text-violet-200 dark:hover:bg-violet-500/15",
+                    )}
+                  >
+                    <span className="mt-0.5 shrink-0">
+                      {busyId === action.id ? (
+                        <ButtonSpinner size={13} />
+                      ) : spent ? (
+                        <Check size={13} />
+                      ) : blocked ? (
+                        <Lock size={13} />
+                      ) : (
+                        iconFor(action)
+                      )}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block">{action.label}</span>
+                      {detail && !spent && (
+                        <span
+                          className={clsx(
+                            "block max-w-[240px] truncate text-[10px] font-normal",
+                            blocked
+                              ? "text-slate-400 dark:text-slate-500"
+                              : "text-violet-500/80 dark:text-violet-300/70",
+                          )}
+                        >
+                          {detail}
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

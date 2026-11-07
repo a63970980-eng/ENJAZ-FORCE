@@ -1,0 +1,321 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { after, before, describe, test } from "node:test";
+
+import { PDFDocument } from "pdf-lib";
+
+import { occupyThreadPool } from "../test/threadPool.js";
+import { emptyZip, withDamagedEntry, zipOf } from "../test/zipFixtures.js";
+import {
+  RESOURCE_AUTO_SUMMARY_CHARS,
+  RESOURCE_MAX_MATCHES,
+  buildMatchSnippet,
+  epubFileToText,
+  extractResourceText,
+  gradeExtraction,
+  markdownToPlainText,
+  pdfBufferToText,
+  summarizeBody,
+  windowText,
+} from "./resources.js";
+
+/**
+ * `pdfBufferToText` used to hand the caller's `Buffer` straight to the pdf.js
+ * copy vendored inside `pdf-parse`, which does not survive the way Node
+ * allocates small buffers — see the note on the function. It surfaced as
+ * "Invalid PDF structure" thrown on a perfectly valid document, on some runs
+ * and not others, on both the upload route and the AI `create_resource` path.
+ *
+ * Both tests below feed the parser exactly that shape: a PDF small enough that
+ * `Buffer.from` serves it out of Node's shared allocation pool.
+ */
+describe("pdfBufferToText", () => {
+  const SENTENCE = "Quarterly revenue summary";
+
+  async function pooledPdfBytes(): Promise<Buffer> {
+    const pdf = await PDFDocument.create();
+    pdf.addPage([612, 792]).drawText(SENTENCE, { x: 48, y: 730, size: 18 });
+    const bytes = Buffer.from(await pdf.save());
+    assert.ok(
+      bytes.byteLength < 4096,
+      `fixture grew to ${bytes.byteLength} bytes and no longer comes from Node's buffer pool`,
+    );
+    return bytes;
+  }
+
+  test("extracts text from a pool-allocated buffer on every attempt", async () => {
+    const bytes = await pooledPdfBytes();
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const text = await pdfBufferToText(Buffer.from(bytes));
+      assert.match(text, new RegExp(SENTENCE), `attempt ${attempt} lost the text`);
+    }
+  });
+
+  test("extracts the same text from concurrent calls", async () => {
+    const bytes = await pooledPdfBytes();
+    const texts = await Promise.all(
+      Array.from({ length: 6 }, () => pdfBufferToText(Buffer.from(bytes))),
+    );
+    for (const text of texts) assert.match(text, new RegExp(SENTENCE));
+  });
+});
+
+/**
+ * M62 — passage retrieval and honest ingestion.
+ *
+ * These are pure functions over a string so they need no database: the point
+ * of moving them out of the MCP handler was that the interesting behaviour is
+ * arithmetic on offsets, and arithmetic is worth testing directly.
+ */
+
+describe("windowText", () => {
+  const BODY = Array.from({ length: 500 }, (_, i) => `line ${i} of the document`).join("\n");
+
+  test("pages a long body to completion without losing or repeating text", () => {
+    let offset = 0;
+    let seen = "";
+    let guard = 0;
+    for (;;) {
+      const win = windowText(BODY, { offset, maxChars: 1_000 });
+      seen += win.text;
+      assert.equal(win.windowStart, offset === 0 ? 0 : win.windowStart);
+      if (!win.hasMore) break;
+      assert.ok(win.nextOffset !== null, "hasMore implies a nextOffset");
+      assert.ok(win.nextOffset > offset, "nextOffset must advance");
+      offset = win.nextOffset;
+      guard += 1;
+      assert.ok(guard < 1_000, "paging did not terminate");
+    }
+    assert.equal(seen, BODY, "concatenated windows must reconstruct the body exactly");
+  });
+
+  test("reports the whole length, not the window length", () => {
+    const win = windowText(BODY, { maxChars: 100 });
+    assert.equal(win.bodyLength, BODY.length);
+    assert.ok(win.text.length <= 100);
+    assert.equal(win.hasMore, true);
+  });
+
+  test("never splits a surrogate pair", () => {
+    // Each emoji is two UTF-16 code units, so an odd cap lands mid-pair.
+    const emoji = "🙂".repeat(50);
+    const win = windowText(emoji, { maxChars: 7 });
+    assert.equal(win.text.length % 2, 0, "a lone surrogate escaped the window");
+    for (const ch of win.text) assert.notEqual(ch, "�");
+    const rest = windowText(emoji, { offset: win.nextOffset ?? 0, maxChars: 7 });
+    assert.equal(rest.text.length % 2, 0);
+  });
+
+  test("`around` centres the window on the phrase", () => {
+    const body = "a".repeat(50_000) + " NEEDLE HERE " + "b".repeat(50_000);
+    const win = windowText(body, { around: "needle here", maxChars: 2_000 });
+    assert.ok(win.text.includes("NEEDLE HERE"), "the phrase must be inside the window");
+    assert.ok(win.windowStart > 0, "the window should not start at the top of the body");
+  });
+
+  test("an offset past the end returns an empty final window", () => {
+    const win = windowText("short", { offset: 999 });
+    assert.equal(win.text, "");
+    assert.equal(win.hasMore, false);
+    assert.equal(win.nextOffset, null);
+  });
+});
+
+describe("buildMatchSnippet", () => {
+  test("finds a hit case-insensitively and reports where it is", () => {
+    const body = "x".repeat(1_000) + " Our Refund Policy is thirty days. " + "y".repeat(1_000);
+    const match = buildMatchSnippet(body, ["refund"]);
+    assert.ok(match, "expected a match");
+    assert.ok(match.snippet.toLowerCase().includes("refund"));
+    assert.equal(body.slice(match.bodyOffset, match.bodyOffset + 6), "Refund");
+  });
+
+  test("bodyOffset round-trips through windowText", () => {
+    const body = "z".repeat(80_000) + " the quarterly target is 40%. " + "z".repeat(80_000);
+    const match = buildMatchSnippet(body, ["quarterly target"]);
+    assert.ok(match);
+    const win = windowText(body, { offset: match.bodyOffset, maxChars: 500 });
+    assert.ok(
+      win.text.includes("quarterly target"),
+      "a search hit's offset must land the reader on the passage",
+    );
+  });
+
+  test("stops counting at the cap rather than walking the whole body", () => {
+    const match = buildMatchSnippet("needle ".repeat(5_000), ["needle"]);
+    assert.ok(match);
+    assert.equal(match.matchCount, RESOURCE_MAX_MATCHES);
+  });
+
+  test("returns null when nothing matches, and survives regex metacharacters", () => {
+    assert.equal(buildMatchSnippet("plain text", ["absent"]), null);
+    assert.equal(buildMatchSnippet("cost is $5 (net)", ["nomatch("]), null);
+    const match = buildMatchSnippet("cost is $5 (net)", ["$5 (net)"]);
+    assert.ok(match, "a query full of metacharacters must match literally");
+  });
+});
+
+describe("gradeExtraction", () => {
+  test("an empty extraction is a failure, not a Ready row", () => {
+    // pdf-parse returns "\n\n" for a scan with no text layer — it does not
+    // throw, which is how these rows used to be saved as Ready and silently
+    // never matched a search.
+    const graded = gradeExtraction("\n\n".trim(), "pdf");
+    assert.equal(graded.status, "failed");
+    assert.match(graded.errorMessage, /no text layer/i);
+    assert.equal(graded.bodyText, "");
+  });
+
+  test("a JS-rendered page says so", () => {
+    const graded = gradeExtraction("", "url");
+    assert.equal(graded.status, "failed");
+    assert.match(graded.errorMessage, /JavaScript/);
+  });
+
+  test("real text is still Ready", () => {
+    const graded = gradeExtraction("The handbook says thirty days.", "pdf");
+    assert.equal(graded.status, "ready");
+    assert.equal(graded.errorMessage, "");
+  });
+});
+
+/**
+ * A text Resource's body is Markdown; its card preview is read without the
+ * syntax. Every other kind's body is already plain extracted text, so its
+ * preview is left exactly as extracted.
+ */
+describe("markdownToPlainText", () => {
+  const plain = (markdown: string) => markdownToPlainText(markdown).replace(/\s+/g, " ").trim();
+
+  test("drops heading marks, emphasis, strikethrough, and inline code", () => {
+    assert.equal(
+      plain("# Title\n\n## Sub\n\nSome **bold**, __strong__, *em*, _em_, ~~gone~~ and `code`."),
+      "Title Sub Some bold, strong, em, em, gone and code.",
+    );
+  });
+
+  test("keeps link labels and image alt text, and drops their targets", () => {
+    assert.equal(
+      plain("Read [the guide](https://example.com/a?b=c) and ![a diagram](https://x/y.png)."),
+      "Read the guide and a diagram.",
+    );
+    assert.equal(plain("See [docs].\n\n[docs]: https://example.com/docs"), "See [docs].");
+  });
+
+  test("drops list bullets, task boxes, quote marks, rules, and table pipes", () => {
+    assert.equal(
+      plain("- one\n* two\n+ three\n1. four\n2) five\n- [ ] six\n- [x] seven"),
+      "one two three four five six seven",
+    );
+    assert.equal(plain("> quoted\n> more\n\n---\n\nafter"), "quoted more after");
+    assert.equal(
+      plain("| Plan | Price |\n| --- | :---: |\n| Pro | $10 |"),
+      "Plan Price Pro $10",
+    );
+  });
+
+  test("keeps fenced code but not the fence or its language", () => {
+    assert.equal(plain("Before\n```ts\nconst a = 1;\n```\nAfter"), "Before const a = 1; After");
+  });
+
+  test("drops HTML tags and leaves ordinary prose untouched", () => {
+    assert.equal(plain("<b>Hi</b> there<br/>friend"), "Hi there friend");
+    const prose = "Revenue grew 12% in Q3 — 3 * 4 = 12, and a_b stays a_b.";
+    assert.equal(plain(prose), prose);
+  });
+
+  test("only ever shortens", () => {
+    for (const sample of ["# a", "**b**", "[c](d)", "plain", "1. x", "|a|b|"]) {
+      assert.ok(markdownToPlainText(sample).length <= sample.length, sample);
+    }
+  });
+});
+
+describe("summarizeBody", () => {
+  test("reads a text Resource's Markdown as plain text", () => {
+    assert.equal(summarizeBody("text", "# Pricing\n\n**Three** tiers."), "Pricing Three tiers.");
+  });
+
+  test("leaves every other kind's extracted text as it is", () => {
+    for (const kind of ["url", "pdf", "epub", "video"] as const) {
+      assert.equal(summarizeBody(kind, "# Not a heading here"), "# Not a heading here");
+    }
+  });
+
+  test("an explicit summary still wins, and long previews are cut", () => {
+    assert.equal(summarizeBody("text", "# Body", "Mine"), "Mine");
+    const long = summarizeBody("text", `# Long\n\n${"word ".repeat(200)}`);
+    assert.equal(long.length, RESOURCE_AUTO_SUMMARY_CHARS);
+    assert.ok(long.endsWith("…"));
+  });
+});
+
+/**
+ * An EPUB is read as a zip, and that used to go through `unzipper.Open.file`:
+ * file streams nobody listened to for errors, one of them possibly still
+ * opening once the import had answered. A stream error nobody listens for is
+ * an uncaught exception, which stops the App — so an EPUB listing no chapters
+ * could take the server down once its bytes were deleted. Not being able to
+ * read one is the Resource's reason instead.
+ */
+describe("epubFileToText", () => {
+  let dir = "";
+
+  before(async () => {
+    dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "genosyn-epub-"));
+  });
+
+  after(async () => {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+
+  async function epub(name: string, bytes: Buffer): Promise<string> {
+    const abs = path.join(dir, name);
+    await fs.promises.writeFile(abs, bytes);
+    return abs;
+  }
+
+  test("reads every chapter's text, in order", async () => {
+    const abs = await epub(
+      "book.epub",
+      await zipOf({
+        mimetype: "application/epub+zip",
+        "OEBPS/chapter-2.xhtml": "<html><body><p>Second chapter.</p></body></html>",
+        "OEBPS/chapter-1.xhtml": "<html><body><h1>First chapter.</h1></body></html>",
+        "OEBPS/cover.jpg": Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+      }),
+    );
+    assert.equal(await epubFileToText(abs), "First chapter.\n\nSecond chapter.");
+  });
+
+  test("an EPUB that is not a zip, or is damaged, is reported as unreadable", async () => {
+    const unreadable = {
+      "typed.epub": Buffer.from("Chapter one, saved as text under an .epub name."),
+      "damaged.epub": withDamagedEntry(
+        await zipOf({ "OEBPS/chapter-1.xhtml": "<p>First chapter.</p>" }),
+      ),
+    };
+    for (const [name, bytes] of Object.entries(unreadable)) {
+      const extracted = await extractResourceText(await epub(name, bytes), name, "epub");
+      assert.equal(extracted.status, "failed", name);
+      assert.match(extracted.errorMessage, /^This EPUB can't be read\./, name);
+    }
+  });
+
+  test("lets go of an EPUB that lists no chapters before reporting it, however busy the server", async () => {
+    const abs = await epub("empty.epub", emptyZip());
+    const drain = occupyThreadPool();
+    try {
+      const extracted = await extractResourceText(abs, "empty.epub", "epub");
+      assert.equal(extracted.status, "failed");
+      // The bytes of an import can be deleted the moment it has answered.
+      fs.unlinkSync(abs);
+    } finally {
+      // An open still waiting in the pool runs now; one that outlived the
+      // import fails here as an uncaught exception, and fails the test.
+      await drain();
+    }
+  });
+});

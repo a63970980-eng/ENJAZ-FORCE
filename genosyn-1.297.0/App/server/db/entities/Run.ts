@@ -1,0 +1,341 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from "typeorm";
+
+/**
+ * `continued` is the planned hand-off: the Run saved actionable progress and an
+ * automatic continuation took over its unfinished work. It is neither a success
+ * nor a failure — the last Run in the chain carries the outcome. A hand-off
+ * whose continuation is cancelled, stopped or skipped before it starts goes
+ * back to `failed` (`revertUnstartedContinuation`).
+ */
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "reviewed"
+  | "continued"
+  | "failed"
+  | "error"
+  | "skipped"
+  | "timeout"
+  | "interrupted";
+
+/** Durable cause for an Error; legacy timeout/interrupted statuses remain readable. */
+export type RunErrorKind = "runtime" | "timeout" | "interrupted";
+
+/**
+ * Why a Run was paused and put back in the queue as itself
+ * (`services/runPause.ts`): `upgrade` or `restart` when Genosyn restarted,
+ * `outage` while its AI Model was unavailable. A pause is never a Standdown.
+ */
+export type RunPauseReason = "upgrade" | "restart" | "outage";
+
+/**
+ * How a completed Run measured against its Routine's acceptance criteria,
+ * judged by a restricted zero-tool checker after the transcript was final.
+ *
+ * `achieved` — the evidence shows the criteria were met.
+ * `off_goal`  — the Run finished but the work does not satisfy the criteria.
+ * `unclear`   — the checker looked and could not tell either way.
+ * `unverified`— **the check never produced a judgement**: the checker errored,
+ *               timed out, or ended without submitting.
+ *
+ * The last two used to be the same word, and that collision was load-bearing
+ * in the wrong direction: every consumer downstream read "we could not verify"
+ * as "nothing was wrong", so a checker outage quietly earned an employee the
+ * same credit as a graded success. They are now separate, and `unverified`
+ * counts against promotion exactly like a bad Run.
+ *
+ * Null when the Routine declares no criteria, or for Runs that predate the
+ * column.
+ */
+export type RunOutcomeVerdict = "achieved" | "unclear" | "off_goal" | "unverified";
+
+/**
+ * Whether this Run's **required Checks** passed — the third axis, and the only
+ * one no model has a say in.
+ *
+ * `passed`  — every required Check passed (possibly after remediation).
+ * `failed`  — at least one required Check did not pass, or could not be run.
+ * `not_run` — the Routine declares no enabled Checks.
+ *
+ * Null for Runs that never reached the check phase or predate the column.
+ * Required Check failures make the Run `failed`; the separate verdict retains
+ * the independent evidence behind that status.
+ */
+export type RunChecksVerdict = "passed" | "failed" | "not_run";
+
+/**
+ * What caused a Run to start. Only `schedule` and `retry` runs are ever
+ * retried automatically — the other three had a caller present who saw the
+ * outcome and can decide for themselves.
+ */
+export type RunTrigger =
+  | "schedule"
+  | "manual"
+  | "webhook"
+  | "approval"
+  | "retry"
+  | "event"
+  | "continuation";
+
+// Run history, the Home failed-routines roll-up, and System Health all filter
+// by routineId and a startedAt window; without this the queries full-scan the
+// highest-volume table in the app. Mirrors the pipeline_runs index.
+@Entity("runs")
+@Index(["routineId", "startedAt"])
+// The crash reconciler sweeps `status = "running"` on every heartbeat and the
+// System Health stuck-run check filters the same way.
+@Index(["status", "startedAt"])
+// The heartbeat's retry scan: terminal rows carrying a due `retryAt`.
+@Index(["retryAt"])
+@Index(["employeeId", "status", "createdAt"])
+// The live-failure roll-up asks, per failed Run, whether a continuation
+// already picked it up. Without this that probe walks the Routine's whole
+// Run history, `logContent` and all, once per failure.
+@Index(["parentRunId"])
+export class Run {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  routineId!: string;
+
+  /** Snapshot of the employee who owns this occurrence; older Runs have none. */
+  @Column({ type: "varchar", nullable: true })
+  employeeId!: string | null;
+
+  /**
+   * Active dispatch marker through final assessment. New claims use `run:<id>:<nonce>`
+   * so independent Runs never occupy a shared employee slot. The legacy column
+   * name and employee-valued claims remain compatible with existing databases.
+   */
+  @Index({ unique: true })
+  @Column({ type: "varchar", nullable: true })
+  queueActiveEmployeeId!: string | null;
+
+  /** Server-only dispatch provenance. Never included in public Run responses. */
+  @Column({ type: "text", nullable: true, select: false })
+  queueOptionsJson!: string | null;
+
+  @Column({ type: dateTimeColumnType })
+  startedAt!: Date;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  finishedAt!: Date | null;
+
+  @Column({ type: "varchar" })
+  status!: RunStatus;
+
+  /** Infrastructure or model failure cause, separate from unmet work. */
+  @Column({ type: "varchar", nullable: true })
+  errorKind!: RunErrorKind | null;
+
+  /**
+   * The AI Employee's explanation of work it could not finish. Reporting this
+   * while running makes finalization fail the Run, without authoring a Check
+   * or an outcome verdict. Immutable once reported; runtime errors still win.
+   */
+  @Column({ type: "text", nullable: true })
+  failureReason!: string | null;
+
+  /** Server-observed, redacted diagnostics, independent of transcript truncation. */
+  @Column({ type: "text", nullable: true })
+  diagnosticsJson!: string | null;
+
+  /** Tool-owned progress, never a Check or a success verdict. */
+  @Column({ type: "text", nullable: true })
+  checkpointJson!: string | null;
+
+  /** Server-recorded tool dependencies, revalidated before a retry starts its model. */
+  @Column({ type: "text", nullable: true })
+  requiredToolsJson!: string | null;
+
+  /** Automatic continuations in this allowance; an admin resumption starts at 0. */
+  @Column({ type: "integer", default: 0 })
+  continuationCount!: number;
+
+  /** Preserve event/retry review scope when a continuation starts. */
+  @Column({ type: "varchar", nullable: true })
+  continuationOriginTriggerKind!: RunTrigger | null;
+
+  /** A preparation-only origin can never become unrestricted mid-chain. */
+  @Column({ type: "boolean", default: false })
+  continuationReviewOnly!: boolean;
+
+  /** Shared deadline; only an explicit admin resumption grants a new allowance. */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  continuationDeadlineAt!: Date | null;
+
+  /** Tokens spent by preceding Runs in this time window, retaining earlier Effects separately. */
+  @Column({ type: "integer", default: 0 })
+  continuationTokensUsed!: number;
+
+  /** Server-owned explanation when automatic continuation cannot proceed. */
+  @Column({ type: "text", nullable: true })
+  continuationStopReason!: string | null;
+
+  /**
+   * Captured model text and tool activity, plus runner framing lines (headers,
+   * timeouts, errors). The DB is the source of truth: the runner checkpoints
+   * this column while a Run is active, then writes the final transcript when
+   * it finishes. Hard-capped at {@link RUN_LOG_MAX_BYTES} to keep a runaway
+   * Run from blowing up the row — we keep the first N bytes and append a
+   * truncation marker once the cap is hit.
+   */
+  @Column({ type: "text", default: "" })
+  logContent!: string;
+
+  /**
+   * Zero for a completed Run. Null for Runs without a clean completion:
+   * `skipped`, `timeout`, `interrupted`, and model/tool failures.
+   */
+  @Column({ type: "integer", nullable: true })
+  exitCode!: number | null;
+
+  /**
+   * When a member acknowledged this failed/timed-out run from the Home
+   * "Failed routines" panel. Non-null rows are hidden from that panel and
+   * from the System Health "Failed routine runs" check, so an
+   * already-noticed failure stops nagging the whole company. The run itself
+   * is left intact — this only suppresses the alert. Null for runs nobody
+   * has dismissed (the default). The acting member + time are also written
+   * to the audit log.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  dismissedAt!: Date | null;
+
+  /**
+   * What caused this run. Named `triggerKind` rather than `trigger` because
+   * TRIGGER is a reserved SQL keyword. See {@link RunTrigger}.
+   */
+  @Column({ type: "varchar", default: "schedule" })
+  triggerKind!: RunTrigger;
+
+  /**
+   * 1-based attempt number within a retry chain. Always read from the row,
+   * never from process memory, so a crash mid-chain resumes at the right count
+   * instead of restarting the budget at 1.
+   */
+  @Column({ type: "integer", default: 1 })
+  attempt!: number;
+
+  /** The run this one is a retry of. Null for first attempts. */
+  @Column({ type: "varchar", nullable: true })
+  parentRunId!: string | null;
+
+  /**
+   * When the heartbeat should start the next attempt. Written on the
+   * **terminal** row alongside its final status, in the same save, so "a retry
+   * is owed" survives a second crash without needing a non-terminal queue
+   * state. Cleared the moment the retry is dispatched. Null means no further
+   * attempt is owed — which is also what stops the row nagging from the Home
+   * failed-routines panel while a retry is still pending. Dispatch temporarily
+   * replaces the due time with an internal, expiring compare-and-set claim;
+   * callers should treat any non-null value as queued or starting.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  retryAt!: Date | null;
+
+  /**
+   * Scheduled occurrences collapsed into this one catch-up run: slots that
+   * elapsed while the server was unavailable, and slots that came due while
+   * this scheduled Run was still waiting to start. 0 normally. Non-zero is the
+   * only durable record that those occurrences got no Run of their own — the
+   * scheduler advances `nextRunAt` from *now*, so they leave no other trace.
+   */
+  @Column({ type: "integer", default: 0 })
+  missedSlots!: number;
+
+  /** See {@link RunOutcomeVerdict}. Written once, after the transcript is final. */
+  @Column({ type: "varchar", nullable: true })
+  outcomeVerdict!: RunOutcomeVerdict | null;
+
+  /**
+   * The checker's one-or-two-sentence reason for the verdict — what the
+   * transcript showed or failed to show. Null whenever `outcomeVerdict` is.
+   */
+  @Column({ type: "text", nullable: true })
+  outcomeNote!: string | null;
+
+  /**
+   * When the outcome check last reached a judgement of any kind — including
+   * `unverified`. This is the predicate the re-grade sweep keys on: a process
+   * that died inside the two-minute verdict window used to strand its Run with
+   * a null verdict forever, and a null verdict counted as clean. Null means
+   * "nobody has graded this yet", which is now a thing the platform notices
+   * rather than a thing it rewards.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  outcomeCheckedAt!: Date | null;
+
+  /** See {@link RunChecksVerdict}. Written before the terminal status save. */
+  @Column({ type: "varchar", nullable: true })
+  checksVerdict!: RunChecksVerdict | null;
+
+  /**
+   * How many bounded remediation rounds the runner spent trying to turn a
+   * failing check green. 0 when the checks passed first time or the Routine
+   * declares none.
+   */
+  @Column({ type: "integer", default: 0 })
+  checkRemediations!: number;
+
+  /**
+   * Prompt tokens this Run consumed, summed across every model turn from the
+   * provider's own per-turn counts (each turn's prompt is billed in full, so
+   * the sum is what the Run actually cost — not the final context size).
+   * Includes the outcome-verdict turn when one ran. 0 for Runs that predate
+   * the column or never reached a model.
+   */
+  @Column({ type: "integer", default: 0 })
+  tokensIn!: number;
+
+  /** Completion tokens this Run consumed, same accounting as {@link tokensIn}. */
+  @Column({ type: "integer", default: 0 })
+  tokensOut!: number;
+
+  /**
+   * When Genosyn last paused this Run to restart — an upgrade, a stop, a
+   * rollout. A paused Run is `queued` again with its transcript, tokens,
+   * progress and Effects intact, and the same Run continues once the server is
+   * back (`services/runPause.ts`). Null for a Run that was never paused. A
+   * pause is not a Standdown: nobody decided the work should stop.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  pausedAt!: Date | null;
+
+  /**
+   * How many times this Run has been paused, for a restart or while its AI
+   * Model was unavailable; bounds how often it resumes. Above zero on a
+   * `queued` Run, it is paused and waits to resume.
+   */
+  @Column({ type: "integer", default: 0 })
+  pauseCount!: number;
+
+  /** The time-limit budget it had left when last paused, given back when it resumes. */
+  @Column({ type: "integer", nullable: true })
+  pauseRemainingMs!: number | null;
+
+  /**
+   * Why it was last paused: Genosyn restarting (`restart`, `upgrade`), or its
+   * AI Model being unavailable (`outage` — `services/modelAvailability.ts`).
+   * Null for a Run never paused, and for one paused before the reason was
+   * recorded, which was always a restart. Neither is a Standdown: nobody
+   * decided the work should stop.
+   */
+  @Column({ type: "varchar", nullable: true })
+  pauseReason!: RunPauseReason | null;
+
+  /**
+   * Of {@link pauseCount}, the pauses for an unavailable AI Model. Counted
+   * apart because they have their own bound: a model that keeps failing a Run
+   * after its checks pass is a different problem from a server that keeps
+   * restarting.
+   */
+  @Column({ type: "integer", default: 0 })
+  outagePauses!: number;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+}

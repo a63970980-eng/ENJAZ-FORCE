@@ -1,0 +1,464 @@
+import {
+  Callout,
+  Code,
+  DocLink,
+  H2,
+  H3,
+  KeyList,
+  LI,
+  OL,
+  P,
+  PageHeader,
+  Strong,
+  UL,
+} from "@/docs/Prose";
+
+export function Revenue() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Module"
+        title="Revenue"
+        lead={
+          <>
+            The people you are selling to, the money you are trying to win, and the timeline of
+            everything that has passed between you. Find it in the sidebar under{" "}
+            <Code>Revenue</Code>. It sits between{" "}
+            <DocLink to="/docs/marketing">Paid Marketing</DocLink> (what you spend on attention) and
+            {" "}
+            <DocLink to="/docs/finance">Finance</DocLink> (what you collect once somebody signs), so
+            ad click → contact → deal → invoice → cash is one chain in one database.
+          </>
+        }
+      />
+
+      <H2 id="what-ships">What ships</H2>
+      <UL>
+        <LI>
+          <DocLink to="/docs/revenue-operations">Revenue operations</DocLink> — one follow-up queue,
+          prospect-through-customer accounts, typed custom fields, partnerships, formal documents,
+          and reversible Base or CSV/JSON/NDJSON migrations.
+        </LI>
+        <LI>
+          <DocLink to="/docs/revenue-data-quality">Revenue data quality</DocLink> — audited merges,
+          bulk cleanup, historical Deal truth, enrichment review, document capture, and exports.
+        </LI>
+        <LI>
+          <Strong>Contacts</Strong> — the humans, whether or not you bill them yet.
+        </LI>
+        <LI>
+          <Strong>Deals</Strong> — one revenue opportunity each, owned by a Member or by an AI
+          employee.
+        </LI>
+        <LI>
+          <Strong>Deal stages and the board</Strong> — your sales process as an ordered list of
+          columns, seeded with a sensible ladder on first visit.
+        </LI>
+        <LI>
+          <Strong>The activity timeline</Strong> — every email, stage change, signal and note
+          against a contact, deal, or account. Mostly written for you.
+        </LI>
+        <LI>
+          <DocLink to="/docs/sequences">Sequences</DocLink> — multi-step outbound where each touch
+          is drafted individually by an AI Employee.
+        </LI>
+        <LI>
+          <DocLink to="/docs/signals">Signals</DocLink> — product-usage triggers over your own
+          database.
+        </LI>
+        <LI>
+          <Strong>Insights</Strong> — MRR movement, retention, CAC, pipeline coverage, win rate and
+          stage conversion.
+        </LI>
+      </UL>
+
+      <H2 id="contacts-vs-customers">Contacts vs. Customers</H2>
+      <P>
+        These are two different objects and the difference is the whole reason this section exists.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Contact",
+            def: (
+              <>
+                A <Strong>person</Strong>. Name, email, phone, job title, LinkedIn. Lives here,
+                under <Code>Revenue → Contacts</Code>. A contact does not need an account attached —
+                but it can link to a prospect account before any invoice exists.
+              </>
+            ),
+          },
+          {
+            term: "Customer",
+            def: (
+              <>
+                An <Strong>account</Strong> — prospect, customer, or former customer. It appears
+                under <Code>Revenue → Accounts</Code> for relationship work and{" "}
+                <DocLink to="/docs/customers">Customers</DocLink> for billing details, contracts,
+                statements, and one overview of everything linked to it — emails, activity, deals,
+                people, and meetings.
+              </>
+            ),
+          },
+        ]}
+      />
+      <P>
+        A contact is linked to a customer when — and only when — an account actually exists for
+        them. Until then the employer is just a free-text <Strong>Company</Strong> field on the
+        contact, which is kept even after you link the account, because the parent company and the
+        billing entity disagree often enough that overwriting one loses information. There is no
+        separate pre-revenue &quot;account&quot; object to keep in step: a Customer is simply not
+        billable until it has an invoice, so contracts, ACV and statements work for a prospect for
+        free.
+      </P>
+      <P>
+        <Code>Revenue → Contacts</Code> lists everyone 25 at a time, most recently touched first and
+        never-touched contacts last. <Strong>Next</Strong> carries on from the last contact on the
+        page, so logging a call (which moves that contact to the top) or archiving someone while you
+        work through the list never makes the next page skip or repeat anyone else;{" "}
+        <Strong>Previous</Strong> goes back to where the page before started. Search, a lifecycle
+        stage and <Strong>Show archived</Strong> each start again from the first page.
+      </P>
+
+      <H3 id="billing-details">Billing details follow finance access</H3>
+      <P>
+        An account&apos;s billing details — its billing email, billing and shipping addresses, and
+        tax number — exist to invoice it, so they follow each Member&apos;s{" "}
+        <DocLink to="/docs/finance#finance-access">finance access</DocLink>, just like the{" "}
+        <DocLink to="/docs/customers#access">Customers</DocLink> pages that edit them. With Full or
+        Read-only access, Revenue shows the billing email beside each account in the Account pickers
+        on contacts and deals and in the Merge destination picker, and a merge preview lists billing
+        details that differ.
+      </P>
+      <P>
+        With None, Revenue leaves billing details out everywhere it shows an account: pickers show
+        the name and domain only, merge previews and the Accounts export omit them, and the API
+        returns accounts without them. Everything <Code>Revenue → Accounts</Code> shows stays, and
+        so do the account&apos;s phone, currency, and annual contract value. Change history leaves
+        them out too: an account&apos;s merges and bulk updates, in the operation list and detail,
+        bulk job details and reconciliations, and the operation audit export, keep every other
+        change and mark what was left out with <Code>billingWithheld</Code>.
+      </P>
+      <P>
+        Changing billing details takes Full access, as it does on the Customers pages. Below Full,
+        Revenue refuses a request that would set one: creating or updating an account with a
+        billing email, a bulk standard-field update that names a billing field (its dry run too), a
+        merge that takes the source&apos;s billing details, and an undo that would restore earlier
+        ones. The refusal uses the finance pages&apos; words: &quot;You have read-only finance
+        access.&quot; or, with None, &quot;You don&apos;t have access to this company&apos;s
+        finances.&quot; Everything else stays open, including a merge that keeps the
+        destination&apos;s billing details.
+      </P>
+      <P>
+        Each contact carries a <Strong>lifecycle stage</Strong> — subscriber, lead, qualified,
+        opportunity, customer, churned, or unqualified — and an <Strong>owner</Strong> who is either
+        a Member or an AI Employee, never both. <Strong>Source</Strong> records where they came
+        from. Deal sources and buying-committee roles use the controlled lists in{" "}
+        <Code>Revenue → Advanced → Setup</Code>; contact source is filled in automatically for contacts a
+        signal created (<Code>signal:trial-expiring</Code>) so attribution survives.
+      </P>
+      <P>
+        <Strong>Do not contact</Strong> is a hard opt-out on the person: it blocks every address you
+        hold for them, on every send path. It is separate from — and checked alongside — the
+        address-level suppression list described in{" "}
+        <DocLink to="/docs/deliverability">Deliverability</DocLink>. Archiving a contact hides them
+        from the list without removing them from historical activities and deals. On a
+        contact&apos;s page <Strong>Archive</Strong> takes one click and turns into{" "}
+        <Strong>Restore</Strong>, the undo; marking someone do not contact still asks first. The
+        contact&apos;s <Strong>Account</Strong> links straight to that account.
+      </P>
+
+      <H2 id="account-merge">Archive or merge a core record</H2>
+      <P>
+        Open <Code>Revenue → Advanced → Data quality</Code> to merge duplicate Accounts, Contacts, Deals, or
+        Partnerships. Archiving only removes a record from default lists; historical links remain,
+        and restore or guarded undo can bring it back. A customer&apos;s page in Customers offers
+        the same Account merge — see{" "}
+        <DocLink to="/docs/customers#merge">Merge duplicate customers</DocLink>.
+      </P>
+      <P>
+        Choose the surviving record, then resolve every conflicting field explicitly: keep the
+        survivor&apos;s value or take the source duplicate&apos;s value. Review the relationship
+        counts and coupled ownership or Deal-status choices before typing the duplicate label.
+        Genosyn then moves every applicable Revenue and Finance reference in one transaction,
+        preserves aliases and source IDs, and archives the duplicate as a redirecting tombstone.
+        Missing custom values are copied; conflicting custom values stay visible until you choose
+        their source or survivor value. A Member without finance access doesn&apos;t see conflicting{" "}
+        <a href="#billing-details">billing details</a>: the preview says they differ, and the
+        survivor keeps its own. A Read-only Member sees them, but taking the duplicate&apos;s needs
+        Full access, so those rows stay on the survivor&apos;s value.
+      </P>
+      <Callout kind="info" title="A merge is atomic, audited, and reversible.">
+        Either every linked record moves or none do. Undo verifies that no affected row has changed
+        since the merge, then restores the exact earlier state. See{" "}
+        <DocLink to="/docs/revenue-data-quality#merge">Merge and archive core records</DocLink>.
+      </Callout>
+
+      <H2 id="deals">Deals</H2>
+      <P>
+        A <Strong>Deal</Strong> is one opportunity: a title, an amount, a currency, an expected
+        close date, and the stage it sits in. Both the customer and the primary contact are
+        optional, because a deal routinely starts as a company name and a number before either
+        exists. Other stakeholders — the buying committee — are added on the deal itself as
+        additional contacts.
+      </P>
+      <P>
+        Three fields do more work than they look. <Strong>Next step</Strong> says what must happen;
+        <Strong>Next follow-up</Strong> puts it in the shared queue, with an optional reminder; and
+        {" "}
+        <Strong>Probability</Strong> is inherited from the stage unless you override it. See{" "}
+        <DocLink to="/docs/revenue-operations#follow-ups">Follow-ups</DocLink>.
+      </P>
+      <P>
+        On a deal&apos;s page, Enter in any <Strong>Details</Strong> box saves once something has
+        changed, and <Code>⌘/Ctrl+Enter</Code> in the activity box logs the note, call, or meeting.
+        The buying committee&apos;s remove button shows on hover, on keyboard focus, and always on a
+        touch screen; removing someone still asks first.
+      </P>
+      <Callout kind="tip" title="Assigning a deal to an AI Employee starts work.">
+        Ownership can be an AI Employee, and it is not decoration. Handing a deal to one kicks off a
+        background work session the same way assigning a Todo does — it researches the account,
+        drafts the outreach, and logs what it did on the timeline. Give it a{" "}
+        <DocLink to="/docs/soul">Soul</DocLink> worth trusting first.
+      </Callout>
+
+      <P>
+        A Contact or Deal with <DocLink to="/docs/tasks#links">linked tasks</DocLink> lists them on
+        its page under <Strong>Tasks</Strong>.
+      </P>
+
+      <H2 id="stages">Deal stages</H2>
+      <P>
+        Your sales process is a flat, ordered list of <Strong>deal stages</Strong>, managed from{" "}
+        <Code>Revenue → Advanced → Setup → Deal Stages</Code>. Each stage has a name, a colour, a default
+        probability, and a <Strong>kind</Strong> that decides what reaching it means:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Open</Strong> — still in play.
+        </LI>
+        <LI>
+          <Strong>Won</Strong> — terminal, counts as revenue.
+        </LI>
+        <LI>
+          <Strong>Lost</Strong> — terminal, does not.
+        </LI>
+      </UL>
+      <P>
+        The kind is the single source of truth for a deal&apos;s status: moving a deal into a stage
+        rewrites the status to match and stamps the close date, and moving it back out reopens it.
+        You never set status by hand.
+      </P>
+      <P>
+        The first time anybody opens the board, Genosyn seeds a conventional B2B ladder —{" "}
+        <Code>New</Code> (10%), <Code>Qualified</Code> (25%), <Code>Demo</Code> (40%),{" "}
+        <Code>Proposal</Code> (60%), <Code>Negotiation</Code> (80%), <Code>Closed Won</Code>, and
+        {" "}
+        <Code>Closed Lost</Code>. Rename, recolour, reorder and reweight them freely; those
+        probabilities are defaults, not claims about your business. Archiving a stage removes it
+        from the board and the move-to picker while keeping it resolvable for deals that closed in
+        it, so a historical win never loses its stage name.
+      </P>
+      <Callout kind="info" title="Deal stages are not Pipelines.">
+        <DocLink to="/docs/pipelines">Pipeline</DocLink> means the DAG automation primitive, and
+        only that. The sales pipeline is this ordered list of deal stages, and the UI calls it{" "}
+        <Strong>the board</Strong>.
+      </Callout>
+
+      <H2 id="board">The board</H2>
+      <P>
+        <Code>Revenue → Board</Code> is one column per open stage, one card per deal, sorted so the
+        deals nearest a decision are where your eye lands. Drag a card between columns to move it —
+        that is the same operation as changing the stage on the detail page, so it writes a{" "}
+        <Code>stage_change</Code> activity, updates the status, and feeds the funnel report.
+        Dropping a card into a <Strong>won</Strong> or <Strong>lost</Strong> column closes the deal;
+        lost asks for a reason, and the reason is worth typing because it is the only field that
+        later explains a conversion cliff.
+      </P>
+      <P>
+        Each column header carries its count and its total value, and the board totals both the raw
+        and the probability-weighted pipeline. Filter by owner to see one person&apos;s — or one AI
+        employee&apos;s — book. <Strong>Board</Strong> or <Strong>List</Strong> stays as you last
+        left it in this browser.
+      </P>
+
+      <H2 id="timeline">The activity timeline</H2>
+      <P>
+        Every contact, deal, and customer has a timeline, and it is the most valuable thing in this
+        section precisely because almost nobody types into it. An <Strong>Activity</Strong> is one
+        event: what happened, when it happened, and who did it.
+      </P>
+      <P>
+        <Code>Revenue → Advanced → Activities</Code> provides the company-wide audit view: search across
+        subjects and bodies, filter by kind or date, inspect a row by ID, and export the filtered
+        result. Manually logged notes, calls, meetings, and tasks can be corrected or removed;
+        machine-recorded mail, Deal, Sequence, and Signal evidence cannot.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "From mail",
+            def: (
+              <>
+                <Code>email_in</Code> / <Code>email_out</Code>, written by mail sync. The bulk of
+                the timeline.
+              </>
+            ),
+          },
+          {
+            term: "From deals",
+            def: (
+              <>
+                <Code>deal_created</Code>, <Code>stage_change</Code>, <Code>deal_won</Code>,{" "}
+                <Code>deal_lost</Code>. Stage changes are what the funnel report reads.
+              </>
+            ),
+          },
+          {
+            term: "From outbound",
+            def: (
+              <>
+                <Code>enrollment</Code>, <Code>sequence_step</Code>, <Code>unsubscribe</Code>,{" "}
+                <Code>bounce</Code>.
+              </>
+            ),
+          },
+          {
+            term: "From signals",
+            def: (
+              <>
+                <Code>signal</Code>, when a product-usage trigger fires on a contact.
+              </>
+            ),
+          },
+          {
+            term: "From humans",
+            def: (
+              <>
+                <Code>note</Code>, <Code>call</Code>, <Code>meeting</Code>, <Code>task</Code> —
+                logged by hand from the <Strong>Log activity</Strong> button.
+              </>
+            ),
+          },
+        ]}
+      />
+
+      <H3 id="timeline-from-mail">How it fills itself from mail</H3>
+      <P>
+        Once a mailbox is connected under <DocLink to="/docs/email">Email</DocLink>, every sync
+        compares the participants on each new thread against the email addresses on your contacts. A
+        match writes an activity onto that contact&apos;s timeline — inbound or outbound, with the
+        subject, a snippet, and a link straight into the thread. Open a contact you have been
+        emailing for two years and the whole correspondence is there, with nobody having done any
+        data entry. That property is what makes the section load-bearing instead of abandoned.
+      </P>
+      <P>Three behaviours are worth knowing, because each one is deliberate:</P>
+      <OL>
+        <LI>
+          <Strong>It links to contacts that already exist; it never creates one.</Strong> A real
+          inbox is mostly newsletters, receipts, vendors and strangers. Auto-creating a contact per
+          address would bury the list within a week and make every number downstream — counts,
+          targeting, reports — noise. Creating a contact stays an explicit act: you add one, you
+          import, or a <DocLink to="/docs/signals">Signal</DocLink> fires.
+        </LI>
+        <LI>
+          <Strong>It is idempotent per message.</Strong> Re-syncing does not double a conversation.
+          The consequence, accepted on purpose: a contact created <em>after</em> a message was
+          already synced does not retroactively inherit that message, because the message is no
+          longer new.
+        </LI>
+        <LI>
+          <Strong>It never breaks the mailbox.</Strong> The linking is best-effort enrichment
+          hanging off sync. If it fails, mail still arrives.
+        </LI>
+      </OL>
+      <P>
+        The same pass does two more jobs: an inbound reply on a thread a{" "}
+        <DocLink to="/docs/sequences">Sequence</DocLink> started stops that enrolment, and a
+        delivery-failure report from a mail daemon suppresses the dead address — see{" "}
+        <DocLink to="/docs/deliverability">Deliverability</DocLink>.
+      </P>
+
+      <H2 id="insights">Insights</H2>
+      <P>
+        <Code>Revenue → Insights</Code> reports over a period you choose, defaulting to the trailing
+        twelve months. Recurring revenue: <Strong>MRR movement</Strong> split into new, expansion,
+        contraction, churn and reactivation (the waterfall is guaranteed to add up),{" "}
+        <Strong>ARR</Strong>, and <Strong>NRR / GRR</Strong> retention. Pipeline:{" "}
+        <Strong>coverage</Strong> against a target you enter, <Strong>win rate</Strong>, median{" "}
+        <Strong>sales-cycle length</Strong>, original-cohort <Strong>stage conversion</Strong>, and
+        entered/progressed counts with median time in each stage. These use timestamped Deal
+        history, never adjacent current-stage counts. Imported and history-free Deals are labelled
+        explicitly. Acquisition: <Strong>CAC by channel</Strong>, <Strong>LTV:CAC</Strong>, and{" "}
+        <Strong>payback months</Strong>. A brand-new company sees zeros, never errors.
+      </P>
+      <P>
+        MRR comes from each customer&apos;s{" "}
+        <DocLink to="/docs/finance#recurring-invoices">recurring invoices</DocLink>, priced as the
+        invoices they create: before tax, so a price that includes VAT counts without it, and after
+        any discount. A customer with no schedule counts a twelfth of their annual contract value
+        instead. Every figure is in the home currency set under{" "}
+        <Code>Finance → Currencies</Code>. Recurring revenue in other currencies converts at the
+        latest exchange rate on file, one rate for every month of the period, so a currency&apos;s
+        own moves never show as expansion or contraction; a note under the figures names the
+        currencies converted. A currency with no rate is left out of every figure rather than added
+        at face value, and the note says how many customers that leaves out, with a link to add a
+        rate (<DocLink to="/docs/finance#currencies-automatic">automatic exchange rates</DocLink>{" "}
+        usually make that unnecessary). Cash collected converts at the rate each payment was booked
+        at.
+      </P>
+      <Callout kind="warn" title="CAC currently reads authorized budget, not settled spend.">
+        The acquisition cost figures are computed from the{" "}
+        <DocLink to="/docs/marketing">Paid Marketing</DocLink> ledger of{" "}
+        <em>authorized budget changes</em>, which is a documented proxy rather than invoiced spend
+        from the ad platforms. Treat the trend as real and the absolute number as approximate.
+      </Callout>
+
+      <H2 id="ai-access">Giving AI Employees revenue access</H2>
+      <P>
+        By default an AI Employee cannot see the revenue section at all — no grant means no revenue
+        tool. Owners and admins grant access from <Code>Revenue → Advanced → AI access</Code> at one of three
+        escalating levels:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Read</Strong> — see follow-ups, accounts, contacts, deals, partnerships, typed
+          fields, documents, activities, signals and reports. Changes nothing.
+        </LI>
+        <LI>
+          <Strong>Write</Strong> — also assign and complete follow-ups, create or update accounts,
+          contacts, deals and partnerships, administer definitions and Deal Stages, manage
+          documents, Sequences and Signals, correct manual activity, and run linked, guarded Base
+          migrations. Drafts still wait for a human.
+        </LI>
+        <LI>
+          <Strong>Send</Strong> — also let a sequence this employee drafts go out without anybody
+          pressing Send. This is the only level that spends your sending reputation unattended, and
+          it is gated a second time by the mailbox grant. See{" "}
+          <DocLink to="/docs/sequences#autosend">autoSend</DocLink>.
+        </LI>
+      </UL>
+      <P>
+        On that page, choose an AI Employee and a level and click <Code>Grant access</Code>; the
+        level picker on the employee&apos;s row changes it, and the trash icon beside it revokes it.
+        Every other Member sees who holds which level, read-only.
+      </P>
+      <P>
+        An account&apos;s <a href="#billing-details">billing details</a> also need finance access:
+        revenue tools return accounts, and their change history, without them unless the employee
+        holds a <DocLink to="/docs/finance#ai-access">Finance → AI access</DocLink> grant. Setting
+        them (an account write, a bulk update or its preview, a merge that takes the source&apos;s,
+        an undo that restores earlier ones) takes Invoicing or Full accounting. In a Member&apos;s
+        chat the Member&apos;s own finance access applies as well, so there it also takes a Member
+        with Full access.
+      </P>
+      <P>
+        Members reach Revenue through the app as usual; these levels govern the AI surface only.
+        Every write an employee makes lands in the audit log marked as an AI actor and on the
+        employee&apos;s journal. See{" "}
+        <DocLink to="/docs/revenue-operations#ai-native">AI-native Revenue operations</DocLink> for
+        the full operating model.
+      </P>
+    </>
+  );
+}

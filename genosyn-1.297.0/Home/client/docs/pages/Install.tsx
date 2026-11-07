@@ -1,0 +1,171 @@
+import { Callout, Code, DocLink, H2, H3, KeyList, P, PageHeader, Pre, Strong } from "@/docs/Prose";
+
+export function Install() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Get started"
+        title="Install"
+        lead={
+          <>
+            Genosyn ships as a single Docker image. The installer pulls it and starts a container on{" "}
+            <Code>localhost:8471</Code>. The same command re-runs to upgrade.
+          </>
+        }
+      />
+
+      <H2 id="requirements">Requirements</H2>
+      <KeyList
+        rows={[
+          {
+            term: "OS",
+            def: "macOS, Linux, or Windows with WSL2.",
+          },
+          {
+            term: "Docker",
+            def: (
+              <>
+                Docker Desktop or any Docker daemon. You don&apos;t have to install it first — the
+                installer sets Docker up when it&apos;s missing. The CLI is a thin wrapper around{" "}
+                <Code>docker</Code>; there are no Node, Python, or system-package deps.
+              </>
+            ),
+          },
+          {
+            term: "Port",
+            def: (
+              <>
+                One free TCP port. Defaults to <Code>8471</Code>.
+              </>
+            ),
+          },
+          {
+            term: "Disk",
+            def: "About 1 GB for the image plus whatever your employees generate.",
+          },
+        ]}
+      />
+
+      <H2 id="install">Install</H2>
+      <P>
+        The installer downloads the <Code>genosyn</Code> CLI to <Code>/usr/local/bin</Code>, then
+        runs <Code>genosyn install</Code> to pull the image and start the container.
+      </P>
+      <Pre lang="bash">{`curl -fsSL https://genosyn.com/install.sh | bash`}</Pre>
+
+      <Callout kind="info" title="Inspect before you pipe.">
+        It&apos;s a short, readable shell script. Open{" "}
+        <a
+          href="/install.sh"
+          className="font-medium text-ink underline decoration-line-strong underline-offset-2"
+        >
+          /install.sh
+        </a>{" "}
+        in your browser first if you&apos;d like to review it.
+      </Callout>
+
+      <H3 id="docker-setup">If you don&apos;t have Docker</H3>
+      <P>
+        The installer checks for a Docker daemon it can reach, and sets one up when it can&apos;t
+        find one. On Linux it runs Docker&apos;s own convenience script from{" "}
+        <Code>get.docker.com</Code>, starts the daemon, and adds you to the <Code>docker</Code>{" "}
+        group so the rest of the install can talk to the socket without <Code>sudo</Code>. On macOS
+        it installs Docker Desktop with Homebrew and launches it. Both paths need your password.
+      </P>
+      <Callout kind="info" title="Log out and back in after a first Linux install.">
+        A new group only reaches new logins. The installer borrows it for the rest of its own run,
+        so nothing stalls, but your existing shells keep the old membership until you log back in.
+      </Callout>
+      <P>
+        To manage Docker yourself, set <Code>GENOSYN_INSTALL_DOCKER=0</Code> on the installer
+        command — it then stops with a pointer to Docker&apos;s docs instead of installing anything.
+      </P>
+
+      <P>
+        When it finishes, Genosyn is running on <Code>http://localhost:8471</Code>. Open it and
+        create your account. The CLI also schedules a daily automatic update at 03:17 local time,
+        using the same safe upgrade path.
+      </P>
+
+      <Callout kind="info" title="Automatic updates are on by default.">
+        Check or change them with <Code>genosyn auto-update status</Code>,{" "}
+        <Code>genosyn auto-update off</Code>, or <Code>genosyn auto-update on</Code>. To opt out
+        during installation, set <Code>GENOSYN_AUTO_UPDATE=0</Code> on the installer command.
+      </Callout>
+
+      <H2 id="docker-run">Without the installer</H2>
+      <P>If you prefer to skip the helper script, the same image runs directly under Docker:</P>
+      <Pre lang="bash">{`docker run -d \\
+  --name genosyn \\
+  --restart unless-stopped \\
+  -p 8471:8471 \\
+  -v genosyn-data:/app/data \\
+  ghcr.io/genosyn/app:latest`}</Pre>
+      <P>
+        Everything user-generated lives under <Code>/app/data</Code> inside the container. The named
+        volume above keeps it across container restarts and upgrades.
+      </P>
+      <Callout kind="info" title="OpenCode is included; host coding works by default.">
+        AI work uses the bundled OpenCode runtime. Commands run directly inside the App container
+        with the App process user&apos;s filesystem and network authority; there is no OS sandbox,
+        and the container keeps Docker&apos;s standard security profile with no extra options. To
+        stop command execution, set the execution mode to <Code>disabled</Code> in{" "}
+        <DocLink to="/docs/self-hosting#config-ts">Configuration</DocLink>.
+      </Callout>
+
+      <H2 id="next-steps">Next steps</H2>
+      <P>
+        Open <Code>http://localhost:8471</Code> and sign up, then open the email-verification link.
+        With no SMTP configured, copy that link from <Code>genosyn logs</Code>. Need another one?
+        Sign in and press <Strong>Resend verification email</Strong> at{" "}
+        <Strong>Account → Profile</Strong>, which also shows whether the address is verified yet. To
+        authorize that verified account for install-wide administration, run:
+      </P>
+      <Pre lang="bash">{`genosyn user grant-master-admin you@example.com`}</Pre>
+      <P>
+        Being first to reach public signup never grants operator access; the command proves control
+        of the Docker host and refuses an unverified account. Sign in again, name your first
+        company, and follow the four-step first-run guide — the company&apos;s Goal, hiring an AI
+        Employee and connecting its AI Model, its suggested Routines, and optional email access. The
+        summary offers a first request in chat. Follow{" "}
+        <DocLink to="/docs/getting-started">Onboard your first AI Employee</DocLink> for the
+        complete walkthrough. If you leave partway, Home keeps a <Strong>Finish setting up</Strong>{" "}
+        banner back into it.
+      </P>
+
+      <H2 id="upgrading">Upgrading</H2>
+      <P>
+        Fresh CLI installs update automatically once a day. You can also upgrade immediately by
+        rerunning the installer or using the CLI:
+      </P>
+      <Pre lang="bash">{`genosyn upgrade`}</Pre>
+      <P>
+        The CLI keeps the previous container until the new version is ready and restarts it
+        automatically if the upgrade fails. Every upgrade first writes a verified archive of the
+        data under <Code>~/.genosyn/backups</Code> while Genosyn keeps running, replacing the
+        previous upgrade&apos;s, and
+        restores it during a failed upgrade. Skip it with <Code>--no-backup</Code>:
+      </P>
+      <Pre lang="bash">{`genosyn upgrade --no-backup`}</Pre>
+      <P>
+        Automatic updates take the same backup, after first updating their own copy of the CLI.
+        See <DocLink to="/docs/cli">CLI reference</DocLink> for every flag.
+      </P>
+
+      <H3 id="backing-up">Backing up</H3>
+      <P>Genosyn ships with a built-in tarball backup of the entire data volume:</P>
+      <Pre lang="bash">{`genosyn backup --out ~/backups/genosyn-$(date +%F).tar.gz`}</Pre>
+      <P>
+        Schedule that on cron, sync it to S3, and you&apos;ve got disaster recovery in one line.
+        Restore is symmetric:
+      </P>
+      <Pre lang="bash">{`genosyn restore ~/backups/genosyn-2026-04-22.tar.gz`}</Pre>
+
+      <H2 id="uninstall">Uninstall</H2>
+      <P>To stop and remove the container but keep your data for later:</P>
+      <Pre lang="bash">{`genosyn uninstall`}</Pre>
+      <P>To wipe the data volume as well — this is destructive:</P>
+      <Pre lang="bash">{`genosyn uninstall --purge`}</Pre>
+    </>
+  );
+}

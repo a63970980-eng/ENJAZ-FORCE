@@ -1,0 +1,223 @@
+name: Publish Helm chart
+
+on:
+  push:
+    tags: ["v*.*.*"]
+    branches: [main]
+    paths:
+      - "Helm/**"
+      - "CLI/deploy-saas.sh"
+      - "CLI/test-deploy-saas.sh"
+      - "package.json"
+      - ".github/workflows/chart.yml"
+  pull_request:
+    paths:
+      - "Helm/**"
+      - "CLI/deploy-saas.sh"
+      - "CLI/test-deploy-saas.sh"
+      - "package.json"
+      - ".github/workflows/chart.yml"
+  # release.yml creates the v*.*.* tag with GITHUB_TOKEN, which doesn't fire
+  # the push trigger above — the release flow dispatches this workflow, same
+  # as docker.yml.
+  workflow_dispatch:
+
+concurrency:
+  group: chart-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  lint:
+    name: Lint chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      # Deployment profiles are operator-private and gitignored. CI creates
+      # its own disposable examples rather than depending on local files.
+      - name: Create synthetic SaaS profiles
+        run: |
+          mkdir -p Helm/Values
+          for environment in test prod; do
+            test ! -e "Helm/Values/${environment}.values.yaml"
+            hosted_sign_in=false
+            if [ "$environment" = prod ]; then hosted_sign_in=true; fi
+            cat > "Helm/Values/${environment}.values.yaml" <<YAML
+          ingress:
+            enabled: true
+            className: ""
+            annotations: {}
+            host: ${environment}.example.com
+            tls:
+              enabled: true
+              secretName: ci-${environment}-tls
+            connect:
+              enabled: ${hosted_sign_in}
+              host: connect.example.com
+              tlsSecretName: ci-connect-tls
+          connect:
+            enabled: ${hosted_sign_in}
+            existingSecret: ci-connect
+          YAML
+          done
+
+      - name: Verify SaaS deployment commands
+        run: npm run test:deploy
+
+      - name: Verify inline secrets and upgrade guards
+        run: bash Helm/test-inline-secrets.sh
+
+      - name: Verify portable Kubernetes resources
+        run: bash Helm/test-portability.sh
+
+      - name: Verify GKE, cert-manager and public URL integrations
+        run: bash Helm/test-integrations.sh
+
+      - name: Validate test and production SaaS profiles
+        env:
+          GENOSYN_BOOTSTRAP_ADMIN_EMAIL: ops@example.com
+        run: |
+          npm run --silent template-deploy-test > /dev/null
+          npm run --silent template-deploy-prod > /dev/null
+
+      - name: Verify the Connect service, its routing and legacy upgrade values
+        run: bash Helm/test-connect-ingress.sh
+
+      # SMTP is not a chart value: it is configured post-boot at Admin → Email
+      # transport, so nothing here sets it.
+      - name: Helm lint
+        run: |
+          helm lint Helm/genosyn
+          helm lint Helm/genosyn -f Helm/genosyn/values-selfhost.yaml
+
+      # Render the shapes users actually deploy, so a template regression
+      # fails the PR and not the operator's upgrade.
+      - name: Helm template smoke tests
+        run: |
+          # A bare default install renders with no values at all.
+          helm template genosyn Helm/genosyn > default.yaml
+          # Production trimmings: TLS ingress, external Postgres, own secrets.
+          helm template genosyn Helm/genosyn \
+            --set config.bootstrapMasterAdminEmail=ops@example.com \
+            --set postgres.enabled=false \
+            --set config.db.postgresUrlSecret.name=my-postgres \
+            --set secrets.existingSecret=my-secrets \
+            --set ingress.enabled=true \
+            --set ingress.host=x.example.com \
+            --set ingress.tls.enabled=true \
+            --set ingress.tls.secretName=x-tls > /dev/null
+          # Genosyn Connect beside the App, as an operator of the public
+          # sign-in service runs it.
+          helm template genosyn Helm/genosyn \
+            --set ingress.enabled=true \
+            --set ingress.host=x.example.com \
+            --set ingress.tls.enabled=true \
+            --set ingress.tls.secretName=x-tls \
+            --set ingress.connect.enabled=true \
+            --set ingress.connect.host=connect.example.com \
+            --set ingress.connect.tlsSecretName=connect-tls \
+            --set connect.enabled=true \
+            --set connect.existingSecret=connect-credentials > connect.yaml
+          # SQLite shape.
+          helm template genosyn Helm/genosyn \
+            -f Helm/genosyn/values-selfhost.yaml > selfhost.yaml
+          if grep -Eiq 'procMount|seccompProfile|hostUsers|apparmor' default.yaml selfhost.yaml connect.yaml; then
+            echo "no install may request sandbox privileges" >&2
+            exit 1
+          fi
+          # The chart runs single-tenant only.
+          if helm template genosyn Helm/genosyn \
+            --set config.multiTenant=true > /dev/null 2> multi-tenant.err; then
+            echo "expected config.multiTenant=true to fail" >&2
+            exit 1
+          fi
+          grep -q "runs Genosyn single-tenant only" multi-tenant.err
+
+      # The rendered config.js is mounted over /app/dist/config.js and must be
+      # valid plain ESM — a template typo would otherwise crash the pod on
+      # import, not at `helm install`.
+      - name: Verify rendered App configuration
+        run: |
+          # Pull the literal block out of the rendered ConfigMap: everything
+          # after `config.js: |`, de-indented by its four spaces.
+          render() {
+            helm template genosyn Helm/genosyn -s templates/configmap.yaml "$@" \
+              | awk 'f { sub(/^    /, ""); print } /^  config\.js: \|/ { f = 1 }'
+          }
+          render > default-config.mjs
+          render -f Helm/genosyn/values-selfhost.yaml > selfhost-config.mjs
+          node --check default-config.mjs
+          node --check selfhost-config.mjs
+          for environment in test prod; do
+            render -f "Helm/Values/${environment}.values.yaml" > "${environment}-config.mjs"
+            node --check "${environment}-config.mjs"
+          done
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          const hostExecution = { enabled: true, executionMode: "host", allowUnsafeHostExecution: true };
+          for (const profile of ["default", "selfhost", "test", "prod"]) {
+            const { config } = await import(`./${profile}-config.mjs`);
+            assert.equal(config.security.multiTenant, false, `${profile}: single-tenant`);
+            assert.deepEqual(config.agent.codingTools, hostExecution, `${profile}: host execution`);
+            assert.equal(config.agent.browserEnabledInMultiTenant, false, `${profile}: browser key`);
+          }
+          const { config: selfhost } = await import("./selfhost-config.mjs");
+          assert.equal(selfhost.db.driver, "sqlite");
+          for (const environment of ["test", "prod"]) {
+            const { config } = await import(`./${environment}-config.mjs`);
+            assert.equal(config.security.trustedProxyHops, 1, `${environment}: one trusted ingress proxy`);
+            assert.equal(config.db.driver, "postgres", `${environment}: Postgres`);
+          }
+          NODE
+
+  publish:
+    name: Package & push to GHCR
+    runs-on: ubuntu-latest
+    needs: lint
+    # Publish only from release tags (or a manual dispatch of one).
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The chart version tracks the repo VERSION file — same value the image
+      # tags carry, no `v` prefix. Chart.yaml's committed version is
+      # overridden here so a release never depends on remembering to bump two
+      # files.
+      - name: Read VERSION
+        id: ver
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Set OCI repository (lowercase owner)
+        id: repo
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=${{ env.REGISTRY }}/${OWNER}/charts" >> "$GITHUB_OUTPUT"
+
+      - name: Package chart
+        run: |
+          helm package Helm/genosyn \
+            --version "${{ steps.ver.outputs.value }}" \
+            --app-version "${{ steps.ver.outputs.value }}"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "${{ env.REGISTRY }}" \
+            --username "${{ github.actor }}" --password-stdin
+
+      - name: Push chart
+        run: helm push "genosyn-${{ steps.ver.outputs.value }}.tgz" "oci://${{ steps.repo.outputs.name }}"

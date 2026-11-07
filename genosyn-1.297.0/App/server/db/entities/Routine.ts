@@ -1,0 +1,265 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from "typeorm";
+import { DEFAULT_ROUTINE_PRIORITY, type RoutinePriority } from "../../../shared/routinePriority.js";
+
+/**
+ * See {@link Routine.catchUpPolicy}. A string union rather than a boolean so a
+ * future replay-every-missed-slot policy can be added without a column change.
+ */
+export type CatchUpPolicy = "once" | "skip";
+
+/** {@link Routine.timeoutSec} for a new Routine: 6 hours, the editor's ceiling. */
+export const DEFAULT_ROUTINE_TIMEOUT_SEC = 6 * 60 * 60;
+
+@Entity("routines")
+@Index(["employeeId", "slug"], { unique: true })
+// The heartbeat's hot query — `enabled = true AND nextRunAt <= now`, every 30
+// seconds. Both sibling schedulers already index their equivalent column.
+@Index(["enabled", "nextRunAt"])
+export class Routine {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  employeeId!: string;
+
+  @Column({ type: "varchar" })
+  name!: string;
+
+  @Column({ type: "varchar" })
+  slug!: string;
+
+  @Column({ type: "varchar" })
+  cronExpr!: string;
+
+  /**
+   * The {@link RoutineFolder} this routine is filed under, or null for
+   * unfiled. Folders are company-scoped while a routine is owned by an
+   * employee, so the write paths check that the folder's company matches the
+   * owning employee's before accepting an id — see `services/routineFolders.ts`.
+   *
+   * Deleting a folder never deletes what is inside it: its routines and
+   * subfolders are re-parented to the folder's own parent, which is null for a
+   * top-level folder and therefore means "unfiled".
+   */
+  @Column({ type: "varchar", nullable: true })
+  folderId!: string | null;
+
+  /**
+   * The {@link Goal} this routine's work serves, or null for work with no
+   * declared objective. Goals are company-scoped while a routine is owned by
+   * an employee, so the write paths check that the goal's company matches the
+   * owning employee's before accepting an id — the `folderId` rule above.
+   * The linked Goal is folded into every Run brief and into the outcome
+   * checker's evidence; deleting a Goal clears the routines pointing at it.
+   */
+  @Column({ type: "varchar", nullable: true })
+  goalId!: string | null;
+
+  @Column({ type: "boolean", default: true })
+  enabled!: boolean;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  lastRunAt!: Date | null;
+
+  /**
+   * The next wall-clock time this routine is scheduled to fire, derived from
+   * `cronExpr`. The heartbeat in `services/cron.ts` looks for enabled routines
+   * whose `nextRunAt` is due and runs them. Null when disabled, when the cron
+   * expression fails to parse, or briefly on fresh rows before the schedule is
+   * computed. See `registerRoutine()` / `nextRunFor()` for the write seam.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  nextRunAt!: Date | null;
+
+  /**
+   * Markdown brief — what used to live at `routines/<slug>/README.md` on
+   * disk. The runner folds this into the prompt each time the routine fires;
+   * the Routine editor round-trips through `/api/.../routines/:rid/readme`.
+   */
+  @Column({ type: "text", default: "" })
+  body!: string;
+
+  /**
+   * Server-owned delivery ceiling for Proactive starters. Null preserves an
+   * ordinary Routine's existing authority. Native editors cannot remove this
+   * ceiling; renaming the Routine or deleting its mailbox does not lift it.
+   * `draft` is the backward-compatible stored marker; runtime enforcement
+   * interprets it as an exact Decision-stack email review and never as a
+   * Gmail/IMAP Drafts write.
+   */
+  @Column({ type: "varchar", nullable: true })
+  mailDeliveryMode!: "draft" | null;
+
+  /** Server-owned suggestion-only scope. Native editors cannot lift this review boundary. */
+  @Column({ type: "boolean", default: false })
+  selfReviewOnly!: boolean;
+
+  /**
+   * Per-routine hard timeout in seconds. The runner SIGKILLs the CLI after
+   * this long and marks the Run `timeout`. Default 6 h
+   * ({@link DEFAULT_ROUTINE_TIMEOUT_SEC}), the editor's ceiling: an initial
+   * Run and its automatic continuations share this one window, and a slow
+   * local model needs most of it for a long backlog. Editable per routine from
+   * the Routine editor (10 s – 6 h).
+   */
+  @Column({ type: "integer", default: DEFAULT_ROUTINE_TIMEOUT_SEC })
+  timeoutSec!: number;
+
+  /**
+   * The Routine's definition of done — what a Run must have achieved for its
+   * work to count, written by a human in plain language ("the digest was
+   * posted to #general and covers every failed run since the last digest").
+   *
+   * Empty (the default) means no verdict pass runs and `Run.outcomeVerdict`
+   * stays null — exactly the pre-M49 behaviour. Non-empty criteria are folded
+   * into the Run brief so the employee knows the bar, and after a completed
+   * Run a restricted zero-tool checker grades the transcript against them.
+   */
+  @Column({ type: "text", default: "" })
+  acceptanceCriteria!: string;
+
+  /**
+   * If true, cron ticks enqueue an {@link Approval} instead of running. A
+   * human decides from the Approvals inbox. Manual "Run now" from the UI
+   * still runs immediately — a human is already in the loop.
+   */
+  @Column({ type: "boolean", default: false })
+  requiresApproval!: boolean;
+
+  /**
+   * Optional HTTP trigger. When enabled, external systems can POST to
+   * `/api/webhooks/r/:routineId/:webhookToken` to fire this routine. The
+   * token is the only secret; regenerate by toggling off and back on.
+   */
+  @Column({ type: "boolean", default: false })
+  webhookEnabled!: boolean;
+
+  @Column({ type: "varchar", nullable: true })
+  webhookToken!: string | null;
+
+  /**
+   * Optional pin to one of the employee's {@link AIModel} rows — the brain
+   * this routine runs on. Null (default) inherits whichever model is active
+   * for the employee, so routines follow the employee's brain unless an
+   * operator deliberately pins one (a cheap model for a noisy hourly digest,
+   * a stronger one for the weekly report).
+   *
+   * Only ever points at a model owned by the same employee — the PATCH route
+   * rejects a foreign id, and deleting a model clears the routines pinned to
+   * it. Resolution still falls back to the active model if the pin dangles;
+   * see `resolveRoutineModel()` in `services/models.ts`.
+   *
+   * Chat is unaffected — this pin applies to the routine's runs only.
+   */
+  @Column({ type: "varchar", nullable: true })
+  modelId!: string | null;
+
+  /**
+   * Per-routine override for the employee's `browserEnabled` flag. Three
+   * states:
+   *
+   *   * `null` (default) — inherit `AIEmployee.browserEnabled`.
+   *   * `true` — force-enable for this routine even when the employee
+   *     setting is off (rare; useful for a single scheduled scrape on an
+   *     otherwise air-gapped employee).
+   *   * `false` — force-disable for this routine even when the employee
+   *     setting is on (common; keep the employee browser-capable for
+   *     ad-hoc chat work but withhold it from a noisy cron).
+   *
+   * Stored as a stringified boolean (`"true"` / `"false"`) so sqlite's
+   * boolean column can still distinguish the three cases via nullable.
+   */
+  @Column({ type: "boolean", nullable: true })
+  browserEnabledOverride!: boolean | null;
+
+  /**
+   * Run this routine's browser work in a {@link MemberBrowser} instead of the
+   * App-owned headless Chromium. NULL (default) uses the server browser.
+   *
+   * A routine fires on cron with nobody watching, so this is gated twice: the
+   * browser's owner must have set `allowUnattended`, and the grant to this
+   * employee must still exist when the Run starts. A sleeping laptop makes the
+   * Run fail loudly rather than quietly re-target the server browser.
+   */
+  @Column({ type: "varchar", nullable: true })
+  memberBrowserId!: string | null;
+
+  /**
+   * What to do when the server was unavailable across one or more of this
+   * routine's scheduled slots.
+   *
+   *   * `"once"` (default) — fire exactly one catch-up run however many slots
+   *     were missed, and record the count on the Run. This is the historical
+   *     behaviour; only the count is new.
+   *   * `"skip"` — don't fire at all when the due slot is already more than a
+   *     minute stale; just re-anchor to the next future slot. For work that is
+   *     only meaningful on time — a 09:00 standup digest arriving at 16:00 is
+   *     noise, not a catch-up.
+   *
+   * Missed slots are never replayed one-for-one. A routine produces at most
+   * one scheduled run per heartbeat pass, whatever the outage length.
+   */
+  @Column({ type: "varchar", default: "once" })
+  catchUpPolicy!: CatchUpPolicy;
+
+  /**
+   * Total attempts for one scheduled occurrence, counting the first. `1`
+   * (default) disables ordinary failure and timeout retries. An initial
+   * scheduled Run on an enabled routine without an approval gate that Genosyn
+   * newly marks `interrupted` is the safety exception: at this default it
+   * receives exactly one durable recovery attempt after an hour. Higher
+   * configured limits also bound interruptions later in that retry chain.
+   * Existing interrupted history is never swept. The configured limit is
+   * capped at 5 by the API.
+   *
+   * Retries are **at-least-once** for side effects: a Run that sent an email
+   * and then died will send it again. Only raise this on routines whose work
+   * is safe to repeat.
+   */
+  @Column({ type: "integer", default: 1 })
+  maxAttempts!: number;
+
+  /**
+   * Base for full-jitter exponential backoff between attempts: the wait before
+   * attempt N is a random slice of `retryBackoffSec * 2^(N-1)`, capped at six
+   * hours. At `maxAttempts: 1` this field is inert; the single interrupted-Run
+   * recovery uses a fixed one-hour delay instead.
+   */
+  @Column({ type: "integer", default: 60 })
+  retryBackoffSec!: number;
+
+  /**
+   * Whether a `timeout` is retryable. Separate from failed/interrupted because
+   * retrying a timeout re-burns the routine's whole `timeoutSec` of model
+   * spend — up to six hours — so it is opted into on its own.
+   */
+  @Column({ type: "boolean", default: false })
+  retryOnTimeout!: boolean;
+
+  /**
+   * Consecutive bad Runs with no retry still owed. "Bad" is any terminal Run
+   * that is not `completed`, or a completed
+   * Run whose required Checks failed or whose outcome went off-goal. Reset to
+   * 0 by the first Run that is clean on every axis.
+   *
+   * Maintained by the runner for diagnostics; the count never stops scheduled
+   * work or places a Standdown.
+   */
+  @Column({ type: "integer", default: 0 })
+  consecutiveFailures!: number;
+
+  /**
+   * Where this Routine's Runs wait while their AI Model is busy. A High
+   * Routine's waiting Runs start before Normal ones; Runs paused for a restart
+   * and continuations of work under way still go first. Read from this row when
+   * the queue decides its order, so changing it moves Runs already waiting —
+   * no Run carries a copy. See `shared/routinePriority.ts` for the order and
+   * its starvation bound. Owners and admins set it; no AI Employee tool does.
+   */
+  @Column({ type: "varchar", default: DEFAULT_ROUTINE_PRIORITY })
+  priority!: RoutinePriority;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+}

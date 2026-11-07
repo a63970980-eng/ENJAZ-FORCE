@@ -1,0 +1,285 @@
+import { Router, type Response } from "express";
+import { z } from "zod";
+import { requireAuth, requireBrowserSession, requireCompanyMember } from "../middleware/auth.js";
+import { validateBody, validateParams } from "../middleware/validate.js";
+import {
+  type DecisionDiscussionResult,
+  getDecisionDiscussion,
+  openDecisionDiscussion,
+} from "../services/decisionDiscussions.js";
+import { applyDecisionBulkAction } from "../services/decisionBulk.js";
+import { kickoffDecision } from "../services/decisionKickoff.js";
+import {
+  cancelDecision,
+  decideDecision,
+  getDecision,
+  hydrateDecisions,
+  listDecisions,
+  restoreDecision,
+} from "../services/decisions.js";
+import { snoozeDecision } from "../services/decisionSnoozes.js";
+
+/**
+ * The Decision Stack — questions AI Employees raised for a human.
+ *
+ * Member-level on purpose, unlike the admin-gated Approvals inbox next door.
+ * Answering a decision performs no side effect: it records which option a human
+ * picked so the employee can read it and carry on. Anything privileged the
+ * employee then does still passes its own gate. See `services/decisions.ts` for
+ * the exactly-once claim and the assignee rule.
+ */
+export const decisionsRouter = Router({ mergeParams: true });
+decisionsRouter.use(requireAuth);
+decisionsRouter.use(requireCompanyMember);
+
+const listQuerySchema = z
+  .object({
+    status: z.enum(["pending", "decided", "cancelled", "expired"]).optional(),
+    limit: z.coerce.number().int().min(1).max(200).optional(),
+  })
+  .strict();
+
+const idParamsSchema = z.object({ cid: z.string().min(1), id: z.string().uuid() }).strict();
+
+const decideSchema = z
+  .object({
+    optionId: z.string().min(1).max(60),
+    note: z.string().max(4_000).optional(),
+  })
+  .strict();
+
+const dismissSchema = z.object({ reason: z.string().max(4_000).optional() }).strict();
+const snoozeDurationSchema = z.enum(["one_hour", "one_day", "two_days", "one_week", "one_month"]);
+const snoozeSchema = z.object({ duration: snoozeDurationSchema }).strict();
+/** As many as the stack lists at once; the page sends a longer selection in parts. */
+const bulkIdsSchema = z.array(z.string().uuid()).min(1).max(200);
+const bulkSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("dismiss"), ids: bulkIdsSchema }).strict(),
+  z
+    .object({ action: z.literal("snooze"), ids: bulkIdsSchema, duration: snoozeDurationSchema })
+    .strict(),
+]);
+const restoreSchema = z.object({}).strict();
+const openDiscussionSchema = z.object({}).strict();
+
+decisionsRouter.get("/decisions", async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const parsed = listQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "ValidationError", issues: parsed.error.issues });
+  }
+  const decisions = await listDecisions({
+    companyId: cid,
+    status: parsed.data.status,
+    limit: parsed.data.limit,
+  });
+  res.json(decisions);
+});
+
+decisionsRouter.get("/decisions/:id", validateParams(idParamsSchema), async (req, res) => {
+  const { cid, id } = req.params as Record<string, string>;
+  const decision = await getDecision({ companyId: cid, decisionId: id });
+  if (!decision) return res.status(404).json({ error: "Not found" });
+  return res.json(decision);
+});
+
+function sendDiscussion(res: Response, result: DecisionDiscussionResult) {
+  if (result.outcome === "not_found") return res.status(404).json({ error: "Not found" });
+  if (result.outcome === "employee_deleted") {
+    return res
+      .status(409)
+      .json({ error: "The AI Employee who asked this decision has been deleted." });
+  }
+  return res.json(result.discussion);
+}
+
+/**
+ * The requesting Member's own discussion of this Decision with the employee
+ * who asked it, shown on the Decision itself. Discussion transcripts carry a
+ * Member's delegated authority, so — like direct chat — API keys cannot read
+ * or open them. Turns are sent through the ordinary conversation endpoints.
+ */
+decisionsRouter.get(
+  "/decisions/:id/discussion",
+  requireBrowserSession,
+  validateParams(idParamsSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const result = await getDecisionDiscussion({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+    });
+    return sendDiscussion(res, result);
+  },
+);
+
+decisionsRouter.post(
+  "/decisions/:id/discussion",
+  requireBrowserSession,
+  validateParams(idParamsSchema),
+  validateBody(openDiscussionSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const result = await openDecisionDiscussion({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+    });
+    return sendDiscussion(res, result);
+  },
+);
+
+decisionsRouter.post(
+  "/decisions/:id/decide",
+  validateParams(idParamsSchema),
+  validateBody(decideSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof decideSchema>;
+    const result = await decideDecision({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+      role: req.companyRole!,
+      optionId: body.optionId,
+      note: body.note ?? null,
+    });
+    switch (result.outcome) {
+      case "not_found":
+        return res.status(404).json({ error: "Not found" });
+      case "forbidden":
+        return res
+          .status(403)
+          .json({ error: "This decision was raised for a specific teammate to answer." });
+      case "unknown_option":
+        return res
+          .status(400)
+          .json({ error: "That option is not one this decision offers. Reload and try again." });
+      case "conflict":
+        return res.status(409).json({ error: `Decision is already ${result.decision.status}` });
+      case "decided": {
+        // Answering is the "go" signal — the employee asked because it was
+        // blocked, so start the work session now instead of leaving the answer
+        // to be noticed on its next routine tick. Fire-and-forget: the row
+        // carries the progress, and every guard lives in the service.
+        void kickoffDecision({
+          companyId: cid,
+          decisionId: result.decision.id,
+          requesterUserId: req.userId!,
+          requesterSessionVersion: req.session?.sessionVersion ?? null,
+        }).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error("[decisions] pickup failed", err);
+        });
+        const [dto] = await hydrateDecisions([result.decision]);
+        return res.json(dto);
+      }
+    }
+  },
+);
+
+decisionsRouter.post(
+  "/decisions/:id/dismiss",
+  validateParams(idParamsSchema),
+  validateBody(dismissSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof dismissSchema>;
+    const result = await cancelDecision({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+      role: req.companyRole!,
+      reason: body.reason ?? null,
+    });
+    if (result.outcome === "not_found") return res.status(404).json({ error: "Not found" });
+    if (result.outcome === "forbidden") {
+      return res
+        .status(403)
+        .json({ error: "This decision was raised for a specific teammate to answer." });
+    }
+    if (result.outcome === "conflict") {
+      return res.status(409).json({ error: `Decision is already ${result.decision.status}` });
+    }
+    const [dto] = await hydrateDecisions([result.decision]);
+    res.json(dto);
+  },
+);
+
+decisionsRouter.post(
+  "/decisions/:id/snooze",
+  validateParams(idParamsSchema),
+  validateBody(snoozeSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof snoozeSchema>;
+    const result = await snoozeDecision({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+      role: req.companyRole!,
+      duration: body.duration,
+    });
+    if (result.outcome === "not_found") return res.status(404).json({ error: "Not found" });
+    if (result.outcome === "forbidden") {
+      return res
+        .status(403)
+        .json({ error: "This decision was raised for a specific teammate to answer." });
+    }
+    if (result.outcome === "conflict") {
+      return res.status(409).json({ error: `Decision is already ${result.decision.status}` });
+    }
+    const [dto] = await hydrateDecisions([result.decision]);
+    return res.json(dto);
+  },
+);
+
+/**
+ * Dismiss or snooze a selection from the stack in one request. Each id is
+ * held to its own row's rules — assignee, tenant, still waiting — and one
+ * that fails them is skipped with its reason, never failing the rest. There
+ * is no bulk answer: answering starts work, one Decision at a time.
+ */
+decisionsRouter.post("/decisions/bulk", validateBody(bulkSchema), async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const body = req.body as z.infer<typeof bulkSchema>;
+  const result = await applyDecisionBulkAction({
+    ...body,
+    companyId: cid,
+    userId: req.userId!,
+    role: req.companyRole!,
+  });
+  return res.json({ action: body.action, ...result });
+});
+
+decisionsRouter.post(
+  "/decisions/:id/restore",
+  validateParams(idParamsSchema),
+  validateBody(restoreSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as Record<string, string>;
+    const result = await restoreDecision({
+      companyId: cid,
+      decisionId: id,
+      userId: req.userId!,
+      role: req.companyRole!,
+    });
+    if (result.outcome === "not_found") return res.status(404).json({ error: "Not found" });
+    if (result.outcome === "forbidden") {
+      return res
+        .status(403)
+        .json({ error: "This decision was raised for a specific teammate to answer." });
+    }
+    if (result.outcome === "not_restorable") {
+      return res
+        .status(409)
+        .json({ error: "This decision was retracted by its AI Employee and cannot be restored." });
+    }
+    if (result.outcome === "conflict") {
+      return res.status(409).json({ error: `Decision is already ${result.decision.status}` });
+    }
+    const [dto] = await hydrateDecisions([result.decision]);
+    return res.json(dto);
+  },
+);

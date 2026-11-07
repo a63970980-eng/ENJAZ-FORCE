@@ -1,0 +1,336 @@
+import type { AIModel } from "../../db/entities/AIModel.js";
+import { holdsApiKeys, readApiKeys } from "../modelApiKeys.js";
+import { PROVIDERS } from "../providers.js";
+
+/**
+ * Turn a provider SDK error into a safe, actionable message for chat and Run
+ * logs. Both OpenAI and Anthropic expose roughly the same useful metadata, but
+ * through different error classes; reading the small shared shape keeps this
+ * formatter independent of either SDK.
+ */
+export function formatModelError(model: AIModel, error: unknown): string {
+  const meta = errorMetadata(error);
+  const category = classifyError(meta, error);
+  const modelLabel = `${PROVIDERS[model.provider].label} · ${oneLine(model.model, 160)}`;
+  const endpoint = endpointLabel(model);
+  const lines = [heading(category), "", `Model: ${modelLabel}`];
+
+  if (endpoint) lines.push(`Endpoint: ${endpoint}`);
+  lines.push(`Details: ${meta.message}`);
+  if (meta.status !== null && !meta.message.startsWith(String(meta.status))) {
+    lines.push(`HTTP status: ${meta.status}`);
+  }
+  if (meta.code && !meta.message.toLowerCase().includes(meta.code.toLowerCase())) {
+    lines.push(`Code: ${meta.code}`);
+  }
+  if (meta.requestId) lines.push(`Request ID: ${meta.requestId}`);
+
+  lines.push("", "What to check:", ...guidance(category, model));
+  lines.push(
+    "",
+    category === "runtime"
+      ? "Ask the Genosyn operator to restore the runtime, then retry."
+      : "Open Settings → Model for this employee, then retry.",
+  );
+  return lines.join("\n");
+}
+
+type ErrorCategory =
+  | "runtime"
+  | "network"
+  | "timeout"
+  | "authentication"
+  | "rate_limit"
+  | "not_found"
+  | "context"
+  | "provider"
+  | "request";
+
+type ErrorMetadata = {
+  message: string;
+  name: string;
+  status: number | null;
+  code: string | null;
+  requestId: string | null;
+};
+
+function errorMetadata(error: unknown): ErrorMetadata {
+  const record = asRecord(error);
+  const status = numberField(record, "status") ?? numberField(record, "statusCode");
+  const code =
+    stringField(record, "code") ??
+    stringField(asRecord(record?.error), "code") ??
+    stringInCauseChain(record, "code");
+  const requestId =
+    stringField(record, "requestID") ??
+    stringField(record, "requestId") ??
+    stringField(record, "request_id");
+
+  return {
+    message: oneLine(stringField(record, "message") ?? String(error), 1_000),
+    name: oneLine(stringField(record, "name") ?? "", 100),
+    status,
+    code: code ? oneLine(code, 120) : null,
+    requestId: requestId ? oneLine(requestId, 200) : null,
+  };
+}
+
+/** Node's fetch errors commonly nest the useful ECONNREFUSED/ENOTFOUND code. */
+function stringInCauseChain(record: Record<string, unknown> | null, key: string): string | null {
+  let current = asRecord(record?.cause);
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    const found = stringField(current, key);
+    if (found) return found;
+    current = asRecord(current.cause);
+  }
+  return null;
+}
+
+function classifyError(meta: ErrorMetadata, error: unknown): ErrorCategory {
+  const haystack = `${meta.name} ${meta.message} ${meta.code ?? ""}`.toLowerCase();
+
+  if (
+    /opencode (did not start|stopped|could not open|rejected the generated|did not create a session)|installed opencode runtime|opencode's activity stream/.test(
+      haystack,
+    )
+  )
+    return "runtime";
+
+  if (
+    meta.status === 401 ||
+    meta.status === 403 ||
+    /authentication|unauthori[sz]ed|permission denied|invalid api key/.test(haystack)
+  ) {
+    return "authentication";
+  }
+  if (meta.status === 429 || /rate.?limit|quota|too many requests/.test(haystack)) {
+    return "rate_limit";
+  }
+  if (
+    /context.{0,20}(length|window|limit)|maximum context|too many tokens|prompt is too long/.test(
+      haystack,
+    )
+  ) {
+    return "context";
+  }
+  if (
+    isModelRequestTimeout(error) ||
+    (meta.status === null && /aborted|aborterror/.test(haystack))
+  ) {
+    return "timeout";
+  }
+  if (
+    !meta.status &&
+    /network|connection error|apiconnection|fetch failed|econn|enotfound|eai_again|dns|socket|tls|certificate/.test(
+      haystack,
+    )
+  ) {
+    return "network";
+  }
+  if (meta.status === 404 || /model.{0,20}not found|unknown model/.test(haystack)) {
+    return "not_found";
+  }
+  if (meta.status !== null && meta.status >= 500) return "provider";
+  return "request";
+}
+
+function heading(category: ErrorCategory): string {
+  switch (category) {
+    case "runtime":
+      return "The OpenCode runtime could not complete this work.";
+    case "network":
+      return "Couldn’t reach the selected AI Model.";
+    case "timeout":
+      return "The selected AI Model did not respond in time.";
+    case "authentication":
+      return "The selected AI Model rejected its credentials.";
+    case "rate_limit":
+      return "The selected AI Model is rate-limited or out of quota.";
+    case "not_found":
+      return "The configured AI Model or endpoint was not found.";
+    case "context":
+      return "The selected AI Model rejected an over-long prompt.";
+    case "provider":
+      return "The selected AI Model service failed this request.";
+    case "request":
+      return "The selected AI Model rejected this request.";
+  }
+}
+
+function guidance(category: ErrorCategory, model: AIModel): string[] {
+  const provider = model.provider;
+  if (category === "runtime") {
+    return [
+      "• Confirm the Genosyn installation includes its pinned OpenCode executable.",
+      "• Check available memory, process capacity, and the Genosyn server logs.",
+      "• Restart the application after correcting the reported runtime problem.",
+    ];
+  }
+  if (category === "network") {
+    return provider === "custom"
+      ? [
+          "• Confirm the model server is running and reachable from the Genosyn container or host.",
+          "• In Docker, use host.docker.internal instead of localhost for a model server running on the host.",
+          "• Check the base URL, DNS, firewall, proxy, and TLS certificate.",
+        ]
+      : [
+          "• Confirm the Genosyn server has internet access.",
+          "• Check outbound DNS, firewall, proxy, and TLS settings on the Genosyn host.",
+          "• Retry after confirming the model API is available.",
+        ];
+  }
+  if (category === "timeout") {
+    if (model.authMode === "subscription") {
+      return [
+        "• The Codex app-server manages retries for subscription-auth turns.",
+        "• Confirm the model service is healthy and not overloaded.",
+        "• Retry once the service is responding normally.",
+      ];
+    }
+    return [
+      "• OpenCode manages model retries within the Run or chat deadline.",
+      "• Confirm the model service is healthy and not overloaded.",
+      "• Check proxy and load-balancer timeouts between Genosyn and the model API.",
+      "• Retry once the service is responding normally.",
+    ];
+  }
+  if (category === "authentication") {
+    if (model.authMode === "subscription") {
+      return [
+        "• Reconnect the ChatGPT subscription from this employee’s Model settings.",
+        "• Confirm the ChatGPT account still has Codex access in its current plan or workspace.",
+      ];
+    }
+    return [
+      "• Replace the saved API key and confirm it is still active.",
+      "• Confirm the key can access the configured model.",
+      ...keyPoolGuidance(model),
+    ];
+  }
+  if (category === "rate_limit") {
+    if (model.authMode === "subscription") {
+      return [
+        "• Check the ChatGPT plan’s current Codex usage and reset window.",
+        "• Wait for the limit to reset or switch the employee to another AI Model.",
+      ];
+    }
+    return [
+      "• Check the model account’s quota, billing status, and rate limits.",
+      "• Wait for the limit to reset or switch the employee to another AI Model.",
+      ...keyPoolGuidance(model),
+    ];
+  }
+  if (category === "not_found") {
+    return provider === "custom"
+      ? [
+          "• Confirm the base URL points at the OpenAI-compatible API root, commonly ending in /v1.",
+          "• Confirm the configured model id exactly matches one exposed by the server.",
+        ]
+      : [
+          `• Confirm the configured model id is valid and available to this ${
+            model.authMode === "subscription" ? "ChatGPT account" : "API key"
+          }.`,
+          "• Switch to a model the account can access if it was renamed or retired.",
+        ];
+  }
+  if (category === "context") {
+    if (model.authMode === "subscription") {
+      return [
+        "• Codex manages the subscription model’s context budget; there is no manual window setting.",
+        "• Reduce unusually large Soul, Skill, attachment, or tool output content, or switch models.",
+      ];
+    }
+    return [
+      "• Set the model’s context window accurately so OpenCode can compact before the limit.",
+      "• Reduce unusually large Soul, Skill, attachment, or tool output content.",
+    ];
+  }
+  if (category === "provider") {
+    if (model.authMode === "subscription") {
+      return [
+        "• The Codex app-server manages retries for subscription-auth turns.",
+        "• Retry later after checking OpenAI’s service status or the Genosyn server logs.",
+        "• If the failure persists, switch the employee to another AI Model.",
+      ];
+    }
+    return [
+      "• OpenCode manages transient model-service retries.",
+      "• Check the Run log for the reported failure and retry activity.",
+      "• Retry later after checking the model service’s status or server logs.",
+      "• If the failure persists, switch the employee to another AI Model.",
+    ];
+  }
+  return [
+    "• Read the provider detail above for the rejected field or unsupported feature.",
+    "• Confirm the model id and connection settings, then retry.",
+  ];
+}
+
+/**
+ * A key refusal reaches the Run only once every key was refused, so say so —
+ * or, with a single key, that more keys would have carried the work on.
+ */
+function keyPoolGuidance(model: AIModel): string[] {
+  if (!holdsApiKeys(model)) return [];
+  return readApiKeys(model.configJson).length > 1
+    ? [
+        "• Every API key on this AI Model was tried. Its API keys, under Advanced in Settings → Model, show which ones the provider refused and why.",
+      ]
+    : [
+        "• Add more API keys under Advanced in Settings → Model: sessions are spread across them, and work moves to another key when the provider refuses one.",
+      ];
+}
+
+/** Host-only endpoint preview. Never decrypt or render the stored full URL. */
+function endpointLabel(model: AIModel): string | null {
+  if (model.provider === "anthropic") return "api.anthropic.com";
+  if (model.provider === "openai") {
+    return model.authMode === "subscription" ? "OpenAI Codex subscription" : "api.openai.com";
+  }
+  try {
+    const cfg = JSON.parse(model.configJson || "{}") as Record<string, unknown>;
+    const preview = typeof cfg.baseURLPreview === "string" ? cfg.baseURLPreview : "";
+    return preview ? oneLine(preview, 300) : "custom endpoint (host unavailable)";
+  } catch {
+    return "custom endpoint (host unavailable)";
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function stringField(record: Record<string, unknown> | null, key: string): string | null {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function numberField(record: Record<string, unknown> | null, key: string): number | null {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function oneLine(value: string, max: number): string {
+  const clean = value.replace(/\s+/g, " ").trim() || "Unknown error";
+  return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
+}
+
+/** Request timeouts, including SDK errors and nested transport/stream causes. */
+export function isModelRequestTimeout(error: unknown): boolean {
+  const record = asRecord(error);
+  const status = numberField(record, "status") ?? numberField(record, "statusCode");
+  if (status === 408 || status === 504) return true;
+  // A timeout mentioned in an authentication/validation response is not a
+  // transient request timeout. Keep those HTTP responses authoritative.
+  if (status !== null && status < 500) return false;
+
+  const timeout = /time[\s_-]*out|timed[\s_-]*out/i;
+  if (!record) return timeout.test(String(error));
+  let current: Record<string, unknown> | null = record;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const detail = ["name", "message", "code"].map((key) => stringField(current, key) ?? "");
+    if (timeout.test(detail.join(" "))) return true;
+    current = asRecord(current.cause);
+  }
+  return false;
+}

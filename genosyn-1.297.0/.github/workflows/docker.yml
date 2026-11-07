@@ -1,0 +1,297 @@
+name: Build & publish images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    # CLI/** is here because Home's prebuild copies ../CLI into the image (see
+    # Home/Dockerfile) and serves it at /genosyn — a CLI-only change with no
+    # Home rebuild leaves the script users download stale. VERSION is here
+    # because it's baked in as the image's org.opencontainers.image.version
+    # label and the APP_VERSION build arg, and RELEASING.md has you push the
+    # bump as its own commit — which matches no other path.
+    paths:
+      - "App/**"
+      - "Connect/**"
+      - "Home/**"
+      - "CLI/**"
+      - "VERSION"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "App/**"
+      - "Connect/**"
+      - "Home/**"
+      - "CLI/**"
+      - "VERSION"
+      - ".github/workflows/docker.yml"
+  # release.yml dispatches this workflow after creating a v*.*.* tag, because
+  # tags created by GITHUB_TOKEN don't fire the push trigger above.
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+# Multi-arch is split across native runners (amd64 on ubuntu-latest, arm64 on
+# ubuntu-24.04-arm) rather than QEMU emulation — App took ~7m under emulation
+# and the native arm64 runner cuts that to under 3m. Each platform job pushes
+# its image by digest only (no tag); the per-project merge job then composes
+# all platform digests into a single multi-arch manifest carrying the tags.
+#
+# Reference: https://docs.docker.com/build/ci/github-actions/multi-platform/
+
+jobs:
+  build:
+    name: Build ${{ matrix.project }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: App
+            image: app
+            # App Help ships a read-only snapshot of the whole Genosyn source
+            # tree, so its Dockerfile needs the repo root as build context.
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - project: App
+            image: app
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - project: Home
+            # Build from repo root so Home's prebuild (sync-cli) can reach
+            # ../CLI/. See Home/Dockerfile for details.
+            image: home
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - project: Home
+            image: home
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # Genosyn Connect, the hosted sign-in service. Built from the repo
+          # root so the image can carry the license.
+          - project: Connect
+            image: connect
+            context: .
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - project: Connect
+            image: connect
+            context: .
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Dockerfile exists
+        id: exists
+        run: |
+          if [ -f "${{ matrix.project }}/Dockerfile" ] && [ -f "${{ matrix.project }}/package.json" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.project }} is not buildable yet — skipping."
+          fi
+
+      - name: Set image name (lowercase owner)
+        if: steps.exists.outputs.ready == 'true'
+        id: img
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=${{ env.REGISTRY }}/${OWNER}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      # Filename-safe platform suffix used for the digest artifact name and
+      # the per-platform cache scope — actions/upload-artifact rejects "/" in
+      # names, and platform-scoped caches keep cross-arch layers from
+      # clobbering each other.
+      - name: Compute platform suffix
+        if: steps.exists.outputs.ready == 'true'
+        id: plat
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "suffix=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.ready == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.exists.outputs.ready == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read VERSION
+        if: steps.exists.outputs.ready == 'true'
+        id: ver
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      # Compute labels here (not tags — the merge job owns tag generation, so
+      # the platform manifests stay tag-less and only the final manifest list
+      # carries the tags). Labels still want to be baked into each per-arch
+      # image so docker inspect on either platform reports the right version.
+      - name: Extract metadata (labels only)
+        if: steps.exists.outputs.ready == 'true'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+
+      # Push by digest only. The merge job downloads every platform's digest
+      # and composes the multi-arch manifest list with the real tags.
+      - name: Build and push by digest
+        if: steps.exists.outputs.ready == 'true'
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ./${{ matrix.project }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          # Append after meta.outputs.labels so this overrides the auto-derived
+          # version (which is "main" / "latest" for non-tag builds). The
+          # genosyn CLI reads this label to display the upgrade transition.
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.value }}
+          # APP_VERSION + APP_COMMIT are baked into the App client bundle by
+          # vite.config.ts (.git is excluded from the build context). The Home
+          # Dockerfile ignores these args, which is harmless.
+          build-args: |
+            APP_VERSION=${{ steps.ver.outputs.value }}
+            APP_COMMIT=${{ github.sha }}
+          outputs: type=image,name=${{ steps.img.outputs.name }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ steps.plat.outputs.suffix }}
+          cache-to: type=gha,scope=${{ matrix.image }}-${{ steps.plat.outputs.suffix }},mode=max
+
+      # Stash the digest as an empty file (filename = the digest itself) so
+      # the merge job can collect them via a wildcard glob.
+      - name: Export digest
+        if: steps.exists.outputs.ready == 'true' && github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: steps.exists.outputs.ready == 'true' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ steps.plat.outputs.suffix }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge ${{ matrix.project }} manifest
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: App
+            image: app
+          - project: Home
+            image: home
+          - project: Connect
+            image: connect
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Dockerfile exists
+        id: exists
+        run: |
+          if [ -f "${{ matrix.project }}/Dockerfile" ] && [ -f "${{ matrix.project }}/package.json" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ matrix.project }} is not buildable yet — skipping."
+          fi
+
+      - name: Set image name (lowercase owner)
+        if: steps.exists.outputs.ready == 'true'
+        id: img
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "name=${{ env.REGISTRY }}/${OWNER}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        if: steps.exists.outputs.ready == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.ready == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.exists.outputs.ready == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` is deliberately absent here. metadata-action's default
+      # `flavor: latest=auto` already tags it from `type=semver` on a v* tag
+      # build, so `latest` means "newest non-prerelease release" and nothing
+      # else. A raw latest-on-main directive used to live here too, which made
+      # the tag mean "whichever of {last main push, last release} ran most
+      # recently" — and since the genosyn CLI defaults to :latest, that shipped
+      # dev code to self-hosters. Main tip is still available as `:main` and
+      # `:sha-<short>`. Don't add `flavor: latest=false`: it suppresses latest
+      # on *tag* builds, which is the opposite of what we want.
+      - name: Extract metadata
+        if: steps.exists.outputs.ready == 'true'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      # Build the manifest list: one `-t` per tag from metadata-action, and
+      # one `image@sha256:<digest>` argument per per-platform digest file.
+      - name: Create manifest list and push
+        if: steps.exists.outputs.ready == 'true'
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect
+        if: steps.exists.outputs.ready == 'true'
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE}:${VERSION}"

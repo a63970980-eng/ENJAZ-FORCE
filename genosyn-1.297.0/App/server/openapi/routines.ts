@@ -1,0 +1,1178 @@
+import { z } from "zod";
+import { MAX_ROUTINE_BRIEF_LENGTH } from "../../shared/routineBrief.js";
+import { ROUTINE_PRIORITIES } from "../../shared/routinePriority.js";
+import { routineRunsQuerySchema } from "../services/runHistory.js";
+import { legacyOrPage, pageBadRequest, pageInfoShape } from "./pagedLists.js";
+import { defaultSecurity, registry } from "./registry.js";
+
+/** A Routine's priority, as every response carries it. */
+const RoutinePriority = z
+  .enum(ROUTINE_PRIORITIES)
+  .describe(
+    "Where this Routine's Runs wait while their AI Model is busy. `high` Runs start before " +
+      "`normal` ones; Runs paused for a restart and continuations still go first, and a " +
+      "`normal` Run that has waited a day counts as `high` from then on. Every Routine is " +
+      "`normal` until an owner or admin changes it.",
+  );
+
+/**
+ * A company tag attached to a routine. Tags are not a Routine column — they
+ * live in a shared, company-scoped catalog (the same one skills, resources,
+ * projects, etc. draw from) and are linked to a routine through assignment
+ * rows. That is why the routine read endpoints carry a resolved `tags` array
+ * rather than a plain string field.
+ */
+const Tag = z
+  .object({
+    id: z.string().uuid(),
+    name: z.string(),
+    color: z
+      .string()
+      .nullable()
+      .describe(
+        "Palette key rendered on the tag chip. Null on tags created before colors shipped.",
+      ),
+  })
+  .openapi("Tag");
+
+const Routine = z
+  .object({
+    id: z.string().uuid(),
+    employeeId: z.string().uuid(),
+    name: z.string(),
+    slug: z.string(),
+    cronExpr: z.string().openapi({
+      description:
+        "When the routine fires, as a cron expression in the server's local time zone. " +
+        "Accepted if BOTH `node-cron` validates it and `cron-parser` can compute a next " +
+        "run from it — the two disagree, and an expression only the first accepts saves " +
+        "and then never fires. Five fields is the normal shape; six-field second " +
+        "granularity is accepted but cannot be delivered faithfully by a 30-second " +
+        "heartbeat. The dashboard builds this from a schedule picker.",
+    }),
+    enabled: z.boolean(),
+    body: z.string().describe("Markdown brief that describes what the routine should do."),
+    tags: z.array(Tag).describe("Company tags attached to this routine."),
+    folderId: z
+      .string()
+      .uuid()
+      .nullable()
+      .describe(
+        "The routine folder this routine is filed under, or null when unfiled. Folders " +
+          "are company-scoped, nest up to 5 levels, and are exclusive — a routine is in " +
+          "at most one. Use tags for the cross-cutting labels instead.",
+      ),
+    modelId: z
+      .string()
+      .uuid()
+      .nullable()
+      .describe(
+        "The employee model this routine runs on. Null inherits whichever model is " +
+          "active for the employee.",
+      ),
+    priority: RoutinePriority,
+    lastRunAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .openapi("Routine");
+
+const Run = z
+  .object({
+    id: z.string().uuid(),
+    routineId: z.string().uuid(),
+    status: z
+      .enum([
+        "queued",
+        "running",
+        "completed",
+        "reviewed",
+        "continued",
+        "failed",
+        "error",
+        "skipped",
+        "timeout",
+        "interrupted",
+      ])
+      .describe(
+        "`continued` means the Run saved its progress and an automatic continuation took over its unfinished work; the last Run in the chain carries the outcome.",
+      ),
+    errorKind: z
+      .enum(["runtime", "timeout", "interrupted"])
+      .nullable()
+      .describe(
+        "Cause of an Error. Timeout and interruption retain their existing automatic retry policy.",
+      ),
+    failureReason: z
+      .string()
+      .nullable()
+      .describe(
+        "The AI Employee's reason the intended work could not be completed; separate from outcome grading and Checks.",
+      ),
+    exitCode: z.number().nullable(),
+    queuedAt: z.string().datetime().describe("When this Run was accepted for dispatch."),
+    startedAt: z.string().datetime(),
+    finishedAt: z.string().datetime().nullable(),
+    triggerKind: z
+      .enum(["schedule", "manual", "webhook", "approval", "retry", "event", "continuation"])
+      .describe(
+        "What started this Run. Only `schedule` and `retry` Runs receive automatic retries; " +
+          "checkpoint continuations are separate bounded follow-ups, enabled by default.",
+      ),
+    attempt: z.number().int().describe("1-based attempt number within a retry chain."),
+    parentRunId: z.string().uuid().nullable().describe("The Run this one retries or continues."),
+    continuationPending: z
+      .boolean()
+      .describe("An automatic continuation is queued or being started."),
+    continuationCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe("Continuation number; zero for the original Run."),
+    continuationStopReason: z
+      .string()
+      .nullable()
+      .describe("Why unfinished work could not continue automatically."),
+    retryAt: z
+      .string()
+      .datetime()
+      .nullable()
+      .describe(
+        "Durable due time for the next retry or checkpoint continuation. With the default attempt limit, an eligible " +
+          "newly interrupted initial scheduled Run receives exactly one recovery attempt an " +
+          "hour after Genosyn marks it interrupted. Null when none is owed or the attempt " +
+          "budget is spent.",
+      ),
+    missedSlots: z
+      .number()
+      .int()
+      .describe(
+        "Scheduled occurrences collapsed into this catch-up run: slots missed while the " +
+          "server was unavailable, or that came due while this Run waited to start. 0 normally.",
+      ),
+    pausedAt: z
+      .string()
+      .datetime()
+      .nullable()
+      .describe(
+        "When Genosyn last paused this Run — to restart (an upgrade or a stop), or while its " +
+          "AI Model was unavailable. A paused Run is `queued` again with its transcript and " +
+          "progress kept, and the same Run continues once Genosyn or its AI Model is back. " +
+          "Null when it was never paused.",
+      ),
+    pauseCount: z
+      .number()
+      .int()
+      .min(0)
+      .describe("How many times this Run has been paused. 0 normally."),
+    pauseReason: z
+      .enum(["upgrade", "restart", "outage"])
+      .nullable()
+      .optional()
+      .describe(
+        "Why it was last paused: Genosyn restarting (`upgrade`, `restart`) or its AI Model " +
+          "being unavailable (`outage`). Null when it was never paused, or for a pause recorded " +
+          "before the reason was kept, which was a restart.",
+      ),
+  })
+  .openapi("Run");
+
+const BrowserRecording = z
+  .object({
+    id: z.string().uuid().describe("BrowserSession id."),
+    status: z
+      .enum(["recording", "finalizing", "ready", "failed", "expired"])
+      .describe(
+        "`expired`: the video was deleted on schedule once it was older than the recording " +
+          "window set at Admin → Runtime → Browser.",
+      ),
+    startedAt: z.string().datetime().nullable(),
+    finishedAt: z.string().datetime().nullable(),
+    mimeType: z.literal("video/mp4"),
+    sizeBytes: z.number().int().nonnegative(),
+    filename: z.string(),
+  })
+  .openapi("BrowserRecording");
+
+const RunLog = z
+  .object({
+    runId: z.string().uuid(),
+    content: z.string().describe("Captured stdout + stderr, capped at 256 KB."),
+    browserRecordings: z
+      .array(BrowserRecording)
+      .describe(
+        "Recordings visible to this browser user. App-browser videos go to company owners and " +
+          "admins; Member-browser videos are visible only to that browser's exact owner. Empty " +
+          "for API keys.",
+      ),
+  })
+  .openapi("RunLog");
+
+const ErrorResponse = z.object({ error: z.string() }).openapi("Error");
+
+/**
+ * The Routine columns the company-scoped endpoints below actually return.
+ *
+ * Deliberately *not* built by extending the `Routine` schema above: that one
+ * advertises an `updatedAt` field the entity has never had, and predates
+ * `nextRunAt`, `timeoutSec`, `requiresApproval`, `webhookEnabled`,
+ * `webhookToken` and `browserEnabledOverride` — all of which these handlers do
+ * return. Reusing it would republish that drift here, so this mirrors
+ * `db/entities/Routine.ts` instead. Reconciling the older schema (and the
+ * employee-scoped path that serves it) is a separate change.
+ *
+ * `body` is not included: the list omits it, and the detail endpoint adds it
+ * back explicitly.
+ */
+const RoutineColumns = z.object({
+  id: z.string().uuid(),
+  employeeId: z.string().uuid(),
+  name: z.string(),
+  slug: z
+    .string()
+    .describe(
+      "Unique per employee rather than per company — which is why the UI addresses a " +
+        "routine as /routines/{empSlug}/{routineSlug}.",
+    ),
+  cronExpr: z.string().openapi({
+    description:
+      "When the routine fires, as a cron expression in the server's local time zone. " +
+      "Accepted if BOTH `node-cron` validates it and `cron-parser` can compute a next " +
+      "run from it — the two disagree, and an expression only the first accepts saves " +
+      "and then never fires. Five fields is the normal shape; six-field second " +
+      "granularity is accepted but cannot be delivered faithfully by a 30-second " +
+      "heartbeat. The dashboard builds this from a schedule picker.",
+  }),
+  enabled: z.boolean(),
+  folderId: z
+    .string()
+    .uuid()
+    .nullable()
+    .describe(
+      "Routine folder this routine is filed under, or null when unfiled. See " +
+        "`GET /routine-folders` for the tree.",
+    ),
+  lastRunAt: z.string().datetime().nullable().describe("When the routine last fired."),
+  nextRunAt: z
+    .string()
+    .datetime()
+    .nullable()
+    .describe(
+      "Next scheduled fire time, derived from `cronExpr`. Null when the routine is " +
+        "disabled, when the expression fails to parse, or briefly on fresh rows.",
+    ),
+  timeoutSec: z
+    .number()
+    .int()
+    .describe(
+      "Per-run hard timeout. The runner SIGKILLs the CLI after this long and marks the " +
+        "run `timeout`. Defaults to 21600 (6 hours), which is also the maximum.",
+    ),
+  requiresApproval: z
+    .boolean()
+    .describe(
+      "When true, a cron tick enqueues an approval instead of running. Manual " +
+        "`POST /routines/{rid}/run` is unaffected — a human is already in the loop.",
+    ),
+  webhookEnabled: z.boolean(),
+  webhookToken: z
+    .string()
+    .nullable()
+    .describe(
+      "Secret for `POST /api/webhooks/r/{routineId}/{webhookToken}`. Null while the " +
+        "webhook is off.",
+    ),
+  modelId: z
+    .string()
+    .uuid()
+    .nullable()
+    .describe(
+      "The employee model this routine runs on. Null inherits whichever model is " +
+        "active for the employee.",
+    ),
+  browserEnabledOverride: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Three-valued: null inherits the employee's `browserEnabled`; an explicit " +
+        "boolean overrides it for this routine only.",
+    ),
+  catchUpPolicy: z
+    .enum(["once", "skip"])
+    .describe(
+      "What to do about slots missed while the server was down. `once` (default) fires " +
+        "one catch-up run however many were missed; `skip` declines a catch-up that is " +
+        "already more than a minute late. Missed slots are never replayed one-for-one.",
+    ),
+  maxAttempts: z
+    .number()
+    .int()
+    .describe(
+      "Total attempts per scheduled occurrence, counting the first. 1 (default) disables " +
+        "ordinary failure and timeout retries, but a newly interrupted initial scheduled Run " +
+        "on an enabled routine without an approval gate still receives exactly one recovery " +
+        "attempt an hour after Genosyn marks it. Higher limits also bound interrupted retries " +
+        "in the same chain. Existing interrupted history is not swept. Retries are " +
+        "at-least-once for side effects.",
+    ),
+  retryBackoffSec: z
+    .number()
+    .int()
+    .describe(
+      "Base for full-jitter exponential backoff between attempts, capped at 6 hours. " +
+        "At `maxAttempts: 1` it is inert; interrupted-Run recovery uses a fixed one-hour " +
+        "delay instead.",
+    ),
+  retryOnTimeout: z
+    .boolean()
+    .describe(
+      "Whether a `timeout` is retryable. Off by default — retrying one re-burns the " +
+        "routine's whole time budget.",
+    ),
+  priority: RoutinePriority,
+  tags: z.array(Tag).describe("Company tags attached to this routine."),
+  createdAt: z.string().datetime(),
+});
+
+/**
+ * The employee slice both endpoints attach under `employee` — enough to render
+ * an avatar, a name, and a link. Narrower than the `Employee` schema in
+ * `employees.ts` on purpose: the full row carries the Soul body and the browser
+ * allowlist, which a routine listing has no business shipping.
+ */
+const EmployeeSummary = z
+  .object({
+    id: z.string().uuid(),
+    name: z.string(),
+    slug: z.string(),
+    role: z.string().describe("Job title — e.g. 'Engineering manager'."),
+    avatarKey: z.string().nullable(),
+  })
+  .openapi("EmployeeSummary");
+
+/**
+ * Nullable variants, registered as components of their own.
+ *
+ * Calling `.nullable()` on an already-registered schema at the point of use
+ * does not survive generation: an OpenAPI 3.0 `$ref` may not carry sibling
+ * keywords, so the v3 generator emits a bare `$ref` and silently drops the
+ * `nullable: true`. That would tell clients these fields are always present
+ * when they demonstrably are not. Registering the nullable variant keeps the
+ * null in the machine-readable contract.
+ *
+ * `lastRun` reuses the `Run` schema above: the handler selects exactly
+ * id/routineId/status/startedAt/finishedAt/exitCode, which is what `Run`
+ * already declares, and those all exist on the entity. Unlike `Routine`, that
+ * schema carries no drift, so reuse is safe here.
+ */
+const EmployeeSummaryOrNull = EmployeeSummary.nullable()
+  .describe("The employee this routine is assigned to.")
+  .openapi("EmployeeSummaryOrNull");
+
+const RunOrNull = Run.nullable()
+  .describe("Newest run for this routine — null if it has never run.")
+  .openapi("RunOrNull");
+
+const RoutineStanddownOrNull = z
+  .object({
+    id: z.string().uuid(),
+    scope: z.enum(["company", "employee", "routine"]),
+    scopeId: z.string().uuid().nullable(),
+    reason: z.string(),
+    source: z.enum(["human", "breaker"]),
+    placedByUserId: z.string().uuid().nullable(),
+    placedAt: z.string().datetime(),
+    liftedAt: z.string().datetime().nullable(),
+    liftedByUserId: z.string().uuid().nullable(),
+    liftedReason: z.string(),
+    active: z.boolean(),
+    createdAt: z.string().datetime(),
+  })
+  .nullable()
+  .describe(
+    "The widest active Standdown covering this Routine: company, then AI Employee, then " +
+      "Routine. Null when none applies. Independent of the Routine's enabled switch.",
+  )
+  .openapi("RoutineStanddownOrNull");
+
+const RoutineListItem = RoutineColumns.extend({
+  employee: EmployeeSummaryOrNull,
+  lastRun: RunOrNull,
+  standdown: RoutineStanddownOrNull,
+}).openapi("RoutineListItem");
+
+const RoutineDetail = RoutineColumns.extend({
+  body: z.string().describe("Markdown brief that describes what the routine should do."),
+  // Non-nullable here, unlike the list: the handler 404s when the routine's
+  // employee isn't in this company, so a 200 always carries an employee.
+  employee: EmployeeSummary,
+  lastRun: RunOrNull,
+  standdown: RoutineStanddownOrNull,
+}).openapi("RoutineDetail");
+
+const RoutineActivityRun = Run.pick({
+  id: true,
+  routineId: true,
+  status: true,
+  errorKind: true,
+  startedAt: true,
+  finishedAt: true,
+  exitCode: true,
+  attempt: true,
+  retryAt: true,
+  continuationPending: true,
+  continuationCount: true,
+  continuationStopReason: true,
+  missedSlots: true,
+})
+  .extend({
+    outcomeVerdict: z.enum(["achieved", "unclear", "off_goal", "unverified"]).nullable(),
+    checksVerdict: z.enum(["passed", "failed", "not_run"]).nullable(),
+  })
+  .openapi("RoutineActivityRun");
+
+const RoutineActivityQueuedRun = RoutineActivityRun.extend({
+  queuedAt: z.string().datetime().describe("When this Run was accepted for dispatch."),
+  pauseCount: z
+    .number()
+    .int()
+    .min(0)
+    .describe("Times this Run was paused. Above zero, it resumes where it stopped."),
+  pausedAt: z
+    .string()
+    .datetime()
+    .nullable()
+    .describe("When Genosyn last paused this Run; null when it never was."),
+  pauseReason: z
+    .enum(["upgrade", "restart", "outage"])
+    .nullable()
+    .describe("Why it was last paused: a restart, or its AI Model being unavailable (`outage`)."),
+  priority: RoutinePriority,
+  position: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .describe(
+      "Its place among the company's Runs waiting to start, 1 being next up: the order the " +
+        "queue offers them to their AI Models. Null for work a Standdown holds and for a Run " +
+        "its reassigned Routine left behind.",
+    ),
+}).openapi("RoutineActivityQueuedRun");
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/routines/activity",
+  summary: "Show active and queued Routines and Routines that ran during a calendar day",
+  description:
+    "Available to every company Member. Running includes all active Runs, even when " +
+    "they started before the requested day. Queued lists Runs waiting to start, including " +
+    "Runs paused for a restart, in the order the queue starts them and at most 100: Runs " +
+    "paused for a restart, then continuations, then the rest, each group High priority " +
+    "first and otherwise oldest first. queuedCount counts them all. " +
+    "Today groups terminal Runs by Routine, " +
+    "excluding skipped ticks, whose start or finish falls in [from, to). Each group " +
+    "contains its Run count and latest Run by finish time (or start time when absent), " +
+    "with Run ID breaking ties. Every section contains metadata only, without transcripts " +
+    "or prose. Supply local-day midnight boundaries as ISO instants with timezone offsets; " +
+    "the interval must advance and span at most 26 hours to allow clock changes.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid() }),
+    query: z.object({
+      from: z.string().datetime({ offset: true }).describe("Inclusive start of the local day."),
+      to: z.string().datetime({ offset: true }).describe("Exclusive end of the local day."),
+    }),
+  },
+  responses: {
+    200: {
+      description:
+        "Active and queued Run summaries and one daily summary per Routine; empty arrays when absent",
+      content: {
+        "application/json": {
+          schema: z.object({
+            running: z.array(RoutineActivityRun),
+            queued: z.array(RoutineActivityQueuedRun),
+            queuedCount: z.number().int().min(0),
+            today: z.array(
+              z.object({
+                routineId: z.string().uuid(),
+                runCount: z.number().int().positive(),
+                latestRun: RoutineActivityRun,
+              }),
+            ),
+          }),
+        },
+      },
+    },
+    400: {
+      description: "Invalid company UUID, datetime, or interval",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    401: {
+      description: "Not authenticated",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a Member of this company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/routines",
+  summary: "List every routine in the company",
+  description:
+    "Every routine across every AI employee in the company, each with its assigned " +
+    "employee and newest run attached. Sorted by employee name, then routine name. " +
+    "Returns `[]` for a company with no employees.\n\n" +
+    "`body` (the markdown brief) is omitted — fetch it per routine via " +
+    "`GET /routines/{rid}` or `GET /routines/{rid}/readme`.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid() }),
+  },
+  responses: {
+    200: {
+      description: "OK",
+      content: { "application/json": { schema: z.array(RoutineListItem) } },
+    },
+    401: {
+      description: "Not authenticated",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a member of this company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/routines/{rid}",
+  summary: "Get one routine",
+  description:
+    "One routine, with its assigned employee and newest run attached. Unlike the list, " +
+    "this includes `body` — the markdown brief the runner folds into the prompt each " +
+    "time the routine fires.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      rid: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "OK",
+      content: { "application/json": { schema: RoutineDetail } },
+    },
+    401: {
+      description: "Not authenticated",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a member of this company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Routine not found, or it belongs to another company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/employees/{eid}/routines",
+  summary: "List routines for an employee",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      eid: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "OK",
+      content: { "application/json": { schema: z.array(Routine) } },
+    },
+    404: {
+      description: "Employee not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{cid}/employees/{eid}/routines",
+  summary: "Create a Routine for an AI employee",
+  description:
+    "Owners and admins only. Send the markdown `brief` the employee should follow on each Run " +
+    "and the Routine starts switched on, with its next Run scheduled from `cronExpr`. Leave " +
+    "the brief out (or send a blank one, or the starter outline unchanged) and the Routine is " +
+    "created paused (`enabled: false`, `nextRunAt: null`) holding a starter outline, so " +
+    "nothing runs before a real brief exists. The first real brief written afterwards with " +
+    "`PUT /routines/{rid}/readme` switches it on and schedules it. The dashboard form " +
+    "always sends a brief.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid(), eid: z.string().uuid() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            name: RoutineColumns.shape.name
+              .min(1)
+              .max(80)
+              .describe("Unique among this employee's routines, ignoring case."),
+            cronExpr: RoutineColumns.shape.cronExpr,
+            brief: z
+              .string()
+              .max(MAX_ROUTINE_BRIEF_LENGTH)
+              .optional()
+              .describe(
+                "Markdown: what the employee should do on each Run. Becomes the routine's " +
+                  "`body`. Without one the routine starts paused.",
+              ),
+            folderId: z
+              .string()
+              .uuid()
+              .nullable()
+              .optional()
+              .describe("File the routine in this folder. Omitted or null leaves it unfiled."),
+            tagIds: z
+              .array(z.string().uuid())
+              .max(20)
+              .optional()
+              .describe("Company tags to attach."),
+            priority: RoutinePriority.optional().describe(
+              "Where the Routine's Runs wait while their AI Model is busy. Omitted means " +
+                "`normal`; `high` Runs start before `normal` ones.",
+            ),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: "Created. `enabled` is false and `nextRunAt` null when no brief was sent.",
+      content: {
+        "application/json": {
+          schema: RoutineColumns.extend({
+            body: z.string().describe("Markdown brief that describes what the routine should do."),
+          }),
+        },
+      },
+    },
+    400: {
+      description:
+        "Invalid body, a cron expression that cannot be scheduled, or a folder or tag from " +
+        "another company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Company admin role required",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Employee not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    409: {
+      description: "This employee already has a routine with that name",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{cid}/routines/{rid}/run",
+  summary: "Start a Routine now",
+  description:
+    "Accepts a Routine Run outside its cron schedule. Returns the new `Run` row in `queued` status " +
+    "while dispatch starts it independently of other Runs for the same AI Employee. " +
+    "Poll `GET /routines/{rid}/runs` or the log via " +
+    "`GET /runs/{runId}/log` to follow progress.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      rid: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: { description: "Run queued", content: { "application/json": { schema: Run } } },
+    404: {
+      description: "Routine not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    409: {
+      description: "A run is already in progress for this routine",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/routines/{rid}/runs",
+  summary: "List recent runs for a routine",
+  description:
+    "Newest first, by when each Run started, without its transcript (read that from " +
+    "`GET /runs/{runId}/log`). Without limit or cursor the answer is the newest 50 Runs — " +
+    "queued and running ones included — as a plain array, the timeline on the Routine's page. " +
+    "With either it is one page of the Routine's finished Runs, the list the list_runs AI tool " +
+    "reads, from the same function: up to limit Runs (default 20, at most 50; more is cut to " +
+    "50), total counting every match, and nextCursor to send back as cursor with exactly the " +
+    "same filters while hasMore is true. A cursor is a keyset position (start time, then id), " +
+    "so Runs that finish between pages are never skipped or repeated, and one issued by " +
+    "list_runs for this Routine continues here. The status and start-date filters apply to " +
+    "both answers; a YYYY-MM-DD bound is a whole UTC calendar day.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      rid: z.string().uuid(),
+    }),
+    query: routineRunsQuerySchema,
+  },
+  responses: {
+    200: {
+      description: "The newest 50 Runs, or one page of finished Runs when limit or cursor is sent",
+      content: {
+        "application/json": {
+          schema: legacyOrPage(
+            z.array(Run),
+            z.object({ ...pageInfoShape, runs: z.array(Run) }).openapi("RunPage"),
+          ),
+        },
+      },
+    },
+    400: pageBadRequest,
+    404: {
+      description: "Routine not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/runs/{runId}/log",
+  summary: "Read the captured log for a run",
+  description:
+    "Returns the joined stdout + stderr captured for a single run. Useful for " +
+    "after-the-fact inspection; for live tail use the SSE endpoint at " +
+    "`/api/companies/{cid}/employees/{eid}/runs/{runId}/stream`.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      runId: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: { description: "OK", content: { "application/json": { schema: RunLog } } },
+    404: {
+      description: "Run not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/runs/{runId}/browser-recordings",
+  summary: "List browser recordings for a Run",
+  description:
+    "Returns only recordings this signed-in Member may see. A Genosyn-browser recording " +
+    "requires an owner or admin role; a Member-browser recording is visible only to that " +
+    "browser's exact owner. API keys cannot access recording metadata.",
+  tags: ["Routines"],
+  security: [{ cookieAuth: [] }],
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      runId: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Visible recording metadata",
+      content: { "application/json": { schema: z.array(BrowserRecording) } },
+    },
+    401: {
+      description: "Not authenticated with a browser session",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a company Member, or authenticated with an API key",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Run not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+const BrowserRecordingFile = z.string().openapi({ format: "binary" });
+const BrowserRecordingRangeHeaders = z.object({
+  "Accept-Ranges": z.literal("bytes"),
+  "Content-Range": z
+    .string()
+    .describe("The returned byte interval, or bytes */<size> for an unsatisfiable range."),
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/runs/{runId}/browser-recordings/{sessionId}",
+  summary: "Play or download one browser recording",
+  description:
+    "Streams a finished silent MP4. Byte ranges are supported for seeking. The same " +
+    "owner/admin and exact Member-browser-owner boundaries as the metadata endpoint " +
+    "apply; unauthorized recordings return 404 so their existence is not disclosed. " +
+    "API keys cannot access recording bytes.",
+  tags: ["Routines"],
+  security: [{ cookieAuth: [] }],
+  request: {
+    params: z.object({
+      cid: z.string().uuid(),
+      runId: z.string().uuid(),
+      sessionId: z.string().uuid(),
+    }),
+    query: z.object({
+      disposition: z.enum(["inline", "attachment"]).optional().default("inline"),
+    }),
+    headers: z.object({
+      range: z.string().optional().describe("RFC 7233 byte range, for example bytes=0-1023."),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Complete MP4",
+      content: { "video/mp4": { schema: BrowserRecordingFile } },
+    },
+    206: {
+      description: "Requested MP4 byte range",
+      headers: BrowserRecordingRangeHeaders,
+      content: { "video/mp4": { schema: BrowserRecordingFile } },
+    },
+    400: {
+      description: "Invalid disposition",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    401: {
+      description: "Not authenticated with a browser session",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a company Member, or authenticated with an API key",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Run or visible ready recording not found",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    416: {
+      description: "Requested byte range is outside the recording",
+      headers: BrowserRecordingRangeHeaders,
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Routine folders
+// ---------------------------------------------------------------------------
+
+/**
+ * A folder in the Routines filing tree. `path` and both counts are derived per
+ * request rather than stored, so a rename or a move is reflected immediately
+ * without a backfill.
+ */
+const RoutineFolder = z
+  .object({
+    id: z.string().uuid(),
+    companyId: z.string().uuid(),
+    name: z.string(),
+    slug: z
+      .string()
+      .describe(
+        "Stable URL handle, unique per company. Left alone on rename so a bookmarked " +
+          "`?folder=<slug>` keeps resolving.",
+      ),
+    parentId: z.string().uuid().nullable().describe("Parent folder, or null at the top level."),
+    sortOrder: z.number().int().describe("Order among siblings under the same parent."),
+    path: z.string().describe('Slash-joined ancestor names, this folder last — "Finance/Weekly".'),
+    depth: z.number().int().describe("1 for a top-level folder; never exceeds `maxDepth`."),
+    routineCount: z.number().int().describe("Routines filed directly in this folder."),
+    totalRoutineCount: z
+      .number()
+      .int()
+      .describe("Routines in this folder and everything nested beneath it."),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .openapi("RoutineFolder");
+
+const RoutineFolderTree = z
+  .object({
+    folders: z
+      .array(RoutineFolder)
+      .describe(
+        "Flat, not nested — every row carries its own `parentId` and `depth`, so a client " +
+          "can index by id and build whatever shape it renders.",
+      ),
+    unfiledCount: z.number().int().describe("Routines in the company that are in no folder."),
+    maxDepth: z.number().int().describe("How deep folders may nest, counting the top level as 1."),
+  })
+  .openapi("RoutineFolderTree");
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{cid}/routine-folders",
+  summary: "List the company's routine folders",
+  description:
+    "The whole folder tree, flat, with per-folder routine counts and the count of " +
+    "unfiled routines. Folders are exclusive — a routine is filed in at most one — " +
+    "and complement tags rather than replacing them: a folder is where a routine " +
+    "lives, a tag is what it is about.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: { params: z.object({ cid: z.string().uuid() }) },
+  responses: {
+    200: {
+      description: "OK",
+      content: { "application/json": { schema: RoutineFolderTree } },
+    },
+    401: {
+      description: "Not authenticated",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Not a member of this company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{cid}/routine-folders",
+  summary: "Create a routine folder",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            name: z.string().min(1).max(60),
+            parentId: z
+              .string()
+              .uuid()
+              .nullable()
+              .optional()
+              .describe("Nest under this folder. Omitted or null creates a top-level folder."),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: "Created",
+      content: {
+        "application/json": {
+          schema: RoutineFolder.omit({
+            path: true,
+            depth: true,
+            routineCount: true,
+            totalRoutineCount: true,
+          }),
+        },
+      },
+    },
+    400: {
+      description:
+        "Duplicate name among siblings, the nesting limit was reached, or `parentId` names " +
+        "no folder in this company. Unlike PATCH, an unresolvable parent is a 400 here — " +
+        "the request body is what is wrong, not the resource being addressed.",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Company admin role required",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{cid}/routine-folders/{fid}",
+  summary: "Rename, move, or reorder a routine folder",
+  description:
+    "Renaming leaves the slug alone so existing links keep working. Moving rejects any " +
+    "destination inside the folder's own subtree, and any move that would push the " +
+    "subtree past the nesting limit.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid(), fid: z.string().uuid() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            name: z.string().min(1).max(60).optional(),
+            parentId: z
+              .string()
+              .uuid()
+              .nullable()
+              .optional()
+              .describe("New parent. Null moves the folder back to the top level."),
+            sortOrder: z.number().int().min(0).max(10_000).optional(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: "Updated",
+      content: {
+        "application/json": {
+          schema: RoutineFolder.omit({
+            path: true,
+            depth: true,
+            routineCount: true,
+            totalRoutineCount: true,
+          }),
+        },
+      },
+    },
+    400: {
+      description: "Cycle, duplicate name among siblings, or nesting limit reached",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Company admin role required",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Folder not found, or it belongs to another company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{cid}/routine-folders/{fid}",
+  summary: "Delete a routine folder",
+  description:
+    "Never deletes what is inside it. Subfolders and routines are promoted to this " +
+    "folder's own parent, which for a top-level folder means they become unfiled.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: { params: z.object({ cid: z.string().uuid(), fid: z.string().uuid() }) },
+  responses: {
+    200: {
+      description: "Deleted",
+      content: {
+        "application/json": {
+          schema: z.object({
+            ok: z.literal(true),
+            movedRoutines: z.number().int().describe("Routines promoted out of the folder."),
+            movedFolders: z.number().int().describe("Subfolders promoted out of the folder."),
+            promotedTo: z
+              .string()
+              .uuid()
+              .nullable()
+              .describe("Where the contents went. Null means they are now unfiled."),
+          }),
+        },
+      },
+    },
+    403: {
+      description: "Company admin role required",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "Folder not found, or it belongs to another company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{cid}/routines/move",
+  summary: "File a batch of routines into a folder",
+  description:
+    "Moves many routines at once — the operation that makes an existing library worth " +
+    "organizing. Every id is checked against the company first, so one foreign routine " +
+    "fails the whole request rather than half-applying it.",
+  tags: ["Routines"],
+  security: defaultSecurity,
+  request: {
+    params: z.object({ cid: z.string().uuid() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            routineIds: z.array(z.string().uuid()).min(1).max(200),
+            folderId: z
+              .string()
+              .uuid()
+              .nullable()
+              .describe("Destination folder. Null unfiles every routine in the batch."),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: "Moved",
+      content: {
+        "application/json": {
+          schema: z.object({
+            ok: z.literal(true),
+            moved: z.number().int(),
+            folderId: z.string().uuid().nullable(),
+          }),
+        },
+      },
+    },
+    400: {
+      description: "The folder belongs to another company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    403: {
+      description: "Company admin role required",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+    404: {
+      description: "One or more routines are not in this company",
+      content: { "application/json": { schema: ErrorResponse } },
+    },
+  },
+});

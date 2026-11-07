@@ -1,0 +1,183 @@
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  EmployeeFinanceGrant,
+  FINANCE_ACCESS_RANK,
+  type FinanceAccessLevel,
+} from "../db/entities/EmployeeFinanceGrant.js";
+
+/**
+ * The finance grant is the AI-side gate for the whole Finance system
+ * (invoices, customers, payments, the books). Humans authorize an employee
+ * from **Finance → AI access**; the MCP finance tools then answer to the
+ * level stored here. Members bypass it — this only governs the AI surface.
+ *
+ * One row per employee (finance is a single company-wide subsystem, not a set
+ * of rows like mailboxes or resources), so the helpers key off `employeeId`.
+ */
+
+export type HydratedFinanceGrant = {
+  id: string;
+  employeeId: string;
+  accessLevel: FinanceAccessLevel;
+  createdAt: string;
+  employee: {
+    id: string;
+    name: string;
+    slug: string;
+    role: string;
+    avatarKey: string | null;
+  } | null;
+};
+
+export async function getFinanceGrant(
+  employeeId: string,
+): Promise<EmployeeFinanceGrant | null> {
+  return AppDataSource.getRepository(EmployeeFinanceGrant).findOneBy({ employeeId });
+}
+
+/**
+ * True when the employee holds a finance grant at or above `required`. The
+ * whole gate is a single integer `>=` on the rank map — mirrors
+ * `hasResourceAccess` / the mail rank check.
+ */
+export async function hasFinanceAccess(
+  employeeId: string,
+  required: FinanceAccessLevel,
+): Promise<boolean> {
+  const grant = await getFinanceGrant(employeeId);
+  if (!grant) return false;
+  return FINANCE_ACCESS_RANK[grant.accessLevel] >= FINANCE_ACCESS_RANK[required];
+}
+
+/** Create or move an employee's finance grant to `level`. Idempotent. */
+export async function upsertFinanceGrant(
+  companyId: string,
+  employeeId: string,
+  level: FinanceAccessLevel,
+): Promise<EmployeeFinanceGrant> {
+  const repo = AppDataSource.getRepository(EmployeeFinanceGrant);
+  let grant = await repo.findOneBy({ employeeId });
+  if (grant) {
+    grant.accessLevel = level;
+    // Keep the denormalized companyId honest even if an employee somehow
+    // moved companies — it never should, but the write is cheap.
+    grant.companyId = companyId;
+  } else {
+    grant = repo.create({ companyId, employeeId, accessLevel: level });
+  }
+  return repo.save(grant);
+}
+
+function hydrate(
+  grants: EmployeeFinanceGrant[],
+  employees: Map<string, AIEmployee>,
+): HydratedFinanceGrant[] {
+  return grants.map((g) => {
+    const emp = employees.get(g.employeeId);
+    return {
+      id: g.id,
+      employeeId: g.employeeId,
+      accessLevel: g.accessLevel,
+      createdAt: g.createdAt.toISOString(),
+      employee: emp
+        ? {
+            id: emp.id,
+            name: emp.name,
+            slug: emp.slug,
+            role: emp.role,
+            avatarKey: emp.avatarKey,
+          }
+        : null,
+    };
+  });
+}
+
+/** Every finance grant in the company, employee-hydrated, oldest first. */
+export async function listFinanceGrants(
+  companyId: string,
+): Promise<HydratedFinanceGrant[]> {
+  const grants = await AppDataSource.getRepository(EmployeeFinanceGrant).find({
+    where: { companyId },
+    order: { createdAt: "ASC" },
+  });
+  if (grants.length === 0) return [];
+  const emps = await AppDataSource.getRepository(AIEmployee).find({
+    where: { id: In(grants.map((g) => g.employeeId)) },
+  });
+  const byId = new Map(emps.map((e) => [e.id, e]));
+  return hydrate(grants, byId);
+}
+
+export type FinanceGrantCandidate = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+  alreadyGranted: boolean;
+};
+
+/** All company AI employees, each flagged whether it already has finance access. */
+export async function listFinanceGrantCandidates(
+  companyId: string,
+): Promise<FinanceGrantCandidate[]> {
+  const [employees, grants] = await Promise.all([
+    AppDataSource.getRepository(AIEmployee).find({
+      where: { companyId },
+      order: { name: "ASC" },
+    }),
+    AppDataSource.getRepository(EmployeeFinanceGrant).find({ where: { companyId } }),
+  ]);
+  const granted = new Set(grants.map((g) => g.employeeId));
+  return employees.map((e) => ({
+    id: e.id,
+    name: e.name,
+    slug: e.slug,
+    role: e.role,
+    avatarKey: e.avatarKey,
+    alreadyGranted: granted.has(e.id),
+  }));
+}
+
+/** Revoke a grant by id, scoped to the company. Returns false if not found. */
+export async function deleteFinanceGrant(
+  companyId: string,
+  id: string,
+): Promise<EmployeeFinanceGrant | null> {
+  const repo = AppDataSource.getRepository(EmployeeFinanceGrant);
+  const grant = await repo.findOneBy({ id, companyId });
+  if (!grant) return null;
+  await repo.delete({ id: grant.id });
+  return grant;
+}
+
+const FINANCE_LEVEL_BLURB: Record<FinanceAccessLevel, string> = {
+  read: "You can read the books: list and open invoices and customers, and pull financial reports and posted transactions. You cannot change anything.",
+  invoice:
+    "You can run accounts receivable: create, issue, and email estimates; create, issue, email, and void invoices; list, inspect, create, and update recurring invoice schedules; create and update customers; and record or reverse payments to mark invoices paid. You can also read everything at the `read` level. Creating an estimate leaves an unnumbered draft. Use issue_estimate when asked to issue a quotation or mark it Sent without emailing: it assigns the permanent number and slug and removes DRAFT from future PDFs, with no ledger effect. Use send_estimate only when sending is authorized; it issues a draft if needed and emails the customer on file. Use the returned estimate.slug for all subsequent reads and attachments, because issuing replaces the draft slug. To prepare a reply in an existing email thread, issue the estimate then attach its new slug with estimateSlug on create_mail_draft or edit_mail_draft; replace any old draft PDF snapshot before sending. Attaching a PDF never issues or accepts the estimate. Draft PDFs stay visibly DRAFT until issue. Issuing an invoice mints its number and posts it to the ledger; sending it emails the customer on file. A recurring schedule can repeat those actions automatically, so choose its status and auto-send setting deliberately.",
+  full: "You have full finance access: everything `invoice` allows, plus the bookkeeping. On Finance → Banking you categorize bank transactions and card purchases (`categorize_banking_transactions`), keep a card purchase's category (`mark_banking_transactions_reviewed`), match bank lines to what is already in the books, and undo or send them back to review. In Entry review you approve transactions with `review_finance_transaction` or many at once with `review_finance_transactions`. Your approval is final, exactly like an owner's: category changes post their reclassification at once and the entry locks, so check the debit/credit lines first. Nobody needs to sign off after you. When the account a transaction belongs in is missing from the chart of accounts, add it yourself with `create_finance_account` (and correct one with `update_finance_account`) rather than waiting on a teammate; ask only when choosing between accounts is a judgement an owner must make.",
+};
+
+/**
+ * A ready-made markdown section telling the employee it has finance access,
+ * at what level, and what that permits. Injected into the chat / routine
+ * prompt next to the Repositories context. Returns "" when the employee
+ * has no finance grant, so nothing is injected for employees without access.
+ */
+export async function composeFinanceContext(employeeId: string): Promise<string> {
+  const grant = await getFinanceGrant(employeeId);
+  if (!grant) return "";
+  return [
+    "",
+    "## Finance",
+    `You have been granted **${grant.accessLevel}** access to the company's finance system. Use the granular Finance tools (including list_subsidiaries, list_estimates, get_estimate, list_finance_products, create_estimate, issue_estimate, send_estimate, list_invoices, get_invoice, create_invoice, send_invoice, record_payment, void_invoice, list_recurring_invoices, get_recurring_invoice, create_recurring_invoice, update_recurring_invoice, list_customers, get_customer, create_customer, and update_customer, plus the accounts, transactions, and report tools) and the Banking tools (list_banking_accounts, list_banking_transactions, get_bank_transaction_matches, pay_invoices_from_bank_transaction, and at the full level categorize_banking_transactions, mark_banking_transactions_reviewed, send_banking_transactions_to_review, match_bank_transaction, undo_bank_transaction, retry_card_transaction, sync_banking_account).`,
+    "Payables: list_vendors, list_bills, get_bill, and at the full level create_vendor, update_vendor, create_bill, update_bill, issue_bill, void_bill, delete_bill, record_bill_payment, reverse_bill_payment. Enter a bill a vendor sent as a draft, give every line an expense account, then issue it; record a payment only once the money has left.",
+    "Banking's To review queue holds bank lines and card purchases waiting for a category or a match; Entry review (list_finance_transactions) holds posted journal entries waiting for approval. They are two queues: clear Banking first, then approve the entries it posted.",
+    "Every Finance list pages, so no transaction, entry, invoice or bill is out of reach: an answer carries total, hasMore and nextCursor, and while hasMore is true you pass nextCursor back as cursor with the same filters for the next page. Narrow a long list instead of reading all of it: by date (from/to), account, amount, words in the description (q) or category.",
+    FINANCE_LEVEL_BLURB[grant.accessLevel],
+    "When a teammate specifies an issuing legal entity, use list_subsidiaries to find its active subsidiaryId and pass that id when creating the invoice, estimate, or recurring invoice schedule. Omit subsidiaryId or pass null to use the company's default issuer. Subsidiary management belongs to an owner or admin; never invent legal identity or registration details.",
+    "Before preparing a quotation, use list_estimates/get_estimate to check prior work and list_finance_products for approved catalogue prices and tax defaults. Never invent pricing or silently convert currencies. Money is stored in integer minor units (cents) with a 3-letter ISO currency code. When a teammate asks you to bill someone once, create the invoice, then issue or send it — don't just describe it. When they ask for repeat billing, create a recurring invoice schedule instead; leave auto-send off when each generated draft should receive Member review, and turn it on only when the invoices should be issued and emailed automatically.",
+  ].join("\n");
+}

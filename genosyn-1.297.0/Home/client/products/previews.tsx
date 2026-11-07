@@ -1,0 +1,1647 @@
+import type { ReactNode } from "react";
+import {
+  ArrowRight,
+  Bell,
+  BookHeart,
+  Building2,
+  CalendarClock,
+  CheckCircle2,
+  ChevronDown,
+  FileText,
+  GitBranch,
+  GitCommitHorizontal,
+  Globe,
+  Hash,
+  Landmark,
+  Library,
+  LifeBuoy,
+  Mail,
+  MessageSquare,
+  Mic,
+  Paperclip,
+  Search,
+  Sparkles,
+  Star,
+  StickyNote,
+  Table2,
+  Terminal,
+  TrendingUp,
+  UserCheck,
+  Webhook,
+  Workflow,
+  Zap,
+} from "lucide-react";
+
+/**
+ * Hero mockups for each product page — a stylized, static rendering of the
+ * real product UI, framed in the same window chrome the home hero uses.
+ * Resolved by slug via productPreview().
+ */
+
+const PREVIEWS: Record<string, () => JSX.Element> = {
+  "ai-employees": EmployeesPreview,
+  workspace: WorkspacePreview,
+  tasks: TasksPreview,
+  bases: BasesPreview,
+  notes: NotesPreview,
+  resources: ResourcesPreview,
+  pipelines: PipelinesPreview,
+  explore: ExplorePreview,
+  marketing: MarketingPreview,
+  revenue: RevenuePreview,
+  email: EmailPreview,
+  support: SupportPreview,
+  customers: CustomersPreview,
+  finance: FinancePreview,
+  recruiting: RecruitingPreview,
+  code: CodePreview,
+};
+
+export function productPreview(slug: string): (() => JSX.Element) | undefined {
+  return PREVIEWS[slug];
+}
+
+// ─────────────────────────────── shared chrome ──────────────────────────────
+
+function Window({ url, children }: { url: string; children: ReactNode }) {
+  return (
+    <div className="overflow-hidden bg-white">
+      <div className="flex h-11 items-center gap-2 border-b border-slate-200 bg-slate-50/80 px-3 text-slate-600">
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className="h-4 w-4 rounded-full border-[1.5px] border-slate-900" />
+          <span className="hidden text-[9px] font-bold tracking-[0.2em] text-slate-900 sm:inline">
+            GENOSYN
+          </span>
+        </div>
+        <span className="h-4 w-px shrink-0 bg-slate-200" />
+        <div className="inline-flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-[10px] font-semibold text-slate-800">
+          <span className="truncate">Northstar Labs</span>
+          <ChevronDown className="h-3 w-3 shrink-0 text-slate-400" />
+        </div>
+        <span className="hidden text-slate-400 sm:inline">/</span>
+        <div className="hidden min-w-0 items-center gap-1.5 sm:flex">
+          <span className="h-4 w-4 rounded bg-slate-200 text-center text-[9px] font-bold leading-4 text-slate-900">
+            G
+          </span>
+          <span className="max-w-48 truncate text-[10px] font-medium text-slate-600">
+            {url.replace("genosyn.com /", "")}
+          </span>
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <span className="hidden rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[8px] font-medium text-slate-500 sm:inline">
+            ⌘ K
+          </span>
+          <span className="flex h-6 w-6 items-center justify-center text-slate-400">
+            <Bell className="h-3 w-3" />
+          </span>
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-900 text-[8px] font-semibold text-white">
+            ND
+          </span>
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Tag({ tone, children }: { tone: string; children: ReactNode }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ring-1 ${tone}`}
+    >
+      {children}
+    </span>
+  );
+}
+
+function Avatar({ initials, color }: { initials: string; color: string }) {
+  return (
+    <span
+      className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${color}`}
+    >
+      {initials}
+    </span>
+  );
+}
+
+// ─────────────────────────────── AI Employees ───────────────────────────────
+
+function EmployeesPreview() {
+  return (
+    <Window url="genosyn.com / mira — bookkeeper">
+      <div className="grid grid-cols-1 gap-0 md:grid-cols-5">
+        <div className="border-b border-slate-50 p-5 md:col-span-2 md:border-b-0 md:border-r">
+          <div className="flex items-center gap-3">
+            <span className="flex h-10 w-10 items-center justify-center bg-slate-50 text-sm font-semibold text-slate-700">
+              MF
+            </span>
+            <div>
+              <div className="text-sm font-semibold text-slate-900">Mira</div>
+              <div className="text-xs text-slate-500">Bookkeeper · AI Employee</div>
+            </div>
+            <span className="ml-auto inline-flex items-center gap-1 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold text-slate-50 ring-1 ring-slate-700">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-900" />
+              Running
+            </span>
+          </div>
+          <div className="mt-4 border border-slate-100 bg-slate-50/60 p-3.5 font-mono text-[11.5px] leading-5 text-slate-700">
+            <div className="flex items-center gap-1.5 pb-1.5 text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+              <BookHeart className="h-3 w-3" />
+              Soul
+            </div>
+            <div className="text-slate-900"># Mira</div>
+            <div className="text-slate-500">Careful, exact, allergic to drift.</div>
+            <div className="mt-1.5 font-semibold text-slate-900">## Never</div>
+            <div>- Post an unbalanced entry.</div>
+            <div>- Guess an exchange rate.</div>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {["reconcile-stripe", "close-the-month", "chase-overdue"].map((s) => (
+              <span
+                key={s}
+                className="inline-flex items-center gap-1 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-700 ring-1 ring-slate-900/[0.08]"
+              >
+                <Sparkles className="h-2.5 w-2.5" />
+                {s}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div className="p-5 md:col-span-3">
+          <div className="flex items-center gap-2 text-[11px]">
+            <CalendarClock className="h-3.5 w-3.5 text-slate-500" />
+            <span className="font-medium text-slate-700">Reconcile Stripe</span>
+            <span className="font-mono text-[10px] text-slate-500">0 7 * * *</span>
+            <span className="ml-auto font-mono text-[10px] text-slate-500">Run #212 · live</span>
+          </div>
+          <div className="mt-3 space-y-1.5 border border-slate-200 bg-slate-900 p-4 font-mono text-[11px] leading-5 text-slate-100">
+            <div>
+              <span className="text-slate-500">[07:00:02]</span> stripe_list_charges — 42 since
+              yesterday
+            </div>
+            <div>
+              <span className="text-slate-500">[07:00:19]</span> matched 41 to open invoices
+            </div>
+            <div>
+              <span className="text-slate-500">[07:00:24]</span> posting DR Bank / CR Accounts
+              Receivable
+            </div>
+            <div>
+              <span className="text-slate-500">[07:00:31]</span> <span className="text-white">✓</span>
+              {" "}
+              ledger balanced — 1 charge flagged for review
+            </div>
+            <div>
+              <span className="text-slate-500">[07:00:33]</span> send_workspace_message → #finance
+            </div>
+          </div>
+          <div className="mt-3 flex items-center justify-between text-[11px] text-slate-500">
+            <span className="inline-flex items-center gap-1.5">
+              <CheckCircle2 className="h-3.5 w-3.5 text-slate-700" />
+              211 successful runs · transcript kept for every one
+            </span>
+            <span className="font-mono text-[10px]">claude · active model</span>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ──────────────────────────────── Workspace ─────────────────────────────────
+
+function WorkspacePreview() {
+  return (
+    <Window url="genosyn.com / workspace / #marketing">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-2.5 text-[11px]">
+        <Hash className="h-3.5 w-3.5 text-slate-500" />
+        <span className="font-medium text-slate-700">marketing</span>
+        <span className="text-slate-500">· Launch week comms</span>
+        <span className="ml-auto font-mono text-[10px] text-slate-500">4 online</span>
+      </div>
+      <div className="space-y-4 px-5 py-5">
+        <ChatLine
+          initials="ND"
+          color="bg-slate-900 text-white"
+          name="Nawaz"
+          time="9:12 AM"
+          message={
+            <>@Alex the launch brief is attached — can you turn it into the Friday digest?</>
+          }
+          attachment="launch-brief.pdf"
+        />
+        <ChatLine
+          initials="AB"
+          color="bg-slate-50 text-slate-700"
+          name="Alex"
+          time="9:13 AM"
+          isAI
+          message={
+            <>
+              Read it. Draft coming to <span className="font-medium">#marketing</span> by 4 PM —
+              pricing section needs one number from @Mira, pinged her in a DM.
+            </>
+          }
+          reaction="👍 2"
+        />
+        <div className="flex items-center gap-2 pl-9 text-[11px] text-slate-500">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-100 bg-slate-50 px-2.5 py-1">
+            <span className="flex gap-0.5">
+              <span className="h-1 w-1 animate-pulse rounded-full bg-white/40" />
+              <span className="h-1 w-1 animate-pulse rounded-full bg-white/40 [animation-delay:150ms]" />
+              <span className="h-1 w-1 animate-pulse rounded-full bg-white/40 [animation-delay:300ms]" />
+            </span>
+            Mira is typing…
+          </span>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+function ChatLine({
+  initials,
+  color,
+  name,
+  time,
+  message,
+  isAI,
+  attachment,
+  reaction,
+}: {
+  initials: string;
+  color: string;
+  name: string;
+  time: string;
+  message: ReactNode;
+  isAI?: boolean;
+  attachment?: string;
+  reaction?: string;
+}) {
+  return (
+    <div className="flex items-start gap-2.5">
+      <Avatar initials={initials} color={color} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="text-[12px] font-semibold text-slate-900">{name}</span>
+          {isAI && (
+            <span className="bg-slate-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-slate-900 ring-1 ring-slate-100">
+              AI
+            </span>
+          )}
+          <span className="text-[11px] text-slate-500">{time}</span>
+        </div>
+        <div className="mt-0.5 text-[12.5px] leading-relaxed text-slate-700">{message}</div>
+        {attachment && (
+          <div className="mt-1.5 inline-flex items-center gap-1.5 border border-slate-100 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-700">
+            <Paperclip className="h-3 w-3" />
+            {attachment}
+          </div>
+        )}
+        {reaction && (
+          <div className="mt-1.5 inline-flex items-center rounded-full border border-slate-100 bg-white px-2 py-0.5 text-[10px] text-slate-700">
+            {reaction}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ────────────────────────────────── Tasks ───────────────────────────────────
+
+function TasksPreview() {
+  const cols: Array<{
+    label: string;
+    count: number;
+    cards: Array<{
+      id: string;
+      title: string;
+      who: string;
+      color: string;
+      isAI?: boolean;
+      review?: boolean;
+    }>;
+  }> = [
+    {
+      label: "In progress",
+      count: 3,
+      cards: [
+        {
+          id: "ENG-42",
+          title: "Ship pricing page A/B test",
+          who: "SS",
+          color: "bg-slate-50 text-slate-700",
+        },
+        {
+          id: "MKT-7",
+          title: "Draft Friday digest",
+          who: "AB",
+          color: "bg-slate-50 text-slate-700",
+          isAI: true,
+        },
+      ],
+    },
+    {
+      label: "In review",
+      count: 2,
+      cards: [
+        {
+          id: "FIN-19",
+          title: "March close checklist",
+          who: "MF",
+          color: "bg-slate-900 text-slate-50",
+          isAI: true,
+          review: true,
+        },
+        {
+          id: "ENG-38",
+          title: "Rotate webhook secrets",
+          who: "SS",
+          color: "bg-slate-50 text-slate-700",
+          review: true,
+        },
+      ],
+    },
+    {
+      label: "Done",
+      count: 14,
+      cards: [
+        {
+          id: "MKT-5",
+          title: "Q2 newsletter calendar",
+          who: "AB",
+          color: "bg-slate-50 text-slate-700",
+          isAI: true,
+        },
+      ],
+    },
+  ];
+  return (
+    <Window url="genosyn.com / tasks / launch-week — board">
+      <div className="grid grid-cols-1 gap-3 p-5 sm:grid-cols-3">
+        {cols.map((col) => (
+          <div key={col.label} className="bg-slate-50/70 p-2.5 ring-1 ring-slate-900/[0.06]">
+            <div className="flex items-center justify-between px-1 pb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              {col.label}
+              <span className="font-mono text-slate-500">{col.count}</span>
+            </div>
+            <div className="space-y-2">
+              {col.cards.map((card) => (
+                <div key={card.id} className="border border-slate-100 bg-white p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-[10px] font-medium text-slate-500">{card.id}</span>
+                    {card.review && <Tag tone="bg-slate-900 text-slate-50 ring-slate-700">awaiting review</Tag>}
+                  </div>
+                  <div className="mt-1 text-[12.5px] font-medium leading-snug text-slate-900">
+                    {card.title}
+                  </div>
+                  <div className="mt-2.5 flex items-center justify-between">
+                    <span
+                      className={`flex h-5 w-5 items-center justify-center text-[8px] font-semibold ${card.color}`}
+                    >
+                      {card.who}
+                    </span>
+                    {card.isAI && (
+                      <span className="bg-slate-50 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider text-slate-900 ring-1 ring-slate-100">
+                        AI
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Window>
+  );
+}
+
+// ────────────────────────────────── Bases ───────────────────────────────────
+
+function BasesPreview() {
+  const rows: Array<{
+    name: string;
+    stage: string;
+    tone: string;
+    owner: string;
+    ownerColor: string;
+    acv: string;
+  }> = [
+    {
+      name: "Acme Co.",
+      stage: "Won",
+      tone: "bg-slate-50 text-slate-700 ring-slate-200",
+      owner: "SS",
+      ownerColor: "bg-slate-50 text-slate-700",
+      acv: "$14,400",
+    },
+    {
+      name: "Globex",
+      stage: "Proposal",
+      tone: "bg-slate-50 text-slate-900 ring-slate-100",
+      owner: "AB",
+      ownerColor: "bg-slate-50 text-slate-700",
+      acv: "$32,000",
+    },
+    {
+      name: "Initech",
+      stage: "Discovery",
+      tone: "bg-slate-900 text-slate-50 ring-slate-700",
+      owner: "SS",
+      ownerColor: "bg-slate-50 text-slate-700",
+      acv: "$9,600",
+    },
+    {
+      name: "Umbrella",
+      stage: "Won",
+      tone: "bg-slate-50 text-slate-700 ring-slate-200",
+      owner: "AB",
+      ownerColor: "bg-slate-50 text-slate-700",
+      acv: "$21,000",
+    },
+  ];
+  return (
+    <Window url="genosyn.com / bases / sales-crm">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-2.5 text-[11px]">
+        <Table2 className="h-3.5 w-3.5 text-slate-500" />
+        <span className="font-medium text-slate-700">Deals</span>
+        <span className="bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
+          view: Pipeline
+        </span>
+        <span className="ml-auto inline-flex items-center gap-1.5 font-mono text-[10px] text-slate-500">
+          filtered · sorted by ACV
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[340px]">
+          <thead>
+            <tr className="border-b border-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
+              <th className="px-5 py-2 text-left font-medium">Company</th>
+              <th className="px-3 py-2 text-left font-medium">Stage</th>
+              <th className="px-3 py-2 text-left font-medium">Owner</th>
+              <th className="px-5 py-2 text-right font-medium">ACV</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-50 text-[12.5px]">
+            {rows.map((r) => (
+              <tr key={r.name}>
+                <td className="px-5 py-2.5 font-medium text-slate-900">{r.name}</td>
+                <td className="px-3 py-2.5">
+                  <Tag tone={r.tone}>{r.stage}</Tag>
+                </td>
+                <td className="px-3 py-2.5">
+                  <span
+                    className={`flex h-5 w-5 items-center justify-center text-[8px] font-semibold ${r.ownerColor}`}
+                  >
+                    {r.owner}
+                  </span>
+                </td>
+                <td className="px-5 py-2.5 text-right tabular-nums text-slate-900">{r.acv}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center gap-2 border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 text-[11px] text-slate-500">
+        <Sparkles className="h-3.5 w-3.5 text-slate-700" />
+        <span>
+          <span className="font-medium text-slate-700">Alex (AI)</span> updated 3 rows from
+          yesterday&apos;s calls · audit-logged
+        </span>
+      </div>
+    </Window>
+  );
+}
+
+// ────────────────────────────────── Notes ───────────────────────────────────
+
+function NotesPreview() {
+  return (
+    <Window url="genosyn.com / notes / ops / incident-runbook">
+      <div className="grid grid-cols-1 md:grid-cols-3">
+        <div className="border-b border-slate-50 p-4 md:border-b-0 md:border-r">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            Ops notebook
+          </div>
+          <ul className="mt-2 space-y-1 text-[12px] text-slate-700">
+            <li className="flex items-center gap-1.5">
+              <StickyNote className="h-3 w-3 text-slate-500" />
+              Onboarding SOP
+            </li>
+            <li className="flex items-center gap-1.5 bg-slate-50 px-1.5 py-1 font-medium text-slate-900">
+              <StickyNote className="h-3 w-3 text-slate-500" />
+              Incident runbook
+            </li>
+            <li className="flex items-center gap-1.5 pl-4">
+              <StickyNote className="h-3 w-3 text-slate-500" />
+              Sev-1 checklist
+            </li>
+            <li className="flex items-center gap-1.5 pl-4">
+              <StickyNote className="h-3 w-3 text-slate-500" />
+              Postmortem template
+            </li>
+            <li className="flex items-center gap-1.5">
+              <StickyNote className="h-3 w-3 text-slate-500" />
+              Vendor contacts
+            </li>
+          </ul>
+        </div>
+        <div className="p-5 md:col-span-2">
+          <div className="text-lg font-semibold text-slate-900">🚨 Incident runbook</div>
+          <div className="mt-1 text-[11px] text-slate-500">
+            Last edited by <span className="font-medium text-slate-700">Sam (AI)</span> · 2 hours ago ·
+            audit-logged
+          </div>
+          <div className="mt-4 space-y-2.5 text-[12.5px] leading-relaxed text-slate-700">
+            <div className="font-semibold text-slate-900">## First five minutes</div>
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 flex h-3.5 w-3.5 items-center justify-center rounded border border-slate-100 bg-white">
+                <CheckCircle2 className="h-3 w-3 text-slate-700" />
+              </span>
+              Page the on-call — Sam watches p99 every 15 min
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 h-3.5 w-3.5 rounded border border-slate-100 bg-white" />
+              Open a #incident channel and pin the timeline
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 h-3.5 w-3.5 rounded border border-slate-100 bg-white" />
+              Snapshot dashboards before restarting anything
+            </div>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ──────────────────────────────── Resources ─────────────────────────────────
+
+function ResourcesPreview() {
+  const items: Array<{
+    icon: typeof Globe;
+    label: string;
+    kind: string;
+    tone: string;
+    meta: string;
+  }> = [
+    {
+      icon: Globe,
+      label: "stripe.com/docs/billing",
+      kind: "URL",
+      tone: "bg-slate-50 text-slate-700 ring-slate-200",
+      meta: "extracted · 41k chars",
+    },
+    {
+      icon: FileText,
+      label: "SOC 2 readiness guide.pdf",
+      kind: "PDF",
+      tone: "bg-slate-50 text-slate-700 ring-slate-200",
+      meta: "18 pages",
+    },
+    {
+      icon: Library,
+      label: "The Mom Test",
+      kind: "EPUB",
+      tone: "bg-slate-50 text-slate-700 ring-slate-200",
+      meta: "12 chapters",
+    },
+    {
+      icon: Mic,
+      label: "All-hands · Q1 retro",
+      kind: "Transcript",
+      tone: "bg-slate-900 text-slate-50 ring-slate-700",
+      meta: "48 min",
+    },
+  ];
+  return (
+    <Window url="genosyn.com / resources">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-3">
+        <div className="flex flex-1 items-center gap-2 border border-slate-100 bg-slate-50/60 px-3 py-1.5 text-[12px] text-slate-500">
+          <Search className="h-3.5 w-3.5" />
+          usage-based billing
+        </div>
+        <span className="font-mono text-[10px] text-slate-500">2 matches</span>
+      </div>
+      <div className="grid grid-cols-2 gap-3 p-5 sm:grid-cols-4">
+        {items.map((it) => (
+          <div key={it.label} className="flex flex-col border border-slate-100 bg-white p-3">
+            <Tag tone={it.tone}>
+              <it.icon className="h-3 w-3" />
+              {it.kind}
+            </Tag>
+            <div className="mt-2.5 truncate text-[12.5px] font-medium text-slate-900">{it.label}</div>
+            <div className="mt-1 text-[10px] text-slate-500">{it.meta}</div>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 text-[11px] text-slate-500">
+        <Sparkles className="h-3.5 w-3.5 text-slate-700" />
+        <span>
+          <span className="font-medium text-slate-700">Alex (AI)</span> cited the Stripe docs in
+          today&apos;s pricing brief — every employee holds a read Grant
+        </span>
+      </div>
+    </Window>
+  );
+}
+
+// ──────────────────────────────── Pipelines ─────────────────────────────────
+
+function PipelinesPreview() {
+  return (
+    <Window url="genosyn.com / pipelines / stripe-large-charge">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-2.5 text-[11px]">
+        <Workflow className="h-3.5 w-3.5 text-slate-500" />
+        <span className="font-medium text-slate-700">stripe-large-charge</span>
+        <Tag tone="bg-slate-50 text-slate-700 ring-slate-200">
+          <span className="h-1.5 w-1.5 rounded-full bg-slate-900" />
+          Live
+        </Tag>
+        <span className="ml-auto font-mono text-[10px] text-slate-500">
+          run #88 · completed in 1.2s
+        </span>
+      </div>
+      <div className="flex items-stretch gap-2 overflow-x-auto p-5 sm:gap-3">
+        <PipelineNode
+          icon={Webhook}
+          title="Stripe webhook"
+          subtitle="Trigger"
+          tone="bg-slate-900 text-slate-50 ring-slate-700"
+        />
+        <PipelineConnector />
+        <PipelineNode
+          icon={GitBranch}
+          title="amount &gt; $1,000"
+          subtitle="Branch"
+          tone="bg-slate-50 text-slate-900 ring-slate-100"
+        />
+        <PipelineConnector />
+        <PipelineNode
+          icon={Sparkles}
+          title="Ask Alex to summarize"
+          subtitle="AI Employee"
+          tone="bg-slate-50 text-slate-700 ring-slate-200"
+        />
+        <PipelineConnector />
+        <PipelineNode
+          icon={MessageSquare}
+          title="Post to #wins"
+          subtitle="Message"
+          tone="bg-slate-50 text-slate-900 ring-slate-900/[0.12]"
+        />
+      </div>
+      <div className="border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 font-mono text-[10.5px] text-slate-500">
+        {"{{trigger.body.amount}}"} → $4,200 · branch: true · reply captured →{" "}
+        {"{{ask-alex.reply}}"}
+      </div>
+    </Window>
+  );
+}
+
+function PipelineNode({
+  icon: Icon,
+  title,
+  subtitle,
+  tone,
+}: {
+  icon: typeof Webhook;
+  title: ReactNode;
+  subtitle: string;
+  tone: string;
+}) {
+  return (
+    <div className="flex min-w-[150px] flex-1 flex-col border border-slate-100 bg-white px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <span className={`flex h-6 w-6 shrink-0 items-center justify-center ring-1 ${tone}`}>
+          <Icon className="h-3.5 w-3.5" />
+        </span>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+          {subtitle}
+        </span>
+      </div>
+      <div className="mt-1.5 truncate text-[12.5px] font-medium text-slate-900">{title}</div>
+    </div>
+  );
+}
+
+function PipelineConnector() {
+  return (
+    <div aria-hidden className="flex shrink-0 items-center self-center text-slate-100">
+      <ArrowRight className="h-4 w-4" />
+    </div>
+  );
+}
+
+// ───────────────────────────────── Explore ──────────────────────────────────
+
+function MarketingPreview() {
+  const rows = [
+    { name: "Brand — Search", spend: "$212.40", pace: "98%", ok: true },
+    { name: "Retargeting — Meta", spend: "$164.02", pace: "104%", ok: true },
+    { name: "Prospecting — PMax", spend: "$489.77", pace: "173%", ok: false },
+  ];
+  return (
+    <Window url="genosyn.com / approvals">
+      <div className="grid grid-cols-1 gap-3 p-5 sm:grid-cols-5">
+        <div className="border border-slate-100 bg-white p-4 sm:col-span-3">
+          <div className="flex items-baseline justify-between">
+            <div className="text-[11px] font-semibold text-slate-700">
+              Daily pacing check · last 7 days
+            </div>
+            <span className="font-mono text-[10px] text-slate-500">
+              google-ads + meta-ads · Reese (AI)
+            </span>
+          </div>
+          <div className="mt-3 flex flex-col gap-2">
+            {rows.map((r) => (
+              <div
+                key={r.name}
+                className="flex items-center justify-between border border-slate-50 px-3 py-2"
+              >
+                <span className="text-[11px] font-medium text-slate-900">{r.name}</span>
+                <span className="font-mono text-[10px] tabular-nums text-slate-500">{r.spend}</span>
+                <span
+                  className={`rounded-full px-2 py-0.5 font-mono text-[9px] ${
+                    r.ok ? "bg-slate-50 text-slate-700" : "bg-slate-50 text-slate-700"
+                  }`}
+                >
+                  {r.pace} pace
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 bg-slate-900 p-3 font-mono text-[10px] leading-4 text-slate-200">
+            <div className="text-slate-500">-- journal · 09:02</div>
+            <div>
+              Prospecting — PMax pacing 173% → <span className="text-slate-900">paused</span> (never
+              gated). Proposal filed for review.
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-col gap-3 sm:col-span-2">
+          <div className="border border-slate-700 bg-slate-900/15 p-4">
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-900">
+              Approval pending
+            </div>
+            <div className="mt-1 text-[11px] font-medium text-slate-900">
+              Google Ads · budget increase · 45.00 USD
+            </div>
+            <div className="mt-0.5 text-[10px] text-slate-700">
+              Brand — Search: 30.00 → 45.00/day. CPA $18 vs $25 target.
+            </div>
+            <div className="mt-3 flex gap-2">
+              <span className="bg-slate-900 px-2.5 py-1 text-[10px] font-medium text-white">Approve</span>
+              <span className="border border-slate-100 bg-white px-2.5 py-1 text-[10px] font-medium text-slate-700">
+                Reject
+              </span>
+            </div>
+          </div>
+          <div className="flex-1 border border-slate-100 bg-white p-4">
+            <div className="text-[11px] font-semibold text-slate-700">Connection caps</div>
+            <div className="mt-2 flex flex-col gap-1.5 font-mono text-[10px] text-slate-500">
+              <div className="flex justify-between">
+                <span>max single increase</span>
+                <span className="text-slate-900">$250</span>
+              </div>
+              <div className="flex justify-between">
+                <span>daily increases</span>
+                <span className="text-slate-900">$120 / $500</span>
+              </div>
+              <div className="flex justify-between">
+                <span>30-day increases</span>
+                <span className="text-slate-900">$980 / $5,000</span>
+              </div>
+              <div className="flex justify-between">
+                <span>kill switch</span>
+                <span className="text-slate-700">off</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+function ExplorePreview() {
+  const bars = [34, 42, 38, 55, 61, 58, 72, 78];
+  return (
+    <Window url="genosyn.com / explore / dashboards / revenue">
+      <div className="grid grid-cols-1 gap-3 p-5 sm:grid-cols-3">
+        <div className="border border-slate-100 bg-white p-4 sm:col-span-2">
+          <div className="flex items-baseline justify-between">
+            <div className="text-[11px] font-semibold text-slate-700">MRR by month</div>
+            <span className="font-mono text-[10px] text-slate-500">postgres · 8 rows</span>
+          </div>
+          <div className="mt-4 flex h-28 items-end gap-2">
+            {bars.map((h, i) => (
+              <div
+                key={i}
+                className={`flex-1 rounded-t-md ${i === bars.length - 1 ? "bg-slate-900" : "bg-slate-100"}`}
+                style={{ height: `${h}%` }}
+              />
+            ))}
+          </div>
+          <div className="mt-2 flex justify-between font-mono text-[9px] text-slate-500">
+            <span>Nov</span>
+            <span>Jun</span>
+          </div>
+        </div>
+        <div className="flex flex-col gap-3">
+          <div className="border border-slate-100 bg-white p-4">
+            <div className="text-[11px] font-semibold text-slate-700">MRR</div>
+            <div className="mt-1 text-2xl font-semibold tabular-nums tracking-tight text-slate-900">
+              $48,220
+            </div>
+            <div className="mt-0.5 text-[10px] font-medium text-slate-700">+8.4% vs last month</div>
+          </div>
+          <div className="flex-1 border border-slate-200 bg-slate-900 p-3.5 font-mono text-[10px] leading-4 text-slate-200">
+            <div className="text-slate-500">-- saved chart · run by Mira (AI)</div>
+            <div>
+              <span className="text-slate-100">select</span> month,{" "}
+              <span className="text-slate-100">sum</span>(mrr)
+            </div>
+            <div>
+              <span className="text-slate-100">from</span> subscriptions
+            </div>
+            <div>
+              <span className="text-slate-100">group by</span> 1{" "}
+              <span className="text-slate-100">order by</span> 1;
+            </div>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ───────────────────────────────── Revenue ──────────────────────────────────
+
+const REVENUE_LOOP = ["ad click", "contact", "deal", "invoice", "collected cash", "ledger"];
+
+function RevenuePreview() {
+  const stages: Array<{
+    label: string;
+    count: number;
+    deal: { name: string; amount: string; who: string; color: string; isAI?: boolean };
+  }> = [
+    {
+      label: "Qualified",
+      count: 6,
+      deal: {
+        name: "Initech",
+        amount: "$9,600",
+        who: "SS",
+        color: "bg-slate-50 text-slate-700",
+      },
+    },
+    {
+      label: "Demo",
+      count: 4,
+      deal: {
+        name: "Umbrella",
+        amount: "$21,000",
+        who: "AB",
+        color: "bg-slate-50 text-slate-700",
+        isAI: true,
+      },
+    },
+    {
+      label: "Proposal",
+      count: 3,
+      deal: {
+        name: "Globex",
+        amount: "$32,000",
+        who: "AB",
+        color: "bg-slate-50 text-slate-700",
+        isAI: true,
+      },
+    },
+    {
+      label: "Closed Won",
+      count: 9,
+      deal: {
+        name: "Acme Co.",
+        amount: "$14,400",
+        who: "SS",
+        color: "bg-slate-50 text-slate-700",
+      },
+    },
+  ];
+
+  const timeline: Array<{
+    icon: typeof Mail;
+    tone: string;
+    label: string;
+    detail: string;
+    time: string;
+  }> = [
+    {
+      icon: Mail,
+      tone: "bg-slate-50 text-slate-700",
+      label: "email in · Lee at Globex",
+      detail: "matched to a known contact by mail sync",
+      time: "9:12",
+    },
+    {
+      icon: Zap,
+      tone: "bg-slate-900 text-slate-50",
+      label: "signal · seats +4 on the trial",
+      detail: "saved query on cron · fired once for this account",
+      time: "9:14",
+    },
+    {
+      icon: Sparkles,
+      tone: "bg-slate-50 text-slate-900",
+      label: "sequence step 2 · drafted by Alex (AI)",
+      detail: "waiting in the review queue for a human Send",
+      time: "9:15",
+    },
+    {
+      icon: TrendingUp,
+      tone: "bg-slate-50 text-slate-700",
+      label: "stage change · Demo → Proposal",
+      detail: "weighted at 60% of $32,000",
+      time: "9:31",
+    },
+  ];
+
+  return (
+    <Window url="genosyn.com / revenue / deals — board">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-2.5 text-[11px]">
+        <TrendingUp className="h-3.5 w-3.5 text-slate-500" />
+        <span className="font-medium text-slate-700">Deals</span>
+        <Tag tone="bg-slate-50 text-slate-700 ring-slate-200">7 stages</Tag>
+        <span className="ml-auto font-mono text-[10px] text-slate-500">
+          weighted $128,400 · coverage 3.2x
+        </span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-5">
+        <div className="border-b border-slate-50 p-5 md:col-span-3 md:border-b-0 md:border-r">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {stages.map((s) => (
+              <div key={s.label} className="bg-slate-50/70 p-2 ring-1 ring-slate-900/[0.06]">
+                <div className="flex items-center justify-between px-1 pb-1.5 text-[9.5px] font-semibold uppercase tracking-wider text-slate-500">
+                  <span className="truncate">{s.label}</span>
+                  <span className="font-mono text-slate-500">{s.count}</span>
+                </div>
+                <div className="border border-slate-100 bg-white p-2.5">
+                  <div className="truncate text-[12px] font-medium text-slate-900">{s.deal.name}</div>
+                  <div className="mt-0.5 font-mono text-[10px] tabular-nums text-slate-500">
+                    {s.deal.amount}
+                  </div>
+                  <div className="mt-2 flex items-center justify-between">
+                    <span
+                      className={`flex h-5 w-5 items-center justify-center text-[8px] font-semibold ${s.deal.color}`}
+                    >
+                      {s.deal.who}
+                    </span>
+                    {s.deal.isAI && (
+                      <span className="bg-slate-50 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider text-slate-900 ring-1 ring-slate-100">
+                        AI
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
+            <CheckCircle2 className="h-3.5 w-3.5 text-slate-700" />
+            <span>Won deals bill from the same database — invoice, payment, journal entry</span>
+          </div>
+        </div>
+        <div className="p-5 md:col-span-2">
+          <div className="flex items-baseline justify-between">
+            <span className="text-[12px] font-semibold text-slate-900">Globex · renewal expansion</span>
+            <span className="font-mono text-[10px] text-slate-500">timeline</span>
+          </div>
+          <div className="mt-3 space-y-2">
+            {timeline.map((t) => (
+              <div key={t.label} className="flex items-start gap-2">
+                <span className={`flex h-5 w-5 shrink-0 items-center justify-center ${t.tone}`}>
+                  <t.icon className="h-3 w-3" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[11.5px] font-medium text-slate-900">{t.label}</div>
+                  <div className="text-[10px] leading-4 text-slate-500">{t.detail}</div>
+                </div>
+                <span className="font-mono text-[9.5px] text-slate-500">{t.time}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 text-[10.5px] text-slate-500">
+        {REVENUE_LOOP.map((step, i) => (
+          <span key={step} className="inline-flex items-center gap-1.5">
+            {i > 0 && <ArrowRight aria-hidden className="h-3 w-3 text-slate-100" />}
+            <span
+              className={` px-1.5 py-0.5 font-medium ${
+                i === REVENUE_LOOP.length - 1
+                  ? "bg-slate-900 text-white"
+                  : "bg-white text-slate-700 ring-1 ring-slate-900/[0.08]"
+              }`}
+            >
+              {step}
+            </span>
+          </span>
+        ))}
+        <span className="ml-auto font-mono text-[10px] text-slate-500">one database</span>
+      </div>
+    </Window>
+  );
+}
+
+// ────────────────────────────────── Email ───────────────────────────────────
+
+function EmailPreview() {
+  return (
+    <Window url="genosyn.com / mail / inbox">
+      <div className="grid grid-cols-1 md:grid-cols-5">
+        <div className="divide-y divide-slate-50 border-b border-slate-50 md:col-span-2 md:border-b-0 md:border-r">
+          {[
+            { from: "Dana · Acme Co.", subject: "Invoice question", tag: "billing", active: true },
+            { from: "signups@", subject: "3 new trials today", tag: null, active: false },
+            {
+              from: "Lee · Globex",
+              subject: "Renewal call next week?",
+              tag: "renewal",
+              active: false,
+            },
+          ].map((m) => (
+            <div key={m.subject} className={`px-4 py-3 ${m.active ? "bg-slate-50" : ""}`}>
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-slate-900">{m.from}</span>
+                {m.tag && (
+                  <span className="bg-slate-50 px-1.5 py-0.5 text-[9px] font-medium text-slate-700 ring-1 ring-slate-200">
+                    {m.tag}
+                  </span>
+                )}
+              </div>
+              <div className="mt-0.5 truncate text-[12px] text-slate-700">{m.subject}</div>
+            </div>
+          ))}
+        </div>
+        <div className="p-5 md:col-span-3">
+          <div className="flex items-center gap-2">
+            <Mail className="h-3.5 w-3.5 text-slate-500" />
+            <span className="text-[12.5px] font-semibold text-slate-900">Invoice question</span>
+            <span className="ml-auto font-mono text-[10px] text-slate-500">9:41 AM</span>
+          </div>
+          <p className="mt-2.5 text-[12px] leading-relaxed text-slate-700">
+            Hi — our March invoice shows two seats but we downgraded to one on the 3rd. Can you take
+            a look?
+          </p>
+          <div className="mt-4 border border-slate-100 bg-slate-50/50 p-3.5">
+            <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-slate-900">
+              <Sparkles className="h-3 w-3" />
+              Draft by Mira (AI) · rule: to contains support@
+            </div>
+            <p className="mt-2 text-[12px] leading-relaxed text-slate-700">
+              Hi Dana — you&apos;re right, the seat change landed after the invoice was issued.
+              I&apos;ve credited the difference ($29) to your April invoice…
+            </p>
+            <div className="mt-3 flex items-center gap-2">
+              <span className="bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-white">Send</span>
+              <span className="border border-slate-100 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700">
+                Edit draft
+              </span>
+              <span className="ml-auto text-[10px] font-medium text-slate-500">grant level: draft</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ──────────────────────────────── Customers ─────────────────────────────────
+
+function CustomersPreview() {
+  return (
+    <Window url="genosyn.com / customers / acme-corp — statement">
+      <div className="grid grid-cols-1 md:grid-cols-5">
+        <div className="border-b border-slate-50 p-5 md:col-span-2 md:border-b-0 md:border-r">
+          <div className="flex items-center gap-3">
+            <span className="flex h-10 w-10 items-center justify-center bg-slate-50 text-sm font-semibold text-slate-700">
+              <Building2 className="h-5 w-5" />
+            </span>
+            <div>
+              <div className="text-sm font-semibold text-slate-900">Acme Corp</div>
+              <div className="text-xs text-slate-500">billing@acme.com · USD</div>
+            </div>
+          </div>
+          <dl className="mt-4 space-y-2 text-[12px]">
+            <div className="flex justify-between">
+              <dt className="text-slate-500">Annual Contract Value</dt>
+              <dd className="font-medium tabular-nums text-slate-900">$14,400</dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-500">Outstanding</dt>
+              <dd className="font-medium tabular-nums text-slate-900">$2,400</dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-500">Lifetime billed</dt>
+              <dd className="font-medium tabular-nums text-slate-900">$38,800</dd>
+            </div>
+          </dl>
+          <div className="mt-4 inline-flex items-center gap-1.5 border border-slate-100 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-700">
+            <FileText className="h-3 w-3" />
+            MSA — signed Mar 2025
+          </div>
+        </div>
+        <div className="p-5 md:col-span-3">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-semibold text-slate-700">Statement · year to date</span>
+            <span className="font-mono text-[10px] text-slate-500">PDF ↓</span>
+          </div>
+          <div className="mt-3 space-y-1.5 text-[12px]">
+            {[
+              { label: "ACME-CORP-INV-0007", date: "Jun 1", amt: "$1,200", credit: false },
+              { label: "Payment — wire", date: "May 12", amt: "$1,200", credit: true },
+              { label: "ACME-CORP-INV-0006", date: "May 1", amt: "$1,200", credit: false },
+            ].map((row) => (
+              <div
+                key={row.label + row.date}
+                className="flex items-center justify-between border border-slate-50 bg-white px-3 py-2"
+              >
+                <span className="font-medium text-slate-700">{row.label}</span>
+                <span className="text-[10px] text-slate-500">{row.date}</span>
+                <span
+                  className={`tabular-nums font-medium ${row.credit ? "text-slate-700" : "text-slate-900"}`}
+                >
+                  {row.credit ? "−" : ""}
+                  {row.amt}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 grid grid-cols-5 gap-1.5 text-center">
+            {[
+              { label: "current", amt: "$1.2k", tone: "bg-slate-50 text-slate-700" },
+              { label: "1–30", amt: "$1.2k", tone: "bg-slate-900 text-slate-50" },
+              { label: "31–60", amt: "—", tone: "bg-slate-50 text-slate-500" },
+              { label: "61–90", amt: "—", tone: "bg-slate-50 text-slate-500" },
+              { label: "90+", amt: "—", tone: "bg-slate-50 text-slate-500" },
+            ].map((b) => (
+              <div key={b.label} className={` px-1 py-1.5 ${b.tone}`}>
+                <div className="text-[9px] font-semibold uppercase tracking-wide">{b.label}</div>
+                <div className="text-[11px] font-semibold tabular-nums">{b.amt}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ───────────────────────────────── Finance ──────────────────────────────────
+
+function FinancePreview() {
+  return (
+    <Window url="genosyn.com / finance / invoices / ACME-CORP-INV-0007">
+      <div className="grid grid-cols-1 md:grid-cols-2">
+        <div className="border-b border-slate-50 p-5 md:border-b-0 md:border-r">
+          <div className="flex items-center justify-between">
+            <span className="text-[12.5px] font-semibold text-slate-900">ACME-CORP-INV-0007</span>
+            <Tag tone="bg-slate-50 text-slate-700 ring-slate-200">Paid</Tag>
+          </div>
+          <div className="mt-3 space-y-1.5 text-[12px]">
+            <div className="flex justify-between text-slate-700">
+              <span>Pro plan · 12 seats</span>
+              <span className="tabular-nums">$1,080.00</span>
+            </div>
+            <div className="flex justify-between text-slate-700">
+              <span>Priority support</span>
+              <span className="tabular-nums">$120.00</span>
+            </div>
+            <div className="flex justify-between border-t border-slate-50 pt-1.5 text-slate-500">
+              <span>VAT 20% (exclusive)</span>
+              <span className="tabular-nums">$240.00</span>
+            </div>
+            <div className="flex justify-between text-[13px] font-semibold text-slate-900">
+              <span>Total</span>
+              <span className="tabular-nums">$1,440.00</span>
+            </div>
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-[10px] text-slate-500">
+            <Landmark className="h-3 w-3" />
+            recurring · every month on the 1st · auto-issue + email PDF
+          </div>
+        </div>
+        <div className="p-5">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            Auto-posted journal entry
+          </div>
+          <div className="mt-3 space-y-1.5 font-mono text-[11px]">
+            {[
+              { acct: "1100 Bank", dr: "$1,440.00", cr: "" },
+              { acct: "1200 Accounts Receivable", dr: "", cr: "$1,440.00" },
+            ].map((l) => (
+              <div
+                key={l.acct}
+                className="flex items-center justify-between border border-slate-50 bg-slate-50/60 px-3 py-2"
+              >
+                <span className="text-slate-700">{l.acct}</span>
+                <span className="w-20 text-right tabular-nums text-slate-900">{l.dr}</span>
+                <span className="w-20 text-right tabular-nums text-slate-500">{l.cr}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center justify-between text-[11px]">
+            <span className="inline-flex items-center gap-1.5 text-slate-700">
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              Ledger balanced
+            </span>
+            <span className="font-mono text-[10px] text-slate-500">trial balance ✓ · period open</span>
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-1.5 text-center text-[10px]">
+            {["P&L", "Balance sheet", "Cash flow"].map((r) => (
+              <span
+                key={r}
+                className="border border-slate-100 bg-white px-2 py-1.5 font-medium text-slate-700"
+              >
+                {r}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}
+
+// ──────────────────────────────── Recruiting ────────────────────────────────
+
+/*
+ * The numbers are the product's own arithmetic, so the picture survives anyone
+ * checking it. Must haves count 3, important 2 and nice to have 1, so these
+ * four criteria are worth 27 points. Ada's ratings earn 23 of them (85, a
+ * strong match). Jonas earns 11 (41), but his first must have was Not shown,
+ * which makes him a weak match rather than a possible one.
+ */
+const RECRUITING_APPLICANTS: Array<{
+  name: string;
+  source: string;
+  score: number | null;
+  match: string;
+  stage: string;
+}> = [
+  { name: "Ada Okafor", source: "Careers site · 9h", score: 85, match: "Strong match", stage: "Interview" },
+  { name: "Tomás Ruiz", source: "Careers site · 7h", score: 70, match: "Good match", stage: "Screening" },
+  { name: "Mei Lin", source: "Added by a Member · 1d", score: 52, match: "Possible match", stage: "Applied" },
+  { name: "Jonas Weber", source: "Careers site · 3h", score: 41, match: "Weak match", stage: "Applied" },
+  { name: "Priya Nair", source: "Careers site · 2m", score: null, match: "Scoring now", stage: "Applied" },
+];
+
+const RECRUITING_SCORECARD: Array<{
+  criterion: string;
+  importance: string;
+  rating: number;
+  label: string;
+  quote: string;
+}> = [
+  {
+    criterion: "Go in production",
+    importance: "Must have",
+    rating: 3,
+    label: "Exceeds",
+    quote: "Led the Go rewrite of our payments API",
+  },
+  {
+    criterion: "Postgres at scale",
+    importance: "Must have",
+    rating: 2,
+    label: "Meets",
+    quote: "Partitioned a 2 TB orders table",
+  },
+  {
+    criterion: "Mentoring",
+    importance: "Important",
+    rating: 3,
+    label: "Exceeds",
+    quote: "Coached three engineers to senior",
+  },
+  {
+    criterion: "On-call",
+    importance: "Nice to have",
+    rating: 2,
+    label: "Meets",
+    quote: "Primary on-call for checkout",
+  },
+];
+
+function RecruitingPreview() {
+  return (
+    <Window url="genosyn.com / recruiting / openings / senior-backend-engineer">
+      <div className="flex items-center gap-2 border-b border-slate-50 px-5 py-2.5 text-[11px]">
+        <UserCheck className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        <span className="shrink-0 font-medium text-slate-700">Senior Backend Engineer</span>
+        <Tag tone="bg-slate-50 text-slate-700 ring-slate-200">Open</Tag>
+        <span className="ml-auto min-w-0 truncate font-mono text-[10px] text-slate-500">
+          Full-time · Remote · €85,000 – €100,000 per year
+        </span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-5">
+        <div className="border-b border-slate-50 md:col-span-3 md:border-b-0 md:border-r">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
+                  <th className="px-5 py-2 text-left font-medium">Candidate</th>
+                  <th className="px-3 py-2 text-left font-medium">AI match</th>
+                  <th className="hidden px-5 py-2 text-left font-medium sm:table-cell">Stage</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-50 text-[12px]">
+                {RECRUITING_APPLICANTS.map((applicant) => (
+                  <tr key={applicant.name}>
+                    <td className="px-5 py-2.5">
+                      <div className="font-medium text-slate-900">{applicant.name}</div>
+                      <div className="text-[10px] text-slate-500">{applicant.source}</div>
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2.5">
+                      {applicant.score === null ? (
+                        <Tag tone="bg-white text-slate-500 ring-slate-200">
+                          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-500" />
+                          {applicant.match}
+                        </Tag>
+                      ) : (
+                        <>
+                          <Tag
+                            tone={
+                              applicant.score >= 80
+                                ? "bg-slate-900 text-slate-50 ring-slate-700"
+                                : "bg-slate-50 text-slate-700 ring-slate-200"
+                            }
+                          >
+                            {`${applicant.score} · ${applicant.match}`}
+                          </Tag>
+                          <div className="mt-1.5 h-1 w-20 bg-slate-100">
+                            <div
+                              className={`h-full ${applicant.score >= 80 ? "bg-slate-900" : "bg-slate-500"}`}
+                              style={{ width: `${applicant.score}%` }}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </td>
+                    <td className="hidden px-5 py-2.5 text-[11px] text-slate-700 sm:table-cell">
+                      {applicant.stage}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="p-5 md:col-span-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[12.5px] font-semibold text-slate-900">Ada Okafor</span>
+            <Tag tone="bg-slate-50 text-slate-700 ring-slate-200">Interview</Tag>
+          </div>
+          <div className="mt-3 flex items-center gap-3">
+            <span className="text-2xl font-semibold tabular-nums tracking-tight text-slate-900">85</span>
+            <div className="min-w-0">
+              <Tag tone="bg-slate-900 text-slate-50 ring-slate-700">Strong match</Tag>
+              <div className="mt-1 text-[10px] leading-4 text-slate-500">
+                AI screen by Noor · score worked out by Genosyn
+              </div>
+            </div>
+          </div>
+          <ul className="mt-3 divide-y divide-slate-50 border border-slate-100">
+            {RECRUITING_SCORECARD.map((row) => (
+              <li key={row.criterion} className="px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate text-[11.5px] font-medium text-slate-900">
+                    {row.criterion}
+                  </span>
+                  <span className="flex shrink-0 items-center gap-1.5 text-[10px] text-slate-500">
+                    <span className="flex gap-0.5">
+                      {[1, 2, 3].map((step) => (
+                        <span
+                          key={step}
+                          className={`h-1.5 w-3 ${row.rating >= step ? "bg-slate-900" : "bg-slate-100"}`}
+                        />
+                      ))}
+                    </span>
+                    {row.label}
+                  </span>
+                </div>
+                <div className="text-[9px] font-semibold uppercase tracking-wider text-slate-500">
+                  {row.importance}
+                </div>
+                <div className="mt-1 flex items-start gap-1 text-[10.5px] leading-4 text-slate-600">
+                  <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-slate-700" />
+                  <span className="italic">{`“${row.quote}”`}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 text-[11px] text-slate-500">
+        <Sparkles className="h-3.5 w-3.5 shrink-0 text-slate-700" />
+        <span>
+          <span className="font-medium text-slate-700">Noor (AI)</span> scored 11 applications
+          overnight, blind to names · every quote checked against the application
+        </span>
+      </div>
+    </Window>
+  );
+}
+
+// ────────────────────────────────── Support ─────────────────────────────────
+
+const SUPPORT_QUEUE: Array<{
+  number: string;
+  from: string;
+  subject: string;
+  state: string;
+  active?: boolean;
+}> = [
+  {
+    number: "#1042",
+    from: "Dana · Acme Co.",
+    subject: "Can we move to annual billing?",
+    state: "Draft ready",
+    active: true,
+  },
+  {
+    number: "#1041",
+    from: "Lee · Globex",
+    subject: "Export a report as CSV",
+    state: "Answered by AI",
+  },
+  {
+    number: "#1040",
+    from: "Noa · Initech",
+    subject: "Sign-in link never arrives",
+    state: "Needs a person",
+  },
+  {
+    number: "#1039",
+    from: "Ines · Hooli",
+    subject: "Where do I find past invoices?",
+    state: "Answered by AI",
+  },
+];
+
+function SupportPreview() {
+  return (
+    <Window url="genosyn.com / support / tickets / 1042">
+      <div className="grid grid-cols-1 md:grid-cols-6">
+        <div className="divide-y divide-slate-50 border-b border-slate-50 md:col-span-2 md:border-b-0 md:border-r">
+          {SUPPORT_QUEUE.map((ticket) => (
+            <div key={ticket.number} className={`px-4 py-3 ${ticket.active ? "bg-slate-50" : ""}`}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate text-[11px] font-semibold text-slate-900">
+                  {ticket.from}
+                </span>
+                <span className="shrink-0 font-mono text-[10px] text-slate-500">{ticket.number}</span>
+              </div>
+              <div className="mt-0.5 truncate text-[12px] text-slate-700">{ticket.subject}</div>
+              <div className="mt-1.5">
+                <Tag
+                  tone={
+                    ticket.state === "Needs a person"
+                      ? "bg-slate-900 text-slate-50 ring-slate-700"
+                      : "bg-slate-50 text-slate-700 ring-slate-200"
+                  }
+                >
+                  {ticket.state}
+                </Tag>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="p-5 md:col-span-4 md:pr-16">
+          <div className="flex items-center gap-2">
+            <LifeBuoy className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            <span className="min-w-0 truncate text-[12.5px] font-semibold text-slate-900">
+              Can we move to annual billing?
+            </span>
+            <span className="ml-auto shrink-0 font-mono text-[10px] text-slate-500">02:40</span>
+          </div>
+          <p className="mt-2.5 text-[12px] leading-relaxed text-slate-700">
+            Hi, can we switch to annual billing partway through a term?
+          </p>
+          <div className="mt-3 border border-slate-100 bg-slate-50/50 p-3.5">
+            <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-slate-900">
+              <Sparkles className="h-3 w-3" />
+              Draft by Pax (AI) · High confidence
+            </div>
+            <p className="mt-2 text-[12px] leading-relaxed text-slate-700">
+              Hi Dana, yes. You can switch at any time, and annual starts on your next renewal date.
+            </p>
+            <div className="mt-2.5 flex items-start gap-1.5 text-[10.5px] leading-4 text-slate-600">
+              <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-slate-700" />
+              <span className="min-w-0">
+                <span className="block italic">
+                  “A switch to annual takes effect on your next renewal date.”
+                </span>
+                <span className="block font-medium text-slate-700">Changing your plan</span>
+              </span>
+            </div>
+            <div className="mt-2.5 text-[10.5px] leading-4 text-slate-500">
+              <div className="font-medium text-slate-700">Held for a person because:</div>
+              Replies on &ldquo;Billing&rdquo; wait for a person.
+            </div>
+            <div className="mt-3 flex items-center gap-2">
+              <span className="bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-white">Send</span>
+              <span className="border border-slate-100 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700">
+                Edit first
+              </span>
+              <span className="px-2 py-1.5 text-[11px] font-medium text-slate-500">Discard</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 border-t border-slate-50 bg-slate-50/60 px-5 py-2.5 text-[11px] text-slate-500">
+        <Sparkles className="h-3.5 w-3.5 shrink-0 text-slate-700" />
+        <span>
+          <span className="font-medium text-slate-700">Pax (AI)</span> answered 3 of 4 Tickets
+          overnight from published Articles · every quote checked word for word
+        </span>
+      </div>
+    </Window>
+  );
+}
+
+// ─────────────────────────────────── Code ───────────────────────────────────
+
+function CodePreview() {
+  return (
+    <Window url="genosyn.com / code / api-server">
+      <div className="grid grid-cols-1 md:grid-cols-5">
+        <div className="border-b border-slate-50 p-4 md:col-span-2 md:border-b-0 md:border-r">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+            Repositories
+          </div>
+          <div className="mt-2 space-y-2">
+            {[
+              {
+                name: "api-server",
+                grant: "work locally",
+                tone: "bg-slate-50 text-slate-700 ring-slate-200",
+              },
+              {
+                name: "marketing-site",
+                grant: "work locally",
+                tone: "bg-slate-50 text-slate-700 ring-slate-200",
+              },
+              {
+                name: "infra",
+                grant: "reference only",
+                tone: "bg-slate-50 text-slate-700 ring-slate-900/[0.08]",
+              },
+            ].map((r) => (
+              <div
+                key={r.name}
+                className="flex items-center justify-between border border-slate-100 bg-white px-3 py-2"
+              >
+                <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-700">
+                  <GitBranch className="h-3 w-3 text-slate-500" />
+                  {r.name}
+                </span>
+                <Tag tone={r.tone}>{r.grant}</Tag>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center gap-1.5 text-[10px] text-slate-500">
+            <Star className="h-3 w-3" />
+            granted to Sam (AI) · SSH deploy key, encrypted
+          </div>
+        </div>
+        <div className="p-4 md:col-span-3">
+          <div className="bg-slate-900 p-4 font-mono text-[11px] leading-5">
+            <div className="flex items-center gap-1.5 pb-2 text-[10px] uppercase tracking-widest text-slate-500">
+              <Terminal className="h-3 w-3" />
+              sam@genosyn · code-repos/api-server
+            </div>
+            <div className="text-slate-500">$ git checkout -b fix/rate-limit-headers</div>
+            <div className="text-slate-500">$ git commit -m &quot;Return Retry-After on 429s&quot;</div>
+            <div className="text-slate-500">
+              [fix/rate-limit-headers 3f2a91c] 2 files changed, 18 insertions(+)
+            </div>
+            <div className="text-slate-500">$ git status --short --branch</div>
+            <div className="text-white">✓ local commit ready for governed publishing</div>
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
+            <GitCommitHorizontal className="h-3.5 w-3.5" />
+            <span>
+              committed as{" "}
+              <span className="font-mono text-[10px] text-slate-700">Sam &lt;sam@genosyn.local&gt;</span>
+              {" "}· checkout persists between Runs
+            </span>
+          </div>
+        </div>
+      </div>
+    </Window>
+  );
+}

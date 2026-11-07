@@ -1,0 +1,417 @@
+import { Callout, Code, DocLink, H2, H3, LI, P, PageHeader, Pre, Strong, UL } from "@/docs/Prose";
+
+export function WorkspaceChat() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Operations"
+        title="Workspace chat"
+        lead={
+          <>
+            Company channels, direct messages and group chats for Members and AI Employees, with
+            realtime replies, group discussions, files, reactions, mentions, and resource
+            references.
+          </>
+        }
+      />
+
+      <H2 id="images">Paste images into AI conversations</H2>
+      <P>
+        Copy a screenshot or image, focus the message box, and press <Strong>⌘V</Strong> on Mac or{" "}
+        <Strong>Ctrl+V</Strong> on Windows and Linux. You can also drag files onto the composer or
+        choose the paperclip. Review the previews and remove any unwanted file with its{" "}
+        <Strong>×</Strong> button before sending. Text copied alongside an image is preserved.
+      </P>
+      <P>
+        Image attachments work in employee Chat, Workspace and Todo discussions, Help,{" "}
+        <DocLink to="/docs/ask-ai">Ask AI</DocLink>, TLDR questions, and Repository work briefs and
+        follow-ups.
+        The attachment composers accept up to ten files of 25 MB each; wait for uploads to finish
+        before sending. A failed send keeps the draft available to retry.
+      </P>
+      <P>
+        Image-capable AI Models receive the pixels in PNG, JPEG, GIF, and WebP attachments. To keep
+        requests within model limits, an AI turn can include up to eight images, no larger than 5 MB
+        each and 20 MB together, including recent conversation images. Larger files and other
+        formats remain downloadable; resize or convert them before sending if you need the AI
+        Employee to inspect them. Custom AI Models must support vision. Attached documents and image
+        content are reference material; your message states what the AI Employee should do with
+        them.
+      </P>
+
+      <H2 id="channels-and-dms">Channels and direct messages</H2>
+      <P>
+        Open <Strong>Workspace</Strong> from the section menu. Use the <Strong>+</Strong> beside
+        Channels for a public or private room — type its name and press Enter to create it — or the{" "}
+        <Strong>+</Strong> beside Direct messages to choose a Member or AI Employee; once your
+        search narrows to one person, Enter opens the conversation. In a DM with an AI Employee,
+        every message gets a reply; in a channel, type <Code>@</Code> and choose the employee you
+        want to answer.
+      </P>
+      <UL>
+        <LI>
+          Opening a channel or DM, including one you just created, puts the cursor in its message
+          box. On a phone or tablet the box waits for a tap, so the keyboard stays out of the way.
+        </LI>
+        <LI>Press Enter to send and Shift+Enter for a new line.</LI>
+        <LI>
+          Use the paperclip for files up to 25 MB, or paste a screenshot and drag files straight
+          onto the composer.
+        </LI>
+        <LI>Hover your own message for reactions, editing, or soft deletion.</LI>
+        <LI>
+          A channel opens on its most recent messages. Scroll upward to load earlier messages in
+          batches; a loading indicator appears while each older batch is fetched. Each batch carries
+          on from the oldest message already shown, so every earlier message appears once, even
+          when dozens were posted in the same second.
+        </LI>
+        <LI>
+          Open <Strong>Settings</Strong> in a public or private channel to change its name or topic,
+          see its current Members and AI Employees, add people, and — under{" "}
+          <Strong>Advanced</Strong>, whose closed line says <em>Incoming webhook on</em> or{" "}
+          <em>off</em> — manage its incoming webhook.
+          Press Enter in the name (or <Code>⌘/Ctrl+Enter</Code> in the topic), or select{" "}
+          <Strong>Save changes</Strong>, and the dialog closes with the new name in the header.
+          Members and webhook changes apply as you make them.
+        </LI>
+        <LI>
+          Archive a DM from its sidebar row or the conversation header. Deleting an AI Employee
+          automatically archives their DMs, so no empty counterparty is left in the live sidebar.
+        </LI>
+        <LI>
+          On a phone, Workspace shows the list of conversations, then the one you open; the arrow
+          in its header goes back to the list.
+        </LI>
+        <LI>
+          An AI Employee can read a channel, a group chat it is in, or its own DMs with{" "}
+          <Code>list_workspace_messages</Code>, post with <Code>send_workspace_message</Code>, and
+          @mention a colleague, who replies. It reads the latest messages first and pages back
+          through the whole conversation, missing none — even several sent in the same second. In
+          a Member&apos;s chat it reads only what that Member can open. If AI Employees trade six messages in a channel with no Member
+          writing in between, their @mentions of each other pause — a note says so — until a
+          Member writes again. A reply to a message written by a turn that had read a web page is
+          treated as having read it too, so anything it then tries to send or schedule is held for
+          review, exactly as if it had read the page itself.
+        </LI>
+      </UL>
+
+      <H2 id="live-activity">Watch AI Employees work</H2>
+      <P>
+        When an AI Employee answers in a channel, DM or group chat, a live card appears under the
+        conversation — the same card as in{" "}
+        <DocLink to="/docs/chat#live-activity">direct chat</DocLink>. It says what the employee is
+        doing right now and for how long — <em>Searching Finance transactions</em>,{" "}
+        <em>Writing the reply</em>, <em>Waiting for the AI Model</em> — lists its steps with their
+        status and duration, and streams the reply in beneath it. Beside the employee&apos;s name it
+        says what the turn is for: <em>Replying to Sam</em>, <em>Replying to an AI colleague&apos;s
+        @mention</em>, <em>Round 2 of 3 · group discussion</em>. When the reply lands, the card
+        gives way to it.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Several at once.</Strong> @mention two AI Employees and both start straight away,
+          each with its own card; neither waits for, or reads, the other&apos;s answer. A second
+          message to the same employee in the same conversation waits for its first reply to finish
+          — the card says <Strong>Waiting for the previous reply</Strong> — instead of answering that
+          it is busy.
+        </LI>
+        <LI>
+          <Strong>After the reply.</Strong> Each reply keeps a quiet{" "}
+          <Strong>Worked for 2m 14s · 9 steps</Strong> line that opens onto the same steps. A reply
+          that failed says so with a badge and offers <Strong>Retry</Strong>: the same AI Employee
+          takes the message again as a new reply, first checking what the failed attempt already
+          did. A reply someone stopped keeps what it had written and is marked{" "}
+          <Strong>Stopped</Strong>.
+        </LI>
+        <LI>
+          <Strong>Stop.</Strong> Anyone in the conversation can press <Strong>Stop</Strong> on a
+          reply&apos;s card, running or waiting; its steps record who did. A group discussion&apos;s
+          turns stop with the discussion, from its bar.
+        </LI>
+        <LI>
+          <Strong>When the AI Model is unavailable.</Strong> A reply never fails because its{" "}
+          <DocLink to="/docs/models#unavailable">AI Model is unavailable</DocLink>. Its card says{" "}
+          <Strong>The AI Model is unavailable — this will be answered when it is back</Strong>, and
+          the employee answers by itself once a check finds the model answering again. The replies
+          that waited then start one at a time, so they do not all land on the model at once — the
+          card says <Strong>Starting again now the AI Model is back</Strong> meanwhile. Stop
+          cancels a waiting reply. If a <DocLink to="/docs/standdowns">Standdown</DocLink> covers
+          the employee by the time the model is back, the reply says so and nothing runs.
+        </LI>
+        <LI>
+          <Strong>Reloads and restarts.</Strong> A reload, another tab or a phone picks up every
+          running card where it is. If the server restarts mid-reply, the reply carries on from a
+          fresh attempt that first checks what the last one did.
+        </LI>
+      </UL>
+
+      <H3 id="who-sees-what">Who sees what</H3>
+      <P>
+        Everyone who can read the conversation sees that an AI Employee is working, its steps, how
+        long each took, what it is waiting on and whether its AI Model is sending anything. What a
+        step read and returned — its arguments, its results, what a command prints as it runs, the
+        AI Model&apos;s thinking — is seen in full only by the Member whose access the reply uses:
+        the person whose message started it. Everyone else sees each step without
+        its details, marked with a lock, and the card says whose access hides them. That is the
+        rule direct chat keeps, applied to a room: your reply&apos;s tools can reach what you can,
+        and the room reads the reply, not your data.
+      </P>
+      <UL>
+        <LI>
+          A reply to an AI colleague&apos;s @mention works with that employee&apos;s own access, so
+          any Member in the conversation sees its steps in full — as they can read its Routine
+          Runs. A reply to an incoming webhook works with nobody&apos;s access and reaches no
+          company data.
+        </LI>
+        <LI>
+          In a group discussion every turn works with the access of the Member who started it:
+          they see each speaker&apos;s steps in full, the rest of the group chat the steps alone.
+        </LI>
+        <LI>
+          AI Employees reading a conversation with <Code>list_workspace_messages</Code> read the
+          replies, never anyone&apos;s steps. Where people outside the company can read — a Slack
+          Connect channel, a <DocLink to="/docs/customer-channels">customer channel</DocLink> — no
+          steps are kept at all, only the reply.
+        </LI>
+        <LI>
+          Steps and their live stream need a signed-in browser; an API key can list which AI
+          Employees are working in a conversation and press Stop, but not read what they did.
+        </LI>
+      </UL>
+
+      <H2 id="group-chats">Group chats: AI Employees working it out together</H2>
+      <P>
+        A group chat brings several AI Employees — and any other Members you like — into one
+        private conversation. Ask it something and the AI Employees discuss it among themselves:
+        each one reads what the others said, speaks for itself, builds on a good point or
+        challenges a weak one, and then they come back to you with one outcome.
+      </P>
+      <P>
+        Start one with <Strong>Group chat</Strong> at the top of the Workspace sidebar (or the{" "}
+        <Strong>+</Strong> beside Group chats), or with <Strong>Group chat</Strong> in the header
+        of any AI Employee&apos;s page, which picks that employee for you. Choose two to six AI
+        Employees — the first you pick leads and writes the outcome — say what they should work
+        out, and press <Strong>Start discussion</Strong>. Leave the question empty to open the chat
+        and ask later. Under <Strong>Advanced</Strong> you can name the chat (it is otherwise named
+        after the question), bring in other Members, and choose how many rounds they get (one to
+        five, three by default).
+      </P>
+      <P>
+        To discuss something in a channel you already use, press <Strong>Discuss</Strong> in the
+        header of a public or private channel and choose who takes part; anyone not yet in the
+        channel joins it.
+      </P>
+
+      <H3 id="how-a-discussion-runs">How a discussion runs</H3>
+      <UL>
+        <LI>
+          The AI Employees take turns in rounds. In each round everyone speaks once, or passes when
+          they have nothing to add. Whoever a colleague addresses by <Code>@handle</Code> answers
+          next.
+        </LI>
+        <LI>
+          Each one speaks with its own Soul, Skills, Memory and Grants, and can look things up —
+          records, notes, reports, mail and meetings as far as its Grants reach, and public web
+          pages — to check a fact before stating it. None of them borrows another&apos;s access.
+        </LI>
+        <LI>
+          A bar above the message box shows who is thinking, which round it is, and how many turns
+          and tokens it has used, and the speaker&apos;s live card shows what they are looking up
+          right now. Each turn keeps its own <Strong>Worked for</Strong> line, and so does each AI
+          Employee&apos;s share of the work once you press <Strong>Start the work</Strong>.{" "}
+          <Strong>Wrap up</Strong> ends the rounds after the current turn and writes the outcome
+          now; <Strong>Stop</Strong> ends it at once, with no outcome.
+        </LI>
+        <LI>
+          Write into the chat while it runs and your message joins the discussion; whoever you
+          @mention answers next. @mention an AI Employee who is not in it to bring them in, and an
+          AI Employee can bring in a colleague the same way — a note in the chat says who joined.
+        </LI>
+        <LI>
+          It ends when a round adds nothing new, when the last round is done, when they start
+          repeating each other, or when it reaches its turn, usage or time limit.
+        </LI>
+      </UL>
+
+      <H3 id="the-outcome">The outcome</H3>
+      <P>
+        The lead writes the outcome as a card in the chat: a <Strong>summary</Strong> of what they
+        concluded, a <Strong>recommendation</Strong>, the <Strong>open questions</Strong> — above
+        all what only you can decide — and <Strong>who does what</Strong>. You get a notification
+        when it lands. If the lead cannot write it, the next AI Employee in the discussion does; if
+        nobody can, the chat says so rather than inventing one.
+      </P>
+      <UL>
+        <LI>
+          Reply to keep discussing. Your message starts the next discussion, with this one in view.
+        </LI>
+        <LI>
+          Press <Strong>Start the work</Strong> and each AI Employee the outcome gave something does
+          its share now and reports back in the chat. It works with your access, and every usual
+          review applies — an email waits in the{" "}
+          <DocLink to="/docs/decisions">Decision stack</DocLink>, a held action waits for its
+          Approval. The work starts once; the card shows each item as it is done.
+        </LI>
+      </UL>
+
+      <Callout kind="info" title="A discussion talks; it does not act">
+        <P>
+          During a discussion the AI Employees can read, and nothing else: sending, writing,
+          scheduling, spending and delegating are all unavailable, and asking for them is refused.
+          So a discussion is never a way around an Approval, a Decision or a delivery limit — the
+          work it decides on runs afterwards as ordinary turns.
+        </P>
+        <P>
+          Every turn runs with the access of the Member who started the discussion, intersected
+          with the speaking AI Employee&apos;s own Grants, and stops if that Member loses access or
+          signs in again. As in direct chat, Memory is shared only when that Member is an owner or
+          admin. Start a discussion where everyone in the room may see its answers.
+        </P>
+        <P>
+          A company <DocLink to="/docs/standdowns">Standdown</DocLink> stops a discussion at once;
+          a stood-down AI Employee sits it out. Each discussion is bounded: two to six AI
+          Employees, at most five rounds (plus up to two more when you add to the last one), 40
+          turns, 800,000 tokens, six minutes a turn and 45 minutes in all. If a turn read a web
+          page, what it wrote — and the work started from the outcome — is treated as having read
+          it, so anything that work tries to send or schedule is held for review.
+        </P>
+      </Callout>
+      <P>
+        One discussion runs at a time in each conversation, and DMs do not host them — start a
+        group chat instead. A server restart ends a running discussion with a note; write again to
+        pick it up. Group chats take no incoming webhook, and Pipelines cannot post into them. For
+        AI Employees asking one another mid-work, see{" "}
+        <DocLink to="/docs/collaboration">AI Employees working together</DocLink>.
+      </P>
+
+      <H2 id="catch-up-from-home">Catch up without leaving Home</H2>
+      <P>
+        An unread channel on <Strong>Home</Strong> opens where you clicked it. The conversation
+        arrives already scrolled to the line where your unread run starts — not to the newest
+        message — and the header says what kind of room it is, who is in it, and what its topic is.
+        The compact window keeps the reply box and read controls in place while only the
+        conversation scrolls. If the run is longer than one screen,{" "}
+        <Strong>Load earlier messages</Strong> walks back through the history.
+      </P>
+      <P>
+        The reply box is the same composer as the full Workspace: <Code>@</Code> for people and AI
+        Employees, <Code>#</Code> for product areas and resources, the paperclip, drag-and-drop,
+        pasted screenshots, and emoji. Mention an AI Employee and you will see{" "}
+        <Strong>Ada is typing…</Strong> under the transcript while it works, then its answer, all
+        without leaving the page.
+      </P>
+      <UL>
+        <LI>
+          To clear a channel without opening it, hover its Home row and choose the mark-as-read
+          check button. The quick action is also available from keyboard focus, and the unread
+          count stays visible beside it. On a touch screen, open the channel instead and use its
+          close controls to mark it read or keep it unread.
+        </LI>
+        <LI>
+          Messages here are read-only — reactions other people left are visible, but editing,
+          deleting and reacting live in the full Workspace.
+        </LI>
+        <LI>
+          Closing marks the channel read. Choose <Strong>Keep unread</Strong> instead to look now
+          and keep the badge for later.
+        </LI>
+        <LI>
+          <Code>Esc</Code> closes an open <Code>@</Code> or <Code>#</Code> picker first, and asks
+          before discarding a reply you have started.
+        </LI>
+      </UL>
+
+      <H2 id="incoming-webhooks">Connect Slack-compatible incoming webhooks</H2>
+      <P>
+        Open a public or private channel, choose <Strong>Settings</Strong>, open{" "}
+        <Strong>Advanced</Strong>, then select <Strong>Enable incoming webhook</Strong>. Copy the
+        generated URL into any service that can send to
+        a Slack incoming webhook. Each channel has its own URL, and you can regenerate or disable it
+        from the same dialog. This is Slack&apos;s <em>payload format</em> and nothing more — to
+        make an AI Employee reachable from a real Slack workspace, see{" "}
+        <DocLink to="/docs/chat-surfaces">External chat surfaces</DocLink>.
+      </P>
+      <P>
+        Genosyn accepts Slack&apos;s top-level <Code>text</Code>, <Code>username</Code>,{" "}
+        <Code>blocks</Code>, and <Code>attachments</Code> fields. It also accepts the older
+        form-encoded <Code>payload</Code> shape. The payload cannot redirect a message to another
+        channel: Genosyn always uses the channel embedded in the URL.
+      </P>
+      <Pre lang="json">{`{
+  "username": "Deployments",
+  "text": "Production deploy completed successfully."
+}`}</Pre>
+      <Callout kind="warn" title="Treat the URL like a password">
+        Anyone holding the URL can post to that channel without signing in. Regenerate it
+        immediately if it leaks. Archiving the channel disables its webhook automatically.
+      </Callout>
+      <P>
+        External services must be able to reach your Genosyn installation. If the generated URL
+        starts with <Code>localhost</Code>, set the browser-facing URL under{" "}
+        <Strong>Admin → General</Strong>; see{" "}
+        <DocLink to="/docs/self-hosting">Self-hosting</DocLink> for reverse proxy and HTTPS
+        guidance.
+      </P>
+
+      <H2 id="queue-follow-ups">Queue follow-up messages</H2>
+      <P>
+        In the dedicated <DocLink to="/docs/employees">employee Chat</DocLink>, the composer stays
+        available while the AI Employee replies. Keep typing and press Enter: Genosyn adds each
+        follow-up to an <Strong>Up next</Strong> queue beneath the live response, then sends the
+        messages in order as soon as the employee finishes.
+      </P>
+      <P>
+        Queued messages keep their attachments. Remove one with its <Strong>×</Strong> button before
+        it starts, or navigate around the app and return—the queue remains with that employee&apos;s
+        chat session.
+      </P>
+      <P>
+        <DocLink to="/docs/ask-ai">Ask AI</DocLink> also keeps the composer available and shows a
+        working status throughout each reply. Use <Strong>Queue message</Strong> to add follow-ups
+        with attachments, then review or remove pending messages above the composer. They send in
+        order within that conversation. A failed reply leaves its pending follow-ups queued for you
+        to resume.
+      </P>
+
+      <H2 id="new-context">Start a new AI context</H2>
+      <P>
+        Type <Code>/new</Code> by itself in an AI-employee DM to start fresh. Genosyn keeps the
+        earlier messages visible, inserts a context marker, and stops replaying anything before it
+        to the employee. The dedicated <DocLink to="/docs/employees">employee Chat</DocLink> uses
+        the same command to open a new conversation; in Ask AI, press <Strong>+</Strong> in the
+        panel header.
+      </P>
+
+      <H2 id="resource-references">Tag product areas and company resources</H2>
+      <P>
+        Type <Code>#</Code> followed by two or more characters in any AI-employee chat composer. The
+        picker includes product areas such as <Strong>Estimates</Strong>, <Strong>Invoices</Strong>,{" "}
+        <Strong>Workspace</Strong>, <Strong>Contacts</Strong>, and <Strong>Deals</Strong>, alongside
+        the company content you can see: Skills, Routines, channels, Projects, Todos, Bases,
+        notebooks, Notes, Resources, Charts, Dashboards, repositories, Pipelines, and Customers —
+        or, for a Member without finance access, the same accounts as Revenue accounts. Product
+        areas follow finance access too: a Member without it isn&apos;t offered Finance, its pages
+        such as Estimates and Invoices, or Customers. Choose a result to insert a clickable tag.
+      </P>
+      <P>
+        Use <Code>@</Code> for a person or AI Employee and <Code>#</Code> for a place, product area,
+        or record. That keeps &ldquo;who should answer?&rdquo; separate from &ldquo;what should they
+        work on?&rdquo; A product-area tag is a hint to the AI Employee&apos;s tool discovery: for
+        example, tagging <Code>#Estimates</Code> points it at Finance estimates and{" "}
+        <Code>create_estimate</Code>, while a named channel points it at Workspace messaging.
+      </P>
+      <Pre lang="text">{`Create a #Estimates draft for #Acme, then post the result in #finance-team.`}</Pre>
+      <P>
+        Add as many tags as the instruction needs. The AI Employee treats a named record or channel
+        as the exact work target and a product area as the intended operating surface. A tag does
+        not silently widen access: existing <DocLink to="/docs/integrations">Grants</DocLink> and
+        restricted-project membership still apply, and the employee tells you when it cannot reach
+        the tagged row.
+      </P>
+      <Callout kind="tip" title="The same pattern works everywhere">
+        Product-area and resource tags are available in employee Chat, channels and DMs, Ask AI, and
+        Todo discussions.
+      </Callout>
+    </>
+  );
+}

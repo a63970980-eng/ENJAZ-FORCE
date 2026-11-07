@@ -1,0 +1,2226 @@
+import React from "react";
+import { createPortal } from "react-dom";
+import { Select } from "@/components/ui/Select";
+import { useNavigate, useParams } from "react-router-dom";
+import { useAskAiPageContext } from "@/components/askAi/AskAiProvider";
+import {
+  Plus,
+  Trash2,
+  Settings as SettingsIcon,
+  Type,
+  AlignLeft,
+  Hash,
+  CheckSquare,
+  Calendar,
+  Mail,
+  LinkIcon,
+  ListFilter,
+  ListChecks,
+  Key,
+  ChevronDown,
+  Users,
+  Maximize2,
+  Check,
+  ArrowUp,
+  ArrowDown,
+  ClipboardList,
+  BarChart3,
+} from "lucide-react";
+import {
+  api,
+  Base,
+  BaseField,
+  BaseFieldType,
+  BaseGrant,
+  BaseLinkOption,
+  BaseRecord,
+  BaseTable,
+  BaseResourceOption,
+  BaseTableContent,
+  BaseView,
+  Company,
+  Employee,
+  isBaseResourceFieldType,
+  SelectOption,
+} from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import { Button } from "../components/ui/Button";
+import { Input } from "../components/ui/Input";
+import { Menu, MenuHeader, MenuItem, MenuSeparator } from "../components/ui/Menu";
+import { FormError } from "../components/ui/FormError";
+import { useDialog } from "../components/ui/Dialog";
+import {
+  ModalCloseButton,
+  ModalPanel,
+  ModalScrim,
+  useModalChrome,
+} from "../components/ui/ModalChrome";
+import { useFocusAfterDelete } from "../components/useFocusAfterDelete";
+import { useBases } from "./BasesLayout";
+import {
+  CellEditor,
+  CellView,
+  RESOURCE_TYPE_ICONS,
+  SelectOptionsEditor,
+} from "./BaseGridCells";
+import { RecordDetailDrawer } from "./BaseRecordDetail";
+import {
+  BASE_COLORS,
+  BASE_ICON_NAMES,
+  BaseIcon,
+  baseAccent,
+} from "../components/BaseIcons";
+import { clsx } from "../components/ui/clsx";
+import { AsyncResourceTagPicker } from "../components/TagPicker";
+import {
+  applyFilters,
+  applySorts,
+  ArrowUpDown,
+  EyeOff,
+  FilterIcon,
+  FilterPopover,
+  HideFieldsPopover,
+  SortPopover,
+  ToolbarButton,
+  ViewTabs,
+} from "./BaseViewControls";
+
+const FIELD_TYPE_META: Record<
+  BaseFieldType,
+  { label: string; icon: React.ElementType; desc: string }
+> = {
+  text: { label: "Text", icon: Type, desc: "One-line text" },
+  longtext: { label: "Long text", icon: AlignLeft, desc: "Multi-line text" },
+  number: { label: "Number", icon: Hash, desc: "Numeric value" },
+  checkbox: { label: "Checkbox", icon: CheckSquare, desc: "True / false" },
+  date: { label: "Date", icon: Calendar, desc: "Calendar date" },
+  datetime: { label: "Date & time", icon: Calendar, desc: "Date with time" },
+  email: { label: "Email", icon: Mail, desc: "Email address" },
+  url: { label: "URL", icon: LinkIcon, desc: "Web link" },
+  select: { label: "Single select", icon: ListFilter, desc: "One colored tag" },
+  multiselect: { label: "Multi-select", icon: ListChecks, desc: "Multiple colored tags" },
+  link: { label: "Link to table", icon: LinkIcon, desc: "Reference rows in another table" },
+  customer: {
+    label: "Customer",
+    icon: RESOURCE_TYPE_ICONS.customer,
+    desc: "Link finance customers",
+  },
+  invoice: {
+    label: "Invoice",
+    icon: RESOURCE_TYPE_ICONS.invoice,
+    desc: "Link finance invoices",
+  },
+  project: {
+    label: "Project",
+    icon: RESOURCE_TYPE_ICONS.project,
+    desc: "Link task projects",
+  },
+  employee: {
+    label: "AI Employee",
+    icon: RESOURCE_TYPE_ICONS.employee,
+    desc: "Link AI employees",
+  },
+  member: {
+    label: "Member",
+    icon: RESOURCE_TYPE_ICONS.member,
+    desc: "Link company members",
+  },
+  note: { label: "Note", icon: RESOURCE_TYPE_ICONS.note, desc: "Link notes" },
+  pipeline: {
+    label: "Pipeline",
+    icon: RESOURCE_TYPE_ICONS.pipeline,
+    desc: "Link pipelines",
+  },
+};
+
+// Direction labels for the column-header sort menu, phrased to match the
+// field's type ("1 → 9" reads better than "A → Z" on a number column).
+function sortDirectionLabels(type: BaseFieldType): { asc: string; desc: string } {
+  switch (type) {
+    case "number":
+      return { asc: "Sort 1 → 9", desc: "Sort 9 → 1" };
+    case "date":
+    case "datetime":
+      return { asc: "Sort oldest first", desc: "Sort newest first" };
+    case "checkbox":
+      return { asc: "Unchecked first", desc: "Checked first" };
+    default:
+      return { asc: "Sort A → Z", desc: "Sort Z → A" };
+  }
+}
+
+type ViewPatch = Partial<Pick<BaseView, "name" | "filters" | "sorts" | "hiddenFieldIds">>;
+
+/**
+ * A change to a view made on this page, kept on screen over the fetched content
+ * until a fetch is sure to include it. `savedAfterFetch` is the number of the
+ * last content fetch started before the server confirmed the save (null while
+ * the save is in flight): any fetch numbered higher read the saved view.
+ */
+type ViewEdit = {
+  id: number;
+  viewId: string;
+  patch: ViewPatch;
+  savedAfterFetch: number | null;
+};
+
+// Lay the view edits still settling over the content last fetched, oldest
+// first, so the newest edit to a setting wins.
+function withViewEdits(
+  content: BaseTableContent | null,
+  edits: ViewEdit[],
+): BaseTableContent | null {
+  if (!content || edits.length === 0) return content;
+  let changed = false;
+  const views = content.views.map((view) =>
+    edits.reduce((v, edit) => {
+      if (edit.viewId !== v.id) return v;
+      changed = true;
+      return { ...v, ...edit.patch };
+    }, view),
+  );
+  return changed ? { ...content, views } : content;
+}
+
+export default function BaseDetail({ company }: { company: Company }) {
+  const { baseSlug, tableSlug } = useParams();
+  const navigate = useNavigate();
+  const dialog = useDialog();
+  const { activeDetail, reloadActive, reload: reloadBases } = useBases();
+
+  // The table as last fetched, and the view edits made here that it may not
+  // include yet. The page shows one laid over the other, so no refetch — live,
+  // or the reload after a write — can put back a view already changed here.
+  const [fetchedContent, setFetchedContent] = React.useState<BaseTableContent | null>(null);
+  const [viewEdits, setViewEdits] = React.useState<ViewEdit[]>([]);
+  const content = React.useMemo(
+    () => withViewEdits(fetchedContent, viewEdits),
+    [fetchedContent, viewEdits],
+  );
+  // Content fetches are numbered as they start; `shownFetch` is the one on screen.
+  const contentFetches = React.useRef(0);
+  const shownFetch = React.useRef(0);
+  const viewEditIds = React.useRef(0);
+  const [contentLoading, setContentLoading] = React.useState(false);
+  const [contentError, setContentError] = React.useState<string | null>(null);
+  const [showSettings, setShowSettings] = React.useState(false);
+  const [openRecordId, setOpenRecordId] = React.useState<string | null>(null);
+  const [activeViewId, setActiveViewId] = React.useState<string | null>(null);
+  const [creatingView, setCreatingView] = React.useState(false);
+
+  // `activeDetail` may belong to the previous base (during nav). Only trust it
+  // once the slug matches the URL.
+  const detail =
+    activeDetail && activeDetail.base.slug === baseSlug ? activeDetail : null;
+
+  const currentTable = React.useMemo(() => {
+    if (!detail) return null;
+    if (tableSlug) return detail.tables.find((t) => t.slug === tableSlug) ?? null;
+    return detail.tables.find((table) => !table.archivedAt) ?? null;
+  }, [detail, tableSlug]);
+
+  // `content` lags a table switch — it still holds the previous table's rows
+  // until the new fetch lands. Only trust it once it names the table on screen.
+  const contentForTable =
+    content && currentTable && content.table.id === currentTable.id ? content : null;
+
+  // Route to the first table when landing on the bare base URL.
+  React.useEffect(() => {
+    if (!detail || tableSlug) return;
+    const first = detail.tables.find((table) => !table.archivedAt);
+    if (first) {
+      navigate(
+        `/c/${company.slug}/bases/${detail.base.slug}/${first.slug}`,
+        { replace: true },
+      );
+    }
+  }, [company.slug, detail, navigate, tableSlug]);
+
+  // Keyed on ids rather than on `detail` and `currentTable`, which are new
+  // objects whenever the base's own live refetch lands: reloading the grid on
+  // each of those started a fetch that could answer after a view edit.
+  const contentBaseSlug = detail?.base.slug ?? null;
+  const contentTableId = currentTable?.id ?? null;
+
+  const loadContent = React.useCallback(
+    async (silent = false) => {
+      if (!contentBaseSlug || !contentTableId) {
+        setFetchedContent(null);
+        return;
+      }
+      const fetchNo = ++contentFetches.current;
+      if (!silent) setContentLoading(true);
+      try {
+        const d = await api.get<BaseTableContent>(
+          `/api/companies/${company.id}/bases/${contentBaseSlug}/tables/${contentTableId}/rows`,
+        );
+        // Fetches overlap, so one that started earlier can answer later, with
+        // older content than the screen already shows.
+        if (fetchNo < shownFetch.current) return;
+        shownFetch.current = fetchNo;
+        setFetchedContent(d);
+        // The view edits this fetch read go, oldest first. Saves can answer out
+        // of order, so one not yet read keeps every later edit with it: laid
+        // over this fetch alone, it would hide a newer change to its setting.
+        setViewEdits((edits) => {
+          const unread = edits.findIndex(
+            (edit) => edit.savedAfterFetch === null || edit.savedAfterFetch >= fetchNo,
+          );
+          if (unread === 0) return edits;
+          return unread === -1 ? [] : edits.slice(unread);
+        });
+        setContentError(null);
+      } catch (err) {
+        // A silent refetch (live socket, post-mutation reload) is background
+        // work: it must not take over a grid the user is working in, and the
+        // mutation that triggered it already owns its own error surface.
+        if (silent) return;
+        setContentError(errorMessage(err, "Could not load this table"));
+      } finally {
+        if (!silent) setContentLoading(false);
+      }
+    },
+    [company.id, contentBaseSlug, contentTableId],
+  );
+
+  React.useEffect(() => {
+    loadContent();
+  }, [loadContent]);
+
+  // Live grid: refetch silently (no spinner flash) when a record in the table
+  // being viewed changes — an AI employee writing rows shows up in place.
+  // Scoped to the active table so other tables' writes don't refetch it.
+  const liveReloadContent = React.useCallback(() => loadContent(true), [loadContent]);
+  useLiveRefetch("baserecord", liveReloadContent, currentTable?.id ?? null);
+  // Fields and views ride the "base" kind: a column or view changed in another
+  // tab or by an AI employee, and the refetch that settles a view edit made
+  // here. Unscoped, because a linked table's primary field labels this
+  // table's link cells.
+  useLiveRefetch("base", liveReloadContent);
+
+  // Reset the active view whenever the user switches tables — view IDs are
+  // per-table so the previous selection is meaningless on the next one. The
+  // load error goes with it: it described the table we just left.
+  React.useEffect(() => {
+    setActiveViewId(null);
+    setContentError(null);
+  }, [currentTable?.id]);
+
+  // Promote the first available view to active once content arrives, and
+  // gracefully fall back if the active view was deleted out from under us.
+  React.useEffect(() => {
+    if (!content) return;
+    const found = activeViewId
+      ? content.views.find((v) => v.id === activeViewId)
+      : null;
+    if (!found) {
+      const next = content.views[0]?.id ?? null;
+      if (next !== activeViewId) setActiveViewId(next);
+    }
+  }, [content, activeViewId]);
+
+  const activeView = React.useMemo(
+    () =>
+      content && activeViewId
+        ? content.views.find((v) => v.id === activeViewId) ?? null
+        : null,
+    [content, activeViewId],
+  );
+
+  // Apply a partial change to the active view and persist it. Optimistic so
+  // toggling a filter feels instant: the edit stays laid over the content
+  // until a fetch that started after its save has landed, and a failed save
+  // takes back its own change and nothing else.
+  const updateActiveView = React.useCallback(
+    async (patch: ViewPatch) => {
+      if (!detail || !currentTable || !activeView) return;
+      const edit: ViewEdit = {
+        id: ++viewEditIds.current,
+        viewId: activeView.id,
+        patch,
+        savedAfterFetch: null,
+      };
+      setViewEdits((edits) => [...edits, edit]);
+      try {
+        await api.patch(
+          `/api/companies/${company.id}/bases/${detail.base.slug}/tables/${currentTable.id}/views/${activeView.id}`,
+          patch,
+        );
+        const savedAfterFetch = contentFetches.current;
+        setViewEdits((edits) =>
+          edits.map((e) => (e.id === edit.id ? { ...e, savedAfterFetch } : e)),
+        );
+      } catch (err) {
+        setViewEdits((edits) => edits.filter((e) => e.id !== edit.id));
+        void dialog.error(err, { title: "Couldn’t update the view" });
+      }
+    },
+    [activeView, company.id, currentTable, detail, dialog],
+  );
+
+  const createView = React.useCallback(async () => {
+    if (!detail || !currentTable) return;
+    const name = await dialog.prompt({
+      title: "New view",
+      placeholder: "View name",
+      defaultValue: `View ${(content?.views.length ?? 0) + 1}`,
+      confirmLabel: "Create",
+    });
+    if (!name) return;
+    setCreatingView(true);
+    try {
+      const created = await api.post<BaseView>(
+        `/api/companies/${company.id}/bases/${detail.base.slug}/tables/${currentTable.id}/views`,
+        { name, filters: [], sorts: [], hiddenFieldIds: [] },
+      );
+      await loadContent(true);
+      setActiveViewId(created.id);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t create the view" });
+    } finally {
+      setCreatingView(false);
+    }
+  }, [company.id, content, currentTable, detail, dialog, loadContent]);
+
+  const renameView = React.useCallback(
+    async (viewId: string) => {
+      if (!detail || !currentTable || !content) return;
+      const v = content.views.find((x) => x.id === viewId);
+      if (!v) return;
+      const name = await dialog.prompt({
+        title: "Rename view",
+        defaultValue: v.name,
+        confirmLabel: "Rename",
+      });
+      if (!name || name === v.name) return;
+      try {
+        await api.patch(
+          `/api/companies/${company.id}/bases/${detail.base.slug}/tables/${currentTable.id}/views/${viewId}`,
+          { name },
+        );
+        await loadContent(true);
+      } catch (err) {
+        void dialog.error(err, { title: "Couldn’t rename the view" });
+      }
+    },
+    [company.id, content, currentTable, detail, dialog, loadContent],
+  );
+
+  const deleteView = React.useCallback(
+    async (viewId: string) => {
+      if (!detail || !currentTable || !content) return;
+      const v = content.views.find((x) => x.id === viewId);
+      if (!v) return;
+      const ok = await dialog.confirm({
+        title: `Delete "${v.name}"?`,
+        message: "Records aren't affected — only this saved view configuration.",
+        confirmLabel: "Delete view",
+        variant: "danger",
+      });
+      if (!ok) return;
+      try {
+        await api.del(
+          `/api/companies/${company.id}/bases/${detail.base.slug}/tables/${currentTable.id}/views/${viewId}`,
+        );
+        if (activeViewId === viewId) setActiveViewId(null);
+        await loadContent(true);
+      } catch (err) {
+        void dialog.error(err, { title: "Couldn’t delete the view" });
+      }
+    },
+    [activeViewId, company.id, content, currentTable, detail, dialog, loadContent],
+  );
+
+  // The drawer below opens a record without changing the URL, so tell Ask AI.
+  const openRecord =
+    openRecordId && contentForTable
+      ? (contentForTable.records.find((r) => r.id === openRecordId) ?? null)
+      : null;
+  useAskAiPageContext(openRecord ? [{ kind: "base_record", id: openRecord.id }] : null);
+
+  if (!detail) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center">
+        <Spinner />
+      </div>
+    );
+  }
+
+  const { base, tables } = detail;
+
+  return (
+    <div className="flex h-full min-h-0">
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Base header */}
+        <div className="flex items-center gap-3 border-b border-slate-200 bg-white px-6 py-3 dark:bg-slate-900 dark:border-slate-700">
+          <div
+            className={
+              "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg " +
+              baseAccent(base.color, "tile")
+            }
+          >
+            <BaseIcon name={base.icon} size={16} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <Breadcrumbs
+              items={[
+                { label: "Bases", to: `/c/${company.slug}/bases` },
+                { label: base.name, to: `/c/${company.slug}/bases/${base.slug}` },
+                ...(currentTable ? [{ label: currentTable.name }] : []),
+              ]}
+            />
+            <h1 className="truncate text-base font-semibold text-slate-900 dark:text-slate-100">
+              {currentTable ? currentTable.name : base.name}
+            </h1>
+          </div>
+          <button
+            onClick={() =>
+              currentTable &&
+              navigate(
+                `/c/${company.slug}/bases/${base.slug}/${currentTable.slug}/forms`,
+              )
+            }
+            disabled={!currentTable}
+            className="flex items-center gap-1.5 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            title="Create and share forms that add rows to this table"
+          >
+            <ClipboardList size={13} /> Forms
+          </button>
+          <button
+            onClick={() =>
+              currentTable &&
+              navigate(
+                `/c/${company.slug}/explore/charts/new?baseId=${base.id}&tableId=${currentTable.id}`,
+              )
+            }
+            disabled={!currentTable}
+            className="flex items-center gap-1.5 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            title="Chart this table in Explore and pin it to a dashboard"
+          >
+            <BarChart3 size={13} /> Chart
+          </button>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="rounded-md p-2 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+            title="Base settings"
+          >
+            <SettingsIcon size={16} />
+          </button>
+        </div>
+
+        <div className="border-b border-slate-200 bg-white px-6 py-1.5 dark:border-slate-700 dark:bg-slate-900">
+          <AsyncResourceTagPicker
+            companyId={company.id}
+            resourceType="base"
+            resourceId={base.id}
+            variant="inline"
+          />
+        </div>
+
+        {/* Grid */}
+        <div className="min-h-0 flex-1 overflow-hidden bg-slate-50 dark:bg-slate-950">
+          {!currentTable ? (
+            <div className="flex h-full items-center justify-center text-sm text-slate-500 dark:text-slate-400">
+              This base has no active tables. Add one or restore an archived table
+              from the sidebar.
+            </div>
+          ) : contentError && !contentForTable ? (
+            <FormError message={contentError} className="m-4" />
+          ) : contentLoading && !contentForTable ? (
+            <div className="flex h-full items-center justify-center">
+              <Spinner />
+            </div>
+          ) : contentForTable ? (
+            <Grid
+              base={base}
+              table={currentTable}
+              tables={tables}
+              content={contentForTable}
+              onReload={() => loadContent(true)}
+              onTablesReload={reloadActive}
+              companyId={company.id}
+              onOpenRecord={(rid) => setOpenRecordId(rid)}
+              activeView={activeView}
+              activeViewId={activeViewId}
+              onSwitchView={setActiveViewId}
+              onCreateView={createView}
+              creatingView={creatingView}
+              onRenameView={renameView}
+              onDeleteView={deleteView}
+              onUpdateActiveView={updateActiveView}
+            />
+          ) : null}
+        </div>
+      </div>
+
+      {openRecordId && currentTable && contentForTable && (() => {
+        const record = contentForTable.records.find((r) => r.id === openRecordId);
+        if (!record) return null;
+        return (
+          <RecordDetailDrawer
+            company={company}
+            base={base}
+            table={currentTable}
+            record={record}
+            fields={contentForTable.fields}
+            linkOptions={contentForTable.linkOptions}
+            resourceOptions={contentForTable.resourceOptions}
+            onClose={() => setOpenRecordId(null)}
+            onChanged={() => loadContent(true)}
+          />
+        );
+      })()}
+
+      {showSettings && (
+        <BaseSettingsModal
+          company={company}
+          base={base}
+          onClose={() => setShowSettings(false)}
+          onSaved={reloadActive}
+          onDeleted={() => {
+            setShowSettings(false);
+            reloadBases();
+            navigate(`/c/${company.slug}/bases`);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────── the grid ────────────────────────────────────────
+
+function Grid({
+  base,
+  table,
+  tables,
+  content,
+  onReload,
+  onTablesReload,
+  companyId,
+  onOpenRecord,
+  activeView,
+  activeViewId,
+  onSwitchView,
+  onCreateView,
+  creatingView,
+  onRenameView,
+  onDeleteView,
+  onUpdateActiveView,
+}: {
+  base: Base;
+  table: BaseTable;
+  tables: BaseTable[];
+  content: BaseTableContent;
+  onReload: () => Promise<void>;
+  onTablesReload: () => Promise<void>;
+  companyId: string;
+  onOpenRecord: (recordId: string) => void;
+  activeView: BaseView | null;
+  activeViewId: string | null;
+  onSwitchView: (id: string) => void;
+  onCreateView: () => Promise<void> | void;
+  creatingView: boolean;
+  onRenameView: (id: string) => Promise<void> | void;
+  onDeleteView: (id: string) => Promise<void> | void;
+  onUpdateActiveView: (
+    patch: Partial<Pick<BaseView, "name" | "filters" | "sorts" | "hiddenFieldIds">>,
+  ) => Promise<void> | void;
+}) {
+  const dialog = useDialog();
+  const { fields, records, linkOptions, resourceOptions, views } = content;
+  const [pendingLinkField, setPendingLinkField] = React.useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [filterOpen, setFilterOpen] = React.useState(false);
+  const [sortOpen, setSortOpen] = React.useState(false);
+  const [hideOpen, setHideOpen] = React.useState(false);
+  const [addingRow, setAddingRow] = React.useState(false);
+  // The row Add row just made: it opens with its first cell ready to type.
+  const [autoEditRowId, setAutoEditRowId] = React.useState<string | null>(null);
+  const [deletingRowId, setDeletingRowId] = React.useState<string | null>(null);
+  const [bulkDeleting, setBulkDeleting] = React.useState(false);
+  const filterBtnRef = React.useRef<HTMLButtonElement>(null);
+  const sortBtnRef = React.useRef<HTMLButtonElement>(null);
+  const hideBtnRef = React.useRef<HTMLButtonElement>(null);
+  const addRowBtnRef = React.useRef<HTMLButtonElement>(null);
+  const lastClickedRowIdRef = React.useRef<string | null>(null);
+
+  // Apply the active view: filter, then sort. The unfiltered set is what the
+  // toolbar's Hide-fields and the bulk bar refer to.
+  const visibleRecords = React.useMemo(() => {
+    if (!activeView) return records;
+    const filtered = applyFilters(records, activeView.filters, fields);
+    return applySorts(filtered, activeView.sorts, fields);
+  }, [activeView, fields, records]);
+
+  const focusAfterDelete = useFocusAfterDelete(visibleRecords, addRowBtnRef);
+
+  // Once the new row has mounted with its cell open, forget it, so a later
+  // remount (a filter toggled off and on) never reopens that cell.
+  React.useEffect(() => {
+    setAutoEditRowId((current) => (current ? null : current));
+  }, [visibleRecords]);
+
+  // Hidden fields are stored on the view; primary fields are never hidden so
+  // a row always has a recognisable label.
+  const visibleFields = React.useMemo(() => {
+    if (!activeView) return fields;
+    const hidden = new Set(activeView.hiddenFieldIds);
+    return fields.filter((f) => f.isPrimary || !hidden.has(f.id));
+  }, [activeView, fields]);
+
+  // Which direction (if any) each field is sorted, so headers can show an
+  // arrow. Reads from the active view's sort list — including multi-column
+  // sorts built in the toolbar's Sort popover.
+  const sortDirByField = React.useMemo(() => {
+    const m = new Map<string, "asc" | "desc">();
+    for (const s of activeView?.sorts ?? []) {
+      if (!m.has(s.fieldId)) m.set(s.fieldId, s.direction);
+    }
+    return m;
+  }, [activeView?.sorts]);
+
+  // Quick single-column sort triggered from a column header. Clicking the
+  // already-active direction clears the sort (toggle off). This replaces any
+  // existing sort — the toolbar's Sort popover stays the place to layer
+  // multiple sort rules.
+  const sortByField = React.useCallback(
+    (fieldId: string, direction: "asc" | "desc" | null) => {
+      if (!direction) {
+        onUpdateActiveView({ sorts: [] });
+        return;
+      }
+      onUpdateActiveView({
+        sorts: [
+          { id: Math.random().toString(36).slice(2, 10), fieldId, direction },
+        ],
+      });
+    },
+    [onUpdateActiveView],
+  );
+
+  // Drop selections that no longer exist (after a filter, delete, or sort).
+  React.useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const stillVisible = new Set(visibleRecords.map((r) => r.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (stillVisible.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [visibleRecords]);
+
+  // Esc clears selection, mirroring most Linear/Airtable-style grids.
+  React.useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && selectedIds.size > 0) {
+        // Whatever is open over the grid answers Escape before this listener and
+        // marks it handled: a modal (the record drawer, the confirm before a bulk
+        // delete) on window capture, a menu or toolbar popover on document. That
+        // key closed the surface; it must not also drop the rows it was opened over.
+        if (e.defaultPrevented) return;
+        // Skip if the user is editing inside an input/textarea — they likely
+        // want to cancel the cell edit, not deselect the row.
+        const tag = (e.target as HTMLElement)?.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        setSelectedIds(new Set());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedIds.size]);
+
+  async function patchCell(row: BaseRecord, fieldId: string, value: unknown) {
+    // Optimistic: update in-place then re-fetch for link-label freshness.
+    row.data[fieldId] = value as never;
+    try {
+      await api.patch(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/rows/${row.id}`,
+        { fieldId, value },
+      );
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t save the cell" });
+      await onReload();
+    }
+  }
+
+  async function addRow() {
+    setAddingRow(true);
+    try {
+      const created = await api.post<BaseRecord>(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/rows`,
+        { data: {} },
+      );
+      setAutoEditRowId(created.id);
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t add the row" });
+    } finally {
+      setAddingRow(false);
+    }
+  }
+
+  async function deleteRow(row: BaseRecord) {
+    // Focus follows a deleted row only for someone driving the grid from the
+    // keyboard. Nothing asks before a row goes, and a click leaves no focus
+    // ring, so a mouse user must not be left on a hidden Delete that their
+    // next Space or Enter would fire.
+    const fromKeyboard = document.activeElement?.matches(":focus-visible") ?? false;
+    setDeletingRowId(row.id);
+    try {
+      await api.del(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/rows/${row.id}`,
+      );
+      if (fromKeyboard) focusAfterDelete.rowDeleted(row.id);
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t delete the row" });
+    } finally {
+      setDeletingRowId(null);
+    }
+  }
+
+  function toggleSelect(rowId: string, shiftKey: boolean) {
+    // Shift-click extends from the last-clicked row to the current one across
+    // the *visible* set, the same behaviour as Airtable / Linear / Finder.
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (shiftKey && lastClickedRowIdRef.current) {
+        const ids = visibleRecords.map((r) => r.id);
+        const a = ids.indexOf(lastClickedRowIdRef.current);
+        const b = ids.indexOf(rowId);
+        if (a !== -1 && b !== -1) {
+          const [from, to] = a < b ? [a, b] : [b, a];
+          for (let i = from; i <= to; i += 1) next.add(ids[i]);
+          return next;
+        }
+      }
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
+      return next;
+    });
+    lastClickedRowIdRef.current = rowId;
+  }
+
+  function toggleSelectAll() {
+    setSelectedIds((prev) => {
+      if (prev.size === visibleRecords.length && visibleRecords.length > 0) {
+        return new Set();
+      }
+      return new Set(visibleRecords.map((r) => r.id));
+    });
+  }
+
+  async function bulkDelete() {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    const ok = await dialog.confirm({
+      title: `Delete ${ids.length} ${ids.length === 1 ? "row" : "rows"}?`,
+      message:
+        "They will be permanently removed along with any comments and attachments.",
+      confirmLabel: `Delete ${ids.length === 1 ? "row" : "rows"}`,
+      variant: "danger",
+    });
+    if (!ok) return;
+    setBulkDeleting(true);
+    try {
+      await api.post<{ ok: true; deleted: number }>(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/rows/bulk-delete`,
+        { ids },
+      );
+      setSelectedIds(new Set());
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, {
+        title: `Couldn’t delete the ${ids.length === 1 ? "row" : "rows"}`,
+      });
+    } finally {
+      setBulkDeleting(false);
+    }
+  }
+
+  async function addField(type: BaseFieldType) {
+    if (type === "link") {
+      // Link fields need both a name AND a target table — launch the richer
+      // dedicated dialog below instead of two serial prompts.
+      const choices = tables.filter((t) => t.id !== table.id && !t.archivedAt);
+      if (choices.length === 0) {
+        await dialog.alert({
+          title: "No table to link",
+          message: "Add another table in this base first, then you can link to it.",
+        });
+        return;
+      }
+      setPendingLinkField("open");
+      return;
+    }
+    const name = await dialog.prompt({
+      title: `Add ${FIELD_TYPE_META[type].label.toLowerCase()} field`,
+      placeholder: "Field name",
+      defaultValue: FIELD_TYPE_META[type].label,
+      confirmLabel: "Add field",
+    });
+    if (!name) return;
+    const config: Record<string, unknown> = {};
+    if (type === "select" || type === "multiselect") {
+      config.options = [];
+    }
+    try {
+      await api.post<BaseField>(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/fields`,
+        { name, type, config },
+      );
+      await onReload();
+      await onTablesReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t add the field" });
+    }
+  }
+
+  async function createLinkField(name: string, targetTableId: string) {
+    try {
+      await api.post<BaseField>(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/fields`,
+        { name, type: "link", config: { targetTableId } },
+      );
+      await onReload();
+      await onTablesReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t add the link field" });
+    }
+  }
+
+  async function patchField(f: BaseField, patch: Partial<BaseField>) {
+    try {
+      await api.patch(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/fields/${f.id}`,
+        patch,
+      );
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t update the field" });
+    }
+  }
+
+  async function deleteField(f: BaseField) {
+    const ok = await dialog.confirm({
+      title: `Delete "${f.name}"?`,
+      message: "This column and all its values across every row will be removed.",
+      confirmLabel: "Delete field",
+      variant: "danger",
+    });
+    if (!ok) return;
+    try {
+      await api.del(
+        `/api/companies/${companyId}/bases/${base.slug}/tables/${table.id}/fields/${f.id}`,
+      );
+      await onReload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t delete the field" });
+    }
+  }
+
+  const filterCount = activeView?.filters.length ?? 0;
+  const sortCount = activeView?.sorts.length ?? 0;
+  const hiddenCount = activeView?.hiddenFieldIds.length ?? 0;
+  const allSelected =
+    visibleRecords.length > 0 && selectedIds.size === visibleRecords.length;
+  const someSelected = selectedIds.size > 0 && !allSelected;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {/* View tabs + toolbar: outside the scrollport, so scrolling the grid
+          sideways never drags them off-screen. */}
+      <div className="shrink-0 border-b border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900">
+        <ViewTabs
+          views={views.map((v) => ({ id: v.id, name: v.name }))}
+          activeViewId={activeViewId}
+          onSwitch={onSwitchView}
+          onCreate={() => void onCreateView()}
+          creating={creatingView}
+          onRename={(id) => void onRenameView(id)}
+          onDelete={(id) => void onDeleteView(id)}
+        />
+        {/* Toolbar */}
+        <div className="flex items-center gap-1 border-t border-slate-100 px-3 py-1.5 dark:border-slate-800">
+          <ToolbarButton
+            buttonRef={filterBtnRef}
+            active={filterCount > 0}
+            count={filterCount}
+            icon={<FilterIcon size={12} />}
+            label="Filter"
+            onClick={() => setFilterOpen((s) => !s)}
+          />
+          <ToolbarButton
+            buttonRef={sortBtnRef}
+            active={sortCount > 0}
+            count={sortCount}
+            icon={<ArrowUpDown size={12} />}
+            label="Sort"
+            onClick={() => setSortOpen((s) => !s)}
+          />
+          <ToolbarButton
+            buttonRef={hideBtnRef}
+            active={hiddenCount > 0}
+            count={hiddenCount}
+            icon={<EyeOff size={12} />}
+            label={hiddenCount > 0 ? "Hidden fields" : "Hide fields"}
+            onClick={() => setHideOpen((s) => !s)}
+          />
+          <div className="ml-auto text-[11px] text-slate-400 dark:text-slate-500">
+            {filterCount > 0 || sortCount > 0
+              ? `${visibleRecords.length} of ${records.length} ${records.length === 1 ? "row" : "rows"}`
+              : `${records.length} ${records.length === 1 ? "row" : "rows"}`}
+          </div>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 p-4">
+        <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          {/* The grid's only scrollport, both axes. Sticky cells anchor to it,
+              which is why the card's overflow-hidden sits on the parent and not
+              here. Borders are separated rather than collapsed: a collapsed
+              table paints cell borders itself and drops them off sticky cells
+              mid-scroll. */}
+          <div className="min-h-0 flex-1 overflow-auto">
+            <table className="w-full border-separate border-spacing-0 text-sm">
+              <thead>
+                <tr>
+                  <th className="sticky left-0 top-0 z-30 w-10 border-b border-r border-slate-200 bg-slate-50 px-0 py-0 dark:border-slate-700 dark:bg-slate-900">
+                    <SelectAllCell
+                      allSelected={allSelected}
+                      someSelected={someSelected}
+                      onToggle={toggleSelectAll}
+                      disabled={visibleRecords.length === 0}
+                    />
+                  </th>
+                  {visibleFields.map((f) => (
+                    <FieldHeader
+                      key={f.id}
+                      field={f}
+                      tables={tables}
+                      sortDirection={sortDirByField.get(f.id) ?? null}
+                      sortable={!!activeView}
+                      onSort={(dir) => sortByField(f.id, dir)}
+                      onPatch={(p) => patchField(f, p)}
+                      onDelete={() => deleteField(f)}
+                    />
+                  ))}
+                  <th className="sticky top-0 z-20 border-b border-slate-200 bg-slate-50 px-1 py-1 dark:border-slate-700 dark:bg-slate-900">
+                    <AddFieldButton onAdd={addField} />
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRecords.map((r, idx) => (
+                  <Row
+                    key={r.id}
+                    index={idx + 1}
+                    record={r}
+                    fields={visibleFields}
+                    linkOptions={linkOptions}
+                    resourceOptions={resourceOptions}
+                    selected={selectedIds.has(r.id)}
+                    onToggleSelect={(shift) => toggleSelect(r.id, shift)}
+                    onPatchCell={(fid, v) => patchCell(r, fid, v)}
+                    onDelete={() => deleteRow(r)}
+                    deleting={deletingRowId === r.id}
+                    deleteButtonRef={focusAfterDelete.deleteButtonRef(r.id)}
+                    onExpand={() => onOpenRecord(r.id)}
+                    startEditingFieldId={
+                      // A new row opens on its primary field, unless that is
+                      // a checkbox, which has nothing to type.
+                      r.id === autoEditRowId
+                        ? (visibleFields.find((f) => f.isPrimary && f.type !== "checkbox")?.id ??
+                          null)
+                        : null
+                    }
+                  />
+                ))}
+                <tr>
+                  <td className="sticky left-0 z-10 w-10 border-r border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900" />
+                  <td
+                    colSpan={visibleFields.length + 1}
+                    className="bg-slate-50 dark:bg-slate-900"
+                  >
+                    {/* Its focus ring is drawn inside, where the sticky header,
+                        the row numbers and the scroller's edge can't hide it. */}
+                    <button
+                      ref={addRowBtnRef}
+                      onClick={addRow}
+                      disabled={addingRow}
+                      aria-busy={addingRow || undefined}
+                      className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-offset-[-2px] dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                    >
+                      {addingRow ? <ButtonSpinner size={12} /> : <Plus size={12} />} Add row
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            {records.length === 0 ? (
+              <div className="sticky left-0 p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                This table is empty. Click <span className="font-semibold">Add row</span> above to start.
+              </div>
+            ) : visibleRecords.length === 0 ? (
+              <div className="sticky left-0 p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+                No rows match the current filters in this view.
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+
+      {/* Filter / sort / hide popovers — anchored by the toolbar buttons. */}
+      {activeView && (
+        <>
+          <FilterPopover
+            open={filterOpen}
+            onClose={() => setFilterOpen(false)}
+            triggerRef={filterBtnRef}
+            fields={fields}
+            filters={activeView.filters}
+            linkOptions={linkOptions}
+            resourceOptions={resourceOptions}
+            onChange={(filters) => void onUpdateActiveView({ filters })}
+          />
+          <SortPopover
+            open={sortOpen}
+            onClose={() => setSortOpen(false)}
+            triggerRef={sortBtnRef}
+            fields={fields}
+            sorts={activeView.sorts}
+            onChange={(sorts) => void onUpdateActiveView({ sorts })}
+          />
+          <HideFieldsPopover
+            open={hideOpen}
+            onClose={() => setHideOpen(false)}
+            triggerRef={hideBtnRef}
+            fields={fields}
+            hiddenFieldIds={activeView.hiddenFieldIds}
+            onChange={(hiddenFieldIds) => void onUpdateActiveView({ hiddenFieldIds })}
+          />
+        </>
+      )}
+
+      {/* Bulk-action bar floats at the bottom while rows are selected. */}
+      {selectedIds.size > 0 && (
+        <BulkActionBar
+          count={selectedIds.size}
+          deleting={bulkDeleting}
+          onClear={() => setSelectedIds(new Set())}
+          onDelete={() => void bulkDelete()}
+        />
+      )}
+
+      {pendingLinkField && (
+        <AddLinkFieldModal
+          tables={tables.filter((t) => t.id !== table.id && !t.archivedAt)}
+          onCancel={() => setPendingLinkField(null)}
+          onCreate={async (name, targetTableId) => {
+            setPendingLinkField(null);
+            await createLinkField(name, targetTableId);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SelectAllCell({
+  allSelected,
+  someSelected,
+  onToggle,
+  disabled,
+}: {
+  allSelected: boolean;
+  someSelected: boolean;
+  onToggle: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      disabled={disabled}
+      className={clsx(
+        "flex h-9 w-full items-center justify-center text-slate-400 disabled:opacity-40",
+        !disabled && "hover:bg-slate-100 dark:hover:bg-slate-800",
+      )}
+      aria-label={allSelected ? "Clear selection" : "Select all rows"}
+      title={allSelected ? "Clear selection" : "Select all"}
+    >
+      <span
+        className={clsx(
+          "flex h-4 w-4 items-center justify-center rounded border",
+          allSelected || someSelected
+            ? "border-indigo-500 bg-indigo-500 text-white"
+            : "border-slate-300 dark:border-slate-600",
+        )}
+      >
+        {allSelected ? (
+          <Check size={11} strokeWidth={3} />
+        ) : someSelected ? (
+          <span className="block h-0.5 w-2 bg-white" />
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+function BulkActionBar({
+  count,
+  deleting,
+  onClear,
+  onDelete,
+}: {
+  count: number;
+  deleting: boolean;
+  onClear: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+      <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 py-1.5 shadow-lg backdrop-blur dark:border-slate-700 dark:bg-slate-900/95">
+        <span className="text-xs font-medium text-slate-700 dark:text-slate-200">
+          {count} {count === 1 ? "row" : "rows"} selected
+        </span>
+        <span className="h-4 w-px bg-slate-200 dark:bg-slate-700" />
+        <button
+          onClick={onDelete}
+          disabled={deleting}
+          aria-busy={deleting || undefined}
+          className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/30"
+        >
+          {deleting ? <ButtonSpinner size={12} /> : <Trash2 size={12} />} Delete
+        </button>
+        <button
+          onClick={onClear}
+          className="rounded-full px-2.5 py-1 text-xs text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AddLinkFieldModal({
+  tables,
+  onCancel,
+  onCreate,
+}: {
+  tables: BaseTable[];
+  onCancel: () => void;
+  onCreate: (name: string, targetTableId: string) => void | Promise<void>;
+}) {
+  const [name, setName] = React.useState("");
+  const [targetTableId, setTargetTableId] = React.useState(tables[0]?.id ?? "");
+  // On the shared overlay stack like Modal and Dialog: it traps Tab, moves focus
+  // in and back out, and answers Escape before the grid sees the key. A window
+  // listener of its own ran after the grid's, so the first Escape cleared the
+  // selected rows and left this open.
+  const { titleId, panelRef } = useModalChrome({ open: true, onDismiss: onCancel });
+
+  const canSubmit = name.trim() && targetTableId;
+
+  return createPortal(
+    <ModalScrim layer="dialog" onDismiss={onCancel}>
+      <ModalPanel ref={panelRef} size="sm" labelledBy={titleId}>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200/70 px-5 py-3 dark:border-slate-800">
+          <h2
+            id={titleId}
+            className="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100"
+          >
+            Add link field
+          </h2>
+          <ModalCloseButton onClick={onCancel} />
+        </div>
+        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto p-5">
+          <Input
+            autoFocus
+            label="Field name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Company"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && canSubmit) {
+                void onCreate(name.trim(), targetTableId);
+              }
+            }}
+          />
+          <Select
+            label="Link to table"
+            value={targetTableId}
+            onChange={(e) => setTargetTableId(e.target.value)}
+          >
+            {tables.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+              </option>
+            ))}
+          </Select>
+          <div className="mt-1 flex justify-end gap-2">
+            <Button variant="secondary" size="sm" onClick={onCancel}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={!canSubmit}
+              onClick={() => void onCreate(name.trim(), targetTableId)}
+            >
+              Add field
+            </Button>
+          </div>
+        </div>
+      </ModalPanel>
+    </ModalScrim>,
+    document.body,
+  );
+}
+
+// ─────────────────────────── row + cells ─────────────────────────────────────
+
+// A row's checkbox and its Open and Delete buttons show on hover, while keyboard
+// focus is anywhere in the row, and always on touch screens, where nothing
+// hovers. Otherwise they are transparent rather than `hidden`: `display: none`
+// took them out of the tab order, so no keyboard could reach them, and left the
+// record drawer nothing to hand focus back to when it closed.
+const ROW_CONTROL_CLASS =
+  "opacity-0 focus-visible:opacity-100 group-hover:opacity-100 group-has-[:focus-visible]:opacity-100 [@media(hover:none)]:opacity-100";
+// The row number gives the checkbox its place whenever the checkbox shows.
+const ROW_NUMBER_CLASS =
+  "group-hover:opacity-0 group-has-[:focus-visible]:opacity-0 [@media(hover:none)]:opacity-0";
+
+function Row({
+  index,
+  record,
+  fields,
+  linkOptions,
+  resourceOptions,
+  selected,
+  onToggleSelect,
+  onPatchCell,
+  onDelete,
+  deleting,
+  deleteButtonRef,
+  onExpand,
+  startEditingFieldId = null,
+}: {
+  index: number;
+  record: BaseRecord;
+  fields: BaseField[];
+  linkOptions: Record<string, BaseLinkOption[]>;
+  resourceOptions: Record<string, BaseResourceOption[]>;
+  selected: boolean;
+  onToggleSelect: (shiftKey: boolean) => void;
+  onPatchCell: (fieldId: string, value: unknown) => void;
+  onDelete: () => void;
+  deleting: boolean;
+  deleteButtonRef: React.Ref<HTMLButtonElement>;
+  onExpand: () => void;
+  /** A row Add row just made opens with this cell ready to type. */
+  startEditingFieldId?: string | null;
+}) {
+  const [editingField, setEditingField] = React.useState<string | null>(startEditingFieldId);
+  const cells = React.useRef(new Map<string, HTMLTableCellElement>());
+
+  // Closing an editor (Enter, Esc, a commit) unmounts the box that had focus.
+  // Unless the person has moved on — clicked another cell — focus returns to
+  // the cell, so the keyboard carries on from where it was.
+  function closeEditor(fieldId: string) {
+    setEditingField(null);
+    window.requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
+      cells.current.get(fieldId)?.focus();
+    });
+  }
+
+  return (
+    <tr
+      className={clsx(
+        "group",
+        selected
+          ? "bg-indigo-50/60 dark:bg-indigo-500/10"
+          : "hover:bg-indigo-50/20 dark:hover:bg-indigo-500/5",
+      )}
+    >
+      <td
+        className={clsx(
+          "sticky left-0 z-10 w-10 border-r border-r-slate-200 px-0 text-center text-[11px] text-slate-400 dark:border-r-slate-700 dark:text-slate-500",
+          index > 1 && "border-t border-t-slate-100 dark:border-t-slate-800",
+          selected
+            ? "bg-indigo-50/60 dark:bg-indigo-500/10"
+            : "bg-white group-hover:bg-indigo-50/20 dark:bg-slate-900",
+        )}
+      >
+        {/* The row number and the selection checkbox share one grid cell, so
+            swapping one for the other moves neither. A selected row shows only
+            its checkbox. The number lets the pointer through: faded out, its
+            opacity below 1 paints it over the checkbox, and it took the click. */}
+        <div className="grid h-9 place-items-center">
+          {!selected && (
+            <span className={clsx("pointer-events-none col-start-1 row-start-1", ROW_NUMBER_CLASS)}>
+              {index}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleSelect(e.shiftKey);
+            }}
+            className={clsx(
+              "col-start-1 row-start-1 inline-flex rounded p-0.5",
+              !selected && ROW_CONTROL_CLASS,
+            )}
+            aria-label={selected ? "Deselect row" : "Select row"}
+            title="Click to select; shift-click for range"
+          >
+            <span
+              className={clsx(
+                "flex h-3.5 w-3.5 items-center justify-center rounded border",
+                selected
+                  ? "border-indigo-500 bg-indigo-500 text-white"
+                  : "border-slate-300 dark:border-slate-600",
+              )}
+            >
+              {selected && <Check size={10} strokeWidth={3} />}
+            </span>
+          </button>
+        </div>
+      </td>
+      {fields.map((f) => {
+        const editing = editingField === f.id;
+        const value = record.data[f.id];
+        return (
+          <td
+            key={f.id}
+            className={clsx(
+              "relative h-9 min-w-[140px] border-r border-slate-100 px-0 align-middle dark:border-slate-800",
+              index > 1 && "border-t",
+              editing && "ring-2 ring-inset ring-indigo-400",
+            )}
+            onClick={() => {
+              if (f.type === "checkbox") {
+                onPatchCell(f.id, !value);
+                return;
+              }
+              if (!editing) setEditingField(f.id);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Delete" || e.key === "Backspace") {
+                if (editing) return;
+                if (value !== undefined && value !== null && value !== "") {
+                  onPatchCell(f.id, null);
+                }
+              }
+              // Enter on a focused cell edits it, as a click does.
+              if (e.key === "Enter" && !editing && e.target === e.currentTarget) {
+                e.preventDefault();
+                if (f.type === "checkbox") onPatchCell(f.id, !value);
+                else setEditingField(f.id);
+              }
+            }}
+            ref={(cell) => {
+              if (cell) cells.current.set(f.id, cell);
+              else cells.current.delete(f.id);
+            }}
+            tabIndex={0}
+          >
+            {editing && f.type !== "checkbox" ? (
+              <CellEditor
+                field={f}
+                value={value}
+                linkOptionsByTable={linkOptions}
+                resourceOptions={resourceOptions}
+                autoFocus
+                onCommit={(next) => onPatchCell(f.id, next)}
+                onClose={() => closeEditor(f.id)}
+              />
+            ) : (
+              <div className="flex h-full items-center px-2 text-sm">
+                <CellView
+                  field={f}
+                  value={value}
+                  linkOptionsByTable={linkOptions}
+                  resourceOptions={resourceOptions}
+                />
+              </div>
+            )}
+          </td>
+        );
+      })}
+      <td
+        className={clsx(
+          "border-slate-100 px-1 align-middle dark:border-slate-800",
+          index > 1 && "border-t",
+        )}
+      >
+        <div className="flex h-9 items-center justify-center gap-1">
+          <button
+            onClick={onExpand}
+            className={clsx(
+              "inline-flex rounded p-1 text-slate-400 hover:bg-indigo-50 hover:text-indigo-600 dark:hover:bg-indigo-950/30",
+              ROW_CONTROL_CLASS,
+            )}
+            title="Open record"
+          >
+            <Maximize2 size={13} />
+          </button>
+          {/* Busy rather than disabled while its delete runs, like a record's
+              comment and file rows: a disabled button drops focus, and this
+              one holds it until the row it deletes is gone. Shown while busy,
+              too, since the pointer may have left the row. */}
+          <button
+            ref={deleteButtonRef}
+            onClick={deleting ? undefined : onDelete}
+            onKeyDown={(e) => {
+              // Focus moves on to the next row's Delete as each row goes, so a
+              // held Enter would delete its way down the table: only a fresh
+              // press counts.
+              if (e.repeat) e.preventDefault();
+            }}
+            aria-disabled={deleting || undefined}
+            aria-busy={deleting || undefined}
+            className={clsx(
+              "inline-flex rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 aria-busy:opacity-100 dark:hover:bg-red-950/30",
+              ROW_CONTROL_CLASS,
+            )}
+            title="Delete row"
+          >
+            {deleting ? <ButtonSpinner size={13} /> : <Trash2 size={13} />}
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ─────────────────────────── field header ────────────────────────────────────
+
+function FieldHeader({
+  field,
+  tables,
+  sortDirection,
+  sortable,
+  onSort,
+  onPatch,
+  onDelete,
+}: {
+  field: BaseField;
+  tables: BaseTable[];
+  sortDirection: "asc" | "desc" | null;
+  sortable: boolean;
+  onSort: (direction: "asc" | "desc" | null) => void;
+  onPatch: (p: Partial<BaseField>) => void;
+  onDelete: () => void;
+}) {
+  const Meta = FIELD_TYPE_META[field.type];
+  const Icon = Meta.icon;
+  const targetTable = (() => {
+    if (field.type !== "link") return null;
+    const cfg = field.config as { targetTableId?: string };
+    return tables.find((t) => t.id === cfg.targetTableId) ?? null;
+  })();
+
+  return (
+    <th className="sticky top-0 z-20 min-w-[140px] border-b border-r border-slate-200 bg-slate-50 px-0 text-left align-middle dark:border-slate-700 dark:bg-slate-900">
+      <Menu
+        width={280}
+        align="left"
+        trigger={({ ref, onClick, open }) => (
+          <button
+            ref={ref}
+            onClick={onClick}
+            className={clsx(
+              "flex w-full items-center gap-1.5 px-2 py-2 text-left",
+              open ? "bg-slate-100 dark:bg-slate-800" : "hover:bg-slate-100 dark:hover:bg-slate-800",
+            )}
+          >
+            <Icon size={12} className="shrink-0 text-slate-500 dark:text-slate-400" />
+            {field.isPrimary && (
+              <Key size={10} className="shrink-0 text-amber-500" />
+            )}
+            <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700 dark:text-slate-200">
+              {field.name}
+            </span>
+            {sortDirection &&
+              (sortDirection === "asc" ? (
+                <ArrowUp size={11} className="shrink-0 text-indigo-500" />
+              ) : (
+                <ArrowDown size={11} className="shrink-0 text-indigo-500" />
+              ))}
+            <ChevronDown size={11} className="text-slate-400 dark:text-slate-500" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <FieldMenu
+            field={field}
+            targetTable={targetTable}
+            sortDirection={sortDirection}
+            sortable={sortable}
+            onSort={onSort}
+            onPatch={(p) => {
+              onPatch(p);
+            }}
+            onDelete={() => {
+              close();
+              onDelete();
+            }}
+            onClose={close}
+          />
+        )}
+      </Menu>
+    </th>
+  );
+}
+
+function FieldMenu({
+  field,
+  targetTable,
+  sortDirection,
+  sortable,
+  onSort,
+  onPatch,
+  onDelete,
+  onClose,
+}: {
+  field: BaseField;
+  targetTable: BaseTable | null;
+  sortDirection: "asc" | "desc" | null;
+  sortable: boolean;
+  onSort: (direction: "asc" | "desc" | null) => void;
+  onPatch: (p: Partial<BaseField>) => void;
+  onDelete: () => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = React.useState(field.name);
+  React.useEffect(() => setName(field.name), [field.id, field.name]);
+
+  function saveName() {
+    const n = name.trim();
+    if (n && n !== field.name) onPatch({ name: n });
+  }
+
+  const sortLabels = sortDirectionLabels(field.type);
+
+  return (
+    <div className="flex flex-col">
+      <div className="p-2">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onBlur={saveName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              (e.target as HTMLInputElement).blur();
+              onClose();
+            }
+          }}
+          className="w-full rounded-md border border-slate-200 bg-white px-2 py-1.5 text-sm focus:border-indigo-400 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        />
+        <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+          {React.createElement(FIELD_TYPE_META[field.type].icon, { size: 10 })}
+          {FIELD_TYPE_META[field.type].label}
+          {field.type === "link" && targetTable && <span>→ {targetTable.name}</span>}
+        </div>
+      </div>
+      <MenuSeparator />
+
+      {sortable && (
+        <>
+          <MenuItem
+            icon={
+              <ArrowUp
+                size={12}
+                className={sortDirection === "asc" ? "text-indigo-600 dark:text-indigo-400" : "text-slate-400"}
+              />
+            }
+            label={sortLabels.asc}
+            active={sortDirection === "asc"}
+            hint={sortDirection === "asc" ? <Check size={12} className="text-indigo-600 dark:text-indigo-400" /> : undefined}
+            onSelect={() => {
+              onSort(sortDirection === "asc" ? null : "asc");
+              onClose();
+            }}
+          />
+          <MenuItem
+            icon={
+              <ArrowDown
+                size={12}
+                className={sortDirection === "desc" ? "text-indigo-600 dark:text-indigo-400" : "text-slate-400"}
+              />
+            }
+            label={sortLabels.desc}
+            active={sortDirection === "desc"}
+            hint={sortDirection === "desc" ? <Check size={12} className="text-indigo-600 dark:text-indigo-400" /> : undefined}
+            onSelect={() => {
+              onSort(sortDirection === "desc" ? null : "desc");
+              onClose();
+            }}
+          />
+          <MenuSeparator />
+        </>
+      )}
+
+      {(field.type === "select" || field.type === "multiselect") && (
+        <div className="p-2">
+          <MenuHeader>Options</MenuHeader>
+          <SelectOptionsEditor
+            options={(field.config as { options?: SelectOption[] })?.options ?? []}
+            onChange={(opts) =>
+              onPatch({ config: { ...field.config, options: opts } } as Partial<BaseField>)
+            }
+          />
+        </div>
+      )}
+
+      {!field.isPrimary && (
+        <MenuItem
+          icon={<Key size={12} className="text-amber-500" />}
+          label="Make primary"
+          onSelect={() => {
+            onPatch({ isPrimary: true });
+            onClose();
+          }}
+        />
+      )}
+      <MenuSeparator />
+      <MenuItem
+        icon={<Trash2 size={12} className="text-red-500" />}
+        label={<span className="text-red-600">Delete field</span>}
+        onSelect={onDelete}
+      />
+    </div>
+  );
+}
+
+function AddFieldButton({ onAdd }: { onAdd: (t: BaseFieldType) => void }) {
+  return (
+    <Menu
+      width={240}
+      align="right"
+      trigger={({ ref, onClick, open }) => (
+        <button
+          ref={ref}
+          onClick={onClick}
+          className={clsx(
+            "flex h-8 w-full items-center justify-center rounded text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800",
+            open && "bg-slate-100 dark:bg-slate-800",
+          )}
+          title="Add field"
+        >
+          <Plus size={14} />
+        </button>
+      )}
+    >
+      {(close) => {
+        const all = Object.keys(FIELD_TYPE_META) as BaseFieldType[];
+        const basic = all.filter((t) => !isBaseResourceFieldType(t));
+        const resource = all.filter(isBaseResourceFieldType);
+        const item = (t: BaseFieldType) => {
+          const m = FIELD_TYPE_META[t];
+          const Icon = m.icon;
+          return (
+            <MenuItem
+              key={t}
+              icon={<Icon size={12} />}
+              label={<span>{m.label}</span>}
+              hint={<span className="text-[10px]">{m.desc}</span>}
+              onSelect={() => {
+                onAdd(t);
+                close();
+              }}
+            />
+          );
+        };
+        return (
+          <>
+            <MenuHeader>Add field</MenuHeader>
+            {basic.map(item)}
+            <MenuSeparator />
+            <MenuHeader>Link to Genosyn</MenuHeader>
+            {resource.map(item)}
+          </>
+        );
+      }}
+    </Menu>
+  );
+}
+
+// ─────────────────────────── settings modal ─────────────────────────────────
+
+function BaseSettingsModal({
+  company,
+  base,
+  onClose,
+  onSaved,
+  onDeleted,
+}: {
+  company: Company;
+  base: Base;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+  onDeleted: () => void;
+}) {
+  const dialog = useDialog();
+  const [name, setName] = React.useState(base.name);
+  const [description, setDescription] = React.useState(base.description);
+  const [icon, setIcon] = React.useState(base.icon);
+  const [color, setColor] = React.useState(base.color);
+  const [busy, setBusy] = React.useState<null | "save" | "delete">(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [tab, setTab] = React.useState<"general" | "access">("general");
+  // On the shared overlay stack: Escape closes this — before the grid behind
+  // could take the key and clear its selection — Tab stays inside, and focus
+  // returns to the settings button. It had no keyboard handling of its own.
+  const { titleId, panelRef } = useModalChrome({ open: true, onDismiss: onClose });
+
+  async function save() {
+    setBusy("save");
+    setError(null);
+    try {
+      await api.patch(`/api/companies/${company.id}/bases/${base.slug}`, {
+        name,
+        description,
+        icon,
+        color,
+      });
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove() {
+    const ok = await dialog.confirm({
+      title: `Delete "${base.name}"?`,
+      message: "Every table, field, and row in this base will be permanently removed.",
+      confirmLabel: "Delete base",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await api.del(`/api/companies/${company.id}/bases/${base.slug}`);
+      onDeleted();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return createPortal(
+    <ModalScrim onDismiss={onClose}>
+      <ModalPanel ref={panelRef} size="md" labelledBy={titleId}>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200/70 px-5 py-3 dark:border-slate-800">
+          <h2
+            id={titleId}
+            className="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-100"
+          >
+            Base settings
+          </h2>
+          <ModalCloseButton onClick={onClose} />
+        </div>
+        <div className="flex shrink-0 gap-1 border-b border-slate-200/70 px-5 dark:border-slate-800">
+          <TabButton active={tab === "general"} onClick={() => setTab("general")}>
+            General
+          </TabButton>
+          <TabButton active={tab === "access"} onClick={() => setTab("access")}>
+            <Users size={12} /> AI access
+          </TabButton>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {tab === "general" ? (
+            <div className="flex flex-col gap-4 p-5">
+              <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+              <div className="flex flex-col gap-1">
+                <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  Description
+                </label>
+                <textarea
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  rows={2}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:ring-indigo-500/25"
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  Icon
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {BASE_ICON_NAMES.map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => setIcon(n)}
+                      className={clsx(
+                        "flex h-8 w-8 items-center justify-center rounded-md border",
+                        icon === n
+                          ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-500/10"
+                          : "border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
+                      )}
+                      title={n}
+                    >
+                      <BaseIcon name={n} size={14} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  Color
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {BASE_COLORS.map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => setColor(c)}
+                      className={clsx(
+                        "flex h-8 w-8 items-center justify-center rounded-md border",
+                        color === c
+                          ? "border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-800"
+                          : "border-slate-200 dark:border-slate-700",
+                        baseAccent(c, "tile"),
+                      )}
+                      title={c}
+                    >
+                      <BaseIcon name={icon} size={12} />
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <FormError message={error} />
+
+              <div className="mt-2 flex items-center justify-between">
+                <Button
+                  variant="danger"
+                  onClick={remove}
+                  loading={busy === "delete"}
+                  disabled={busy !== null}
+                >
+                  <Trash2 size={14} /> Delete base
+                </Button>
+                <div className="flex gap-2">
+                  <Button variant="secondary" onClick={onClose} disabled={busy !== null}>
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={save}
+                    loading={busy === "save"}
+                    disabled={busy !== null || !name.trim()}
+                  >
+                    {busy === "save" ? "Saving…" : "Save"}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <BaseAccessTab company={company} base={base} onClose={onClose} />
+          )}
+        </div>
+      </ModalPanel>
+    </ModalScrim>,
+    document.body,
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        "flex items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium transition",
+        active
+          ? "border-indigo-500 text-indigo-700 dark:text-indigo-300"
+          : "border-transparent text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function BaseAccessTab({
+  company,
+  base,
+  onClose,
+}: {
+  company: Company;
+  base: Base;
+  onClose: () => void;
+}) {
+  const dialog = useDialog();
+  const [grants, setGrants] = React.useState<BaseGrant[] | null>(null);
+  const [employees, setEmployees] = React.useState<Employee[]>([]);
+  const [picker, setPicker] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [grantError, setGrantError] = React.useState<string | null>(null);
+  const [grantingId, setGrantingId] = React.useState<string | null>(null);
+  const [revokingId, setRevokingId] = React.useState<string | null>(null);
+
+  const reload = React.useCallback(async () => {
+    try {
+      const [g, emps] = await Promise.all([
+        api.get<BaseGrant[]>(
+          `/api/companies/${company.id}/bases/${base.slug}/grants`,
+        ),
+        api.get<Employee[]>(`/api/companies/${company.id}/employees`),
+      ]);
+      setGrants(g);
+      setEmployees(emps);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load access"));
+      setGrants([]);
+    }
+  }, [base.slug, company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  const grantedIds = React.useMemo(
+    () => new Set((grants ?? []).map((g) => g.employeeId)),
+    [grants],
+  );
+  const grantable = React.useMemo(
+    () => employees.filter((e) => !grantedIds.has(e.id)),
+    [employees, grantedIds],
+  );
+
+  async function grant(emp: Employee) {
+    setGrantError(null);
+    setGrantingId(emp.id);
+    try {
+      await api.post<BaseGrant>(
+        `/api/companies/${company.id}/bases/${base.slug}/grants`,
+        { employeeId: emp.id },
+      );
+      setPicker(false);
+      reload();
+    } catch (err) {
+      setGrantError(errorMessage(err));
+    } finally {
+      setGrantingId(null);
+    }
+  }
+
+  async function revoke(g: BaseGrant) {
+    const ok = await dialog.confirm({
+      title: `Revoke ${g.employee?.name ?? "employee"}?`,
+      message: `They lose access to this base on their next spawn.`,
+      confirmLabel: "Revoke",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setRevokingId(g.id);
+    try {
+      await api.del(
+        `/api/companies/${company.id}/bases/${base.slug}/grants/${g.employeeId}`,
+      );
+      setGrants((prev) => (prev ?? []).filter((x) => x.id !== g.id));
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t revoke access" });
+    } finally {
+      setRevokingId(null);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 p-5">
+      <div>
+        <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+          AI employees with access
+        </h3>
+        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+          Granted employees can read and write records in this base through
+          their MCP tools on their next spawn.
+        </p>
+      </div>
+
+      {loadError ? (
+        <FormError message={loadError} />
+      ) : grants === null ? (
+        <div className="flex justify-center py-6">
+          <Spinner size={16} />
+        </div>
+      ) : grants.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-slate-200 p-4 text-center dark:border-slate-700">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            No AI employees can access this base yet.
+          </p>
+          <Button
+            size="sm"
+            onClick={() => setPicker(true)}
+            disabled={employees.length === 0}
+            className="mt-2"
+          >
+            Grant access
+          </Button>
+          {employees.length === 0 && (
+            <p className="mt-1 text-[10px] text-slate-400 dark:text-slate-500">
+              Hire an AI employee first.
+            </p>
+          )}
+        </div>
+      ) : (
+        <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 dark:divide-slate-800 dark:border-slate-700">
+          {grants.map((g) => (
+            <li key={g.id} className="flex items-center gap-3 px-3 py-2">
+              <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                {(g.employee?.name ?? "?").slice(0, 1).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                  {g.employee?.name ?? "Unknown"}
+                </div>
+                <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                  {g.employee?.role ?? ""}
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                loading={revokingId === g.id}
+                onClick={() => revoke(g)}
+              >
+                <Trash2 size={12} />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {grants !== null && grants.length > 0 && (
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => setPicker(true)}
+          disabled={grantable.length === 0}
+        >
+          <Plus size={12} /> Grant to another employee
+        </Button>
+      )}
+
+      <div className="flex justify-end border-t border-slate-100 pt-3 dark:border-slate-800">
+        <Button variant="secondary" size="sm" onClick={onClose}>
+          Done
+        </Button>
+      </div>
+
+      {picker && (
+        <EmployeePickerModal
+          employees={grantable}
+          error={grantError}
+          pendingId={grantingId}
+          onCancel={() => {
+            setPicker(false);
+            setGrantError(null);
+          }}
+          onPick={grant}
+        />
+      )}
+    </div>
+  );
+}
+
+function EmployeePickerModal({
+  employees,
+  error,
+  pendingId,
+  onCancel,
+  onPick,
+}: {
+  employees: Employee[];
+  error: string | null;
+  pendingId: string | null;
+  onCancel: () => void;
+  onPick: (e: Employee) => void;
+}) {
+  // Stacked over the settings modal, so Escape closes this one alone.
+  const { titleId, panelRef } = useModalChrome({ open: true, onDismiss: onCancel });
+
+  return createPortal(
+    <ModalScrim layer="top" onDismiss={onCancel}>
+      <ModalPanel ref={panelRef} size="sm" labelledBy={titleId}>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200/70 px-5 py-3 dark:border-slate-800">
+          <h3
+            id={titleId}
+            className="text-sm font-semibold tracking-tight text-slate-900 dark:text-slate-100"
+          >
+            Grant access
+          </h3>
+          <ModalCloseButton onClick={onCancel} />
+        </div>
+        <div className="min-h-0 overflow-y-auto p-3">
+          <FormError message={error} className="mb-2" />
+          {employees.length === 0 ? (
+            <p className="px-2 py-4 text-center text-xs text-slate-500 dark:text-slate-400">
+              Every AI employee already has access.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {employees.map((e) => (
+                <li key={e.id}>
+                  <button
+                    onClick={() => onPick(e)}
+                    disabled={pendingId === e.id}
+                    aria-busy={pendingId === e.id || undefined}
+                    className="flex w-full items-center gap-3 rounded-lg border border-slate-200 p-2.5 text-left hover:border-indigo-300 hover:bg-indigo-50/40 dark:border-slate-700 dark:hover:border-indigo-700 dark:hover:bg-indigo-950/30"
+                  >
+                    <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                      {pendingId === e.id ? (
+                        <ButtonSpinner size={14} />
+                      ) : (
+                        e.name.slice(0, 1).toUpperCase()
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                        {e.name}
+                      </div>
+                      <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                        {e.role}
+                      </div>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </ModalPanel>
+    </ModalScrim>,
+    document.body,
+  );
+}

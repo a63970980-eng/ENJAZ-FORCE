@@ -1,0 +1,640 @@
+import fs from "node:fs";
+import { Router, type RequestHandler } from "express";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { Company } from "../db/entities/Company.js";
+import { Membership } from "../db/entities/Membership.js";
+import { Invitation } from "../db/entities/Invitation.js";
+import { User } from "../db/entities/User.js";
+import { In } from "typeorm";
+import { logRedactedError } from "../middleware/error.js";
+import { validateBody, validateParams } from "../middleware/validate.js";
+import {
+  requireAuth,
+  requireBrowserSession,
+  requireCompanyMember,
+} from "../middleware/auth.js";
+import { describeBrowserSessionCondition } from "../middleware/routeMetadata.js";
+import { toSlug } from "../lib/slug.js";
+import { MAX_TIME_ZONE_LENGTH, isValidTimeZone } from "../lib/timeZone.js";
+import { generateToken, hashToken } from "../lib/token.js";
+import { sendEmail } from "../services/email.js";
+import { ensureDefaultNotebook } from "../services/notebooks.js";
+import { loadOnboardingStatus } from "../services/onboardingStatus.js";
+import { companyHasGoal, companyIdsWithGoal } from "../services/companyDirection.js";
+import { GoalError, createGoal } from "../services/goals.js";
+import { deleteCompanyCascade } from "../services/companyDelete.js";
+import { companyDir } from "../services/paths.js";
+import { avatarAbsPath, mimeFromKey } from "../services/avatars.js";
+import { getPublicUrl } from "../services/publicUrl.js";
+import { financeAccessFor } from "../middleware/financeAccess.js";
+import { config } from "../../config.js";
+import { hasTwoFactorMethod } from "../services/twoFactor.js";
+import { recordAudit } from "../services/audit.js";
+import { ApiKey } from "../db/entities/ApiKey.js";
+import { Channel } from "../db/entities/Channel.js";
+import { ChannelMember } from "../db/entities/ChannelMember.js";
+import { Project } from "../db/entities/Project.js";
+import { ProjectMember } from "../db/entities/ProjectMember.js";
+import { Notification } from "../db/entities/Notification.js";
+import { VaultItem } from "../db/entities/VaultItem.js";
+import { VaultItemMemberAccess } from "../db/entities/VaultItemMemberAccess.js";
+import {
+  emitMembershipAuthorizationChange,
+  emitResourceChange,
+} from "../services/resourceEvents.js";
+import { rescheduleCompanyRoutines } from "../services/companyTimeZone.js";
+import { rescheduleBoardLetters } from "../services/boardLetters.js";
+
+export const companiesRouter = Router();
+
+companiesRouter.use(requireAuth);
+
+companiesRouter.get("/", async (req, res) => {
+  const mems = await AppDataSource.getRepository(Membership).find({
+    where: { userId: req.userId! },
+  });
+  if (mems.length === 0) return res.json([]);
+  const companies = await AppDataSource.getRepository(Company).find({
+    where: { id: In(mems.map((m) => m.companyId)) },
+  });
+  const byId = new Map(companies.map((c) => [c.id, c]));
+  const withGoal = await companyIdsWithGoal(companies.map((c) => c.id));
+  const out = mems
+    .map((m) => {
+      const c = byId.get(m.companyId);
+      if (!c) return null;
+      return {
+        id: c.id,
+        name: c.name,
+        slug: c.slug,
+        mission: c.mission,
+        vision: c.vision,
+        hasGoal: withGoal.has(c.id),
+        timezone: c.timezone,
+        role: m.role,
+        // The client needs this to stop offering finance affordances a
+        // restricted Member cannot use — the mail surface's invoice and
+        // estimate buttons, today. It is the same value the finance routes
+        // gate on, so the button and the server agree.
+        financeAccess: financeAccessFor(m.role, m.financeAccess),
+        requireTwoFactor: c.requireTwoFactor,
+      };
+    })
+    .filter(Boolean);
+  res.json(out);
+});
+
+const companyProfileField = z.string().trim().max(2_000).default("");
+
+/**
+ * The first Goal, written while the company is created. It is the same
+ * manual, top-level Goal the Goals page would make (same limits as
+ * `routes/goals.ts`), so the one thing a new company must say is "a direction
+ * and a number" and the form in the way needs nothing else.
+ */
+const firstGoalSchema = z.object({
+  title: z.string().trim().min(1).max(140),
+  targetValue: z.number().finite(),
+  direction: z.enum(["increase_to", "decrease_to"]).optional(),
+  unit: z.string().trim().max(20).optional(),
+});
+
+/**
+ * The zone this company's Routine schedules are read in. Empty is "server
+ * time" and is how a company returns to the old behavior; anything else must
+ * be an IANA name the runtime can schedule in (`lib/timeZone.ts`), so a typo is
+ * a 400 here rather than a Routine that never fires.
+ */
+const timeZoneField = z
+  .string()
+  .trim()
+  .max(MAX_TIME_ZONE_LENGTH)
+  .refine(
+    (value) => value === "" || isValidTimeZone(value),
+    "Unknown time zone. Use an IANA name such as Europe/Berlin, or leave it empty for server time.",
+  );
+const createSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  mission: companyProfileField,
+  vision: companyProfileField,
+  goal: firstGoalSchema.optional(),
+  // Lenient on purpose: see the create handler.
+  timezone: z.string().trim().max(MAX_TIME_ZONE_LENGTH).default(""),
+});
+
+async function uniqueSlug(base: string): Promise<string> {
+  const repo = AppDataSource.getRepository(Company);
+  let slug = base || "company";
+  let n = 1;
+  while (await repo.findOneBy({ slug })) {
+    n += 1;
+    slug = `${base}-${n}`;
+  }
+  return slug;
+}
+
+companiesRouter.post("/", requireBrowserSession, validateBody(createSchema), async (req, res) => {
+  if (config.security.multiTenant && !req.user!.emailVerifiedAt) {
+    return res.status(403).json({ error: "Verify your email before creating a company" });
+  }
+  const { name, mission, vision, goal, timezone } = req.body as z.infer<typeof createSchema>;
+  const coRepo = AppDataSource.getRepository(Company);
+  const memRepo = AppDataSource.getRepository(Membership);
+  const slug = await uniqueSlug(toSlug(name));
+  const co = coRepo.create({
+    name,
+    slug,
+    ownerId: req.userId!,
+    mission,
+    vision,
+    // The first zone is the creator's browser's. One this runtime cannot
+    // schedule in starts the company on server time instead of refusing it;
+    // Settings → Company can pick another, and that choice is checked.
+    timezone: isValidTimeZone(timezone) ? timezone : "",
+    requireTwoFactor: false,
+  });
+  await coRepo.save(co);
+  await memRepo.save(memRepo.create({ companyId: co.id, userId: req.userId!, role: "owner" }));
+  // Every company needs a default notebook so the create-note flow has a
+  // home from day one.
+  await ensureDefaultNotebook(co.id, req.userId!);
+  if (goal) {
+    try {
+      const created = await createGoal(
+        co.id,
+        {
+          title: goal.title,
+          targetValue: goal.targetValue,
+          direction: goal.direction,
+          unit: goal.unit,
+          metricKind: "manual",
+        },
+        req.userId!,
+      );
+      await recordAudit({
+        companyId: co.id,
+        actorUserId: req.userId!,
+        action: "goal.create",
+        targetType: "goal",
+        targetId: created.id,
+        targetLabel: created.title,
+        metadata: { metricKind: created.metricKind, targetValue: created.targetValue },
+      });
+    } catch (err) {
+      // A company that exists without the Goal it was created for is stuck
+      // behind the hire gate, and a retry would make a second company beside
+      // it. Take the half-made one away before answering.
+      try {
+        await deleteCompanyCascade({ companyId: co.id, companySlug: co.slug });
+      } catch (cleanupError) {
+        logRedactedError(
+          "[companies] could not remove a company made without its Goal",
+          cleanupError,
+        );
+      }
+      if (err instanceof GoalError) return res.status(400).json({ error: err.message });
+      // Express 4 does not forward a rejected async handler, so answer the way
+      // the error handler would, or the request would never be answered.
+      logRedactedError("[error]", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+  res.json({
+    id: co.id,
+    name: co.name,
+    slug: co.slug,
+    mission: co.mission,
+    vision: co.vision,
+    hasGoal: Boolean(goal),
+    timezone: co.timezone,
+    role: "owner",
+    financeAccess: financeAccessFor("owner", undefined),
+    requireTwoFactor: co.requireTwoFactor,
+  });
+});
+
+companiesRouter.get("/:cid", requireCompanyMember, async (req, res) => {
+  const co = await AppDataSource.getRepository(Company).findOneBy({ id: req.params.cid });
+  if (!co) return res.status(404).json({ error: "Not found" });
+  res.json({
+    id: co.id,
+    name: co.name,
+    slug: co.slug,
+    mission: co.mission,
+    vision: co.vision,
+    hasGoal: await companyHasGoal(co.id),
+    timezone: co.timezone,
+    requireTwoFactor: co.requireTwoFactor,
+  });
+});
+
+/**
+ * Who is calling, inside this company: the API's `whoami`. `/api/auth/me` is
+ * the account itself and stays browser-only, so this is the identity check an
+ * API key can make — it answers with the key's Member, their role and Finance
+ * access here, and which key it was.
+ */
+companiesRouter.get(
+  "/:cid/me",
+  requireCompanyMember,
+  validateParams(z.object({ cid: z.string().uuid() })),
+  async (req, res) => {
+    const co = await AppDataSource.getRepository(Company).findOneBy({ id: req.params.cid });
+    if (!co) return res.status(404).json({ error: "Not found" });
+    const user = req.user!;
+    res.json({
+      user: { id: user.id, email: user.email, name: user.name, handle: user.handle ?? null },
+      company: { id: co.id, name: co.name, slug: co.slug },
+      role: req.companyRole,
+      financeAccess: financeAccessFor(req.companyRole, req.membership?.financeAccess),
+      authentication: req.apiKey ? "api_key" : req.connectedApp ? "connected_app" : "session",
+      apiKey: req.apiKey
+        ? {
+            id: req.apiKey.id,
+            name: req.apiKey.name,
+            prefix: `gen_${req.apiKey.prefix}`,
+            expiresAt: req.apiKey.expiresAt ? req.apiKey.expiresAt.toISOString() : null,
+          }
+        : null,
+      connectedApp: req.connectedApp
+        ? {
+            id: req.connectedApp.id,
+            name: req.connectedApp.name,
+            expiresAt: req.connectedApp.expiresAt.toISOString(),
+          }
+        : null,
+    });
+  },
+);
+
+const onboardingStatusParamsSchema = z.object({ cid: z.string().uuid() });
+const onboardingStatusQuerySchema = z.object({ employeeId: z.string().uuid().optional() });
+
+/**
+ * First-run progress, derived from the company's real state rather than a
+ * stored flag — see `services/onboardingStatus.ts`. Read by the guide's
+ * closing summary, which names an employee, and by Home's "finish setting up"
+ * banner, which asks about the company's first hire and so passes none.
+ */
+companiesRouter.get(
+  "/:cid/onboarding-status",
+  requireCompanyMember,
+  validateParams(onboardingStatusParamsSchema),
+  async (req, res) => {
+    const query = onboardingStatusQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      return res.status(400).json({ error: "ValidationError", issues: query.error.issues });
+    }
+    const co = await AppDataSource.getRepository(Company).findOneBy({ id: req.params.cid });
+    if (!co) return res.status(404).json({ error: "Not found" });
+    res.json(await loadOnboardingStatus(co.id, query.data.employeeId));
+  },
+);
+
+const patchSchema = z
+  .object({
+    name: z.string().min(1).max(80).optional(),
+    slug: z.string().min(1).max(80).optional(),
+    mission: z.string().trim().max(2_000).optional(),
+    vision: z.string().trim().max(2_000).optional(),
+    timezone: timeZoneField.optional(),
+    requireTwoFactor: z.boolean().optional(),
+  })
+  .refine(
+    (v) =>
+      v.name !== undefined ||
+      v.slug !== undefined ||
+      v.mission !== undefined ||
+      v.vision !== undefined ||
+      v.timezone !== undefined ||
+      v.requireTwoFactor !== undefined,
+    { message: "Provide a company profile field, a time zone, or a two-factor policy" },
+  );
+
+/** Apply a middleware only when this PATCH changes the company MFA policy. */
+function whenTwoFactorPolicyChanges(middleware: RequestHandler): RequestHandler {
+  return (req, res, next) => {
+    const body = req.body as Partial<z.infer<typeof patchSchema>>;
+    if (body.requireTwoFactor === undefined) {
+      next();
+      return;
+    }
+    middleware(req, res, next);
+  };
+}
+
+companiesRouter.patch(
+  "/:cid",
+  requireCompanyMember,
+  validateBody(patchSchema),
+  describeBrowserSessionCondition(
+    whenTwoFactorPolicyChanges(requireBrowserSession),
+    "to change requireTwoFactor",
+  ),
+  async (req, res) => {
+    const role = (req as unknown as { role: string }).role;
+    if (role !== "owner" && role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const repo = AppDataSource.getRepository(Company);
+    const co = await repo.findOneBy({ id: req.params.cid });
+    if (!co) return res.status(404).json({ error: "Not found" });
+    const body = req.body as z.infer<typeof patchSchema>;
+
+    if (body.name !== undefined) co.name = body.name;
+    if (body.mission !== undefined) co.mission = body.mission;
+    if (body.vision !== undefined) co.vision = body.vision;
+    const timeZoneChanged = body.timezone !== undefined && body.timezone !== co.timezone;
+    if (body.timezone !== undefined) co.timezone = body.timezone;
+
+    if (body.requireTwoFactor !== undefined) {
+      if (body.requireTwoFactor && !(await hasTwoFactorMethod(req.userId!))) {
+        return res.status(400).json({
+          error: "Enable two-factor authentication on your account before requiring it",
+        });
+      }
+      co.requireTwoFactor = body.requireTwoFactor;
+    }
+
+    if (body.slug !== undefined) {
+      const normalized = toSlug(body.slug);
+      if (!normalized) {
+        return res.status(400).json({ error: "Slug must contain at least one letter or digit" });
+      }
+      if (normalized !== co.slug) {
+        const existing = await repo.findOneBy({ slug: normalized });
+        if (existing && existing.id !== co.id) {
+          return res.status(409).json({ error: "That slug is already taken" });
+        }
+        const oldDir = companyDir(co.slug);
+        const newDir = companyDir(normalized);
+        if (fs.existsSync(newDir)) {
+          return res.status(409).json({ error: "A data directory for that slug already exists" });
+        }
+        if (fs.existsSync(oldDir)) {
+          try {
+            fs.renameSync(oldDir, newDir);
+          } catch (err) {
+            return res
+              .status(500)
+              .json({ error: `Failed to rename data directory: ${(err as Error).message}` });
+          }
+        }
+        co.slug = normalized;
+      }
+    }
+
+    await repo.save(co);
+    if (timeZoneChanged) {
+      // Every enabled Routine's next run was worked out on the old clock.
+      // `trigger: false` refreshes open Routine lists without starting any
+      // event-triggered work: nothing here is business content.
+      await rescheduleCompanyRoutines(co.id);
+      emitResourceChange(co.id, "routine", undefined, { trigger: false });
+      // The first of the month moved too, and with it when the letter is due.
+      await rescheduleBoardLetters(new Date(), co.id);
+    }
+    res.json({
+      id: co.id,
+      name: co.name,
+      slug: co.slug,
+      mission: co.mission,
+      vision: co.vision,
+      hasGoal: await companyHasGoal(co.id),
+      timezone: co.timezone,
+      requireTwoFactor: co.requireTwoFactor,
+    });
+  },
+);
+
+companiesRouter.delete(
+  "/:cid",
+  requireCompanyMember,
+  requireBrowserSession,
+  async (req, res) => {
+    const co = await AppDataSource.getRepository(Company).findOneBy({ id: req.params.cid });
+    if (!co) return res.status(404).json({ error: "Not found" });
+    if (co.ownerId !== req.userId) return res.status(403).json({ error: "Owner only" });
+    await deleteCompanyCascade({ companyId: co.id, companySlug: co.slug });
+    res.json({ ok: true });
+  },
+);
+
+const inviteSchema = z.object({ email: z.string().email() });
+
+companiesRouter.post(
+  "/:cid/invitations",
+  requireCompanyMember,
+  requireBrowserSession,
+  validateBody(inviteSchema),
+  async (req, res) => {
+    const role = (req as unknown as { role: string }).role;
+    if (role !== "owner" && role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const { email } = req.body as z.infer<typeof inviteSchema>;
+    const repo = AppDataSource.getRepository(Invitation);
+    const token = generateToken();
+    const inv = repo.create({
+      companyId: req.params.cid,
+      email: email.toLowerCase(),
+      token: hashToken(token),
+      expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 7),
+      acceptedAt: null,
+    });
+    await repo.save(inv);
+    const link = `${getPublicUrl()}/invite/${token}`;
+    await sendEmail({
+      to: email,
+      subject: "You're invited to a Genosyn company",
+      text: `Accept the invite: ${link}`,
+      bodyPreview: "Company invitation link redacted. The invitation expires in 7 days.",
+      companyId: req.params.cid,
+      purpose: "invitation",
+      triggeredByUserId: req.userId ?? null,
+    });
+    res.json({ id: inv.id, email: inv.email });
+  },
+);
+
+companiesRouter.get("/:cid/members", requireCompanyMember, async (req, res) => {
+  const mems = await AppDataSource.getRepository(Membership).find({
+    where: { companyId: req.params.cid },
+  });
+  const userIds = mems.map((m) => m.userId);
+  const users = userIds.length
+    ? await AppDataSource.getRepository(User).find({ where: { id: In(userIds) } })
+    : [];
+  const byId = new Map(users.map((u) => [u.id, u]));
+  res.json(
+    mems.map((m) => ({
+      userId: m.userId,
+      role: m.role,
+      financeAccess: m.financeAccess,
+      email: byId.get(m.userId)?.email ?? null,
+      name: byId.get(m.userId)?.name ?? null,
+      avatarKey: byId.get(m.userId)?.avatarKey ?? null,
+    })),
+  );
+});
+
+const memberRoleSchema = z.object({ role: z.enum(["member", "admin"]) });
+
+companiesRouter.patch(
+  "/:cid/members/:uid",
+  requireCompanyMember,
+  requireBrowserSession,
+  validateBody(memberRoleSchema),
+  async (req, res) => {
+    if (req.companyRole !== "owner") {
+      return res.status(403).json({ error: "Only the company owner can change roles" });
+    }
+    const { cid, uid } = req.params;
+    const membership = await AppDataSource.getRepository(Membership).findOneBy({
+      companyId: cid,
+      userId: uid,
+    });
+    if (!membership) return res.status(404).json({ error: "Member not found" });
+    if (membership.role === "owner") {
+      return res.status(400).json({ error: "The owner role cannot be changed here" });
+    }
+    const { role } = req.body as z.infer<typeof memberRoleSchema>;
+    membership.role = role;
+    await AppDataSource.getRepository(Membership).save(membership);
+    emitMembershipAuthorizationChange(cid);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "member.role.update",
+      targetType: "member",
+      targetId: uid,
+      metadata: { role },
+    });
+    res.json({ userId: uid, role });
+  },
+);
+
+const memberFinanceAccessSchema = z.object({
+  financeAccess: z.enum(["none", "read", "full"]),
+});
+
+// Set a member's finance access level (M33 A4). Owners and admins can dial a
+// member down to read-only or none; the level is inert for owners/admins
+// themselves (they are always treated as full) but we allow setting it so the
+// UI needn't special-case them.
+companiesRouter.patch(
+  "/:cid/members/:uid/finance-access",
+  requireCompanyMember,
+  requireBrowserSession,
+  validateBody(memberFinanceAccessSchema),
+  async (req, res) => {
+    if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+      return res.status(403).json({ error: "Only owners and admins can change finance access" });
+    }
+    const { cid, uid } = req.params;
+    const membership = await AppDataSource.getRepository(Membership).findOneBy({
+      companyId: cid,
+      userId: uid,
+    });
+    if (!membership) return res.status(404).json({ error: "Member not found" });
+    const { financeAccess } = req.body as z.infer<typeof memberFinanceAccessSchema>;
+    membership.financeAccess = financeAccess;
+    await AppDataSource.getRepository(Membership).save(membership);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "member.finance_access.update",
+      targetType: "member",
+      targetId: uid,
+      metadata: { financeAccess },
+    });
+    res.json({ userId: uid, financeAccess });
+  },
+);
+
+companiesRouter.delete(
+  "/:cid/members/:uid",
+  requireCompanyMember,
+  requireBrowserSession,
+  async (req, res) => {
+    const { cid, uid } = req.params;
+    const membership = await AppDataSource.getRepository(Membership).findOneBy({
+      companyId: cid,
+      userId: uid,
+    });
+    if (!membership) return res.status(404).json({ error: "Member not found" });
+    if (membership.role === "owner") {
+      return res.status(400).json({ error: "The company owner cannot be removed" });
+    }
+    const removingSelf = uid === req.userId;
+    const allowed =
+      req.companyRole === "owner" ||
+      (req.companyRole === "admin" && (membership.role === "member" || removingSelf)) ||
+      removingSelf;
+    if (!allowed) return res.status(403).json({ error: "Forbidden" });
+    await AppDataSource.transaction(async (manager) => {
+      const [channels, projects] = await Promise.all([
+        manager.getRepository(Channel).find({ where: { companyId: cid }, select: { id: true } }),
+        manager.getRepository(Project).find({ where: { companyId: cid }, select: { id: true } }),
+      ]);
+      if (channels.length > 0) {
+        await manager.getRepository(ChannelMember).delete({
+          channelId: In(channels.map((channel) => channel.id)),
+          userId: uid,
+        });
+      }
+      if (projects.length > 0) {
+        await manager.getRepository(ProjectMember).delete({
+          projectId: In(projects.map((project) => project.id)),
+          userId: uid,
+        });
+      }
+      await manager
+        .getRepository(ApiKey)
+        .update({ companyId: cid, userId: uid }, { revokedAt: new Date() });
+      await manager.getRepository(Notification).delete({ companyId: cid, userId: uid });
+      await manager.getRepository(VaultItemMemberAccess).delete({ companyId: cid, userId: uid });
+      // Leaving a company must not let a later re-invite silently resurrect the
+      // creator's full Vault rights. Preserve the item for the company, but
+      // hand management to the remaining owners/admins.
+      await manager
+        .getRepository(VaultItem)
+        .update({ companyId: cid, createdByUserId: uid }, { createdByUserId: null });
+      await manager.getRepository(Membership).delete({ companyId: cid, userId: uid });
+    });
+    emitMembershipAuthorizationChange(cid);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: removingSelf ? "member.leave" : "member.remove",
+      targetType: "member",
+      targetId: uid,
+    });
+    res.json({ ok: true });
+  },
+);
+
+/**
+ * Serve a teammate's avatar inside a company scope. Mounted on the companies
+ * router (not auth) because the authorization we want is "you must share
+ * this company with that user" — `requireCompanyMember` already checks the
+ * caller; the membership lookup on the target ensures the caller can't
+ * enumerate random user ids.
+ */
+companiesRouter.get("/:cid/members/:uid/avatar", requireCompanyMember, async (req, res) => {
+  const targetMembership = await AppDataSource.getRepository(Membership).findOneBy({
+    companyId: req.params.cid,
+    userId: req.params.uid,
+  });
+  if (!targetMembership) return res.status(404).json({ error: "Not found" });
+  const user = await AppDataSource.getRepository(User).findOneBy({
+    id: req.params.uid,
+  });
+  if (!user || !user.avatarKey) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const abs = avatarAbsPath(user.avatarKey);
+  if (!abs || !fs.existsSync(abs)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  res.setHeader("Content-Type", mimeFromKey(user.avatarKey));
+  res.setHeader("Cache-Control", "private, max-age=60");
+  res.sendFile(abs);
+});

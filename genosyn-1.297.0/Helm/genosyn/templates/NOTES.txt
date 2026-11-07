@@ -1,0 +1,112 @@
+Genosyn {{ .Chart.AppVersion }} is rolling out.
+
+1. Reach the app
+{{- if .Values.ingress.enabled }}
+
+   http{{ if include "genosyn.ingressTls" . }}s{{ end }}://{{ .Values.ingress.host }}
+{{- else }}
+
+   No Ingress is enabled. Port-forward to try it out:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "genosyn.fullname" . }} 8471:{{ .Values.service.port }}
+
+   then open http://localhost:8471. For real use, set ingress.enabled=true
+   and ingress.host (WebSockets pass through a plain Ingress rule).
+{{- end }}
+
+{{- if include "genosyn.gke.enabled" . }}
+
+   gke.enabled=true: GKE's load balancer uses BackendConfig
+   {{ include "genosyn.gke.backendConfigName" . }} (timeouts, /api/health, request logging off), and the
+   App trusts its two proxy hops.
+{{- if include "genosyn.gke.managedCertificate" . }} Point every Ingress hostname at the Ingress
+   address (DNS only) so Google can provision ManagedCertificate
+   {{ include "genosyn.gke.managedCertificateName" . }}:
+
+     kubectl -n {{ .Release.Namespace }} get ingress {{ include "genosyn.fullname" . }}
+{{- end }}
+{{- else }}
+
+   Select your installed controller with ingress.className and extend its
+   configuration with ingress.annotations or service.annotations. Set its
+   WebSocket/streaming timeouts and buffering as needed, and omit query
+   strings from access logs (OAuth callbacks contain authorization codes).
+   Kubernetes Ingress has no portable timeout field. The App defaults to
+   one trusted ingress proxy; match trustedProxyHops to your actual chain.
+   On GKE's built-in Ingress, gke.enabled=true configures all of this.
+{{- end }}
+{{- if (default dict .Values.ingress.tls.certManager).enabled }}
+
+   cert-manager issues and renews the Ingress TLS Secrets. Point every
+   Ingress hostname at the Ingress address; until the first issuance the
+   Secrets hold a temporary self-signed certificate.
+{{- end }}
+
+2. First boot
+
+   The pod becomes Ready once every database migration has run — /api/health
+   answers only after boot completes, so a pending readiness probe during the
+   first minute is normal.
+{{- $publicUrl := include "genosyn.publicUrl" . }}
+{{- if $publicUrl }}
+
+   A post-install Job stored the public URL {{ $publicUrl }}, which email
+   links and OAuth callbacks use; an origin already changed at
+   Admin -> General is kept. Session cookies are Secure from then on, so
+   sign in through the HTTPS Ingress, not a plain http:// port-forward.
+{{- else }}
+
+   The first master admin's sign-in records its browser origin as the
+   public URL; review it at Admin -> General.
+{{- end }}
+{{- with .Values.config.bootstrapMasterAdminEmail }}
+
+   Register {{ . }} and open its verification link to make it the master
+   admin. Do it before sharing the address: whenever the App starts without
+   a master admin, it promotes the earliest registered account.
+{{- else }}
+
+   config.bootstrapMasterAdminEmail is empty: no account becomes master admin
+   until the App restarts, which promotes the earliest registered account.
+   Name the operator before anyone registers:
+
+     helm upgrade {{ .Release.Name }} ... --set config.bootstrapMasterAdminEmail=you@example.com
+{{- end }}
+
+   System email (verification, invites, password resets) is NOT in this
+   chart. Configure it after boot at Admin -> Email transport; it is stored
+   encrypted in the database. Until then boot prints a warning and every
+   such mail — including the master admin's own verification link — is
+   written to the pod log instead of being sent. Read it with:
+
+     kubectl logs -n {{ .Release.Namespace }} deploy/{{ include "genosyn.fullname" . }}
+
+   Paste that link into the browser to verify and claim the account, then set
+   up SMTP from the dashboard.
+
+3. One organization per install
+
+   AI Employee commands run in the App container as the App user, with its
+   filesystem and network access to every company in this install. Give
+   each unrelated organization its own install.
+
+4. Data
+
+   /app/data {{ if .Values.persistence.enabled }}is persisted on PVC {{ .Values.persistence.existingClaim | default (printf "%s-data" (include "genosyn.fullname" .)) }}{{ else }}is NOT persisted — persistence.enabled=false is only
+   safe for throwaway evaluation{{ end }}. Keep the volume even on Postgres
+   installs: it holds checkouts, browser state, and uploads.
+{{- if not .Values.secrets.existingSecret }}
+
+   The session/encryption secrets live in Secret {{ include "genosyn.instanceSecretsName" . }}
+   (set once, kept across upgrades AND `helm uninstall` — rotating the
+   encryption secret would orphan every encrypted row). Back that Secret up
+   with the database.
+{{- end }}
+{{- if .Values.postgres.enabled }}
+
+5. Bundled Postgres
+
+   postgres.enabled=true runs a single-node, untuned Postgres for evaluation.
+   For production, operate your own Postgres and point
+   config.db.postgresUrlSecret at it.
+{{- end }}

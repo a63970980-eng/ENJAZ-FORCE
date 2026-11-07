@@ -1,0 +1,2567 @@
+#!/usr/bin/env bash
+# Genosyn — cluster maintainer CLI.
+#
+# Manages a self-hosted Genosyn container (pull, upgrade, start/stop, logs,
+# backup, restore). Thin wrapper around `docker` — no other runtime deps.
+#
+# Env overrides (flags on individual commands take precedence):
+#   GENOSYN_PORT     host port to expose (default: 8471)
+#   GENOSYN_NAME     container name       (default: genosyn)
+#   GENOSYN_VOLUME   data volume name     (default: genosyn-data)
+#   GENOSYN_IMAGE    image reference      (default: ghcr.io/genosyn/app:latest)
+#   GENOSYN_CLI_URL  fetch URL for the CLI script used by self-upgrade
+#                    (default: https://genosyn.com/genosyn)
+#   GENOSYN_AUTO_UPDATE  enable daily automatic upgrades after install
+#                        (default: 1; set to 0 to opt out)
+#   GENOSYN_BACKUP_DIR   host directory for the backup each upgrade takes
+#                        (default: ~/.genosyn/backups)
+#   GENOSYN_DRAIN_MINUTES  how long an upgrade lets running Routine Runs
+#                          finish before it pauses the rest (default: 0)
+#   GENOSYN_PAUSE_GRACE_SECONDS  how long each paused Run gets to save its
+#                          progress before the restart (default: 90)
+#   GENOSYN_VLLM_DIR working dir for the `vllm` command's compose + .env
+#                    (default: ~/.genosyn/vllm)
+
+set -euo pipefail
+
+CLI_VERSION="0.15.0"
+
+PORT="${GENOSYN_PORT:-8471}"
+NAME="${GENOSYN_NAME:-genosyn}"
+VOLUME="${GENOSYN_VOLUME:-genosyn-data}"
+IMAGE="${GENOSYN_IMAGE:-ghcr.io/genosyn/app:latest}"
+CLI_URL="${GENOSYN_CLI_URL:-https://genosyn.com/genosyn}"
+VLLM_DIR="${GENOSYN_VLLM_DIR:-${HOME}/.genosyn/vllm}"
+AUTO_UPDATE_DIR="${GENOSYN_STATE_DIR:-${HOME}/.genosyn}"
+UPGRADE_BACKUP_DIR="${GENOSYN_BACKUP_DIR:-${HOME}/.genosyn/backups}"
+DRAIN_MINUTES="${GENOSYN_DRAIN_MINUTES:-0}"
+PAUSE_GRACE_SECONDS="${GENOSYN_PAUSE_GRACE_SECONDS:-90}"
+
+# ---------- output helpers ----------
+
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_INDIGO=$'\033[38;5;99m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_INDIGO=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+fi
+
+step() { printf '%s→%s %s\n' "${C_INDIGO}" "${C_RESET}" "$*"; }
+ok()   { printf '%s✓%s %s\n' "${C_GREEN}"  "${C_RESET}" "$*"; }
+warn() { printf '%s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "${C_RED}"    "${C_RESET}" "$*" >&2; exit 1; }
+
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    u[1]="B"; u[2]="KB"; u[3]="MB"; u[4]="GB"; u[5]="TB";
+    i=1; while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%dB", b; else printf "%.1f%s", b, u[i]
+  }'
+}
+
+# ---------- progress ----------
+
+# A long step reports how far it has got as "genosyn-progress <bytes>" lines on
+# its stderr, which with_progress draws as a bar.
+PROGRESS_MARK="genosyn-progress"
+
+# Whether progress is drawn: on a terminal that can redraw a line. Cron's log,
+# a pipe, or a file gets the same lines as ever.
+progress_tty() { [ -t 2 ] && [ "${TERM:-dumb}" != "dumb" ]; }
+
+# Run a command and draw the progress it reports as a bar of bytes done out of
+# $2 (empty when unknown), on one line beneath the current step; until the
+# first report, the line says what is happening, $1. Every other line the
+# command writes to stderr passes through. The line is drawn only on a
+# terminal and cleared when the command ends. Returns the command's status;
+# its stdin and stdout are the caller's.
+with_progress() {
+  local label="$1" total="$2" rc=0
+  shift 2
+  { { "$@" 2>&1 >&3 3>&-; } | draw_progress "${label}" "${total}" >&2 3>&-; } 3>&1 || rc=$?
+  return "${rc}"
+}
+
+# with_progress's line, drawn from the command's stderr on stdin. Always
+# succeeds, so the pipeline's status is the command's.
+draw_progress() {
+  local label="$1" total="$2" line bytes pct last="" shown="" next cols width=30
+  local total_size="" filled empty percent
+  if progress_tty; then
+    cols="$(stty size <&2 2>/dev/null | cut -d' ' -f2)"
+    case "${cols}" in ''|0|*[!0-9]*) ;; *) width=$((cols - 30)) ;; esac
+    [ "${width}" -le 30 ] || width=30
+    [ "${width}" -ge 10 ] || width=10
+    case "${total}" in ''|0|*[!0-9]*) total="" ;; *) total_size="$(human_size "${total}")" ;; esac
+    shown="  ${label}…"
+    printf '\r\033[K%s' "${shown}"
+  fi
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      *"${PROGRESS_MARK} "[0-9]*)
+        [ -n "${shown}" ] || continue
+        bytes="${line##*"${PROGRESS_MARK} "}"
+        bytes="${bytes%%[!0-9]*}"
+        if [ -z "${total}" ]; then
+          next="  ${label}… $(human_size "${bytes}")"
+        else
+          # A live volume can grow past the size measured before it.
+          [ "${bytes}" -le "${total}" ] || bytes="${total}"
+          pct=$((bytes * 100 / total))
+          [ "${pct}" != "${last}" ] || continue
+          last="${pct}"
+          printf -v filled '%*s' $((bytes * width / total)) ''
+          printf -v empty '%*s' $((width - bytes * width / total)) ''
+          printf -v percent '%3d%%' "${pct}"
+          next="  ${C_INDIGO}${filled// /█}${C_DIM}${empty// /░}${C_RESET} ${percent}  $(human_size "${bytes}") of ${total_size}"
+        fi
+        [ "${next}" != "${shown}" ] || continue
+        shown="${next}"
+        printf '\r\033[K%s' "${shown}"
+        ;;
+      *)
+        if [ -n "${shown}" ]; then
+          printf '\r\033[K%s\n%s' "${line}" "${shown}"
+        else
+          printf '%s\n' "${line}"
+        fi
+        ;;
+    esac
+  done
+  [ -z "${shown}" ] || printf '\r\033[K'
+  return 0
+}
+
+# Reduce an image reference to its bare repository: no tag, no digest.
+#
+#   ghcr.io/genosyn/app:latest        -> ghcr.io/genosyn/app
+#   localhost:5000/app                -> localhost:5000/app
+#   ghcr.io/genosyn/app@sha256:abc…   -> ghcr.io/genosyn/app
+#
+# Naively stripping at the last colon is wrong twice over: a registry can carry
+# a port, so `localhost:5000/app` would reduce to `localhost`, and a digest ref
+# would reduce to `…/app@sha256`. Only a colon in the *final path segment* is a
+# tag separator, and the digest has to come off first. `prune` compares
+# repositories with this, so a bad reduction there selects unrelated images for
+# deletion.
+image_repo() {
+  local ref="${1%%@*}"
+  case "${ref##*/}" in
+    *:*) ref="${ref%:*}" ;;
+  esac
+  printf '%s' "${ref}"
+}
+
+# Read the org.opencontainers.image.version label off a Docker image. Empty
+# string when the image is missing, the label is unset, or docker isn't
+# available. Used by `genosyn upgrade` to show the before/after transition.
+image_version_label() {
+  [ -n "$1" ] || return 0
+  docker image inspect \
+    --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+    "$1" 2>/dev/null
+}
+
+# Resolve the absolute path of the running genosyn script.
+self_path() {
+  local p="${BASH_SOURCE[0]}"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "${p}" 2>/dev/null || printf '%s' "${p}"
+  elif command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    readlink -f "${p}" 2>/dev/null || printf '%s' "${p}"
+  else
+    case "${p}" in
+      /*) printf '%s' "${p}" ;;
+      *)  printf '%s/%s' "$(pwd)" "${p}" ;;
+    esac
+  fi
+}
+
+# Compute SHA-256 of a file. Outputs the hex digest, or empty if unavailable.
+file_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
+# Whether a file is a genosyn CLI this host can run: a bash script that
+# declares CLI_VERSION and parses. Checked before a file replaces a CLI,
+# because automatic updates run whatever their copy holds -- a truncated
+# download or an error page installed there would wedge every later run.
+cli_file_valid() {
+  [ -s "$1" ] \
+    && head -1 "$1" | grep -q '^#!' \
+    && grep -q '^CLI_VERSION=' "$1" \
+    && bash -n "$1" >/dev/null 2>&1
+}
+
+# The CLI_VERSION a CLI file declares; empty when it declares none.
+cli_file_version() {
+  sed -n 's/^CLI_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null
+}
+
+# Replace $2 with a copy of $1 by renaming a temporary file over it in the same
+# directory: nothing ever sees a half-written file, and a run still executing
+# the old file keeps reading the old file.
+replace_file_atomically() {
+  local src="$1" dest="$2" mode="$3" tmp
+  tmp="$(mktemp "${dest}.XXXXXX")" || return 1
+  if cp "${src}" "${tmp}" && chmod "${mode}" "${tmp}" && mv -f "${tmp}" "${dest}"; then
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
+# Download the latest CLI from CLI_URL and replace the running script if it
+# differs. Returns 0 if no change (already up to date or download skipped),
+# 1 if the binary on disk was replaced (caller should re-exec to pick it up).
+self_upgrade() {
+  local quiet="${1:-}"
+  local url="${CLI_URL}"
+  local sp
+  sp="$(self_path)"
+
+  local fetcher=""
+  if command -v curl >/dev/null 2>&1; then fetcher="curl"
+  elif command -v wget >/dev/null 2>&1; then fetcher="wget"
+  else
+    [ "${quiet}" = "1" ] || warn "Neither curl nor wget is available — skipping CLI self-upgrade."
+    return 0
+  fi
+
+  [ "${quiet}" = "1" ] || step "Checking for CLI updates"
+
+  local tmp
+  tmp="$(mktemp -t genosyn-cli.XXXXXX)"
+  local rc=0
+  if [ "${fetcher}" = "curl" ]; then
+    curl -fsSL "${url}" -o "${tmp}" 2>/dev/null || rc=$?
+  else
+    wget -q "${url}" -O "${tmp}" 2>/dev/null || rc=$?
+  fi
+  if [ "${rc}" -ne 0 ] || [ ! -s "${tmp}" ]; then
+    rm -f "${tmp}"
+    [ "${quiet}" = "1" ] || warn "Could not fetch ${url} — keeping current CLI."
+    return 0
+  fi
+
+  if ! cli_file_valid "${tmp}"; then
+    rm -f "${tmp}"
+    [ "${quiet}" = "1" ] || warn "Downloaded file is not a working genosyn CLI — keeping current."
+    return 0
+  fi
+
+  local cur_hash new_hash
+  cur_hash="$(file_sha256 "${sp}")"
+  new_hash="$(file_sha256 "${tmp}")"
+  if [ -n "${cur_hash}" ] && [ "${cur_hash}" = "${new_hash}" ]; then
+    rm -f "${tmp}"
+    [ "${quiet}" = "1" ] || ok "CLI is already up to date."
+    return 0
+  fi
+
+  step "Updating CLI at ${sp}"
+  if [ -w "${sp}" ] 2>/dev/null; then
+    # Rename a complete file into place. GNU install overwrites in place, so a
+    # failed write -- a full disk, say -- would leave a truncated CLI for the
+    # next automatic run to start. Only a file whose directory we cannot write
+    # still takes the in-place route.
+    local replaced=0
+    if [ -w "$(dirname "${sp}")" ]; then
+      replace_file_atomically "${tmp}" "${sp}" 0755 && replaced=1
+    else
+      install -m 0755 "${tmp}" "${sp}" && replaced=1
+    fi
+    if [ "${replaced}" = "0" ]; then
+      rm -f "${tmp}"
+      [ "${quiet}" = "1" ] || warn "Could not replace ${sp} — keeping current CLI."
+      return 0
+    fi
+  elif command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+    sudo install -m 0755 "${tmp}" "${sp}"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n install -m 0755 "${tmp}" "${sp}"
+  else
+    rm -f "${tmp}"
+    [ "${quiet}" = "1" ] || warn "Cannot update ${sp} without interactive or passwordless sudo — keeping current CLI."
+    return 0
+  fi
+  rm -f "${tmp}"
+  ok "CLI updated."
+  return 1
+}
+
+# ---------- automatic upgrades ----------
+
+# Fresh installs schedule a daily `genosyn upgrade` through the host's cron.
+# A small wrapper captures this instance's settings and Docker overrides so
+# cron does not depend on its deliberately sparse environment. One entry is
+# kept per container name, which lets operators maintain several instances.
+#
+# The wrapper runs the schedule's own copy of the CLI, not the installed one.
+# The installer usually leaves /usr/local/bin/genosyn owned by root, which a
+# cron job cannot replace without a password, so self-upgrade failed there on
+# every run and each night repeated an outdated CLI. The copy belongs to the
+# crontab's owner, so each run updates it first and then runs the latest CLI,
+# while the `genosyn` people run by hand keeps working as it always has.
+auto_update_key() {
+  printf '%s' "${NAME}" | tr -c '[:alnum:]_.-' '_'
+}
+
+auto_update_marker() {
+  printf '# genosyn-auto-update:%s' "$(auto_update_key)"
+}
+
+auto_update_wrapper_path() {
+  printf '%s/auto-update-%s.sh' "${AUTO_UPDATE_DIR}" "$(auto_update_key)"
+}
+
+auto_update_log_path() {
+  printf '%s/auto-update-%s.log' "${AUTO_UPDATE_DIR}" "$(auto_update_key)"
+}
+
+auto_update_disabled_path() {
+  printf '%s/auto-update-%s.disabled' "${AUTO_UPDATE_DIR}" "$(auto_update_key)"
+}
+
+auto_update_cli_path() {
+  printf '%s/auto-update-%s.cli' "${AUTO_UPDATE_DIR}" "$(auto_update_key)"
+}
+
+# The wrapper line naming the CLI it runs. It tells a wrapper that runs the
+# schedule's own copy apart from one an older CLI wrote.
+auto_update_cli_line() {
+  printf 'cli_path=%q' "$(auto_update_cli_path)"
+}
+
+auto_update_enabled() {
+  command -v crontab >/dev/null 2>&1 || return 1
+  [ -x "$(auto_update_wrapper_path)" ] || return 1
+  crontab -l 2>/dev/null | grep -Fq "$(auto_update_marker)"
+}
+
+# The copy must stay something its own runs can execute and replace.
+auto_update_cli_usable() {
+  local cli
+  cli="$(auto_update_cli_path)"
+  [ -f "${cli}" ] && [ -O "${cli}" ] && [ -w "${cli}" ] && [ -x "${cli}" ] \
+    && cli_file_valid "${cli}"
+}
+
+auto_update_runs_own_cli() {
+  auto_update_cli_usable \
+    && grep -Fxq -- "$(auto_update_cli_line)" "$(auto_update_wrapper_path)" 2>/dev/null
+}
+
+# Cron runs whatever this directory holds, so nobody but the crontab's owner
+# may be able to change it. Refusing one another user owns, or one inside
+# another user's directory, also keeps a root crontab (sudo can keep HOME)
+# from running a launcher an ordinary user could swap out.
+prepare_auto_update_dir() {
+  local parent_owner
+  mkdir -p "${AUTO_UPDATE_DIR}" || return 1
+  parent_owner="$(ls -ldn "${AUTO_UPDATE_DIR}/.." 2>/dev/null | awk '{ print $3 }')" || true
+  if [ ! -O "${AUTO_UPDATE_DIR}" ] \
+    || { [ "${parent_owner}" != "$(id -u)" ] && [ "${parent_owner}" != "0" ]; }; then
+    warn "Automatic updates will not run code from ${AUTO_UPDATE_DIR}: another user can change it."
+    return 1
+  fi
+  chmod go-w "${AUTO_UPDATE_DIR}"
+}
+
+# Give the schedule its own copy of the running CLI.
+install_auto_update_cli() {
+  local src
+  src="$(self_path)"
+  prepare_auto_update_dir || return 1
+  cli_file_valid "${src}" || return 1
+  replace_file_atomically "${src}" "$(auto_update_cli_path)" 0755
+}
+
+# The launcher cron starts. It passes nothing but `upgrade`, which every CLI
+# version understands, so it can never outrun the copy it starts.
+auto_update_wrapper_content() {
+  printf '%s\n' '#!/usr/bin/env bash' 'set -uo pipefail'
+  printf 'export PATH=%q\n' "${PATH}"
+  printf 'export GENOSYN_PORT=%q\n' "${PORT}"
+  printf 'export GENOSYN_NAME=%q\n' "${NAME}"
+  printf 'export GENOSYN_VOLUME=%q\n' "${VOLUME}"
+  printf 'export GENOSYN_IMAGE=%q\n' "${IMAGE}"
+  printf 'export GENOSYN_CLI_URL=%q\n' "${CLI_URL}"
+  printf 'export GENOSYN_BACKUP_DIR=%q\n' "${UPGRADE_BACKUP_DIR}"
+  printf 'export GENOSYN_STATE_DIR=%q\n' "${AUTO_UPDATE_DIR}"
+  printf 'log_path=%q\n' "$(auto_update_log_path)"
+  printf '%s\n' "$(auto_update_cli_line)"
+  cat <<'EOF'
+mkdir -p "$(dirname "${log_path}")"
+{
+  printf '\n[%s] Starting automatic Genosyn update\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "${cli_path}" upgrade
+} >>"${log_path}" 2>&1
+EOF
+}
+
+write_auto_update_wrapper() {
+  local wrapper tmp
+  wrapper="$(auto_update_wrapper_path)"
+  prepare_auto_update_dir || return 1
+  tmp="$(mktemp "${wrapper}.XXXXXX")" || return 1
+  if auto_update_wrapper_content >"${tmp}" && chmod 0700 "${tmp}" && mv -f "${tmp}" "${wrapper}"; then
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
+# Point a wrapper an older CLI wrote at the schedule's own copy, keeping every
+# other line. Those wrappers run the installed CLI. Rewriting one from this
+# shell's environment instead could quietly move the nightly job to another
+# port or image; the copy's first run rewrites it from the environment the
+# wrapper exported, which is exactly what it captured.
+repoint_auto_update_wrapper() {
+  local wrapper tmp line found=0
+  wrapper="$(auto_update_wrapper_path)"
+  prepare_auto_update_dir || return 1
+  tmp="$(mktemp "${wrapper}.XXXXXX")" || return 1
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      cli_path=*) line="$(auto_update_cli_line)"; found=1 ;;
+    esac
+    printf '%s\n' "${line}"
+  done <"${wrapper}" >"${tmp}"
+  if [ "${found}" = "1" ] && chmod 0700 "${tmp}" && mv -f "${tmp}" "${wrapper}"; then
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
+# Every upgrade keeps an enabled schedule on a copy it can replace: it restores
+# a missing or unusable copy and moves a wrapper an older CLI wrote onto it.
+# When this run *is* the copy, its environment is what the wrapper exported,
+# so a wrapper this version would write differently is rewritten from it. That
+# is how later wrapper changes reach existing installs without anyone acting.
+refresh_auto_update_launcher() {
+  if ! auto_update_cli_usable; then
+    install_auto_update_cli || return 1
+  fi
+  if ! grep -Fxq -- "$(auto_update_cli_line)" "$(auto_update_wrapper_path)"; then
+    repoint_auto_update_wrapper || return 1
+    ok "Automatic updates now run their own copy of the CLI, which they can update without sudo."
+  elif [ "$(self_path)" -ef "$(auto_update_cli_path)" ] \
+    && [ "$(auto_update_wrapper_content)" != "$(cat "$(auto_update_wrapper_path)")" ]; then
+    write_auto_update_wrapper || return 1
+    ok "Refreshed the automatic update launcher."
+  fi
+}
+
+enable_auto_update() {
+  local quiet="${1:-0}"
+  mkdir -p "${AUTO_UPDATE_DIR}"
+  rm -f "$(auto_update_disabled_path)"
+
+  if ! command -v crontab >/dev/null 2>&1; then
+    [ "${quiet}" = "1" ] || warn "crontab is unavailable — automatic updates could not be enabled."
+    return 1
+  fi
+
+  if ! install_auto_update_cli || ! write_auto_update_wrapper; then
+    [ "${quiet}" = "1" ] || warn "Could not write the automatic update launcher under ${AUTO_UPDATE_DIR}."
+    return 1
+  fi
+
+  local marker wrapper existing filtered line
+  marker="$(auto_update_marker)"
+  wrapper="$(auto_update_wrapper_path)"
+  existing="$(crontab -l 2>/dev/null || true)"
+  filtered="$(printf '%s\n' "${existing}" | awk -v marker="${marker}" 'index($0, marker) == 0')"
+  printf -v line '17 3 * * * %q %s' "${wrapper}" "${marker}"
+
+  if ! {
+    [ -z "${filtered}" ] || printf '%s\n' "${filtered}"
+    printf '%s\n' "${line}"
+  } | crontab -; then
+    rm -f "${wrapper}" "$(auto_update_cli_path)"
+    [ "${quiet}" = "1" ] || warn "Could not install the automatic update cron entry."
+    return 1
+  fi
+
+  [ "${quiet}" = "1" ] || ok "Automatic updates enabled (daily at 03:17 local time)."
+}
+
+disable_auto_update() {
+  local quiet="${1:-0}"
+  local remember="${2:-1}"
+  local marker existing filtered
+  marker="$(auto_update_marker)"
+
+  mkdir -p "${AUTO_UPDATE_DIR}"
+  if [ "${remember}" = "1" ]; then
+    touch "$(auto_update_disabled_path)"
+  else
+    rm -f "$(auto_update_disabled_path)"
+  fi
+
+  local cron_ok=1
+  if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "${marker}"; then
+    existing="$(crontab -l 2>/dev/null || true)"
+    filtered="$(printf '%s\n' "${existing}" | awk -v marker="${marker}" 'index($0, marker) == 0')"
+    if [ -n "${filtered}" ]; then
+      printf '%s\n' "${filtered}" | crontab - || cron_ok=0
+    else
+      crontab -r 2>/dev/null || cron_ok=0
+    fi
+  fi
+
+  rm -f "$(auto_update_wrapper_path)" "$(auto_update_cli_path)"
+  if [ "${cron_ok}" = "0" ]; then
+    [ "${quiet}" = "1" ] || warn "The update launcher was disabled, but its stale cron entry could not be removed."
+    return 1
+  fi
+  [ "${quiet}" = "1" ] || ok "Automatic updates disabled."
+}
+
+ensure_auto_update_default() {
+  [ -e "$(auto_update_disabled_path)" ] && return 0
+  if auto_update_enabled; then
+    refresh_auto_update_launcher \
+      || warn "Could not update the automatic update launcher under ${AUTO_UPDATE_DIR}. Run 'genosyn auto-update on' to rewrite it."
+    return 0
+  fi
+  if ! enable_auto_update 1; then
+    warn "Automatic updates are on by default, but cron setup failed. Run 'genosyn auto-update on' after installing cron."
+  fi
+}
+
+auto_update_requested() {
+  case "${1:-1}" in
+    0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------- preconditions ----------
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 \
+    || die "Docker is not installed. Get it at https://docs.docker.com/get-docker/"
+  docker info >/dev/null 2>&1 \
+    || die "Docker daemon is not reachable. Start Docker Desktop (or your daemon) and re-run."
+}
+
+container_exists() {
+  docker ps -a --format '{{.Names}}' | grep -qx "${NAME}"
+}
+
+container_running() {
+  docker ps --format '{{.Names}}' | grep -qx "${NAME}"
+}
+
+volume_exists() {
+  docker volume ls --format '{{.Name}}' | grep -qx "${VOLUME}"
+}
+
+# Wait for the app to answer on its HTTP port from inside the container.
+wait_for_ready() {
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if docker exec "${NAME}" sh -c "wget -qO- http://127.0.0.1:8471 >/dev/null 2>&1 || curl -fsS http://127.0.0.1:8471 >/dev/null 2>&1" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Upgrades may need to apply database migrations before HTTP is available.
+# Give them longer than a normal start before deciding the new image failed.
+wait_for_upgrade_ready() {
+  local attempts=0
+  while [ "${attempts}" -lt 60 ]; do
+    if docker exec "${NAME}" sh -c "wget -qO- http://127.0.0.1:8471 >/dev/null 2>&1 || curl -fsS http://127.0.0.1:8471 >/dev/null 2>&1" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  return 1
+}
+
+container_named_exists() {
+  docker ps -a --format '{{.Names}}' | grep -qx "$1"
+}
+
+# Pause running Routine Runs before the container stops, so an upgrade never
+# cuts them off: each saves its progress and waits in the queue with its
+# transcript, and the upgraded container continues the same Runs where they
+# stopped. New Runs wait for the upgrade meanwhile. --drain-minutes N first
+# lets running Runs finish for up to N minutes; --now pauses without the time
+# to save progress. An image from before pausing only holds its queue, and the
+# upgraded image resumes whatever the restart cuts off while it is held.
+pause_routine_runs() {
+  local minutes="$1" grace="$2" rc=0
+  local pause_entry="dist/server/admin/pauseRoutines.js"
+  local drain_entry="dist/server/admin/drainRoutines.js"
+  if docker exec "${NAME}" test -f "/app/${pause_entry}" >/dev/null 2>&1; then
+    step "Pausing running Routine Runs; they continue after the upgrade"
+    # Cancelling must not leave the queue held or the pause in force.
+    trap 'docker exec -w /app "${NAME}" node "'"${pause_entry}"'" --release >/dev/null 2>&1 || true; trap - INT TERM; die "Upgrade cancelled; Routines are running again."' INT TERM
+    docker exec -w /app "${NAME}" node "${pause_entry}" \
+      --finish-minutes "${minutes}" --grace-seconds "${grace}" || rc=$?
+    trap - INT TERM
+    if [ "${rc}" = "3" ]; then
+      warn "Some Routine Runs did not pause in time; the restart stops them and they resume from their last saved line."
+    elif [ "${rc}" != "0" ]; then
+      warn "Could not pause running Routine Runs; upgrading anyway."
+    fi
+    return 0
+  fi
+  # Images without either script restart as they always did.
+  docker exec "${NAME}" test -f "/app/${drain_entry}" >/dev/null 2>&1 || return 0
+  if [ "${minutes}" -gt 0 ] 2>/dev/null; then
+    step "Letting running Routine Runs finish first (up to ${minutes} min)"
+  else
+    step "Holding the Routine queue for the upgrade"
+  fi
+  trap 'docker exec -w /app "${NAME}" node "'"${drain_entry}"'" --release >/dev/null 2>&1 || true; trap - INT TERM; die "Upgrade cancelled; Routines are running again."' INT TERM
+  docker exec -w /app "${NAME}" node "${drain_entry}" --minutes "${minutes}" || rc=$?
+  trap - INT TERM
+  if [ "${rc}" = "3" ]; then
+    warn "Routine Runs still running are stopped by the restart; the upgraded version resumes them from their last saved line."
+  elif [ "${rc}" != "0" ]; then
+    warn "Could not hold the Routine queue; upgrading anyway."
+  fi
+}
+
+upgrade_backup_path() {
+  mkdir -p "${UPGRADE_BACKUP_DIR}"
+  chmod 0700 "${UPGRADE_BACKUP_DIR}" 2>/dev/null || true
+
+  local backup_dir
+  backup_dir="$(cd "${UPGRADE_BACKUP_DIR}" && pwd)"
+  printf '%s/genosyn-pre-upgrade-%s-%s-%s.tar.gz' \
+    "${backup_dir}" "$(auto_update_key)" "$(date -u +%Y%m%d-%H%M%S)" "$$"
+}
+
+# Whether an archive holds something and reads end to end, drawn as a bar of
+# the archive read so far. BusyBox tar reports nothing, so the shell beside it
+# finds whichever process has the archive open -- the gunzip tar forks -- and
+# reads its position in the file from /proc twice a second.
+archive_valid() {
+  [ -s "$1" ] || return 1
+  with_progress "Verifying the backup" "$(wc -c <"$1" | tr -d ' ')" docker run --rm \
+    -v "$(cd "$(dirname "$1")" && pwd):/backup:ro" \
+    alpine:3.20 \
+    sh -c 'tar -tzf "/backup/$1" >/dev/null &
+pid=$!
+while kill -0 "$pid" 2>/dev/null; do
+  for fd in /proc/[0-9]*/fd/*; do
+    [ "$(readlink "$fd" 2>/dev/null)" = "/backup/$1" ] && sed -n "s/^pos:[[:space:]]*/$2 /p" "${fd%/fd/*}/fdinfo/${fd##*/}" >&2 2>/dev/null
+  done
+  sleep 0.5
+done
+wait "$pid"' sh "$(basename "$1")" "${PROGRESS_MARK}"
+}
+
+# Bytes of data an archive of the volume reads, by apparent size, without the
+# App's Backup/ folder when $1 is 1: the total for backup_volume_to's progress.
+# Empty if it can't be read.
+volume_archive_bytes() {
+  docker run --rm -v "${VOLUME}:/data:ro" alpine:3.20 \
+    sh -c 'total=$(du -sb /data | cut -f1); kept=0; if [ "$1" = "1" ] && [ -d /data/Backup ]; then kept=$(du -sb /data/Backup | cut -f1); fi; echo $((total - kept))' \
+    sh "${1:-0}" 2>/dev/null || true
+}
+
+# Write and validate a complete volume archive. The app must be stopped by the
+# caller when a consistent SQLite snapshot matters; backup_running_volume_to
+# takes one from a running app instead. Pass 1 as the second argument to leave
+# out the App's own Backup/ archives: an upgrade backup does not need them,
+# they can dwarf everything else, and a restore keeps them. BusyBox tar reports
+# no progress, so the shell beside it reads how much tar has read from /proc
+# twice a second, and a terminal shows that against the volume's size.
+backup_volume_to() {
+  local out="$1"
+  local skip_app_backups="${2:-0}"
+  local out_dir out_base owner_uid owner_gid total=""
+  out_dir="$(cd "$(dirname "${out}")" && pwd)"
+  out_base="$(basename "${out}")"
+  owner_uid="$(id -u)"
+  owner_gid="$(id -g)"
+  if progress_tty; then
+    total="$(volume_archive_bytes "${skip_app_backups}")"
+  fi
+
+  if ! with_progress "Archiving the volume" "${total}" docker run --rm \
+    -v "${VOLUME}:/data:ro" \
+    -v "${out_dir}:/backup" \
+    alpine:3.20 \
+    sh -c 'umask 077; rm -f "/backup/$1"; cd /data || exit 1
+if [ "$4" = "1" ]; then tar -czf "/backup/$1" --exclude=./Backup . & else tar -czf "/backup/$1" . & fi
+pid=$!
+while kill -0 "$pid" 2>/dev/null; do sed -n "s/^rchar: /$5 /p" "/proc/$pid/io" >&2 2>/dev/null; sleep 0.5; done
+wait "$pid" && chmod 0600 "/backup/$1" && { chown "$2:$3" "/backup/$1" 2>/dev/null || true; }' \
+    sh "${out_base}" "${owner_uid}" "${owner_gid}" "${skip_app_backups}" "${PROGRESS_MARK}" >/dev/null; then
+    return 1
+  fi
+
+  [ -s "${out}" ] || return 1
+  chmod 0600 "${out}" || return 1
+  archive_valid "${out}"
+}
+
+# Where a live backup stages its database snapshot: inside the running App
+# container, never the data volume, so no in-app backup can pick it up and a
+# copy a crash leaves behind goes with the container.
+LIVE_SNAPSHOT_DIR="/tmp/genosyn-upgrade-backup"
+
+# The "Total bytes written" a GNU tar command reports with --totals. Given
+# --file=/dev/null, tar reads the tree but no file, so this is the size of the
+# uncompressed archive it would write. Empty when it can't tell.
+tar_bytes_written() {
+  { "$@" 2>&1 >/dev/null || true; } | sed -n 's/^Total bytes written: \([0-9][0-9]*\).*/\1/p' | tail -n 1
+}
+
+# Archive the volume of a running Genosyn without stopping it, in the shape
+# backup_volume_to writes, so restore and rollback read it unchanged. SQLite
+# first copies the database with VACUUM INTO -- a reader, which the App's
+# writes never wait on -- into a consistent snapshot inside the container; the
+# App image's GNU tar then streams the volume out with that snapshot standing
+# in for the live database and its WAL. The archive holds the database as it
+# was at the snapshot: what Genosyn writes afterwards is not in it. The second
+# argument leaves out the App's Backup/ archives, as for backup_volume_to.
+backup_running_volume_to() {
+  local out="$1"
+  local skip_app_backups="${2:-0}"
+  local db total="" checkpoint=1000 rc=0
+  local tar_args=(--directory=/app/data --anchored --ignore-failed-read
+    --warning=no-file-changed --warning=no-file-removed --warning=no-file-ignored)
+
+  docker exec -u 0 "${NAME}" rm -rf "${LIVE_SNAPSHOT_DIR}" >/dev/null 2>&1 || true
+  # Prints the database's path inside the data directory, or nothing when the
+  # volume holds no SQLite database (Postgres, or a path outside it).
+  db="$(with_progress "Snapshotting the database" "" \
+    docker exec -i -w /app -e "GENOSYN_SNAPSHOT_DIR=${LIVE_SNAPSHOT_DIR}" "${NAME}" node <<'NODE'
+(async () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
+  const { config } = await import(pathToFileURL("/app/dist/config.js").href);
+  if (config.db && config.db.driver === "postgres") return;
+  const dataDir = path.resolve(config.dataDir || "./data");
+  const dbPath = path.resolve((config.db && config.db.sqlitePath) || "./data/app.sqlite");
+  const rel = path.relative(dataDir, dbPath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel) || !fs.existsSync(dbPath)) return;
+  const target = path.join(process.env.GENOSYN_SNAPSHOT_DIR, rel);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const Database = require("better-sqlite3");
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 60000 });
+  try {
+    db.prepare("VACUUM INTO ?").run(target);
+  } finally {
+    db.close();
+  }
+  process.stdout.write(rel);
+})().catch((e) => {
+  console.error("Could not snapshot the database: " + (e && e.message ? e.message : String(e)));
+  process.exit(1);
+});
+NODE
+)" || rc=$?
+  if [ "${rc}" = "0" ]; then
+    [ "${skip_app_backups}" != "1" ] || tar_args+=(--exclude=./Backup)
+    if [ -n "${db}" ]; then
+      tar_args+=(--exclude="./${db}" --exclude="./${db}-wal" --exclude="./${db}-shm"
+        --exclude="./${db}-journal" . --directory="${LIVE_SNAPSHOT_DIR}" "${db}")
+    else
+      tar_args+=(.)
+    fi
+    # tar reports what it has written every so many 10KiB records. A terminal
+    # measures the whole first, with a dry run, so the bar moves about a
+    # thousand times; elsewhere nobody sees it and a report every ~10MB will do.
+    if progress_tty; then
+      total="$(tar_bytes_written docker exec -u 0 -e LC_ALL=C "${NAME}" tar \
+        --create --file=/dev/null --totals "${tar_args[@]}")"
+      [ -z "${total}" ] || checkpoint=$((total / 10240 / 1000 + 1))
+    fi
+    # GNU tar exits 1 when a file changed while it was read, which a live
+    # archive expects; only 2 and above mean the archive is unusable.
+    (umask 077 && with_progress "Archiving the volume" "${total}" \
+      docker exec -u 0 "${NAME}" tar --create --gzip --file=- \
+      --checkpoint="${checkpoint}" "--checkpoint-action=echo=${PROGRESS_MARK} %{}T" \
+      "${tar_args[@]}" >"${out}") || rc=$?
+    [ "${rc}" -gt 1 ] || rc=0
+  fi
+  docker exec -u 0 "${NAME}" rm -rf "${LIVE_SNAPSHOT_DIR}" >/dev/null 2>&1 || true
+  [ "${rc}" = "0" ] || return 1
+  chmod 0600 "${out}" || return 1
+  archive_valid "${out}"
+}
+
+# Replace the volume's contents with an archive's. The App's own Backup/
+# archives stay: an upgrade backup leaves them out, and wiping them would throw
+# away every in-app backup along with the data being restored.
+restore_volume_from() {
+  local file="$1"
+  local file_dir file_base
+  file_dir="$(cd "$(dirname "${file}")" && pwd)"
+  file_base="$(basename "${file}")"
+
+  docker run --rm \
+    -v "${VOLUME}:/data" \
+    -v "${file_dir}:/backup:ro" \
+    alpine:3.20 \
+    sh -c 'cd /data && find . -mindepth 1 -maxdepth 1 ! -name Backup -exec rm -rf {} + 2>/dev/null; tar -xzf "/backup/$1"' \
+    sh "${file_base}" >/dev/null
+}
+
+# Each upgrade keeps one backup, the one it is about to take: daily automatic
+# upgrades would otherwise fill the disk with archives nobody would restore.
+# Only this install's archives match — another install's name may begin the
+# same way, so the timestamp and pid after it must be exactly what
+# upgrade_backup_path writes.
+prune_pre_upgrade_backups() {
+  local prefix old rest
+  [ -d "${UPGRADE_BACKUP_DIR}" ] || return 0
+  prefix="genosyn-pre-upgrade-$(auto_update_key)-"
+  for old in "${UPGRADE_BACKUP_DIR}/${prefix}"*.tar.gz; do
+    [ -f "${old}" ] || continue
+    rest="$(basename "${old}")"
+    rest="${rest#"${prefix}"}"
+    case "${rest}" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-*.tar.gz) ;;
+      *) continue ;;
+    esac
+    rest="${rest#????????-??????-}"
+    case "${rest%.tar.gz}" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    rm -f "${old}" && step "Removed the previous upgrade backup $(basename "${old}")"
+  done
+}
+
+# KiB an upgrade backup archives: the data volume without the App's Backup/
+# folder. Uncompressed, so a ceiling on the archive. Empty if it can't be read.
+volume_backup_size_kb() {
+  docker run --rm -v "${VOLUME}:/data:ro" alpine:3.20 \
+    sh -c 'total=$(du -sk /data | cut -f1); kept=0; if [ -d /data/Backup ]; then kept=$(du -sk /data/Backup | cut -f1); fi; echo $((total - kept))' \
+    2>/dev/null || true
+}
+
+# KiB the database snapshot of a live backup can take: the SQLite file, which
+# the snapshot never outgrows. 0 when the volume holds none.
+sqlite_snapshot_size_kb() {
+  docker run --rm -v "${VOLUME}:/data:ro" alpine:3.20 \
+    sh -c 'if [ -f /data/app.sqlite ]; then du -sk /data/app.sqlite | cut -f1; else echo 0; fi' \
+    2>/dev/null || true
+}
+
+# KiB free where a running container stages that snapshot.
+container_tmp_free_kb() {
+  docker exec "${NAME}" df -Pk /tmp 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# KiB free on the filesystem that holds $1.
+free_space_kb() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# Give back the space Docker can rebuild or download again: its build cache,
+# and images with no tag that no container uses -- among them Genosyn images an
+# upgrade pulled but never started. Tagged images, containers, and volumes
+# stay: they may belong to other software on the host, and volumes are where
+# data lives. Genosyn leaves no unused volume behind (its one VOLUME is always
+# the named data volume), so pruning them could only delete someone else's.
+reclaim_docker_space() {
+  docker image prune --force >/dev/null 2>&1 || true
+  docker builder prune --all --force >/dev/null 2>&1 || true
+}
+
+# Before anything is paused or stopped: clear the previous upgrade backup and
+# make sure the next one fits, with 1 GiB to spare for everything else on the
+# disk, reclaiming Docker's spare space first when it doesn't. A running
+# Genosyn's backup also holds a database snapshot until the archive is done,
+# counted against the backup's disk (the usual layout puts both on one) and
+# against the container's own. Writing until a disk filled would take the
+# host's other services down with it, so an upgrade that still has no room
+# stops here and leaves Genosyn as it was.
+prepare_pre_upgrade_backup() {
+  local needed snapshot=0 free free_before tmp_free
+  mkdir -p "${UPGRADE_BACKUP_DIR}" || die "Could not create the backup directory ${UPGRADE_BACKUP_DIR}. Nothing was changed."
+  chmod 0700 "${UPGRADE_BACKUP_DIR}" 2>/dev/null || true
+  prune_pre_upgrade_backups
+  step "Checking there is room for the upgrade backup"
+  needed="$(volume_backup_size_kb)"
+  if container_running; then
+    snapshot="$(sqlite_snapshot_size_kb)"
+  fi
+  free="$(free_space_kb "${UPGRADE_BACKUP_DIR}")"
+  case "${needed}:${snapshot}:${free}" in
+    *[!0-9:]*|:*|*:|*::*)
+      warn "Could not measure the space the upgrade backup needs; trying anyway."
+      return 0
+      ;;
+  esac
+  needed=$((needed + snapshot))
+  if [ "${free}" -lt $((needed + 1048576)) ]; then
+    step "Clearing Docker's build cache and unused untagged images to make room"
+    reclaim_docker_space
+    free_before="${free}"
+    free="$(free_space_kb "${UPGRADE_BACKUP_DIR}")"
+    case "${free}" in ''|*[!0-9]*) free="${free_before}" ;; esac
+    if [ "${free}" -gt "${free_before}" ]; then
+      ok "Freed $(human_size $(((free - free_before) * 1024)))."
+    fi
+  fi
+  if [ "${free}" -lt $((needed + 1048576)) ]; then
+    die "Not enough free space for the upgrade backup in ${UPGRADE_BACKUP_DIR}: it can take up to $(human_size $((needed * 1024))) and $(human_size $((free * 1024))) is free. Free some space, set GENOSYN_BACKUP_DIR to a larger disk, or run 'genosyn upgrade --no-backup'. Genosyn was not changed."
+  fi
+  if [ "${snapshot}" -gt 0 ]; then
+    tmp_free="$(container_tmp_free_kb)"
+    case "${tmp_free}" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "${tmp_free}" -lt $((snapshot + 1048576)) ]; then
+          die "Not enough free space for the database snapshot in '${NAME}': it can take up to $(human_size $((snapshot * 1024))) and $(human_size $((tmp_free * 1024))) is free. Free some space on Docker's disk, or run 'genosyn upgrade --no-backup'. Genosyn was not changed."
+        fi
+        ;;
+    esac
+  fi
+}
+
+rollback_upgrade() {
+  local rollback_name="$1"
+  local backup_path="$2"
+
+  warn "The new version did not become ready — rolling back automatically."
+
+  if container_exists; then
+    docker logs --tail 50 "${NAME}" >&2 2>/dev/null || true
+    step "Removing failed container '${NAME}'"
+    docker rm -f "${NAME}" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${backup_path}" ]; then
+    step "Restoring pre-upgrade backup"
+    if ! restore_volume_from "${backup_path}"; then
+      if container_named_exists "${rollback_name}" && ! container_exists; then
+        docker rename "${rollback_name}" "${NAME}" >/dev/null 2>&1 || true
+      fi
+      warn "Automatic restore failed. The previous container is stopped and the backup is preserved at ${backup_path}."
+      return 1
+    fi
+  fi
+
+  if ! docker rename "${rollback_name}" "${NAME}" >/dev/null; then
+    if [ -n "${backup_path}" ]; then
+      warn "Data was restored, but the previous container could not be renamed. It remains '${rollback_name}'."
+    else
+      warn "The previous container could not be renamed. It remains '${rollback_name}'."
+    fi
+    return 1
+  fi
+
+  step "Restarting previous container '${NAME}'"
+  if ! docker start "${NAME}" >/dev/null; then
+    if [ -n "${backup_path}" ]; then
+      warn "Data was restored, but the previous container could not be restarted."
+    else
+      warn "The previous container could not be restarted."
+    fi
+    return 1
+  fi
+
+  if ! wait_for_ready; then
+    warn "The previous container was restored but did not become ready. Check 'genosyn logs'."
+    return 1
+  fi
+
+  if [ -n "${backup_path}" ]; then
+    ok "Rollback complete. Previous version and data restored; backup kept at ${backup_path}."
+  else
+    ok "Rollback complete. Previous version restarted with the current data volume."
+  fi
+  return 0
+}
+
+print_post_install() {
+  echo
+  printf '   Open    %shttp://localhost:%s%s\n' "${C_INDIGO}" "${PORT}" "${C_RESET}"
+  printf '   Logs    %sgenosyn logs -f%s\n'     "${C_DIM}"   "${C_RESET}"
+  printf '   Status  %sgenosyn status%s\n'      "${C_DIM}"   "${C_RESET}"
+  printf '   Upgrade %sgenosyn upgrade%s\n'     "${C_DIM}"   "${C_RESET}"
+  echo
+}
+
+# Start a fresh container with the configured name/port/volume/image.
+run_container() {
+  run_container_with_image "${IMAGE}"
+}
+
+run_container_with_image() {
+  local image_ref="$1"
+  docker run -d \
+    --name "${NAME}" \
+    --restart unless-stopped \
+    -p "${PORT}:8471" \
+    -v "${VOLUME}:/app/data" \
+    "${image_ref}" >/dev/null
+}
+
+# ---------- flag parsing ----------
+#
+# Every command accepts --port, --name, --volume, --image so operators can
+# override on a per-invocation basis without exporting env vars. Unknown flags
+# fall through to command-specific parsing (see `logs`, `backup`, etc).
+
+parse_common_flags() {
+  REMAINING=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)
+        [ $# -ge 2 ] || die "Missing value for --port"
+        PORT="$2"; shift 2
+        ;;
+      --name)
+        [ $# -ge 2 ] || die "Missing value for --name"
+        NAME="$2"; shift 2
+        ;;
+      --volume)
+        [ $# -ge 2 ] || die "Missing value for --volume"
+        VOLUME="$2"; shift 2
+        ;;
+      --image)
+        [ $# -ge 2 ] || die "Missing value for --image"
+        IMAGE="$2"; shift 2
+        ;;
+      --port=*)    PORT="${1#*=}"; shift ;;
+      --name=*)    NAME="${1#*=}"; shift ;;
+      --volume=*)  VOLUME="${1#*=}"; shift ;;
+      --image=*)   IMAGE="${1#*=}"; shift ;;
+      *) REMAINING+=("$1"); shift ;;
+    esac
+  done
+}
+
+confirm() {
+  local prompt="${1:-Are you sure?}"
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    die "Refusing to run a destructive action without a TTY. Re-run interactively or pass --yes."
+  fi
+  printf '%s [y/N] ' "$prompt"
+  local reply
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- commands ----------
+
+cmd_install() {
+  local auto_update="${GENOSYN_AUTO_UPDATE:-1}"
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""               ) shift ;;
+      --auto-update     ) auto_update=1; shift ;;
+      --no-auto-update  ) auto_update=0; shift ;;
+      *) die "Unknown argument to install: $1" ;;
+    esac
+  done
+
+  require_docker
+
+  printf '%sGenosyn%s %sinstaller%s\n' "${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+  printf '%sRun companies autonomously.%s\n\n' "${C_DIM}" "${C_RESET}"
+
+  if container_exists; then
+    warn "Container '${NAME}' already exists — using the retained-container upgrade path."
+    if auto_update_requested "${auto_update}"; then
+      if ! enable_auto_update 1; then
+        warn "Automatic updates could not be scheduled. Run 'genosyn auto-update on' after installing cron."
+      fi
+    else
+      disable_auto_update 1
+    fi
+    cmd_upgrade \
+      --port "${PORT}" \
+      --name "${NAME}" \
+      --volume "${VOLUME}" \
+      --image "${IMAGE}"
+    return $?
+  fi
+
+  step "Pulling ${IMAGE}"
+  docker pull "${IMAGE}" >/dev/null
+
+  step "Starting '${NAME}' on port ${PORT}"
+  run_container
+
+  wait_for_ready || warn "Container started but did not answer HTTP in time. Check 'genosyn logs'."
+
+  if auto_update_requested "${auto_update}"; then
+    if ! enable_auto_update 1; then
+      warn "Genosyn is installed, but automatic updates could not be scheduled. Run 'genosyn auto-update on' after installing cron."
+    fi
+  else
+    disable_auto_update 1
+  fi
+
+  ok "Genosyn is running."
+  if auto_update_enabled; then
+    printf '%sUpdates%s    automatic, daily at 03:17 local time\n' "${C_DIM}" "${C_RESET}"
+  else
+    printf '%sUpdates%s    manual\n' "${C_DIM}" "${C_RESET}"
+  fi
+  print_post_install
+}
+
+cmd_upgrade() {
+  local original_args=("$@")
+  local skip_self=0
+  # Every upgrade backs the data up first unless told not to. --backup is the
+  # default now, still accepted so older scripts keep working.
+  local take_backup=1
+  local drain_minutes="${DRAIN_MINUTES}"
+  local pause_grace="${PAUSE_GRACE_SECONDS}"
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""               ) shift ;;
+      --backup          ) take_backup=1; shift ;;
+      --no-backup|--skip-backup) take_backup=0; shift ;;
+      --no-self-upgrade) skip_self=1; shift ;;
+      --now            ) drain_minutes=0; pause_grace=0; shift ;;
+      --drain-minutes  )
+        [ $# -ge 2 ] || die "--drain-minutes needs a number of minutes."
+        case "$2" in ''|*[!0-9]*) die "--drain-minutes needs a whole number of minutes." ;; esac
+        drain_minutes="$2"; shift 2 ;;
+      *) die "Unknown argument to upgrade: $1" ;;
+    esac
+  done
+  # The environment settings reach a script inside the container; a value it
+  # cannot read would cost the pause, so fall back to the defaults instead.
+  case "${drain_minutes}" in
+    ''|*[!0-9]*) warn "GENOSYN_DRAIN_MINUTES must be a whole number of minutes; using 0."; drain_minutes=0 ;;
+  esac
+  case "${pause_grace}" in
+    ''|*[!0-9]*) warn "GENOSYN_PAUSE_GRACE_SECONDS must be a whole number of seconds; using 90."; pause_grace=90 ;;
+  esac
+
+  require_docker
+
+  if [ "${skip_self}" = "0" ]; then
+    if ! self_upgrade; then
+      step "Re-running with updated CLI"
+      exec "$(self_path)" upgrade --no-self-upgrade ${original_args[@]+"${original_args[@]}"}
+    fi
+  fi
+
+  if ! container_exists; then
+    die "No container named '${NAME}' found. Run 'genosyn install' first."
+  fi
+
+  # Existing installations adopt the default-on schedule the first time they
+  # upgrade with a CLI that supports it. `auto-update off` writes a durable
+  # opt-out marker so later manual upgrades do not silently turn it back on.
+  ensure_auto_update_default
+
+  local before after before_ver after_ver
+  before="$(docker inspect --format '{{.Image}}' "${NAME}")"
+  before_ver="$(image_version_label "${before}")"
+
+  step "Pulling ${IMAGE}"
+  docker pull "${IMAGE}" >/dev/null
+  after="$(docker image inspect --format '{{.Id}}' "${IMAGE}")"
+  after_ver="$(image_version_label "${after}")"
+
+  local ver_msg=""
+  if [ -n "${before_ver}" ] && [ -n "${after_ver}" ] && [ "${before_ver}" != "${after_ver}" ]; then
+    ver_msg=" (${before_ver} → ${after_ver})"
+  elif [ -n "${after_ver}" ]; then
+    ver_msg=" (${after_ver})"
+  fi
+
+  if [ -n "${before}" ] && [ "${before}" = "${after}" ]; then
+    ok "Already on the latest image${ver_msg}."
+    if container_running; then
+      return 0
+    fi
+    warn "Container is not running — starting it."
+    docker start "${NAME}" >/dev/null
+    wait_for_ready || warn "Container started but did not answer HTTP in time. Check 'genosyn logs'."
+    return 0
+  fi
+
+  local rollback_name="${NAME}-upgrade-rollback"
+  if container_named_exists "${rollback_name}"; then
+    die "Cannot upgrade while rollback container '${rollback_name}' exists. Remove or recover it first."
+  fi
+
+  # A running Genosyn is backed up while it keeps serving, so the archive --
+  # however long a large volume takes -- costs no downtime, and only the
+  # restart below does. One that is already stopped is archived as it lies.
+  local backup_path=""
+  if [ "${take_backup}" = "1" ]; then
+    prepare_pre_upgrade_backup
+    backup_path="$(upgrade_backup_path)" \
+      || die "Could not prepare the pre-upgrade backup directory. Nothing was changed."
+    if container_running; then
+      step "Backing up volume '${VOLUME}' while '${NAME}' keeps running → ${backup_path}"
+      if ! backup_running_volume_to "${backup_path}" 1; then
+        rm -f "${backup_path}"
+        die "Could not back up '${NAME}' while it runs. Upgrade aborted; it is still running and nothing was changed. Stop it first ('genosyn stop') to back it up offline, or run 'genosyn upgrade --no-backup'."
+      fi
+    else
+      step "Backing up volume '${VOLUME}' → ${backup_path}"
+      if ! backup_volume_to "${backup_path}" 1; then
+        rm -f "${backup_path}"
+        die "Pre-upgrade backup failed or could not be validated. Upgrade aborted; the existing container was not replaced."
+      fi
+    fi
+    ok "Pre-upgrade backup verified."
+  fi
+
+  local was_running=0
+  if container_running; then
+    was_running=1
+    pause_routine_runs "${drain_minutes}" "${pause_grace}"
+    step "Stopping '${NAME}' for upgrade"
+    docker stop "${NAME}" >/dev/null
+  fi
+
+  step "Keeping previous container as '${rollback_name}'"
+  if ! docker rename "${NAME}" "${rollback_name}" >/dev/null; then
+    [ "${was_running}" = "0" ] || docker start "${NAME}" >/dev/null 2>&1 || true
+    if [ -n "${backup_path}" ]; then
+      die "Could not preserve the previous container. Upgrade aborted; backup kept at ${backup_path}."
+    fi
+    die "Could not preserve the previous container. Upgrade aborted."
+  fi
+
+  step "Starting upgraded '${NAME}'"
+  local upgrade_failed=0
+  if ! run_container_with_image "${IMAGE}"; then
+    upgrade_failed=1
+  elif ! wait_for_upgrade_ready; then
+    upgrade_failed=1
+  fi
+
+  if [ "${upgrade_failed}" = "1" ]; then
+    if rollback_upgrade "${rollback_name}" "${backup_path}"; then
+      if [ -n "${backup_path}" ]; then
+        warn "Upgrade failed; the previous version and data were restored automatically."
+      else
+        warn "Upgrade failed; the previous version was restarted without restoring the data volume."
+      fi
+    else
+      if [ -n "${backup_path}" ]; then
+        warn "Upgrade and automatic rollback both need attention. Backup: ${backup_path}"
+      else
+        warn "Upgrade and automatic rollback both need attention. No pre-upgrade backup is available."
+      fi
+    fi
+    return 1
+  fi
+
+  step "Removing retained previous container"
+  local previous_container_removed=0
+  if docker rm "${rollback_name}" >/dev/null; then
+    previous_container_removed=1
+  else
+    warn "Upgrade succeeded, but retained container '${rollback_name}' could not be removed."
+  fi
+
+  if [ "${previous_container_removed}" = "1" ] && [ -n "${before}" ] && [ "${before}" != "${after}" ]; then
+    step "Removing previous images"
+    docker image rm "${before}" >/dev/null 2>&1 || true
+    # An upgrade that stopped before the restart, or rolled back, leaves the
+    # image it pulled. Once a newer pull takes its tag it has no name and no
+    # container, so nothing else would ever remove it. The label every release
+    # image carries keeps this to Genosyn's own.
+    docker image prune --force \
+      --filter "label=org.opencontainers.image.source=https://github.com/Genosyn/genosyn" \
+      >/dev/null 2>&1 || true
+  fi
+
+  ok "Genosyn upgraded${ver_msg}."
+  if [ -n "${backup_path}" ]; then
+    printf '%sBackup%s     %s\n' "${C_DIM}" "${C_RESET}" "${backup_path}"
+  fi
+  print_post_install
+}
+
+cmd_start() {
+  parse_common_flags "$@"
+  require_docker
+  container_exists || die "No container named '${NAME}' found. Run 'genosyn install' first."
+  if container_running; then
+    ok "Already running."
+    return 0
+  fi
+  step "Starting '${NAME}'"
+  docker start "${NAME}" >/dev/null
+  ok "Started."
+}
+
+cmd_stop() {
+  parse_common_flags "$@"
+  require_docker
+  container_exists || die "No container named '${NAME}' found."
+  if ! container_running; then
+    ok "Already stopped."
+    return 0
+  fi
+  step "Stopping '${NAME}'"
+  docker stop "${NAME}" >/dev/null
+  ok "Stopped."
+}
+
+cmd_restart() {
+  cmd_stop "$@"
+  cmd_start "$@"
+}
+
+cmd_status() {
+  parse_common_flags "$@"
+  require_docker
+
+  if ! container_exists; then
+    printf '%sNot installed%s — run %sgenosyn install%s\n' "${C_YELLOW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+    return 0
+  fi
+
+  local state image_id image_digest created started health
+  state="$(docker inspect --format '{{.State.Status}}' "${NAME}")"
+  image_id="$(docker inspect --format '{{.Image}}' "${NAME}")"
+  image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}<local>{{end}}' "${image_id}" 2>/dev/null || echo '<unknown>')"
+  created="$(docker inspect --format '{{.Created}}' "${NAME}")"
+  started="$(docker inspect --format '{{.State.StartedAt}}' "${NAME}")"
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' "${NAME}")"
+
+  printf '%sContainer%s  %s\n'  "${C_BOLD}" "${C_RESET}" "${NAME}"
+  printf '%sState%s      %s\n'  "${C_DIM}"  "${C_RESET}" "${state}"
+  printf '%sHealth%s     %s\n'  "${C_DIM}"  "${C_RESET}" "${health}"
+  printf '%sImage%s      %s\n'  "${C_DIM}"  "${C_RESET}" "${IMAGE}"
+  printf '%sDigest%s     %s\n'  "${C_DIM}"  "${C_RESET}" "${image_digest}"
+  printf '%sVolume%s     %s\n'  "${C_DIM}"  "${C_RESET}" "${VOLUME}"
+  printf '%sPort%s       %s → 8471\n' "${C_DIM}" "${C_RESET}" "${PORT}"
+  printf '%sCreated%s    %s\n'  "${C_DIM}"  "${C_RESET}" "${created}"
+  printf '%sStarted%s    %s\n'  "${C_DIM}"  "${C_RESET}" "${started}"
+
+  if [ "${state}" = "running" ]; then
+    printf '\n%sOpen%s  %shttp://localhost:%s%s\n' "${C_DIM}" "${C_RESET}" "${C_INDIGO}" "${PORT}" "${C_RESET}"
+  fi
+}
+
+cmd_logs() {
+  parse_common_flags "$@"
+  set -- "${REMAINING[@]-}"
+
+  local follow=0
+  local tail=""
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""       ) shift ;;
+      -f|--follow) follow=1; shift ;;
+      --tail)    tail="$2"; shift 2 ;;
+      --tail=*)  tail="${1#*=}"; shift ;;
+      -n)        tail="$2"; shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+
+  require_docker
+  container_exists || die "No container named '${NAME}' found."
+
+  local cmd=(docker logs)
+  [ "${follow}" = "1" ] && cmd+=(-f)
+  [ -n "${tail}" ] && cmd+=(--tail "${tail}")
+  cmd+=("${NAME}")
+  "${cmd[@]}"
+}
+
+cmd_backup() {
+  parse_common_flags "$@"
+  set -- "${REMAINING[@]-}"
+
+  local out=""
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""       ) shift ;;
+      --out)    out="$2"; shift 2 ;;
+      --out=*)  out="${1#*=}"; shift ;;
+      -o)       out="$2"; shift 2 ;;
+      *) die "Unknown argument to backup: $1" ;;
+    esac
+  done
+
+  require_docker
+  volume_exists || die "Data volume '${VOLUME}' not found. Nothing to back up."
+
+  if [ -z "${out}" ]; then
+    out="genosyn-backup-$(date -u +%Y%m%d-%H%M%S).tar.gz"
+  fi
+
+  local out_abs out_dir out_base
+  mkdir -p "$(dirname "${out}")"
+  out_dir="$(cd "$(dirname "${out}")" && pwd)"
+  out_base="$(basename "${out}")"
+  out_abs="${out_dir}/${out_base}"
+
+  step "Backing up volume '${VOLUME}' → ${out_abs}"
+  if ! backup_volume_to "${out_abs}"; then
+    rm -f "${out_abs}"
+    die "Backup failed or the archive could not be validated."
+  fi
+
+  ok "Backup written: ${out_abs}"
+}
+
+cmd_restore() {
+  parse_common_flags "$@"
+  set -- "${REMAINING[@]-}"
+
+  local file=""
+  local assume_yes=0
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""       ) shift ;;
+      -y|--yes) assume_yes=1; shift ;;
+      -*)       die "Unknown flag: $1" ;;
+      *)        file="$1"; shift ;;
+    esac
+  done
+
+  [ -n "${file}" ] || die "Usage: genosyn restore <backup.tar.gz>"
+  [ -f "${file}" ] || die "Backup file not found: ${file}"
+
+  require_docker
+
+  local file_abs
+  file_abs="$(cd "$(dirname "${file}")" && pwd)/$(basename "${file}")"
+
+  if volume_exists; then
+    warn "This will ERASE the current contents of volume '${VOLUME}' and replace them with '${file_abs}'."
+    if [ "${assume_yes}" != "1" ]; then
+      confirm "Continue?" || die "Aborted."
+    fi
+  fi
+
+  if container_running; then
+    step "Stopping '${NAME}' before restore"
+    docker stop "${NAME}" >/dev/null
+  fi
+
+  if ! volume_exists; then
+    step "Creating volume '${VOLUME}'"
+    docker volume create "${VOLUME}" >/dev/null
+  fi
+
+  step "Restoring into volume '${VOLUME}'"
+  if ! restore_volume_from "${file_abs}"; then
+    die "Restore failed. The source archive is unchanged at ${file_abs}."
+  fi
+
+  if container_exists; then
+    step "Starting '${NAME}'"
+    docker start "${NAME}" >/dev/null
+  fi
+
+  ok "Restore complete."
+}
+
+cmd_uninstall() {
+  parse_common_flags "$@"
+  set -- "${REMAINING[@]-}"
+
+  local purge=0
+  local assume_yes=0
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""       ) shift ;;
+      --purge) purge=1; shift ;;
+      -y|--yes) assume_yes=1; shift ;;
+      *) die "Unknown argument to uninstall: $1" ;;
+    esac
+  done
+
+  require_docker
+
+  if ! container_exists && ! volume_exists; then
+    disable_auto_update 1 0 || warn "Automatic updates were disabled, but the stale cron entry could not be removed."
+    ok "Nothing to uninstall."
+    return 0
+  fi
+
+  if [ "${purge}" = "1" ]; then
+    warn "--purge will DELETE the data volume '${VOLUME}' (SQLite DB + per-employee credentials). This is not reversible."
+    if [ "${assume_yes}" != "1" ]; then
+      confirm "Continue?" || die "Aborted."
+    fi
+  fi
+
+  if container_exists; then
+    step "Removing container '${NAME}'"
+    docker rm -f "${NAME}" >/dev/null
+  fi
+
+  if [ "${purge}" = "1" ] && volume_exists; then
+    step "Removing volume '${VOLUME}'"
+    docker volume rm "${VOLUME}" >/dev/null
+  elif volume_exists; then
+    printf '%sKept%s data volume %s (use --purge to delete)\n' "${C_DIM}" "${C_RESET}" "${VOLUME}"
+  fi
+
+  disable_auto_update 1 0 || warn "Automatic updates were disabled, but the stale cron entry could not be removed."
+
+  ok "Uninstalled."
+}
+
+cmd_auto_update() {
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+
+  local action="${1:-status}"
+  [ $# -le 1 ] || die "Usage: genosyn auto-update <on|off|status>"
+  case "${action}" in
+    on|enable)
+      require_docker
+      container_exists || die "No container named '${NAME}' found. Run 'genosyn install' first."
+      enable_auto_update
+      ;;
+    off|disable)
+      disable_auto_update
+      ;;
+    status)
+      if auto_update_enabled; then
+        printf '%sEnabled%s — daily at 03:17 local time\n' "${C_GREEN}" "${C_RESET}"
+        printf '%sLog%s      %s\n' "${C_DIM}" "${C_RESET}" "$(auto_update_log_path)"
+        if auto_update_runs_own_cli; then
+          printf '%sCLI%s      %s (%s)\n' "${C_DIM}" "${C_RESET}" \
+            "$(auto_update_cli_path)" "$(cli_file_version "$(auto_update_cli_path)")"
+        else
+          warn "These updates cannot replace their own CLI yet. Run 'genosyn upgrade' once to give them a copy they can update without sudo."
+        fi
+      else
+        printf '%sDisabled%s — run %sgenosyn auto-update on%s to enable\n' \
+          "${C_YELLOW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+      fi
+      ;;
+    *) die "Unknown auto-update action: ${action}. Use on, off, or status." ;;
+  esac
+}
+
+cmd_self_upgrade() {
+  parse_common_flags "$@"
+  self_upgrade || true
+}
+
+cmd_prune() {
+  local dry_run=0
+  local assume_yes=0
+  parse_common_flags "$@"
+  set -- "${REMAINING[@]-}"
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""        ) shift ;;
+      --dry-run ) dry_run=1; shift ;;
+      -y|--yes  ) assume_yes=1; shift ;;
+      *) die "Unknown argument to prune: $1" ;;
+    esac
+  done
+
+  require_docker
+
+  step "Finding old Genosyn images"
+
+  local current
+  current="$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null || true)"
+
+  local repo
+  repo="$(image_repo "${IMAGE}")"
+
+  local victims=()
+  local id refs ref
+  while IFS= read -r id; do
+    [ -n "${id}" ] || continue
+    [ "${id}" = "${current}" ] && continue
+    refs="$(docker image inspect --format '{{range .RepoDigests}}{{.}} {{end}}{{range .RepoTags}}{{.}} {{end}}' "${id}" 2>/dev/null || true)"
+    # Reduce each ref to its repository and compare exactly. This used to be a
+    # substring glob against the whole ref list, which matched any repository
+    # that merely *contained* ours -- `localhost` matching `localhost:5000/…`
+    # being the case that could delete a bystander's images.
+    for ref in ${refs}; do
+      if [ "$(image_repo "${ref}")" = "${repo}" ]; then
+        victims+=("${id}")
+        break
+      fi
+    done
+  done < <(docker images --no-trunc --format '{{.ID}}' | sort -u)
+
+  if [ "${#victims[@]}" -eq 0 ]; then
+    ok "Nothing to prune."
+    return 0
+  fi
+
+  printf '\nFound %s%d%s old image(s) for %s:\n' "${C_BOLD}" "${#victims[@]}" "${C_RESET}" "${repo}"
+  local total_size=0
+  local short tags size
+  for id in "${victims[@]}"; do
+    short="${id#sha256:}"; short="${short:0:12}"
+    tags="$(docker image inspect --format '{{if .RepoTags}}{{join .RepoTags ", "}}{{else}}<none>{{end}}' "${id}" 2>/dev/null || echo '<none>')"
+    size="$(docker image inspect --format '{{.Size}}' "${id}" 2>/dev/null || echo 0)"
+    total_size=$((total_size + size))
+    printf '  %s  %8s  %s\n' "${short}" "$(human_size "${size}")" "${tags}"
+  done
+  printf '%sTotal:%s %s\n\n' "${C_DIM}" "${C_RESET}" "$(human_size "${total_size}")"
+
+  if [ "${dry_run}" = "1" ]; then
+    ok "Dry run — nothing removed."
+    return 0
+  fi
+
+  if [ "${assume_yes}" != "1" ]; then
+    confirm "Remove these ${#victims[@]} image(s)?" || die "Aborted."
+  fi
+
+  local removed=0
+  for id in "${victims[@]}"; do
+    if docker image rm "${id}" >/dev/null 2>&1; then
+      removed=$((removed + 1))
+    fi
+  done
+
+  ok "Removed ${removed} of ${#victims[@]} image(s)."
+  if [ "${removed}" -lt "${#victims[@]}" ]; then
+    warn "Some images are still referenced by other containers and were skipped."
+  fi
+}
+
+cmd_users() {
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+
+  local format="table"
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""      ) shift ;;
+      --json  ) format="json"; shift ;;
+      *) die "Unknown argument to users: $1" ;;
+    esac
+  done
+
+  require_docker
+  container_exists  || die "No container named '${NAME}' found. Run 'genosyn install' first."
+  container_running || die "Container '${NAME}' is not running. Start it with 'genosyn start'."
+
+  # Query the app DB inside the container. We import the app's compiled config
+  # (dist/config.js) so we honour whatever driver + connection it actually uses
+  # — SQLite via better-sqlite3, or Postgres via pg. Both ship in the app's
+  # node_modules, so no extra binaries are needed. Quoted heredoc → no bash
+  # expansion; the output format flows in via an env var so the JS stays a
+  # pure literal. Column identifiers are double-quoted because TypeORM stores
+  # them camelCase and Postgres folds unquoted names to lowercase.
+  docker exec -i \
+    -e "GENOSYN_USERS_FORMAT=${format}" \
+    -w /app \
+    "${NAME}" node <<'NODE'
+(async () => {
+  const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
+
+  let config;
+  try {
+    ({ config } = await import(pathToFileURL("/app/dist/config.js").href));
+  } catch (e) {
+    console.error("Could not load app config from /app/dist/config.js: " + e.message);
+    process.exit(1);
+  }
+
+  const QUERY =
+    'SELECT u.email AS email, u.name AS name, u.handle AS handle, ' +
+    'u."createdAt" AS "createdAt", ' +
+    '(SELECT COUNT(*) FROM memberships m WHERE m."userId" = u.id) AS companies ' +
+    'FROM users u ORDER BY u."createdAt" ASC';
+
+  let rows;
+  if (config.db && config.db.driver === "postgres") {
+    const { Client } = require("pg");
+    const client = new Client({ connectionString: config.db.postgresUrl });
+    try {
+      await client.connect();
+      rows = (await client.query(QUERY)).rows;
+    } catch (e) {
+      console.error("Postgres query failed: " + e.message);
+      process.exit(1);
+    } finally {
+      await client.end().catch(() => {});
+    }
+  } else {
+    const Database = require("better-sqlite3");
+    const dbPath = path.resolve(config.db && config.db.sqlitePath || "./data/app.sqlite");
+    let db;
+    try {
+      db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    } catch (e) {
+      console.error("Could not open " + dbPath + ": " + e.message);
+      process.exit(1);
+    }
+    rows = db.prepare(QUERY).all();
+  }
+
+  // Postgres returns COUNT(*) as a string; normalise to a number everywhere.
+  for (const r of rows) r.companies = Number(r.companies);
+
+  if (process.env.GENOSYN_USERS_FORMAT === "json") {
+    process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
+    return;
+  }
+  if (rows.length === 0) {
+    console.log("No users yet.");
+    return;
+  }
+
+  // SQLite hands back createdAt as ISO-ish text, Postgres as a JS Date.
+  // Normalise both to "YYYY-MM-DD HH:MM:SS".
+  const fmtDate = (v) => {
+    if (v == null) return "";
+    const s = v instanceof Date ? v.toISOString() : String(v);
+    return s.slice(0, 19).replace("T", " ");
+  };
+  const cols = [
+    { key: "email",     label: "EMAIL" },
+    { key: "name",      label: "NAME" },
+    { key: "handle",    label: "HANDLE" },
+    { key: "companies", label: "COMPANIES" },
+    { key: "createdAt", label: "CREATED" },
+  ];
+  const fmt = (k, v) => k === "createdAt" ? fmtDate(v) : (v == null ? "" : String(v));
+  const widths = cols.map(c =>
+    Math.max(c.label.length, ...rows.map(r => fmt(c.key, r[c.key]).length))
+  );
+  const line = (vals) => vals.map((v, i) => v.padEnd(widths[i])).join("  ");
+  console.log(line(cols.map(c => c.label)));
+  for (const r of rows) console.log(line(cols.map(c => fmt(c.key, r[c.key]))));
+  console.log("\n" + rows.length + " user" + (rows.length === 1 ? "" : "s") + ".");
+})().catch((e) => {
+  console.error(e && e.message ? e.message : String(e));
+  process.exit(1);
+});
+NODE
+}
+
+cmd_reset_password() {
+  local email=""
+  local password=""
+  local assume_yes=0
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""           ) shift ;;
+      --password   ) password="$2"; shift 2 ;;
+      --password=* ) password="${1#*=}"; shift ;;
+      -y|--yes     ) assume_yes=1; shift ;;
+      -*           ) die "Unknown flag to reset-password: $1" ;;
+      *)
+        if [ -z "${email}" ]; then email="$1"; shift
+        else die "Unexpected argument: $1"; fi
+        ;;
+    esac
+  done
+
+  [ -n "${email}" ] || die "Usage: genosyn reset-password <email> [--password <pw>] [-y]"
+
+  # Mirror the app's password policy so we fail fast before touching the DB.
+  if [ -n "${password}" ] && [ "${#password}" -lt 12 ]; then
+    die "Password must be at least 12 characters."
+  fi
+
+  require_docker
+  container_exists  || die "No container named '${NAME}' found. Run 'genosyn install' first."
+  container_running || die "Container '${NAME}' is not running. Start it with 'genosyn start'."
+
+  if [ "${assume_yes}" != "1" ]; then
+    confirm "Reset the password for '${email}'? This overwrites their current password." \
+      || die "Aborted."
+  fi
+
+  # Hash + update inside the container so we reuse the app's bcrypt and config.
+  # Email + (optional) password flow in via env. When no password is supplied
+  # the script generates one itself, so the generated secret never appears in
+  # argv, the host process table, or shell history. Same driver-agnostic
+  # config import as `users`; camelCase columns are double-quoted for Postgres.
+  docker exec -i \
+    -e "GENOSYN_RP_EMAIL=${email}" \
+    -e "GENOSYN_RP_PASSWORD=${password}" \
+    -w /app \
+    "${NAME}" node <<'NODE'
+(async () => {
+  const path = require("node:path");
+  const crypto = require("node:crypto");
+  const { pathToFileURL } = require("node:url");
+
+  let config;
+  try {
+    ({ config } = await import(pathToFileURL("/app/dist/config.js").href));
+  } catch (e) {
+    console.error("Could not load app config from /app/dist/config.js: " + e.message);
+    process.exit(1);
+  }
+
+  const email = String(process.env.GENOSYN_RP_EMAIL || "").trim().toLowerCase();
+  if (!email) {
+    console.error("No email provided.");
+    process.exit(1);
+  }
+
+  let password = process.env.GENOSYN_RP_PASSWORD || "";
+  const generated = password.length === 0;
+  if (generated) {
+    // 16 url-safe alphanumerics — strong, and easy to read out or paste.
+    password = crypto.randomBytes(24).toString("base64").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
+  } else if (password.length < 12) {
+    console.error("Password must be at least 12 characters.");
+    process.exit(1);
+  }
+
+  const bcrypt = require("bcrypt");
+  const hash = await bcrypt.hash(password, 10);
+
+  let user;
+  if (config.db && config.db.driver === "postgres") {
+    const { Client } = require("pg");
+    const client = new Client({ connectionString: config.db.postgresUrl });
+    try {
+      await client.connect();
+      user = (await client.query("SELECT id, name FROM users WHERE email = $1", [email])).rows[0];
+      if (!user) {
+        console.error("No user found with email: " + email);
+        process.exit(1);
+      }
+      await client.query("BEGIN");
+      await client.query(
+        'UPDATE users SET "passwordHash" = $1, "resetToken" = NULL, "resetExpiresAt" = NULL, "sessionVersion" = "sessionVersion" + 1 WHERE id = $2',
+        [hash, user.id]
+      );
+      await client.query(
+        'UPDATE api_keys SET "revokedAt" = NOW() WHERE "userId" = $1 AND "revokedAt" IS NULL',
+        [user.id]
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("Postgres update failed: " + e.message);
+      process.exit(1);
+    } finally {
+      await client.end().catch(() => {});
+    }
+  } else {
+    const Database = require("better-sqlite3");
+    const dbPath = path.resolve(config.db && config.db.sqlitePath || "./data/app.sqlite");
+    let db;
+    try {
+      db = new Database(dbPath, { fileMustExist: true });
+    } catch (e) {
+      console.error("Could not open " + dbPath + ": " + e.message);
+      process.exit(1);
+    }
+    user = db.prepare("SELECT id, name FROM users WHERE email = ?").get(email);
+    if (!user) {
+      console.error("No user found with email: " + email);
+      process.exit(1);
+    }
+    db.transaction(() => {
+      db.prepare(
+        'UPDATE users SET "passwordHash" = ?, "resetToken" = NULL, "resetExpiresAt" = NULL, "sessionVersion" = "sessionVersion" + 1 WHERE id = ?'
+      ).run(hash, user.id);
+      db.prepare(
+        'UPDATE api_keys SET "revokedAt" = CURRENT_TIMESTAMP WHERE "userId" = ? AND "revokedAt" IS NULL'
+      ).run(user.id);
+    })();
+  }
+
+  const who = user.name ? email + " (" + user.name + ")" : email;
+  console.log("Password reset for " + who + ".");
+  if (generated) console.log("New password: " + password);
+  console.log("Every older browser session and personal API key was revoked.");
+  console.log("Have them sign in and change it from Account → Profile.");
+})().catch((e) => {
+  console.error(e && e.message ? e.message : String(e));
+  process.exit(1);
+});
+NODE
+}
+
+cmd_user_help() {
+  cat <<EOF
+${C_BOLD}genosyn user${C_RESET} — manage human users (Members).
+
+${C_BOLD}Usage:${C_RESET}
+  genosyn user <subcommand> [flags]
+
+${C_BOLD}Subcommands:${C_RESET}
+  list [--json]                       List all users (email, name, handle,
+                                      company count, signup date).
+  reset-password <email> [--password <pw>] [-y]
+                                      Reset a user's password. Generates a
+                                      strong one and prints it unless
+                                      --password is given. Prompts unless -y.
+  grant-master-admin <email> [-y]      Grant instance master-admin access to a
+                                      verified account. Prompts unless -y.
+  delete <email> [-y]                 Delete a user. Removes their account and
+                                      company memberships; authored content
+                                      (chat, todos, notes) is kept but
+                                      unlinked. Refuses if they own a company.
+                                      Prompts unless -y.
+EOF
+}
+
+cmd_grant_master_admin() {
+  local email=""
+  local assume_yes=0
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""        ) shift ;;
+      -y|--yes  ) assume_yes=1; shift ;;
+      -*        ) die "Unknown flag to 'user grant-master-admin': $1" ;;
+      *)
+        if [ -z "${email}" ]; then email="$1"; shift
+        else die "Unexpected argument: $1"; fi
+        ;;
+    esac
+  done
+
+  [ -n "${email}" ] || die "Usage: genosyn user grant-master-admin <email> [-y]"
+  require_docker
+  container_exists  || die "No container named '${NAME}' found. Run 'genosyn install' first."
+  container_running || die "Container '${NAME}' is not running. Start it with 'genosyn start'."
+  if [ "${assume_yes}" != "1" ]; then
+    confirm "Grant instance master-admin access to '${email}'?" || die "Aborted."
+  fi
+
+  docker exec -i \
+    -e "GENOSYN_MASTER_EMAIL=${email}" \
+    -w /app \
+    "${NAME}" node <<'NODE'
+(async () => {
+  const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
+  let config;
+  try {
+    ({ config } = await import(pathToFileURL("/app/dist/config.js").href));
+  } catch (e) {
+    console.error("Could not load app config from /app/dist/config.js: " + e.message);
+    process.exit(1);
+  }
+  const email = String(process.env.GENOSYN_MASTER_EMAIL || "").trim().toLowerCase();
+  const SELECT =
+    'SELECT id, email, "emailVerifiedAt", "isMasterAdmin" FROM users WHERE email = ';
+
+  const assertEligible = (user) => {
+    if (!user) throw new Error("No user found with email: " + email);
+    if (!user.emailVerifiedAt) {
+      throw new Error("Verify this account's email before granting master-admin access.");
+    }
+  };
+
+  if (config.db && config.db.driver === "postgres") {
+    const { Client } = require("pg");
+    const client = new Client({ connectionString: config.db.postgresUrl });
+    try {
+      await client.connect();
+      await client.query("BEGIN");
+      const user = (await client.query(SELECT + "$1 FOR UPDATE", [email])).rows[0];
+      assertEligible(user);
+      if (!user.isMasterAdmin) {
+        await client.query(
+          'UPDATE users SET "isMasterAdmin" = TRUE, "sessionVersion" = "sessionVersion" + 1 WHERE id = $1',
+          [user.id]
+        );
+      }
+      await client.query("COMMIT");
+      console.log(user.isMasterAdmin ? email + " is already a master admin." : "Granted master-admin access to " + email + ". Sign in again to continue.");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error(e.message);
+      process.exit(1);
+    } finally {
+      await client.end().catch(() => {});
+    }
+    return;
+  }
+
+  const Database = require("better-sqlite3");
+  const dbPath = path.resolve(config.db && config.db.sqlitePath || "./data/app.sqlite");
+  let db;
+  try {
+    db = new Database(dbPath, { fileMustExist: true });
+    const user = db.prepare(SELECT + "?").get(email);
+    assertEligible(user);
+    if (!user.isMasterAdmin) {
+      db.prepare(
+        'UPDATE users SET "isMasterAdmin" = 1, "sessionVersion" = "sessionVersion" + 1 WHERE id = ?'
+      ).run(user.id);
+    }
+    console.log(user.isMasterAdmin ? email + " is already a master admin." : "Granted master-admin access to " + email + ". Sign in again to continue.");
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  } finally {
+    if (db) db.close();
+  }
+})().catch((e) => {
+  console.error(e && e.message ? e.message : String(e));
+  process.exit(1);
+});
+NODE
+}
+
+# Delete a user via the app's admin entrypoint inside the container. The
+# cascade (which rows to drop vs. which author pointers to NULL) is schema-
+# coupled, so it lives in TypeScript at server/admin/deleteUser.ts — kept in
+# lockstep with the entities — rather than being re-implemented in shell. We
+# preflight (read-only) so the operator sees who/what before confirming.
+cmd_user_delete() {
+  local email=""
+  local assume_yes=0
+  parse_common_flags "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      ""        ) shift ;;
+      -y|--yes  ) assume_yes=1; shift ;;
+      -*        ) die "Unknown flag to 'user delete': $1" ;;
+      *)
+        if [ -z "${email}" ]; then email="$1"; shift
+        else die "Unexpected argument: $1"; fi
+        ;;
+    esac
+  done
+
+  [ -n "${email}" ] || die "Usage: genosyn user delete <email> [-y]"
+
+  require_docker
+  container_exists  || die "No container named '${NAME}' found. Run 'genosyn install' first."
+  container_running || die "Container '${NAME}' is not running. Start it with 'genosyn start'."
+
+  local entry="dist/server/admin/deleteUser.js"
+  docker exec "${NAME}" test -f "/app/${entry}" 2>/dev/null \
+    || die "This Genosyn image predates 'user delete'. Upgrade first: genosyn upgrade"
+
+  # Preflight prints "Deletable: …" and exits 0 when safe, or prints the reason
+  # (not found / owns a company) and exits non-zero. Surface its output as-is.
+  if ! docker exec -i -w /app "${NAME}" node "${entry}" "${email}" --preflight; then
+    exit 1
+  fi
+
+  if [ "${assume_yes}" != "1" ]; then
+    confirm "Delete '${email}'? Removes their account + memberships and cannot be undone." \
+      || die "Aborted."
+  fi
+
+  docker exec -i -w /app "${NAME}" node "${entry}" "${email}"
+}
+
+# `genosyn user <subcommand>` — namespace for human-user management.
+cmd_user() {
+  if [ $# -eq 0 ]; then
+    cmd_user_help
+    return 0
+  fi
+  local sub="$1"; shift
+  case "${sub}" in
+    list|ls)               cmd_users          "$@" ;;
+    reset-password|passwd) cmd_reset_password "$@" ;;
+    grant-master-admin)    cmd_grant_master_admin "$@" ;;
+    delete|rm)             cmd_user_delete    "$@" ;;
+    help|-h|--help)        cmd_user_help ;;
+    *) die "Unknown user subcommand: ${sub}. Run 'genosyn user help' for usage." ;;
+  esac
+}
+
+# ---------- vllm: self-hosted OpenAI-compatible model server ----------
+#
+# `genosyn vllm` stands up a vLLM server on a GPU host so a Genosyn AI Employee
+# can use the "Custom" provider and point at it — no Anthropic/OpenAI key. It
+# drives docker compose against a compose file this CLI materializes into
+# VLLM_DIR (so `curl | bash` installs need no repo checkout). The service
+# definition below mirrors CLI/vllm/docker-compose.yml (comments trimmed) —
+# keep the two in sync.
+
+# Resolve the compose CLI into the COMPOSE_CMD array (plugin form preferred).
+COMPOSE_CMD=()
+resolve_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
+  else
+    die "Docker Compose is not available. Install the Compose plugin ('docker compose') or docker-compose."
+  fi
+}
+
+# Run compose scoped to our project + files. --env-file only when it exists so
+# read-only subcommands work before the first `up`.
+vllm_compose() {
+  local base=(-f "${VLLM_DIR}/docker-compose.yml" --project-name genosyn-vllm)
+  if [ -f "${VLLM_DIR}/.env" ]; then
+    base+=(--env-file "${VLLM_DIR}/.env")
+  fi
+  "${COMPOSE_CMD[@]}" "${base[@]}" "$@"
+}
+
+# Materialize the compose file. Quoted heredoc → ${...} land literally so
+# Compose interpolates them from .env at runtime.
+vllm_write_compose() {
+  mkdir -p "${VLLM_DIR}"
+  cat > "${VLLM_DIR}/docker-compose.yml" <<'VLLM_COMPOSE'
+# Genosyn — vLLM model server (OpenAI-compatible). Managed by `genosyn vllm`.
+# Canonical source: CLI/vllm/docker-compose.yml in the Genosyn repo.
+services:
+  vllm:
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    container_name: ${VLLM_CONTAINER:-genosyn-vllm}
+    restart: unless-stopped
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+    ipc: host
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
+      --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.90}
+      --tensor-parallel-size ${VLLM_TP:-1}
+      --enable-auto-tool-choice
+      --tool-call-parser ${VLLM_TOOL_PARSER:-hermes}
+      ${VLLM_EXTRA_ARGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 600s
+
+volumes:
+  hf-cache:
+VLLM_COMPOSE
+}
+
+# Seed a default .env on first run. Quoted heredoc; values mirror .env.example.
+vllm_write_default_env() {
+  cat > "${VLLM_DIR}/.env" <<'VLLM_ENV'
+VLLM_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
+VLLM_TOOL_PARSER=hermes
+VLLM_MAX_MODEL_LEN=32768
+VLLM_GPU_UTIL=0.90
+VLLM_TP=1
+VLLM_PORT=8000
+HUGGING_FACE_HUB_TOKEN=
+VLLM_API_KEY=
+VLLM_TAG=latest
+VLLM_CONTAINER=genosyn-vllm
+VLLM_EXTRA_ARGS=
+VLLM_ENV
+}
+
+# Upsert KEY=VALUE in an env file, preserving every other line.
+vllm_env_set() {
+  local key="$1" val="$2" file="$3" tmp found=0 line
+  tmp="$(mktemp)"
+  if [ -f "${file}" ]; then
+    while IFS= read -r line || [ -n "${line}" ]; do
+      case "${line}" in
+        "${key}="*)
+          if [ "${found}" = "0" ]; then
+            printf '%s=%s\n' "${key}" "${val}" >> "${tmp}"
+            found=1
+          fi
+          ;;
+        *)          printf '%s\n' "${line}" >> "${tmp}" ;;
+      esac
+    done < "${file}"
+  fi
+  [ "${found}" = "1" ] || printf '%s=%s\n' "${key}" "${val}" >> "${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+# Read a KEY's value from an env file (last match wins). Empty if absent.
+vllm_env_get() {
+  local key="$1" file="$2"
+  [ -f "${file}" ] || return 0
+  grep -E "^${key}=" "${file}" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+
+# Best-effort primary IP of this host, for the connect URL we print.
+vllm_host_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  if [ -z "${ip}" ] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  [ -n "${ip}" ] || ip="<vm-ip>"
+  printf '%s' "${ip}"
+}
+
+# Print the exact values to paste into Genosyn (Settings → AI Model → Custom).
+vllm_print_connect() {
+  local port model key ip
+  port="$(vllm_env_get VLLM_PORT "${VLLM_DIR}/.env")"; [ -n "${port}" ] || port="8000"
+  model="$(vllm_env_get VLLM_MODEL "${VLLM_DIR}/.env")"; [ -n "${model}" ] || model="<model-id>"
+  key="$(vllm_env_get VLLM_API_KEY "${VLLM_DIR}/.env")"
+  ip="$(vllm_host_ip)"
+  echo
+  printf '%sConnect Genosyn%s — Settings → AI Model → Custom:\n' "${C_BOLD}" "${C_RESET}"
+  printf '   Base URL  %shttp://%s:%s/v1%s\n' "${C_INDIGO}" "${ip}" "${port}" "${C_RESET}"
+  printf '   Model id  %s\n' "${model}"
+  if [ -n "${key}" ]; then
+    printf '   API key   %s\n' "${key}"
+  else
+    printf '   API key   %s(none — endpoint is unauthenticated)%s\n' "${C_YELLOW}" "${C_RESET}"
+  fi
+  echo
+  if [ -z "${key}" ]; then
+    warn "No API key set — anyone who can reach ${ip}:${port} can use this GPU. Re-run 'genosyn vllm up --api-key <secret>' and firewall the port."
+  fi
+}
+
+cmd_vllm_up() {
+  local model="" port="" hf="" apikey="" tp="" maxlen="" parser="" gpuutil="" tag=""
+  local set_hf=0 set_key=0
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      --model)           model="$2"; shift 2 ;;
+      --model=*)         model="${1#*=}"; shift ;;
+      --port)            port="$2"; shift 2 ;;
+      --port=*)          port="${1#*=}"; shift ;;
+      --hf-token)        hf="$2"; set_hf=1; shift 2 ;;
+      --hf-token=*)      hf="${1#*=}"; set_hf=1; shift ;;
+      --api-key)         apikey="$2"; set_key=1; shift 2 ;;
+      --api-key=*)       apikey="${1#*=}"; set_key=1; shift ;;
+      --tp)              tp="$2"; shift 2 ;;
+      --tp=*)            tp="${1#*=}"; shift ;;
+      --max-model-len)   maxlen="$2"; shift 2 ;;
+      --max-model-len=*) maxlen="${1#*=}"; shift ;;
+      --parser)          parser="$2"; shift 2 ;;
+      --parser=*)        parser="${1#*=}"; shift ;;
+      --gpu-util)        gpuutil="$2"; shift 2 ;;
+      --gpu-util=*)      gpuutil="${1#*=}"; shift ;;
+      --tag)             tag="$2"; shift 2 ;;
+      --tag=*)           tag="${1#*=}"; shift ;;
+      -h|--help)         cmd_vllm_help; return 0 ;;
+      *) die "Unknown argument to 'vllm up': $1" ;;
+    esac
+  done
+
+  require_docker
+  resolve_compose
+
+  step "Writing compose + config to ${VLLM_DIR}"
+  vllm_write_compose
+  [ -f "${VLLM_DIR}/.env" ] || vllm_write_default_env
+
+  [ -n "${model}" ]   && vllm_env_set VLLM_MODEL "${model}" "${VLLM_DIR}/.env"
+  [ -n "${port}" ]    && vllm_env_set VLLM_PORT "${port}" "${VLLM_DIR}/.env"
+  [ -n "${tp}" ]      && vllm_env_set VLLM_TP "${tp}" "${VLLM_DIR}/.env"
+  [ -n "${maxlen}" ]  && vllm_env_set VLLM_MAX_MODEL_LEN "${maxlen}" "${VLLM_DIR}/.env"
+  [ -n "${parser}" ]  && vllm_env_set VLLM_TOOL_PARSER "${parser}" "${VLLM_DIR}/.env"
+  [ -n "${gpuutil}" ] && vllm_env_set VLLM_GPU_UTIL "${gpuutil}" "${VLLM_DIR}/.env"
+  [ -n "${tag}" ]     && vllm_env_set VLLM_TAG "${tag}" "${VLLM_DIR}/.env"
+  [ "${set_hf}" = "1" ]  && vllm_env_set HUGGING_FACE_HUB_TOKEN "${hf}" "${VLLM_DIR}/.env"
+  [ "${set_key}" = "1" ] && vllm_env_set VLLM_API_KEY "${apikey}" "${VLLM_DIR}/.env"
+
+  local the_model
+  the_model="$(vllm_env_get VLLM_MODEL "${VLLM_DIR}/.env")"
+  step "Starting vLLM for ${the_model}"
+  vllm_compose up -d
+
+  ok "vLLM container is up. First boot downloads the weights — that can take a while."
+  printf '   Follow   %sgenosyn vllm logs -f%s\n' "${C_DIM}" "${C_RESET}"
+  printf '   Ready?   %sgenosyn vllm status%s\n' "${C_DIM}" "${C_RESET}"
+  vllm_print_connect
+}
+
+cmd_vllm_down() {
+  local purge=0
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      --purge)   purge=1; shift ;;
+      -h|--help) cmd_vllm_help; return 0 ;;
+      *) die "Unknown argument to 'vllm down': $1" ;;
+    esac
+  done
+
+  require_docker
+  resolve_compose
+  [ -f "${VLLM_DIR}/docker-compose.yml" ] \
+    || die "vLLM isn't set up here. Run 'genosyn vllm up' first."
+
+  step "Stopping vLLM"
+  if [ "${purge}" = "1" ]; then
+    warn "--purge also deletes the model cache volume — weights will be re-downloaded next time."
+    vllm_compose down --volumes
+    ok "vLLM stopped and its model cache removed."
+  else
+    vllm_compose down
+    ok "vLLM stopped. Downloaded weights are kept in the hf-cache volume."
+  fi
+}
+
+cmd_vllm_status() {
+  require_docker
+  resolve_compose
+
+  if [ ! -f "${VLLM_DIR}/docker-compose.yml" ]; then
+    printf '%sNot set up%s — run %sgenosyn vllm up%s\n' \
+      "${C_YELLOW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+    return 0
+  fi
+
+  vllm_compose ps
+
+  local port
+  port="$(vllm_env_get VLLM_PORT "${VLLM_DIR}/.env")"; [ -n "${port}" ] || port="8000"
+  echo
+  if curl -fsS "http://localhost:${port}/health" >/dev/null 2>&1 \
+     || wget -qO- "http://localhost:${port}/health" >/dev/null 2>&1; then
+    ok "API is answering on :${port}."
+  else
+    warn "API not answering on :${port} yet — the model may still be loading. Check 'genosyn vllm logs -f'."
+  fi
+  vllm_print_connect
+}
+
+cmd_vllm_logs() {
+  local follow=0 tail=""
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      -f|--follow) follow=1; shift ;;
+      --tail)      tail="$2"; shift 2 ;;
+      --tail=*)    tail="${1#*=}"; shift ;;
+      -n)          tail="$2"; shift 2 ;;
+      -h|--help)   cmd_vllm_help; return 0 ;;
+      *) die "Unknown argument to 'vllm logs': $1" ;;
+    esac
+  done
+
+  require_docker
+  resolve_compose
+  [ -f "${VLLM_DIR}/docker-compose.yml" ] \
+    || die "vLLM isn't set up here. Run 'genosyn vllm up' first."
+
+  local args=(logs)
+  [ "${follow}" = "1" ] && args+=(-f)
+  [ -n "${tail}" ] && args+=(--tail "${tail}")
+  vllm_compose "${args[@]}"
+}
+
+cmd_vllm_help() {
+  cat <<EOF
+${C_BOLD}genosyn vllm${C_RESET} — run a self-hosted, OpenAI-compatible model server.
+
+Stand up vLLM on a GPU host, then point a Genosyn employee at it with the
+${C_BOLD}Custom${C_RESET} provider. No Anthropic or OpenAI key required.
+
+${C_BOLD}Usage:${C_RESET}
+  genosyn vllm <subcommand> [flags]
+
+${C_BOLD}Subcommands:${C_RESET}
+  up [flags]           Write the compose + .env to ${VLLM_DIR}
+                       and start the server (idempotent). Flags:
+                         --model <hf-id>      model to serve (also the Genosyn
+                                              "Model id"); default
+                                              Qwen/Qwen2.5-Coder-32B-Instruct
+                         --port <n>           host port (default 8000)
+                         --api-key <secret>   bearer token clients must send
+                         --hf-token <token>   HuggingFace token for gated weights
+                         --tp <n>             GPUs to shard across (default 1)
+                         --max-model-len <n>  context length (default 32768)
+                         --parser <name>      tool-call parser (hermes | llama3_json
+                                              | mistral); default hermes
+                         --gpu-util <0..1>    GPU memory fraction (default 0.90)
+                         --tag <tag>          vllm/vllm-openai image tag
+  status               Show container state, readiness, and the connect URL.
+  logs [-f] [--tail N] Show server logs. -f follows.
+  down [--purge]       Stop the server. --purge also deletes the model cache.
+
+${C_BOLD}Requires on the host:${C_RESET} an NVIDIA GPU + driver + the
+nvidia-container-toolkit, and Docker Compose. See
+https://genosyn.com/docs/open-source-models
+
+${C_BOLD}Examples:${C_RESET}
+  genosyn vllm up --model Qwen/Qwen2.5-Coder-32B-Instruct --api-key \$(openssl rand -hex 24)
+  genosyn vllm up --model meta-llama/Llama-3.3-70B-Instruct --tp 4 --parser llama3_json --hf-token hf_xxx
+  genosyn vllm status
+  genosyn vllm logs -f
+  genosyn vllm down
+EOF
+}
+
+# `genosyn vllm <subcommand>` — namespace for the self-hosted model server.
+cmd_vllm() {
+  if [ $# -eq 0 ]; then
+    cmd_vllm_help
+    return 0
+  fi
+  local sub="$1"; shift
+  case "${sub}" in
+    up|start)       cmd_vllm_up     "$@" ;;
+    down|stop)      cmd_vllm_down   "$@" ;;
+    status|ps)      cmd_vllm_status "$@" ;;
+    logs|log)       cmd_vllm_logs   "$@" ;;
+    help|-h|--help) cmd_vllm_help ;;
+    *) die "Unknown vllm subcommand: ${sub}. Run 'genosyn vllm help' for usage." ;;
+  esac
+}
+
+cmd_version() {
+  printf 'genosyn cli  %s\n' "${CLI_VERSION}"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && container_exists; then
+    local image_ref
+    image_ref="$(docker inspect --format '{{.Config.Image}}' "${NAME}" 2>/dev/null || true)"
+    [ -n "${image_ref}" ] && printf 'container    %s\n' "${image_ref}"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}genosyn${C_RESET} — cluster maintainer for self-hosted Genosyn.
+
+${C_BOLD}Usage:${C_RESET}
+  genosyn <command> [flags]
+
+${C_BOLD}Commands:${C_RESET}
+  install              Pull the image, start the container, and enable daily
+                       automatic updates. Pass --no-auto-update to opt out.
+  upgrade [--no-backup] Self-upgrade the CLI, pull the latest image, and
+                       recreate the container. The previous container is kept
+                       until ready. A verified data backup is taken first,
+                       while Genosyn keeps running, and restored on failure;
+                       each upgrade replaces the last one.
+                       If it would not fit, Docker's build cache and unused
+                       untagged images are cleared first, never volumes.
+                       Pass --no-backup (or --skip-backup) to skip it. Pass
+                       --no-self-upgrade to skip the script update.
+                       Running Routine Runs are paused, saving their
+                       progress, and continue where they stopped after the
+                       upgrade; new ones wait. --drain-minutes N lets them
+                       finish for up to N minutes first; --now pauses at once.
+  self-upgrade         Update only the genosyn CLI script in place.
+  auto-update <action> Manage daily upgrades: on, off, or status.
+  start                Start a stopped container.
+  stop                 Stop the running container.
+  restart              Stop, then start.
+  status               Show container state, image, volume, and URL.
+  logs [-f] [--tail N] Show container logs. -f follows.
+  backup [--out FILE]  Tarball the data volume (default: timestamped file in cwd).
+  restore <FILE> [-y]  Restore a backup tarball. Destructive; prompts unless -y.
+  uninstall [--purge]  Remove the container. --purge also deletes the data volume.
+  prune [--dry-run]    Remove orphaned Genosyn images left over from prior upgrades.
+  vllm <subcommand>    Run a self-hosted, OpenAI-compatible model server (vLLM)
+                       on a GPU host and connect an employee to it. Run
+                       'genosyn vllm help' for up/status/logs/down.
+  user <subcommand>    Manage human users. Run 'genosyn user help' for the
+                       list, reset-password, and delete subcommands.
+  version              Print CLI and container image versions.
+  help                 Show this message.
+
+${C_BOLD}Common flags (any command):${C_RESET}
+  --port <n>           Host port (default: 8471, env: GENOSYN_PORT)
+  --name <s>           Container name (default: genosyn, env: GENOSYN_NAME)
+  --volume <s>         Data volume (default: genosyn-data, env: GENOSYN_VOLUME)
+  --image <ref>        Image reference (default: ghcr.io/genosyn/app:latest,
+                       env: GENOSYN_IMAGE)
+
+${C_BOLD}Command execution:${C_RESET}
+  AI Employee commands run directly in the container, under Docker's standard
+  security profile. There is no sandbox to configure.
+
+${C_BOLD}Examples:${C_RESET}
+  genosyn install --port 9000
+  genosyn auto-update status
+  genosyn upgrade
+  genosyn logs -f --tail 100
+  genosyn backup --out ~/backups/genosyn-\$(date +%F).tar.gz
+  genosyn restore ~/backups/genosyn-2026-04-22.tar.gz
+  genosyn user list
+  genosyn user reset-password alice@example.com
+  genosyn user delete alice@example.com
+  genosyn vllm up --model Qwen/Qwen2.5-Coder-32B-Instruct --api-key \$(openssl rand -hex 24)
+  genosyn uninstall --purge
+
+Docs: https://genosyn.com  •  Source: https://github.com/genosyn/genosyn
+EOF
+}
+
+# ---------- dispatch ----------
+
+main() {
+  if [ $# -eq 0 ]; then
+    cmd_help
+    exit 0
+  fi
+
+  local sub="$1"; shift
+  case "${sub}" in
+    install)           cmd_install   "$@" ;;
+    upgrade|update)    cmd_upgrade   "$@" ;;
+    start)             cmd_start     "$@" ;;
+    stop)              cmd_stop      "$@" ;;
+    restart)           cmd_restart   "$@" ;;
+    status|ps)         cmd_status    "$@" ;;
+    logs|log)          cmd_logs      "$@" ;;
+    backup)            cmd_backup    "$@" ;;
+    restore)           cmd_restore   "$@" ;;
+    uninstall|remove)  cmd_uninstall "$@" ;;
+    prune|clean)       cmd_prune     "$@" ;;
+    vllm)              cmd_vllm      "$@" ;;
+    user)              cmd_user      "$@" ;;
+    # Back-compat aliases for the pre-`user`-namespace commands.
+    users)             cmd_users     "$@" ;;
+    reset-password)    cmd_reset_password "$@" ;;
+    self-upgrade|self-update) cmd_self_upgrade "$@" ;;
+    auto-update|autoupdate) cmd_auto_update "$@" ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h)    cmd_help ;;
+    *) die "Unknown command: ${sub}. Run 'genosyn help' for usage." ;;
+  esac
+}
+
+# Run unless we're being sourced -- test-genosyn.sh sources this file to
+# exercise the pure helpers without docker. BASH_SOURCE is unset when the
+# script is fed to bash on stdin, where we're definitely not sourced, so it
+# defaults to $0 and main still runs.
+if [ "${BASH_SOURCE[0]:-${0}}" = "${0}" ]; then
+  main "$@"
+fi

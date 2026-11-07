@@ -1,0 +1,211 @@
+import { AppDataSource } from "../../db/datasource.js";
+import { IntegrationConnection } from "../../db/entities/IntegrationConnection.js";
+import { MailAccount } from "../../db/entities/MailAccount.js";
+import { assertIntegrationAllowed, getProvider } from "../../integrations/index.js";
+import { createApiKeyConnection, deleteConnection } from "../integrations.js";
+import { registeredOauthApps } from "../oauthApps.js";
+import { hostedSignInAvailability, type HostedSignInAvailability } from "../hostedOauth.js";
+import { hostedScopeGroups } from "../hostedOauthApps.js";
+import { createMailAccount, parseSenderName } from "./accounts.js";
+import { assertMailConnectionAllowed } from "./hostPolicy.js";
+import { discoverMailbox, type MailboxConnectRoute, type MailboxDiscovery } from "./discovery.js";
+
+/**
+ * "Type your email address, press continue."
+ *
+ * Connecting a mailbox used to be a scavenger hunt across five screens and a
+ * cloud console. The person had to know, before they started, that a mailbox
+ * is really three objects — an install-wide OAuth app, a company Connection,
+ * and a MailAccount — because the product asked them to create each one
+ * separately, in that order, from different pages. Nowhere did it ask for the
+ * one thing they actually knew: the address.
+ *
+ * This module inverts it. {@link describeMailboxConnect} takes an address and
+ * answers with what will work for it — a one-click Google button when the
+ * install has a Google app registered, and an IMAP form with the right servers
+ * already filled in for other mailboxes. {@link connectImapMailbox} then does the whole
+ * rest in one call: verify the credential, create the Connection, create the
+ * MailAccount, start the import.
+ */
+
+/** One connect route, with the deployment facts the resolver cannot know. */
+export type MailboxConnectOption = MailboxConnectRoute & {
+  /** True when this route needs nothing registered by an admin first. */
+  ready: boolean;
+  /** Why it is not ready, when it is not. */
+  blockedReason?: string;
+  /** Genosyn Connect will sign in, verified just now, with no OAuth app registered here. */
+  hostedSignIn?: boolean;
+};
+
+export type MailboxConnectPlan = Omit<MailboxDiscovery, "routes"> & {
+  options: MailboxConnectOption[];
+};
+
+/**
+ * What will actually work for this address on this install.
+ *
+ * The discovery layer knows what the *provider* offers; only this layer knows
+ * whether an OAuth app has been registered here. Keeping the two apart means
+ * the decision table is unit-testable without a database, and the connect
+ * dialog still never offers a Google button that would fail at the token
+ * exchange.
+ */
+export async function describeMailboxConnect(email: string): Promise<MailboxConnectPlan> {
+  const found = await discoverMailbox(email);
+  const registered = await registeredOauthApps();
+  const googleRoute = found.routes.find(
+    (route) => route.kind === "oauth" && route.provider === "google",
+  );
+  // Genosyn Connect is the default way into Gmail; an installation that
+  // registered its own Google app has chosen that instead.
+  const hosted =
+    googleRoute && !registered.has("google") ? await hostedSignInAvailability("google") : null;
+  // A shared multi-tenant install refuses raw-TCP connectors, IMAP among them.
+  // Offering the form anyway and refusing on submit would waste the person's
+  // app password on a route that was never going to work here.
+  const imapBlocked = imapBlockedReason();
+  const options: MailboxConnectOption[] = found.routes.map((route) => {
+    if (route.kind !== "oauth") {
+      return imapBlocked
+        ? { ...route, ready: false, blockedReason: imapBlocked }
+        : { ...route, ready: true };
+    }
+    const instanceApp = registered.has(route.provider);
+    const hostedSignIn =
+      route.provider === "google" && hostedCovers(hosted, route.scopeGroups);
+    const ready = instanceApp || hostedSignIn;
+    return {
+      ...route,
+      instanceApp,
+      ...(hostedSignIn ? { hostedSignIn: true } : {}),
+      ready,
+      ...(ready ? {} : { blockedReason: oauthBlockedReason(route.provider, hosted) }),
+    };
+  });
+  // A blocked OAuth route must not sit above a working password route, or the
+  // dialog leads with a button that cannot be pressed.
+  options.sort((a, b) => Number(b.ready) - Number(a.ready));
+  const { routes: _routes, ...rest } = found;
+  return { ...rest, options };
+}
+
+function hostedCovers(hosted: HostedSignInAvailability | null, scopeGroups: string[]): boolean {
+  const workspace = getProvider("google");
+  if (hosted?.status !== "available" || !workspace) return false;
+  const covered = hostedScopeGroups(workspace, hosted.scopes);
+  return scopeGroups.length > 0 && scopeGroups.every((key) => covered.includes(key));
+}
+
+/**
+ * Why a sign-in route cannot be used here — specific enough that the person
+ * who reads it knows whom to ask for what.
+ */
+function oauthBlockedReason(
+  provider: "google" | "microsoft",
+  hosted: HostedSignInAvailability | null,
+): string {
+  if (provider !== "google") {
+    return "No Microsoft OAuth app is registered on this install. Ask an instance admin to add one at Admin → Integrations, then return here to sign in.";
+  }
+  const service = hosted?.issuer ?? "Genosyn Connect";
+  switch (hosted?.status) {
+    case "disabled":
+      return "Google sign-in needs Genosyn Connect or a Google OAuth app registered on this install, and an instance admin has turned Genosyn Connect off. Ask them to turn it on at Admin → Runtime → Hosted sign-in, or to register a Google OAuth app at Admin → Integrations.";
+    case "unreachable":
+      return `This installation could not reach ${service} to sign in with Google. Check that it can make outbound HTTPS requests and try again, or ask an instance admin to register a Google OAuth app at Admin → Integrations.`;
+    default:
+      return `${service} does not offer Gmail sign-in right now. Ask an instance admin to register a Google OAuth app at Admin → Integrations, then return here to sign in.`;
+  }
+}
+
+/** Why an IMAP mailbox cannot be connected on this deployment, or null. */
+function imapBlockedReason(): string | null {
+  try {
+    assertIntegrationAllowed("imap");
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : "IMAP is unavailable on this install.";
+  }
+}
+
+export type ImapConnectInput = {
+  address: string;
+  password: string;
+  username?: string;
+  imapHost?: string;
+  imapPort?: number;
+  smtpHost?: string;
+  smtpPort?: number;
+  /**
+   * The name recipients see beside the address — the "Your name" every mail
+   * client asks for when an account is added. Optional; it lives on the
+   * mailbox rather than in the credential, so it survives a reconnect.
+   */
+  senderName?: string;
+};
+
+/**
+ * Connect an IMAP mailbox in one call: credential → Connection → MailAccount.
+ *
+ * The two objects are created together because a person connecting their
+ * email has no use for one without the other, and leaving a Connection behind
+ * when the mailbox step fails is how an install accumulates rows nobody can
+ * explain. So a failure after the Connection exists deletes it again — the
+ * credential was already proven valid by then, so the only realistic causes
+ * are "this mailbox is already connected" and a database error, and in both
+ * the right end state is the one the person started from.
+ */
+export async function connectImapMailbox(args: {
+  companyId: string;
+  userId: string | null;
+  input: ImapConnectInput;
+}): Promise<{ connection: IntegrationConnection; account: MailAccount }> {
+  // First, and before any network: a name that would be refused at the last
+  // step must not cost the person a credential check and a rolled-back row.
+  const senderName = parseSenderName(args.input.senderName ?? "");
+  // Before the Connection row exists: a hosted tenant must not be able to
+  // store an endpoint pointing into the operator's network, whether or not
+  // anything ever connects to it. The defaults mirror
+  // `parseImapConnectionConfig`, so what is checked is what would be dialled.
+  await assertMailConnectionAllowed({
+    imapHost: args.input.imapHost ?? "",
+    imapPort: args.input.imapPort ?? 993,
+    smtpHost: args.input.smtpHost ?? "",
+    smtpPort: args.input.smtpPort ?? 587,
+  });
+  const address = args.input.address.trim().toLowerCase();
+  const existing = await AppDataSource.getRepository(MailAccount).findOneBy({
+    companyId: args.companyId,
+    address,
+  });
+  if (existing) throw new Error(`${address} is already connected to this company.`);
+
+  const connection = await createApiKeyConnection({
+    companyId: args.companyId,
+    provider: "imap",
+    label: address,
+    fields: {
+      address,
+      password: args.input.password,
+      username: args.input.username ?? "",
+      imapHost: args.input.imapHost ?? "",
+      imapPort: args.input.imapPort ? String(args.input.imapPort) : "",
+      smtpHost: args.input.smtpHost ?? "",
+      smtpPort: args.input.smtpPort ? String(args.input.smtpPort) : "",
+    },
+  });
+
+  try {
+    const account = await createMailAccount({
+      companyId: args.companyId,
+      connectionId: connection.id,
+      createdByUserId: args.userId,
+      senderName,
+    });
+    return { connection, account };
+  } catch (error) {
+    await deleteConnection(args.companyId, connection.id).catch(() => undefined);
+    throw error;
+  }
+}

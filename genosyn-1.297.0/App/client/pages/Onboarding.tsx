@@ -1,0 +1,439 @@
+import React from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import {
+  AlertCircle,
+  Bot,
+  Check,
+  Building2,
+  KeyRound,
+  Mail,
+  RefreshCw,
+  Rocket,
+  UserRound,
+  type LucideIcon,
+} from "lucide-react";
+import { api, Company, Employee } from "../lib/api";
+import { Button } from "../components/ui/Button";
+import { Card, CardBody } from "../components/ui/Card";
+import { FormError } from "../components/ui/FormError";
+import { Input } from "../components/ui/Input";
+import { Spinner } from "../components/ui/Spinner";
+import { clsx } from "../components/ui/clsx";
+import { buildGoalPayload } from "../lib/goalSentence";
+import { AuthShell } from "./Login";
+import { AccessStep } from "./onboarding/AccessStep";
+import { EmailStep } from "./onboarding/EmailStep";
+import { EmployeeStep } from "./onboarding/EmployeeStep";
+import { FirstRequestStep } from "./onboarding/FirstRequestStep";
+import { CompanyStep } from "./onboarding/CompanyStep";
+import { GoalFields, MissionVisionFields, useGoalDraft } from "./onboarding/GoalFields";
+import { resolveOnboardingStep, type OnboardingStep } from "@/lib/onboardingFlow";
+import { DoneStep } from "./onboarding/DoneStep";
+import { RecommendationsStep } from "./onboarding/RecommendationsStep";
+import { STEP_WIDTH } from "./onboarding/OnboardingFrame";
+import { selectOnboardingEmployee } from "../lib/onboardingRecommendations";
+import { createCompanyAndSwitch } from "../lib/companySwitch";
+
+/**
+ * The rail. `done` is deliberately absent — it is the terminal state, and shows
+ * the rail with every step complete rather than adding another dot.
+ */
+const STEPS: Array<{
+  id: OnboardingStep;
+  label: string;
+  hint: string;
+  icon: LucideIcon;
+}> = [
+  { id: "company", label: "Company", hint: "Your Goal", icon: Building2 },
+  { id: "employee", label: "AI Employee", hint: "Hire and connect a model", icon: Bot },
+  {
+    id: "recommendations",
+    label: "Routines",
+    hint: "Work that moves your Goal",
+    icon: Rocket,
+  },
+  { id: "email", label: "Email", hint: "Optional mailbox access", icon: Mail },
+  { id: "access", label: "Access", hint: "What they can reach", icon: KeyRound },
+];
+
+/**
+ * The no-company gate. Once the row exists we refresh App's auth state before
+ * navigating so `/c/:slug/onboarding` resolves in the company route tree
+ * instead of briefly bouncing back through this gate.
+ */
+export default function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
+  const [name, setName] = React.useState("");
+  const goal = useGoalDraft();
+  const [mission, setMission] = React.useState("");
+  const [vision, setVision] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const navigate = useNavigate();
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!name.trim()) {
+      setError("Add your company name to continue.");
+      return;
+    }
+    const built = buildGoalPayload(goal.draft);
+    if (!built.ok) {
+      setError(built.error);
+      return;
+    }
+    setLoading(true);
+    try {
+      await createCompanyAndSwitch({
+        createCompany: () =>
+          api.post<Company>("/api/companies", {
+            name: name.trim(),
+            goal: built.goal,
+            ...(mission.trim() ? { mission: mission.trim() } : {}),
+            ...(vision.trim() ? { vision: vision.trim() } : {}),
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          }),
+        refreshCompanies: onDone,
+        navigate,
+        suffix: "/onboarding?step=employee",
+      });
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <AuthShell
+      title="Set up your company"
+      subtitle="Name your company and write its Goal. Then hire an AI Employee to work toward it."
+    >
+      <form className="flex flex-col gap-4" onSubmit={submit}>
+        <FormError message={error} />
+        <Input
+          label="Company name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Acme"
+          autoFocus
+          required
+        />
+        <GoalFields goal={goal} disabled={loading} compact />
+        <MissionVisionFields
+          mission={mission}
+          vision={vision}
+          onMission={setMission}
+          onVision={setVision}
+          disabled={loading}
+        />
+        <Button type="submit" loading={loading}>
+          {loading ? "Creating…" : "Create company and continue"}
+        </Button>
+      </form>
+    </AuthShell>
+  );
+}
+
+export function CompanyOnboarding({
+  company,
+  onCompanyChanged,
+}: {
+  company: Company;
+  onCompanyChanged: () => Promise<void>;
+}) {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedEmployeeId = searchParams.get("employee");
+  const requestedTemplateId = searchParams.get("template");
+  const [employees, setEmployees] = React.useState<Employee[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [reloadToken, setReloadToken] = React.useState(0);
+  const [selectedEmployee, setSelectedEmployee] = React.useState<Employee | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = React.useState<string | null>(
+    requestedTemplateId,
+  );
+
+  const step = resolveOnboardingStep(searchParams.get("step"), company);
+
+  const updateLocation = React.useCallback(
+    (nextStep: OnboardingStep, employee?: Employee | null, templateId?: string | null) => {
+      const next = new URLSearchParams();
+      next.set("step", nextStep);
+      const id = employee?.id ?? selectedEmployee?.id;
+      if (id) next.set("employee", id);
+      const nextTemplateId = templateId === undefined ? selectedTemplateId : templateId;
+      if (nextTemplateId) next.set("template", nextTemplateId);
+      setSearchParams(next);
+    },
+    [selectedEmployee, selectedTemplateId, setSearchParams],
+  );
+
+  React.useEffect(() => {
+    setSelectedTemplateId(requestedTemplateId);
+  }, [requestedTemplateId]);
+
+  // Scroll back to the top on every step change: the steps differ enough in
+  // height that advancing from a long one used to drop the member halfway down
+  // the next. The pane scrolls, not the window.
+  const scrollRef = React.useRef<HTMLElement>(null);
+  React.useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [step]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setEmployees(null);
+    setLoadError(null);
+    api
+      .get<Employee[]>(`/api/companies/${company.id}/employees`)
+      .then((list) => {
+        if (cancelled) return;
+        setEmployees(list);
+        setSelectedEmployee(selectOnboardingEmployee(list, requestedEmployeeId));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        // Distinct from "no employees yet" — an empty picker after a failed
+        // request reads as "this instance has nothing", and invites a
+        // duplicate hire.
+        setEmployees([]);
+        setSelectedEmployee(null);
+        setLoadError((err as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [company.id, requestedEmployeeId, reloadToken]);
+
+  const needsEmployee = step !== "company" && step !== "employee" && selectedEmployee === null;
+
+  return (
+    // The same scroll container every other page gets from `ContextualLayout`,
+    // so the guide behaves like the rest of the app and the shell's "Skip to
+    // main content" link has a target on the first screen a member ever sees.
+    <main
+      ref={scrollRef}
+      id="main-content"
+      tabIndex={-1}
+      className="min-h-0 min-w-0 flex-1 overflow-y-auto bg-slate-50 dark:bg-slate-900"
+    >
+      <div className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6 lg:py-12">
+        <div className="mb-6 text-center">
+          <div className="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-600 dark:text-indigo-400">
+            {company.name}
+          </div>
+          <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl dark:text-slate-50">
+            {step === "done" ? "Review your setup" : "Set up your company"}
+          </h1>
+        </div>
+
+        <StepRail current={step} onNavigate={updateLocation} />
+
+        <div className={STEP_WIDTH}>
+          {step === "company" ? (
+            <CompanyStep
+              company={company}
+              onSaved={async () => {
+                await onCompanyChanged();
+                updateLocation("employee");
+              }}
+            />
+          ) : employees === null ? (
+            <div
+              className="flex justify-center py-24"
+              role="status"
+              aria-label="Loading AI Employees"
+            >
+              <Spinner size={24} />
+            </div>
+          ) : loadError !== null ? (
+            <Card>
+              <CardBody className="p-8 text-center">
+                <AlertCircle className="mx-auto text-amber-500" size={26} />
+                <h2 className="mt-3 text-lg font-semibold text-slate-900 dark:text-slate-100">
+                  We could not load your AI Employees
+                </h2>
+                <p className="mx-auto mt-1 max-w-md text-sm leading-6 text-slate-500 dark:text-slate-400">
+                  {loadError}
+                </p>
+                <Button className="mt-5" onClick={() => setReloadToken((n) => n + 1)}>
+                  <RefreshCw size={15} /> Try again
+                </Button>
+              </CardBody>
+            </Card>
+          ) : step === "employee" ? (
+            <EmployeeStep
+              company={company}
+              employee={selectedEmployee}
+              onCreated={(employee, templateId) => {
+                setEmployees((current) => [...(current ?? []), employee]);
+                setSelectedEmployee(employee);
+                setSelectedTemplateId(templateId);
+                updateLocation("employee", employee, templateId);
+              }}
+              onBack={() => updateLocation("company")}
+              onContinue={() => updateLocation("recommendations")}
+            />
+          ) : needsEmployee ? (
+            <Card>
+              <CardBody className="p-8 text-center">
+                <UserRound className="mx-auto text-slate-400" size={28} />
+                <h2 className="mt-3 text-lg font-semibold text-slate-900 dark:text-slate-100">
+                  Hire an AI Employee first
+                </h2>
+                <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                  A launch plan, email access, and first requests all belong to an AI Employee.
+                </p>
+                <Button className="mt-5" onClick={() => updateLocation("employee")}>
+                  Start hiring
+                </Button>
+              </CardBody>
+            </Card>
+          ) : step === "recommendations" ? (
+            <RecommendationsStep
+              company={company}
+              employee={selectedEmployee as Employee}
+              templateId={selectedTemplateId}
+              onBack={() => updateLocation("employee")}
+              onContinue={() => updateLocation("email")}
+              continueLabel="Continue to email"
+            />
+          ) : step === "email" ? (
+            <EmailStep
+              company={company}
+              employee={selectedEmployee as Employee}
+              onBack={() => updateLocation("recommendations")}
+              onContinue={() => updateLocation("access")}
+            />
+          ) : step === "access" ? (
+            <AccessStep
+              company={company}
+              employee={selectedEmployee as Employee}
+              onBack={() => updateLocation("email")}
+              onContinue={() => updateLocation("done")}
+            />
+          ) : step === "first_request" ? (
+            <FirstRequestStep
+              company={company}
+              employee={selectedEmployee as Employee}
+              onBack={() => updateLocation("done")}
+            />
+          ) : (
+            <DoneStep
+              company={company}
+              employee={selectedEmployee as Employee}
+              onOpenFirstRequest={() => updateLocation("first_request")}
+            />
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function StepRail({
+  current,
+  onNavigate,
+}: {
+  current: OnboardingStep;
+  onNavigate: (step: OnboardingStep) => void;
+}) {
+  const done = current === "done" || current === "first_request";
+  const currentIndex = done ? -1 : STEPS.findIndex((s) => s.id === current);
+  const active = STEPS[currentIndex] ?? null;
+  const completeThrough = done ? STEPS.length : currentIndex;
+
+  return (
+    <div className="mb-6">
+      {/* Mobile: a rail of four labels does not fit, so name the position. */}
+      <p className="mb-4 text-center text-sm text-slate-500 sm:hidden dark:text-slate-400">
+        {active ? (
+          <>
+            <span className="font-medium text-slate-900 dark:text-slate-100">
+              Step {currentIndex + 1} of {STEPS.length}
+            </span>{" "}
+            · {active.label}
+          </>
+        ) : (
+          <span className="font-medium text-slate-900 dark:text-slate-100">Setup summary</span>
+        )}
+      </p>
+
+      <ol className="mx-auto hidden max-w-3xl grid-cols-5 sm:grid" aria-label="Setup progress">
+        {STEPS.map((step, index) => {
+          const Icon = step.icon;
+          const complete = index < completeThrough;
+          const isActive = index === currentIndex;
+          const revisitable = complete || (done && !complete);
+          const label = `Step ${index + 1} of ${STEPS.length}: ${step.label}`;
+          const dot = (
+            <>
+              <span
+                className={clsx(
+                  "relative z-10 grid h-8 w-8 place-items-center rounded-full border transition-colors",
+                  isActive
+                    ? "border-indigo-500 bg-white text-indigo-600 ring-4 ring-indigo-100 dark:bg-slate-900 dark:text-indigo-300 dark:ring-indigo-500/20"
+                    : complete
+                      ? "border-indigo-500 bg-indigo-600 text-white dark:bg-indigo-500"
+                      : "border-slate-200 bg-white text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-500",
+                )}
+              >
+                {complete ? <Check size={14} /> : <Icon size={14} />}
+              </span>
+              <span
+                className={clsx(
+                  "text-xs font-medium",
+                  isActive || complete
+                    ? "text-slate-900 dark:text-slate-100"
+                    : "text-slate-500 dark:text-slate-400",
+                )}
+              >
+                {step.label}
+              </span>
+              <span className="px-1 text-[11px] leading-4 text-slate-400 dark:text-slate-500">
+                {step.hint}
+              </span>
+            </>
+          );
+
+          return (
+            <li
+              key={step.id}
+              aria-current={isActive ? "step" : undefined}
+              className="relative flex flex-col items-center gap-1.5 text-center"
+            >
+              {index > 0 && (
+                <span
+                  aria-hidden="true"
+                  className={clsx(
+                    "absolute right-1/2 top-4 h-px w-full",
+                    index <= completeThrough
+                      ? "bg-indigo-400 dark:bg-indigo-500"
+                      : "bg-slate-200 dark:bg-slate-700",
+                  )}
+                />
+              )}
+              {revisitable ? (
+                // Every step re-derives its state from the server, so moving
+                // around is always safe — and the rail already looks clickable.
+                <button
+                  type="button"
+                  onClick={() => onNavigate(step.id)}
+                  aria-label={complete ? `${label} — completed, go back` : `${label} — go to step`}
+                  className="flex flex-col items-center gap-1.5 rounded-lg px-1 py-0.5 hover:opacity-80"
+                >
+                  {dot}
+                </button>
+              ) : (
+                <span className="flex flex-col items-center gap-1.5 px-1 py-0.5">
+                  <span className="sr-only">{label}</span>
+                  {dot}
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}

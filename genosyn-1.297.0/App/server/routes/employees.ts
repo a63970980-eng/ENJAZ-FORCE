@@ -1,0 +1,686 @@
+import fs from "node:fs";
+import { Router } from "express";
+import { z } from "zod";
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Company } from "../db/entities/Company.js";
+import { Skill } from "../db/entities/Skill.js";
+import { Routine } from "../db/entities/Routine.js";
+import { ProjectIntake } from "../db/entities/ProjectIntake.js";
+import { RoutineChatMessage } from "../db/entities/RoutineChatMessage.js";
+import { Run } from "../db/entities/Run.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { ProjectMember } from "../db/entities/ProjectMember.js";
+import { Approval } from "../db/entities/Approval.js";
+import { McpServer } from "../db/entities/McpServer.js";
+import { Team } from "../db/entities/Team.js";
+import { Customer } from "../db/entities/Customer.js";
+import { Contact } from "../db/entities/Contact.js";
+import { Deal } from "../db/entities/Deal.js";
+import { Activity } from "../db/entities/Activity.js";
+import { Partnership } from "../db/entities/Partnership.js";
+import { RevenueDocument } from "../db/entities/RevenueDocument.js";
+import { RevenueImportBatch } from "../db/entities/RevenueImportBatch.js";
+import { EmployeeSigningGrant } from "../db/entities/EmployeeSigningGrant.js";
+import { SignatureEnvelope } from "../db/entities/SignatureEnvelope.js";
+import { EmployeeVaultGrant } from "../db/entities/EmployeeVaultGrant.js";
+import {
+  deleteResourceGrantsForEmployee,
+  grantAllResourcesToEmployee,
+} from "../services/resources.js";
+import { deleteExploreGrantsForEmployee, grantExploreToEmployee } from "../services/explore.js";
+import { deleteRoutineAccessForEmployee } from "../services/routineAccess.js";
+import { releaseGoalsOwnedBy } from "../services/goals.js";
+import { VaultItem } from "../db/entities/VaultItem.js";
+import { validateBody, validateParams } from "../middleware/validate.js";
+import {
+  requireAuth,
+  requireCompanyMember,
+  requireCompanyRoleForMutations,
+  onRoutePaths,
+} from "../middleware/auth.js";
+import { toSlug } from "../lib/slug.js";
+import { employeeDir, ensureDir } from "../services/paths.js";
+import { isModelConnected } from "../services/providers.js";
+import { attachedModelsByEmployee, deleteEmployeeAttachments } from "../services/models.js";
+import { removeDir, soulTemplate, skillTemplate } from "../services/files.js";
+import { deleteEmployeeConversations } from "./employeeSurface.js";
+import { unassignPhoneNumbersForEmployee } from "../services/phone/numbers.js";
+import { detachEmployeeFromCustomerChannels } from "../services/customerChannels/cleanup.js";
+import { recordAudit } from "../services/audit.js";
+import { findTemplate, personalizeTemplateSoul } from "../services/templates.js";
+import { archiveEmployeeDirectMessages } from "../services/workspaceChat.js";
+import {
+  closeAllBrowserSessionsForEmployee,
+  revokeDisabledBrowserSessionsForEmployee,
+} from "../services/browserAccess.js";
+import { removeBrowserStorageForEmployee } from "../services/browserStorage.js";
+import { removeRepositoryPrivateStateForEmployee } from "../services/repositorySshFiles.js";
+import { detachEmployeeFromTldrs, ensureDefaultTldrSchedule } from "../services/tldrs.js";
+import { detachEmployeeFromBoardLetters } from "../services/boardLetters.js";
+import { detachEmployeeFromRecruiting } from "../services/recruiting/grants.js";
+import { detachEmployeeFromDataRooms } from "../services/dataRooms/grants.js";
+import { detachEmployeeFromSupport } from "../services/support/grants.js";
+import {
+  deleteBrowserRecordingsForRunIds,
+  markBrowserRecordingEmployeeDeleting,
+} from "../services/browserRecordings.js";
+import {
+  applyRoutineRecommendations,
+  findRoutineRecommendationDefinition,
+  loadOnboardingRecommendations,
+} from "../services/onboardingRecommendations.js";
+import {
+  avatarAbsPath,
+  avatarUploadMiddleware,
+  mimeFromKey,
+  removeAvatarFile,
+  replaceAvatarFile,
+} from "../services/avatars.js";
+import { COMPANY_DIRECTION_REQUIRED, hasCompanyDirection } from "../services/companyDirection.js";
+
+export const employeesRouter = Router({ mergeParams: true });
+employeesRouter.use(requireAuth);
+employeesRouter.use(requireCompanyMember);
+employeesRouter.use(
+  onRoutePaths(
+    [/^\/$/, /^\/[^/]+(?:\/soul|\/avatar)?$/, /^\/[^/]+\/onboarding-recommendations\/routines$/],
+    requireCompanyRoleForMutations("admin"),
+  ),
+);
+
+async function loadCompany(cid: string): Promise<Company | null> {
+  return AppDataSource.getRepository(Company).findOneBy({ id: cid });
+}
+
+async function uniqueEmpSlug(companyId: string, base: string): Promise<string> {
+  const repo = AppDataSource.getRepository(AIEmployee);
+  let slug = base || "employee";
+  let n = 1;
+  while (await repo.findOneBy({ companyId, slug })) {
+    n += 1;
+    slug = `${base}-${n}`;
+  }
+  return slug;
+}
+
+async function findEmployeeByName(
+  companyId: string,
+  name: string,
+  excludeId?: string,
+): Promise<AIEmployee | null> {
+  const qb = AppDataSource.getRepository(AIEmployee)
+    .createQueryBuilder("e")
+    .where("e.companyId = :companyId", { companyId })
+    .andWhere("LOWER(e.name) = LOWER(:name)", { name: name.trim() });
+  if (excludeId) qb.andWhere("e.id != :excludeId", { excludeId });
+  return qb.getOne();
+}
+
+employeesRouter.get("/", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const co = await loadCompany(cid);
+  if (!co) return res.status(404).json({ error: "Company not found" });
+  const emps = await AppDataSource.getRepository(AIEmployee).find({
+    where: { companyId: cid },
+  });
+  // Include a lightweight summary of the *active* model per employee so the
+  // dashboard can show connection chips from a single roundtrip. Keep it
+  // minimal — the full model list lives at /employees/:eid/models.
+  const attached = await attachedModelsByEmployee(emps.map((e) => e.id));
+  const rows = emps.map((e) => {
+    const { models: list, activeId } = attached.get(e.id) ?? { models: [], activeId: null };
+    const m = list.find((x) => x.id === activeId) ?? null;
+    return {
+      ...e,
+      model: m
+        ? {
+            provider: m.provider,
+            model: m.model,
+            authMode: m.authMode,
+            status: isModelConnected(m) ? "connected" : "not_connected",
+          }
+        : null,
+      modelCount: list.length,
+      // Chat answers from any connected model, not just the active one, so this
+      // is not `model.status`. The Proactive overview reads it the same way.
+      chatReady: list.some((model) => isModelConnected(model)),
+    };
+  });
+  res.json(rows);
+});
+
+const createSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  role: z.string().trim().min(1).max(80),
+  templateId: z.string().min(1).max(80).optional(),
+});
+
+employeesRouter.post("/", validateBody(createSchema), async (req, res) => {
+  const body = req.body as z.infer<typeof createSchema>;
+  const co = await loadCompany((req.params as Record<string, string>).cid);
+  if (!co) return res.status(404).json({ error: "Company not found" });
+  if (!(await hasCompanyDirection(co))) {
+    return res.status(400).json({ error: COMPANY_DIRECTION_REQUIRED });
+  }
+  if (await findEmployeeByName(co.id, body.name)) {
+    return res.status(409).json({ error: "An employee with that name already exists" });
+  }
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const slug = await uniqueEmpSlug(co.id, toSlug(body.name));
+  const template = body.templateId ? findTemplate(body.templateId) : undefined;
+  if (body.templateId && !template) {
+    return res.status(400).json({ error: "Unknown template" });
+  }
+
+  const soulBody = template
+    ? personalizeTemplateSoul(template, body.name)
+    : soulTemplate(body.name, body.role);
+
+  const emp = repo.create({
+    companyId: co.id,
+    name: body.name,
+    role: body.role,
+    slug,
+    soulBody,
+  });
+  await repo.save(emp);
+  await ensureDefaultTldrSchedule(co.id, emp.id);
+  // Hand the new hire the company's existing library. `grantResourceToAllEmployees`
+  // only ever ran from resource creation, so a company that filed its material
+  // before hiring gave the new employee an empty shelf and no way to notice.
+  // Awaited, not fire-and-forget: a Run started in the gap would read `[]` and
+  // confidently report that the company has nothing on the subject.
+  await grantAllResourcesToEmployee(co.id, emp.id);
+  await grantExploreToEmployee(co.id, emp.id);
+
+  // Coding tools need an employee working directory for artifacts. Soul,
+  // Skills, and Routines live in the database.
+  ensureDir(employeeDir(co.slug, slug));
+
+  // A template provides a Soul and Skills. Recurring work is recommended from
+  // the saved role and company direction, then scheduled only after selection.
+  if (template) {
+    const skillRepo = AppDataSource.getRepository(Skill);
+    for (const s of template.skills) {
+      const sSlug = toSlug(s.name);
+      const skillRow = skillRepo.create({
+        employeeId: emp.id,
+        name: s.name,
+        slug: sSlug,
+        body: s.readme || skillTemplate(s.name),
+      });
+      await skillRepo.save(skillRow);
+    }
+  }
+
+  await recordAudit({
+    companyId: co.id,
+    actorUserId: req.userId ?? null,
+    action: "employee.create",
+    targetType: "employee",
+    targetId: emp.id,
+    targetLabel: emp.name,
+    metadata: { role: emp.role, slug: emp.slug, templateId: template?.id ?? null },
+  });
+  res.json(emp);
+});
+
+const onboardingRecommendationQuerySchema = z.object({
+  templateId: z.string().min(1).max(80).optional(),
+});
+const onboardingRecommendationParamsSchema = z.object({
+  cid: z.string().uuid(),
+  eid: z.string().uuid(),
+});
+
+employeesRouter.get(
+  "/:eid/onboarding-recommendations",
+  validateParams(onboardingRecommendationParamsSchema),
+  async (req, res) => {
+    const query = onboardingRecommendationQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      return res.status(400).json({ error: "ValidationError", issues: query.error.issues });
+    }
+    if (query.data.templateId && !findTemplate(query.data.templateId)) {
+      return res.status(400).json({ error: "Unknown template" });
+    }
+
+    const cid = (req.params as Record<string, string>).cid;
+    const [company, employee] = await Promise.all([
+      loadCompany(cid),
+      AppDataSource.getRepository(AIEmployee).findOneBy({
+        id: req.params.eid,
+        companyId: cid,
+      }),
+    ]);
+    if (!company) return res.status(404).json({ error: "Company not found" });
+    if (!employee) return res.status(404).json({ error: "Not found" });
+
+    res.json(
+      await loadOnboardingRecommendations({
+        company,
+        employee,
+        templateId: query.data.templateId,
+      }),
+    );
+  },
+);
+
+const applyRoutineRecommendationsSchema = z.object({
+  recommendationIds: z.array(z.string().min(1).max(100)).min(1).max(5),
+});
+
+employeesRouter.post(
+  "/:eid/onboarding-recommendations/routines",
+  validateParams(onboardingRecommendationParamsSchema),
+  validateBody(applyRoutineRecommendationsSchema),
+  async (req, res) => {
+    const body = req.body as z.infer<typeof applyRoutineRecommendationsSchema>;
+    const invalidIds = [...new Set(body.recommendationIds)].filter(
+      (id) => !findRoutineRecommendationDefinition(id),
+    );
+    if (invalidIds.length > 0) {
+      return res.status(400).json({
+        error: `Unknown Routine recommendation: ${invalidIds.join(", ")}`,
+      });
+    }
+
+    const cid = (req.params as Record<string, string>).cid;
+    const [company, employee] = await Promise.all([
+      loadCompany(cid),
+      AppDataSource.getRepository(AIEmployee).findOneBy({
+        id: req.params.eid,
+        companyId: cid,
+      }),
+    ]);
+    if (!company) return res.status(404).json({ error: "Company not found" });
+    if (!employee) return res.status(404).json({ error: "Not found" });
+
+    const result = await applyRoutineRecommendations({
+      company,
+      employee,
+      recommendationIds: body.recommendationIds,
+      actorUserId: req.userId ?? null,
+    });
+    res.json(result);
+  },
+);
+
+employeesRouter.get("/:eid", async (req, res) => {
+  const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  res.json(emp);
+});
+
+// Strict, because stripping unknown keys made an edit this route cannot apply
+// look saved: `{ "soulBody": "..." }` answered 200 and left the Soul as it was.
+// The Soul is edited through `PUT /:eid/soul`. A key not listed here is a 400
+// that names it, and nothing is written — which is also how the removed
+// reporting-line fields (`reportsToEmployeeId`, `reportsToUserId`) answer.
+const patchSchema = z
+  .object({
+    name: z.string().min(1).max(80).optional(),
+    role: z.string().min(1).max(80).optional(),
+    slug: z.string().min(1).max(80).optional(),
+    teamId: z.string().uuid().nullable().optional(),
+    browserEnabled: z.boolean().optional(),
+    // Newline-separated host globs. The materializer trims and parses;
+    // empty / whitespace-only strings clear the list.
+    browserAllowedHosts: z.string().max(4000).nullable().optional(),
+    browserApprovalRequired: z.boolean().optional(),
+  })
+  .strict();
+
+employeesRouter.patch("/:eid", validateBody(patchSchema), async (req, res) => {
+  const body = req.body as z.infer<typeof patchSchema>;
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const emp = await repo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  const co = await loadCompany(emp.companyId);
+  if (!co) return res.status(404).json({ error: "Company not found" });
+  const before = { name: emp.name, role: emp.role, slug: emp.slug };
+  if (body.name !== undefined) {
+    if (await findEmployeeByName(emp.companyId, body.name, emp.id)) {
+      return res.status(409).json({ error: "An employee with that name already exists" });
+    }
+    emp.name = body.name;
+  }
+  if (body.role !== undefined) emp.role = body.role;
+  if (body.teamId !== undefined) {
+    if (body.teamId === null) {
+      emp.teamId = null;
+    } else {
+      const team = await AppDataSource.getRepository(Team).findOneBy({
+        id: body.teamId,
+        companyId: emp.companyId,
+      });
+      if (!team) {
+        return res.status(400).json({ error: "Team not found in this company" });
+      }
+      emp.teamId = team.id;
+    }
+  }
+  if (body.browserEnabled !== undefined) {
+    emp.browserEnabled = body.browserEnabled;
+  }
+  if (body.browserAllowedHosts !== undefined) {
+    const next = body.browserAllowedHosts;
+    emp.browserAllowedHosts = next === null || next.trim().length === 0 ? null : next;
+  }
+  if (body.browserApprovalRequired !== undefined) {
+    emp.browserApprovalRequired = body.browserApprovalRequired;
+  }
+  if (body.slug !== undefined) {
+    const normalized = toSlug(body.slug);
+    if (!normalized) {
+      return res.status(400).json({ error: "Slug must contain at least one letter or digit" });
+    }
+    if (normalized !== emp.slug) {
+      const taken = await repo.findOneBy({ companyId: emp.companyId, slug: normalized });
+      if (taken && taken.id !== emp.id) {
+        return res.status(409).json({ error: "That slug is already taken" });
+      }
+      // Credentials + CLI artifacts live under the employee's directory; rename
+      // it alongside the slug so relative paths (`.mcp.json`, `.claude`, …)
+      // keep resolving after the rename.
+      const oldDir = employeeDir(co.slug, emp.slug);
+      const newDir = employeeDir(co.slug, normalized);
+      if (fs.existsSync(newDir)) {
+        return res.status(409).json({ error: "A data directory for that slug already exists" });
+      }
+      if (fs.existsSync(oldDir)) {
+        try {
+          fs.renameSync(oldDir, newDir);
+        } catch (err) {
+          return res.status(500).json({
+            error: `Failed to rename employee directory: ${(err as Error).message}`,
+          });
+        }
+      }
+      emp.slug = normalized;
+    }
+  }
+  await repo.save(emp);
+  if (body.browserEnabled !== undefined) {
+    await revokeDisabledBrowserSessionsForEmployee(emp.id);
+  }
+  await recordAudit({
+    companyId: emp.companyId,
+    actorUserId: req.userId ?? null,
+    action: "employee.update",
+    targetType: "employee",
+    targetId: emp.id,
+    targetLabel: emp.name,
+    metadata: {
+      fields: Object.keys(body),
+      before,
+      after: { name: emp.name, role: emp.role, slug: emp.slug },
+    },
+  });
+  res.json(emp);
+});
+
+employeesRouter.delete("/:eid", async (req, res) => {
+  const empRepo = AppDataSource.getRepository(AIEmployee);
+  const emp = await empRepo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  markBrowserRecordingEmployeeDeleting(emp.id);
+  const co = await loadCompany((req.params as Record<string, string>).cid);
+
+  await closeAllBrowserSessionsForEmployee(emp.id);
+  await detachEmployeeFromTldrs(emp.companyId, emp.id);
+  await detachEmployeeFromBoardLetters(emp.companyId, emp.id);
+  await detachEmployeeFromRecruiting(emp.companyId, emp.id);
+  await detachEmployeeFromDataRooms(emp.companyId, emp.id);
+  await detachEmployeeFromSupport(emp.companyId, emp.id);
+  // Email keeps being filed, for the AI to choose who works it or a person to.
+  const intakes = AppDataSource.getRepository(ProjectIntake);
+  await intakes.update({ assigneeEmployeeId: emp.id }, { assigneeEmployeeId: null });
+  await intakes.update({ reviewerEmployeeId: emp.id }, { reviewerEmployeeId: null });
+
+  const routines = await AppDataSource.getRepository(Routine).find({
+    where: { employeeId: emp.id },
+    select: { id: true },
+  });
+  const routineIds = routines.map((routine) => routine.id);
+  const runs = routineIds.length
+    ? await AppDataSource.getRepository(Run).find({
+        where: { routineId: In(routineIds) },
+        select: { id: true },
+      })
+    : [];
+  await AppDataSource.getRepository(Approval).delete({ employeeId: emp.id });
+  await deleteBrowserRecordingsForRunIds(runs.map((run) => run.id));
+  if (routineIds.length) {
+    await AppDataSource.getRepository(Run).delete({ routineId: In(routineIds) });
+    // The Ask AI conversation on each routine goes with the routine. Nothing
+    // can reach these rows once the routine is gone — the panel resolves a
+    // routine first — so leaving them behind strands transcript text, Run log
+    // excerpts included, in every future backup.
+    await AppDataSource.getRepository(RoutineChatMessage).delete({
+      routineId: In(routineIds),
+    });
+  }
+  await AppDataSource.getRepository(Routine).delete({ employeeId: emp.id });
+  await AppDataSource.getRepository(Skill).delete({ employeeId: emp.id });
+  // Its AI Models are the company's: letting the employee go detaches them,
+  // and their keys stay in Settings → AI Models for whoever uses them next.
+  await deleteEmployeeAttachments([emp.id]);
+  await AppDataSource.getRepository(McpServer).delete({ employeeId: emp.id });
+  await deleteEmployeeConversations(emp.id);
+  await archiveEmployeeDirectMessages(emp.id);
+  // Phone numbers belong to the company: they stay reserved, unassigned, for
+  // the next employee an admin gives them to.
+  await unassignPhoneNumbersForEmployee(emp.id);
+  // Customer channels too: they stay linked, keeping their messages, until an
+  // admin gives them to another employee.
+  await detachEmployeeFromCustomerChannels(emp.id);
+  await AppDataSource.getRepository(JournalEntry).delete({ employeeId: emp.id });
+  await AppDataSource.getRepository(EmployeeSigningGrant).delete({ employeeId: emp.id });
+  await AppDataSource.getRepository(EmployeeVaultGrant).delete({ employeeId: emp.id });
+  // Resource grants outlived their employee until M62 — only company teardown
+  // ever cleared them — which left the share modal rendering a permanent
+  // "Unknown" row for everyone the company had ever fired.
+  await deleteResourceGrantsForEmployee(emp.id);
+  await deleteExploreGrantsForEmployee(emp.id);
+  await deleteRoutineAccessForEmployee(emp.id);
+  await AppDataSource.getRepository(VaultItem).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await AppDataSource.getRepository(SignatureEnvelope).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Customer).update(
+    { ownerEmployeeId: emp.id },
+    { ownerEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Contact).update(
+    { ownerEmployeeId: emp.id },
+    { ownerEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Contact).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Deal).update(
+    { ownerEmployeeId: emp.id },
+    { ownerEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Deal).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Activity).update(
+    { assignedEmployeeId: emp.id },
+    { assignedEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Activity).update(
+    { actorEmployeeId: emp.id },
+    { actorEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Partnership).update(
+    { ownerEmployeeId: emp.id },
+    { ownerEmployeeId: null },
+  );
+  await AppDataSource.getRepository(Partnership).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await releaseGoalsOwnedBy(emp.companyId, emp.id);
+  await AppDataSource.getRepository(RevenueDocument).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  await AppDataSource.getRepository(RevenueImportBatch).update(
+    { createdByEmployeeId: emp.id },
+    { createdByEmployeeId: null },
+  );
+  // Access entries are deleted, not nulled — a row whose employee is gone
+  // matches nobody and would linger in the project's Access list.
+  await AppDataSource.getRepository(ProjectMember).delete({ employeeId: emp.id });
+  await empRepo.delete({ id: emp.id });
+  // Recheck after the row is gone. A settings update that began while the
+  // longer cleanup above was running may have selected this employee after
+  // the first detach; its transaction-level ownership check now sees the
+  // deletion, and this pass clears any assignment that committed just before
+  // it.
+  await detachEmployeeFromTldrs(emp.companyId, emp.id);
+  await detachEmployeeFromBoardLetters(emp.companyId, emp.id);
+  await detachEmployeeFromRecruiting(emp.companyId, emp.id);
+  await detachEmployeeFromDataRooms(emp.companyId, emp.id);
+  await detachEmployeeFromSupport(emp.companyId, emp.id);
+
+  await removeBrowserStorageForEmployee(emp.companyId, emp.id);
+  removeRepositoryPrivateStateForEmployee(emp.companyId, emp.id);
+  if (co) removeDir(employeeDir(co.slug, emp.slug));
+  await recordAudit({
+    companyId: emp.companyId,
+    actorUserId: req.userId ?? null,
+    action: "employee.delete",
+    targetType: "employee",
+    targetId: emp.id,
+    targetLabel: emp.name,
+    metadata: { role: emp.role, slug: emp.slug },
+  });
+  res.json({ ok: true });
+});
+
+// Soul — stored on the AIEmployee row as `soulBody`.
+employeesRouter.get("/:eid/soul", async (req, res) => {
+  const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  res.json({ content: emp.soulBody });
+});
+
+const soulSchema = z.object({ content: z.string() });
+
+employeesRouter.put("/:eid/soul", validateBody(soulSchema), async (req, res) => {
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const emp = await repo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  emp.soulBody = (req.body as z.infer<typeof soulSchema>).content;
+  await repo.save(emp);
+  await recordAudit({
+    companyId: emp.companyId,
+    actorUserId: req.userId ?? null,
+    action: "employee.soul.update",
+    targetType: "employee",
+    targetId: emp.id,
+    targetLabel: emp.name,
+    metadata: { fields: ["soulBody"] },
+  });
+  res.json({ ok: true });
+});
+
+// ───────────────────────────── Avatar ──────────────────────────────
+//
+// GET is public-to-company-members (requireCompanyMember above already gates)
+// so the UI can embed a bare `<img src>` without wiring headers. POST accepts
+// a single `file` multipart field; DELETE clears the avatar on disk + DB.
+
+employeesRouter.get("/:eid/avatar", async (req, res) => {
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const emp = await repo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp || !emp.avatarKey) return res.status(404).json({ error: "Not found" });
+  const abs = avatarAbsPath(emp.avatarKey);
+  if (!abs || !fs.existsSync(abs)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  res.setHeader("Content-Type", mimeFromKey(emp.avatarKey));
+  res.setHeader("Cache-Control", "private, max-age=60");
+  res.sendFile(abs);
+});
+
+employeesRouter.post("/:eid/avatar", avatarUploadMiddleware.single("file"), async (req, res) => {
+  const file = (req as unknown as { file?: Express.Multer.File }).file;
+  if (!file) return res.status(400).json({ error: "No file uploaded" });
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const emp = await repo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) {
+    // Row missing — drop the freshly-written file so we don't orphan it.
+    removeAvatarFile(file.filename);
+    return res.status(404).json({ error: "Not found" });
+  }
+  const previousKey = emp.avatarKey;
+  emp.avatarKey = file.filename;
+  await repo.save(emp);
+  replaceAvatarFile(previousKey, file.filename);
+  await recordAudit({
+    companyId: emp.companyId,
+    actorUserId: req.userId ?? null,
+    action: "employee.avatar.upload",
+    targetType: "employee",
+    targetId: emp.id,
+    targetLabel: emp.name,
+  });
+  res.json({ avatarKey: emp.avatarKey });
+});
+
+employeesRouter.delete("/:eid/avatar", async (req, res) => {
+  const repo = AppDataSource.getRepository(AIEmployee);
+  const emp = await repo.findOneBy({
+    id: req.params.eid,
+    companyId: (req.params as Record<string, string>).cid,
+  });
+  if (!emp) return res.status(404).json({ error: "Not found" });
+  const previous = emp.avatarKey;
+  emp.avatarKey = null;
+  await repo.save(emp);
+  removeAvatarFile(previous);
+  if (previous) {
+    await recordAudit({
+      companyId: emp.companyId,
+      actorUserId: req.userId ?? null,
+      action: "employee.avatar.remove",
+      targetType: "employee",
+      targetId: emp.id,
+      targetLabel: emp.name,
+    });
+  }
+  res.json({ ok: true });
+});

@@ -1,0 +1,765 @@
+import {
+  Callout,
+  Code,
+  DocLink,
+  ExtLink,
+  H2,
+  H3,
+  KeyList,
+  LI,
+  P,
+  PageHeader,
+  Pre,
+  Strong,
+  UL,
+} from "@/docs/Prose";
+
+const CATALOG: Array<{ name: string; kind: string }> = [
+  { name: "GitHub", kind: "engineering" },
+  { name: "Forgejo / Gitea", kind: "engineering (self-hosted)" },
+  { name: "Stripe", kind: "finance" },
+  { name: "Brex", kind: "finance" },
+  { name: "Mercury", kind: "finance" },
+  { name: "Ramp", kind: "finance" },
+  { name: "Wise", kind: "finance" },
+  { name: "Gmail / Google", kind: "comms + drive" },
+  { name: "Google Analytics", kind: "analytics" },
+  { name: "Google Search Console", kind: "SEO / search" },
+  { name: "Notion", kind: "knowledge" },
+  { name: "Airtable", kind: "data" },
+  { name: "Linear", kind: "tickets" },
+  { name: "Slack", kind: "chat surface" },
+  { name: "Microsoft Teams", kind: "chat surface" },
+  { name: "WhatsApp", kind: "chat surface" },
+  { name: "Telegram", kind: "chat surface" },
+  { name: "Twilio", kind: "phone numbers" },
+  { name: "Postgres / MySQL / ClickHouse", kind: "databases" },
+  { name: "Reddit, X, LinkedIn", kind: "social" },
+  { name: "Google Ads", kind: "paid marketing" },
+  { name: "Meta Ads", kind: "paid marketing" },
+  { name: "Microsoft Advertising", kind: "paid marketing" },
+  { name: "Reddit Ads", kind: "paid marketing" },
+];
+
+export function Integrations() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Brains & tools"
+        title="Integrations"
+        lead={
+          <>
+            An <Strong>Integration</Strong> is a connector type — Stripe, Gmail, GitHub, Postgres. A{" "}
+            <Strong>Connection</Strong> is one authenticated account inside an integration. A{" "}
+            <Strong>Grant</Strong> gives an AI Employee access to one Connection.
+          </>
+        }
+      />
+
+      <H2 id="three-words">Three words, three rows</H2>
+      <KeyList
+        rows={[
+          {
+            term: "Integration",
+            def: (
+              <>
+                A connector <em>type</em>, defined in code under{" "}
+                <Code>server/integrations/providers/</Code>. Static catalog — you add one by writing
+                a provider file, not by clicking a button.
+              </>
+            ),
+          },
+          {
+            term: "Connection",
+            def: (
+              <>
+                One authenticated <em>account</em> inside an integration. DB row (
+                <Code>IntegrationConnection</Code>), per-company. You might have two Stripe
+                connections — &quot;live&quot; and &quot;test&quot;.
+              </>
+            ),
+          },
+          {
+            term: "Grant",
+            def: (
+              <>
+                A row on <Code>EmployeeConnectionGrant</Code> giving one employee access to one
+                connection. Without a grant, the employee&apos;s MCP server simply doesn&apos;t list
+                those tools.
+              </>
+            ),
+          },
+        ]}
+      />
+
+      <Callout kind="info" title="Granular by design.">
+        Grants are per-employee, per-connection. Your Bookkeeper gets the Stripe Live grant; your
+        Brand Writer doesn&apos;t. Both employees share the same company, but the MCP surface they
+        see is different.
+      </Callout>
+      <Callout kind="warn" title="Process and network restrictions">
+        Company-configured stdio MCP servers run on the host in the default host execution mode,
+        with the App process user&apos;s authority, and are omitted when command execution is
+        disabled. HTTP MCP servers remain available in both modes. Connection URLs and HTTP MCP
+        servers go through the outbound network policy, so a host on a private network must be
+        allowed first; see{" "}
+        <DocLink to="/docs/self-hosting#private-hosts">Reaching something on your own network</DocLink>
+        .
+      </Callout>
+
+      <H2 id="instance-oauth-apps">Google sign-in and your own OAuth apps</H2>
+      <P>
+        For Gmail, open <Strong>Email</Strong>, enter your address, and choose{" "}
+        <Strong>Continue with Google</Strong>. No Google Cloud project is needed, even on a
+        self-hosted installation: <DocLink to="/docs/connect">Genosyn Connect</DocLink> handles
+        Google&apos;s consent and token renewal, while email reads and sends go directly between
+        your installation and Google. The same applies in <Strong>Settings → Integrations</Strong>{" "}
+        to every Google product Connect offers — the connect form says which, and asks for nothing
+        to set up when you pick only those. Credentials are stored encrypted on your installation;
+        renewing access sends the refresh token to the Connect service that issued it.
+      </P>
+      <P>
+        An instance admin manages this at <Strong>Admin → Runtime → Hosted sign-in</Strong>, which
+        also shows whether Connect is reachable and what it offers. Turning off{" "}
+        <Strong>Use Genosyn Connect</Strong> stops new sign-ins through it without revoking existing
+        Connections. Changing the service URL affects new Connections; existing ones keep renewing
+        through the service that issued them. Only use a replacement service you trust with those
+        credentials. This does not change Member login.
+      </P>
+      <P>
+        To use your own app instead — for products Connect does not offer, your own consent
+        screen, or your own API quota — or for other OAuth integrations, register an app{" "}
+        <Strong>once for the whole install</Strong>. Open{" "}
+        <Strong>Admin → Integrations</Strong>, where each provider is one line saying{" "}
+        <em>Registered</em> or <em>Not registered</em>. Open a provider, copy the redirect URI it
+        shows into the provider&apos;s console, paste back the Client ID and Client Secret, and
+        select <Strong>Register</Strong>. From then on,
+        every company on the instance connects that provider by clicking it and approving on the
+        provider&apos;s own screen — there is no ID to create and nothing to paste. Connecting a
+        Google Workspace Connection becomes: click <Strong>Google Workspace</Strong>, tick the products it may
+        touch, approve. A locally registered Google app takes precedence over Genosyn Connect.
+        (A mailbox that is not on Google needs no registration at all — see{" "}
+        <Strong>Email account (IMAP)</Strong> below.)
+      </P>
+      <P>
+        One registration covers every integration that shares the app: registering{" "}
+        <Strong>Google</Strong> unlocks Google Workspace, Google Analytics, Search Console, and
+        Google Ads together. You can register{" "}
+        <Strong>Google, GitHub, Microsoft, LinkedIn, Reddit</Strong>, and <Strong>X</Strong>.
+      </P>
+      <P>
+        Nothing about this is mandatory, and it does not take anything away. A company that needs
+        its own client — a Workspace tenant with its own consent policy, a separate quota, an
+        account the instance admin should not see — clicks{" "}
+        <Strong>Use my own OAuth client instead</Strong> on the connect form, which brings back the
+        Client ID and Secret fields; those credentials then win for that Connection. An install can
+        mix the two freely.
+      </P>
+      <Callout kind="info" title="Client secrets stay on the server.">
+        A registered secret is encrypted at rest with the same key that protects every other stored
+        credential, and the admin page never reads it back — it shows the Client ID (which is not a
+        secret) and whether a secret is on file. Leaving the secret field blank when you save keeps
+        the one already stored, so you can correct a mistyped Client ID without fetching the secret
+        again.
+      </Callout>
+      <Callout kind="info" title="Rotating a secret is safe; swapping the whole client is not.">
+        Each Connection stores the credentials it was created with, so removing the registration
+        never breaks one that already exists. If you rotate the <em>secret</em> and keep the same
+        Client ID, <Strong>Reconnect</Strong> on a Connection picks up the new secret, because
+        Genosyn recognises it as the instance app. Replacing the Client ID entirely is a different
+        client as far as the provider is concerned: existing Connections stay on the old one and
+        keep working until its credentials are revoked, at which point they have to be disconnected
+        and created again.
+      </Callout>
+
+      <H2 id="product-pages">Connect from the product you are using</H2>
+      <P>
+        Every product has an <Code>Integrations</Code> link in its sidebar. That page is a focused
+        view of the company catalog: it shows the Connections and connector types that belong in the
+        current workflow, without making you leave the product to configure them.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Explore → Integrations</Strong> shows Postgres, MySQL, and ClickHouse.
+        </LI>
+        <LI>
+          <Strong>Email → Integrations</Strong> shows Google Workspace, where the Gmail product is
+          authorized, and <Strong>Email account (IMAP)</Strong> for every other provider.
+        </LI>
+        <LI>
+          <Strong>Code → Integrations</Strong> shows GitHub and Forgejo / Gitea;{" "}
+          <Strong>Finance → Integrations</Strong> shows payment and banking Connections.
+        </LI>
+        <LI>
+          <Strong>Revenue → Integrations</Strong> includes Stripe, Gmail, and data Connections.
+        </LI>
+        <LI>
+          AI Employees, Skills, Routines, and Pipelines show the full catalog because they can use
+          any granted Connection. On a single employee that catalog is one entry down in{" "}
+          <Strong>Settings → Integrations</Strong>.
+        </LI>
+      </UL>
+      <P>
+        Open <Code>Settings → Integrations</Code> whenever you want the complete company-wide
+        catalog. Connecting, reconnecting, checking, renaming, granting, and disconnecting work the
+        same way in either view. For a key-based Integration, the connect form fills in the Label
+        and puts the cursor in the first credential field, so pasting the key and pressing Enter
+        connects it.
+      </P>
+
+      <H2 id="how-tools-show-up">How tools show up</H2>
+      <P>
+        Every Run, Genosyn regenerates the MCP server list for the selected runtime. The built-in{" "}
+        <Code>genosyn</Code> server lists every integration tool the employee has a Grant for; the
+        agent reaches every one of them the same way and never has to know anything about
+        Connections. Integration tools live in the searchable catalogue rather than the up-front
+        working set — see <DocLink to="/docs/tool-discovery">How tools reach the model</DocLink>.
+      </P>
+
+      <H2 id="sites-without-an-api">Sites with no usable API</H2>
+      <P>
+        Every Integration talks to an API. Some sites have no usable API, or paywall the parts that
+        matter, and a Connection cannot help you there — Genosyn no longer stores a site password on
+        a Connection, so there is no <Strong>Browser login</Strong> tab on X or anywhere else. Keep
+        the credential in the <DocLink to="/docs/vault">Vault</DocLink> instead and let an AI
+        employee sign in with the <DocLink to="/docs/browser">built-in Browser</DocLink>.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Store the login once.</Strong> Add a Vault item carrying the site&apos;s origin,
+          the username, the password, and its authenticator setup key if it has one.
+        </LI>
+        <LI>
+          <Strong>Grant the item, not the password.</Strong> An employee with <Strong>Use</Strong>{" "}
+          fills those fields through <Code>browser_fill_vault</Code>, so the plaintext never reaches
+          the model, the Run transcript, or a log.
+        </LI>
+        <LI>
+          <Strong>Challenges stay human.</Strong> Genosyn never solves a captcha or a 2FA prompt it
+          has no setup key for. Open the live browser panel, click <Strong>Take over</Strong>, sign
+          in by hand once, and the employee carries on with the session you established.
+        </LI>
+      </UL>
+      <P>
+        X is the connector this changes most, though not in what it can do: it stays a full OAuth
+        Integration exposing search, timelines, posting, replies, likes, retweets, follows and DMs.
+        What went away is its <Strong>browser login</Strong> auth mode, which kept a site password
+        on the Connection row. Connect X over OAuth instead; if you need a site Genosyn ships no
+        Integration for, keep that login in the <DocLink to="/docs/vault">Vault</DocLink> and let
+        the built-in Browser sign in under a Grant.
+      </P>
+
+      <H2 id="external-mcp">Connecting an external MCP client</H2>
+      <P>
+        The built-in <Code>genosyn</Code> tools an employee gets inside a run — the same tool
+        catalog Genosyn supplies to the <DocLink to="/docs/models">runtime</DocLink> per Run — are
+        also reachable over the network. Point any MCP client at an employee&apos;s endpoint and it
+        drives that employee from anywhere: Claude Desktop, Cursor, VS Code, or your own agent, all
+        seeing the same tools, Grants, and audit trail as the in-app assistant.
+      </P>
+      <P>
+        To give an outside agent everything a Member can do through the API instead — not one
+        employee&apos;s tools, but Revenue, Finance, Tasks, Routines and the rest, acting as the
+        key&apos;s Member — connect it to the <DocLink to="/docs/mcp-server">MCP server</DocLink>.
+      </P>
+
+      <H3 id="external-mcp-url">Get the endpoint URL</H3>
+      <P>
+        Open the employee, then <Strong>Settings → Advanced → MCP</Strong>. The{" "}
+        <Strong>Connect an external harness</Strong> panel at the top shows a copyable URL:
+      </P>
+      <Pre lang="text">{`https://<your-genosyn-host>/api/companies/<company-id>/employees/<employee-id>/mcp/connect`}</Pre>
+      <P>
+        The ids are the company and employee UUIDs, wired in for you — just copy it. Whichever
+        employee the URL names is the one the client acts <em>as</em>: every call runs with that
+        employee&apos;s Grants and lands in its journal.
+      </P>
+
+      <H3 id="external-mcp-auth">Authenticate</H3>
+      <P>
+        Requests carry a Genosyn API key as a bearer token — the same durable credential the REST
+        API uses. Mint one at <Code>Settings → API keys</Code> with <Strong>Generate key</Strong>;
+        the plaintext is shown exactly once, so copy it then. Send it on every request:
+      </P>
+      <Pre lang="http">{`Authorization: Bearer gen_xxxxxxxx…`}</Pre>
+      <P>
+        A key is scoped to a single company and authenticates as the member who minted it; this
+        endpoint needs an owner or admin. The same key drives the whole{" "}
+        <DocLink to="/docs/api">REST API</DocLink>, browsable on your install at{" "}
+        <ExtLink href="/api/docs">/api/docs</ExtLink>.
+      </P>
+
+      <H3 id="external-mcp-config">Transport &amp; client config</H3>
+      <P>
+        The endpoint speaks the MCP <Strong>Streamable HTTP</Strong> transport and is stateless —
+        the client POSTs JSON-RPC and reads a JSON reply, with no session to keep alive. Any client
+        that takes a remote server as <Code>{"{ url, headers }"}</Code> connects natively:
+      </P>
+      <Pre lang="json">{`{
+  "mcpServers": {
+    "genosyn": {
+      "url": "https://<your-host>/api/companies/<company-id>/employees/<employee-id>/mcp/connect",
+      "headers": { "Authorization": "Bearer gen_xxxxxxxx…" }
+    }
+  }
+}`}</Pre>
+      <P>
+        <Strong>Claude Code</Strong> registers it in one command:
+      </P>
+      <Pre lang="bash">{`claude mcp add --transport http genosyn \\
+  "https://<your-host>/api/companies/<company-id>/employees/<employee-id>/mcp/connect" \\
+  --header "Authorization: Bearer gen_xxxxxxxx…"`}</Pre>
+      <P>
+        <Strong>Claude Desktop</Strong> has no field for a custom auth header yet, so bridge the
+        endpoint through <Code>mcp-remote</Code> in <Code>claude_desktop_config.json</Code>. Keep
+        the token in an env var, where its space survives — passed as a raw <Code>--header</Code>{" "}
+        arg it can get mangled:
+      </P>
+      <Pre lang="json">{`{
+  "mcpServers": {
+    "genosyn": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://<your-host>/api/companies/<company-id>/employees/<employee-id>/mcp/connect",
+        "--header",
+        "Authorization:\${AUTH_HEADER}"
+      ],
+      "env": { "AUTH_HEADER": "Bearer gen_xxxxxxxx…" }
+    }
+  }
+}`}</Pre>
+      <P>
+        Cursor and VS Code use the same <Code>url</Code> + <Code>headers</Code> shape (VS Code names
+        the block <Code>servers</Code> and prompts for the token as an <Code>input</Code>); any
+        stdio-only client can reach the endpoint through the same <Code>mcp-remote</Code> bridge.
+      </P>
+
+      <Callout kind="warn" title="An API key is a company-wide credential.">
+        Any valid key an owner or admin minted for a company can drive <em>any</em> employee in it —
+        there is no per-employee scope beyond that — and every write runs as that employee, landing in its
+        audit log and journal. Serve Genosyn over HTTPS, keep keys out of committed config, and
+        revoke a leaked one at <Code>Settings → API keys</Code>.
+      </Callout>
+
+      <H2 id="catalog">What ships today</H2>
+      <P>A non-exhaustive sampling of integrations available in the latest image:</P>
+      <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+        {CATALOG.map((c) => (
+          <div
+            key={c.name}
+            className="flex items-center justify-between rounded-2xl border border-line bg-paper-raised px-3 py-2 text-[13px]"
+          >
+            <span className="font-medium text-ink">{c.name}</span>
+            <span className="text-[11px] uppercase tracking-wider text-ink-500">{c.kind}</span>
+          </div>
+        ))}
+      </div>
+
+      <H2 id="adding-an-integration">Adding an Integration</H2>
+      <P>
+        Integrations live in code: a file under <Code>server/integrations/providers/</Code> exports
+        the auth flow, config shape, and MCP tools the integration contributes. Once compiled, the
+        integration appears in the UI for <em>any</em> company on that instance — no per-tenant
+        flag.
+      </P>
+
+      <H2 id="grants-and-revocation">Grants & revocation</H2>
+      <UL>
+        <LI>
+          <Strong>Add a grant</Strong> at the employee&apos;s{" "}
+          <Strong>Settings → Connections</Strong>, or tick several Connections — alongside
+          mailboxes, notes, Vault items and the rest — on its{" "}
+          <DocLink to="/docs/employees#access">Settings → Access</DocLink> and grant them in one
+          go. The MCP tool list updates on the next run.
+        </LI>
+        <LI>
+          <Strong>Revoke a grant</Strong> in either place. The next routine won&apos;t see the
+          tools.
+        </LI>
+        <LI>
+          <Strong>Delete a Connection</Strong> at the company level. All dependent grants disappear
+          with it.
+        </LI>
+      </UL>
+
+      <H3 id="chat-surfaces">Chat surfaces</H3>
+      <P>
+        Four connectors face mostly <em>inbound</em>: <Strong>Slack</Strong>,{" "}
+        <Strong>Microsoft Teams</Strong>, <Strong>WhatsApp</Strong> and <Strong>Telegram</Strong>.
+        Granting one to an AI Employee does more than hand it outbound tools — it makes that
+        employee reachable from the platform, so a DM or an @-mention gets an answer with the same
+        Soul and Skills as the chat inside Genosyn.
+      </P>
+      <P>
+        Two rules differ from every other connector here, and both surprise people. Where several
+        employees hold a Grant on the same Connection, the <Strong>first</Strong> one granted is the
+        one that answers incoming messages; the rest still get the outbound tools. And a person
+        messaging from outside is answered as a stranger — no Soul, no Skills, no company data —
+        until they open the one-time link the employee replies with. Microsoft Teams and WhatsApp
+        are webhook-only, so their catalog cards stay disabled until{" "}
+        <Strong>Admin → General → Public URL</Strong> is set.
+      </P>
+      <P>
+        Setup steps for each platform, the linking flow, and what deliberately stays inside the app
+        are on <DocLink to="/docs/chat-surfaces">External chat surfaces</DocLink>.
+      </P>
+
+      <H3 id="brex">Brex Cash and corporate cards</H3>
+      <P>
+        To connect your company&apos;s Brex account, sign in to Brex as an administrator, open{" "}
+        <Code>Developer → Settings</Code>, and create a user token with the{" "}
+        <Code>accounts.cash.readonly</Code>, <Code>transactions.cash.readonly</Code>, and{" "}
+        <Code>transactions.card.readonly</Code> scopes. In Genosyn, open{" "}
+        <Code>Finance → Integrations</Code>, choose <Code>Brex</Code>, and paste that token into a
+        new Connection. Genosyn encrypts the token and never returns it to the browser after
+        creation.
+      </P>
+      <P>
+        The Connection contributes read-only cash-account, Cash transaction, and card transaction
+        tools to employees who receive a Grant. To bring Cash transactions into the books, open{" "}
+        <DocLink to="/docs/banking#add-account">Finance → Banking</DocLink>, click{" "}
+        <Code>Add account</Code>, choose <Code>Brex business account</Code>, and pick the
+        Connection and Cash account. Its transactions start coming in at once and{" "}
+        <DocLink to="/docs/banking#sync">keep syncing on their own</DocLink>; if the token is
+        later rejected, the account&apos;s card says so and links back here to reconnect it.
+      </P>
+      <P>
+        For corporate card accounting, add a <Code>Brex card</Code> the same way. Its purchases are
+        filed under a default expense category you can change per purchase, and{" "}
+        <Code>Advanced</Code> sets the card liability and the bank account that pays the card. Brex
+        exposes only settled transactions: pending card activity appears after it settles.
+      </P>
+
+      <H3 id="mercury">Mercury accounts</H3>
+      <P>
+        To connect your company&apos;s Mercury account, sign in to Mercury, click your
+        organization&apos;s name at the top left, choose <Code>All Settings</Code>, then{" "}
+        <Code>Tokens</Code>, and click <Code>Create an API Token</Code>. Choose{" "}
+        <Code>Read Only</Code> — it is all Genosyn needs, and unlike a token that can send money it
+        needs no IP whitelist — and copy the token, which Mercury shows only once. In Genosyn, open{" "}
+        <Code>Finance → Integrations</Code>, choose <Code>Mercury</Code>, and paste the whole token,
+        including its <Code>secret-token:</Code> beginning, into a new Connection. Genosyn talks to
+        Mercury directly, encrypts the token, and never returns it to the browser after creation.
+      </P>
+      <P>
+        To bring an account&apos;s transactions into the books, open{" "}
+        <DocLink to="/docs/banking#add-account">Finance → Banking</DocLink>, click{" "}
+        <Code>Add account</Code>, choose <Code>Mercury account</Code>, and pick the Connection and
+        the checking or savings account; it <DocLink to="/docs/banking#sync">syncs on its own</DocLink>{" "}
+        from then on. Only settled transactions come in. Mercury accounts are in US dollars, so they
+        can be added only when your books are in USD.
+      </P>
+      <P>
+        The Connection contributes read-only account and transaction tools to employees who receive
+        a Grant. Account numbers show only their last four digits, and neither routing numbers nor
+        a counterparty&apos;s bank details reach an employee. No tool sends or moves money. Mercury
+        deletes a token nobody uses for 45 days; an account syncing on Banking keeps its token in
+        use.
+      </P>
+
+      <H3 id="ramp">Ramp cards</H3>
+      <P>
+        Ramp connects through a developer app rather than a token. As a Ramp admin, open{" "}
+        <Code>Company → Developer</Code> and click <Code>Create New App</Code>. Under{" "}
+        <Code>Grant types</Code>, add <Code>Client Credentials</Code>; under{" "}
+        <Code>Scopes</Code>, allow <Code>business:read</Code>, <Code>transactions:read</Code>,{" "}
+        <Code>transfers:read</Code>, and <Code>cashbacks:read</Code>. Copy the app&apos;s client ID
+        and client secret, then in Genosyn open <Code>Finance → Integrations</Code>, choose{" "}
+        <Code>Ramp</Code>, and paste both into a new Connection. Genosyn trades them for a
+        short-lived access token when it reads, keeps that token in memory only, and never returns
+        the secret to the browser after creation.
+      </P>
+      <P>
+        For corporate card accounting, open{" "}
+        <DocLink to="/docs/banking#add-account">Finance → Banking</DocLink>, click{" "}
+        <Code>Add account</Code>, and choose <Code>Ramp card</Code>. It brings in settled card
+        transactions, the payments that settle your Ramp bill, and cashback: purchases are filed
+        under a default expense category you can change per purchase, refunds and cashback come back
+        under it, and bill payments move what you owe on the card against the bank account that
+        paid. Ramp dates a transaction by when the card was used, so each sync looks back a month
+        for purchases that settled late, such as hotel stays.
+      </P>
+      <P>
+        The Connection contributes read-only tools to employees who receive a Grant: card
+        transactions with the merchant and cardholder, bill payments, cashback, and the card
+        balance and limit. No tool issues cards, changes limits, or moves money.
+      </P>
+
+      <H3 id="wise">Wise balances</H3>
+      <P>
+        To connect your company&apos;s Wise business account, sign in to Wise, open{" "}
+        <Code>Your Account → Connect and manage apps → API tokens</Code>, click{" "}
+        <Code>Add new token</Code>, and copy the token — Wise shows it only once. Genosyn only
+        reads, so if Wise asks which permissions the token should have, read-only is enough. In
+        Genosyn, open <Code>Finance → Integrations</Code>, choose <Code>Wise</Code>, and paste the
+        token into a new Connection. Genosyn talks to Wise directly, with no aggregator in between,
+        encrypts the token, and never returns it to the browser after creation.
+      </P>
+      <P>
+        To bring a balance&apos;s transactions into the books, open{" "}
+        <DocLink to="/docs/banking#add-account">Finance → Banking</DocLink>, click{" "}
+        <Code>Add account</Code>, choose <Code>Wise balance</Code>, and pick the Connection and the
+        balance; it <DocLink to="/docs/banking#sync">syncs on its own</DocLink> from then on. Only
+        a balance in your home currency can be added, because bank transactions are in your home
+        currency; balances in other currencies are listed but greyed out.
+      </P>
+      <P>
+        The Connection contributes read-only profile, balance, and balance statement tools to
+        employees who receive a Grant. A statement covers at most 469 days and lists each
+        transaction once, with its fees included and without the payer&apos;s bank account number.
+        No tool sends, converts, or moves money.
+      </P>
+      <Callout kind="info" title="Where Wise releases statements">
+        Wise releases balance statements to a personal API token only for business accounts based
+        in the US, Canada, Australia, New Zealand, Singapore, and Malaysia. Elsewhere — the UK and
+        the EEA included — Wise asks for Strong Customer Authentication first, which a token
+        can&apos;t complete. The Connection still lists profiles and balances, and{" "}
+        <Code>Add account</Code> explains why instead of adding the balance.
+      </Callout>
+
+      <H3 id="stripe-reads">Stripe reads and coverage</H3>
+      <P>
+        A granted Stripe Connection returns compact customer, subscription, invoice and charge
+        pages. Every page reports its filters, row count and whether it reached the end. An AI
+        Employee follows <Code>nextStartingAfter</Code> as <Code>startingAfter</Code>, keeping the
+        filters unchanged, until <Code>coverage.reachedEnd</Code> is true. A final page does not
+        include earlier pages; <Code>completeFromStart</Code> is true only when one call covered the
+        whole filtered list. Creation-time bounds use Unix seconds: <Code>createdGte</Code> includes
+        its boundary and <Code>createdLt</Code> excludes it.
+      </P>
+      <P>
+        Subscriptions default to non-canceled statuses; use <Code>status=all</Code> for all statuses.
+        Compact rows omit large metadata and invoice line items, and show up to five subscription
+        price items with their own <Code>has_more</Code> marker. Use <Code>compact=false</Code> for
+        full provider rows when needed. Amounts keep Stripe&apos;s currency units; a page of charges
+        is not an account-wide revenue total. These reads use the existing Connection Grant and
+        require no new write access.
+      </P>
+      <P>
+        Stripe commercial-value reconciliation follows every subscription and paid-invoice page
+        before proposing a value, with a fixed creation-time boundary and page/row counts in the
+        evidence. If it reaches its 100-page safety bound, loses cursor progress, or finds a
+        subscription whose item list is incomplete, it reports the gap and makes no proposal from
+        that partial scan.
+      </P>
+
+      <H3 id="github-engineering">Git hosts &amp; engineering grants</H3>
+      <P>
+        GitHub and Forgejo Connections are special: a Connection holds a list of repositories the
+        employee is allowed to touch, and the runner materializes a git checkout of each allowed
+        repository into <Code>data/companies/&lt;co&gt;/employees/&lt;emp&gt;/repos/...</Code>{" "}
+        before each run. The git token exists only inside a short-lived server-owned clone or
+        refresh operation. It is never copied into the checkout, an environment variable visible to
+        the AI Employee, or a reusable credential helper. A matching HTTPS Repository can reuse the
+        same server-held credential when the Connection is granted to that employee. Genosyn prefers
+        an exact owner/repository allowlist match and can use the employee&apos;s sole Connection
+        for that server when no disambiguation is needed.
+      </P>
+      <P>
+        GitHub also exposes <Code>list_repository_activity</Code>: compact, structured events for
+        pushes, issues, pull requests, comments, reviews and releases, with source links and
+        explicit coverage. A scan captures stable event IDs; follow <Code>nextCursor</Code> as{" "}
+        <Code>cursor</Code> with unchanged repository, page size and timestamp bounds
+        (<Code>since</Code> inclusive, <Code>until</Code> exclusive). Newly arriving events cannot
+        shift that saved sequence. A new scan returns its events oldest first: GitHub keeps only
+        the newest 300, so on a busy repository the oldest leave first, and a slow scan reads them
+        before they do. Genosyn also keeps the events it has read, so a scan still returns an event
+        the feed has dropped since; after a restart it reports that event as a gap instead. Save{" "}
+        <Code>resumeCursor</Code> before processing and record
+        each successfully processed event ID in a Workstream. After an interruption, pass that
+        saved value as <Code>cursor</Code> and the last processed ID as <Code>afterEventId</Code>.
+        Save <Code>nextCursor</Code> after the whole batch succeeds. Replaying an unacknowledged
+        cursor intentionally returns the same batch; a read receipt cannot prove that its effects
+        were applied exactly once. Cursors and checkpoints are short references (
+        <Code>gha3.</Code> and 20 characters) to progress Genosyn keeps for 31 days, so a model
+        has little to copy on each call. Copy them exactly: a reference Genosyn did not issue is
+        rejected before reading GitHub. Restore the original saved value when a continuation is
+        invalid; longer progress values saved before remain usable.
+      </P>
+      <P>
+        At scan end, save <Code>checkpoint</Code> and pass it to the next scan. It excludes the
+        processed IDs while finding new and delayed arrivals. A missing saved event, an evicted
+        anchor, or an expired checkpoint reports a <Code>coverage.gap</Code> without advancing
+        progress; reconcile against commit, issue or pull-request reads before starting afresh.
+        GitHub retains at most 300 events from 30 days, can delay them by six hours, and provides no
+        atomic event snapshot. Coverage stays partial even when <Code>snapshotComplete</Code> is
+        true: an empty feed does not prove inactivity or provide a complete CI history.
+      </P>
+
+      <H3 id="forgejo-gitea">Forgejo / Gitea</H3>
+      <P>
+        <Strong>Forgejo / Gitea</Strong> is the same Integration for a server you host yourself.
+        Gitea forked from Gogs and Forgejo forked from Gitea, so all three serve one API and one
+        Connection covers the family — Forgejo is what this was built and tested against, Gitea is
+        the same surface, and Gogs has drifted far enough that it is best-effort rather than
+        supported.
+      </P>
+      <P>
+        Connect it with two fields: the <Strong>Server URL</Strong> — the root of your install, not
+        its <Code>/api/v1</Code> path — and an <Strong>Access token</Strong> generated at{" "}
+        <Code>&lt;your server&gt;/user/settings/applications</Code> with repository, issue, and user
+        scopes. There is no OAuth option: an OAuth app is registered per instance, and
+        Genosyn&apos;s instance-wide app registry holds one app per Integration, which fits
+        github.com and fits nothing that a hundred companies each host separately.
+      </P>
+      <P>
+        The server URL must be <Code>https://</Code>. Genosyn sends this token on every API call and
+        <Code>git</Code> sends it again on every push, so a plain <Code>http://</Code> server is
+        refused at the connect form rather than accepted into a Connection whose tools work and
+        whose pushes quietly fail.
+      </P>
+      <P>
+        An AI Employee granted a Forgejo Connection gets the shared repository, issue and
+        pull-request tools. GitHub&apos;s <Code>search_code</Code> and{" "}
+        <Code>list_repository_activity</Code> are absent: Forgejo has no equivalent code-search
+        endpoint, and the activity reader depends on GitHub&apos;s event-feed contract.
+      </P>
+      <P>
+        The server URL is also what makes a Repository on that host reviewable. Genosyn will only
+        speak an API to — and only send a token to — a host some Connection was explicitly
+        configured for, matching scheme, host, port and path prefix exactly. A server nobody has
+        connected stays an ordinary git remote that can be cloned and pushed but has no{" "}
+        <Strong>Open pull request</Strong> button. See{" "}
+        <DocLink to="/docs/repositories">Repositories</DocLink>.
+      </P>
+      <P>
+        A self-hosted server usually lives on a private network, and Genosyn refuses outbound
+        requests to non-public addresses by default. Add its hostname at{" "}
+        <Strong>Admin → Runtime → Network</Strong> before connecting it — see{" "}
+        <DocLink to="/docs/self-hosting">Self-hosting</DocLink>.
+      </P>
+
+      <H3 id="imap">Email account (IMAP)</H3>
+      <P>
+        The connector with nothing to register. Give it an address and an app password and it
+        connects any mailbox that speaks IMAP and SMTP — Fastmail, iCloud, Yahoo, Zoho, a company
+        Exchange server, a Dovecot box you run yourself. Genosyn works the server settings out from
+        the domain, so the connect form is two fields; the rest are there, collapsed, for the
+        mailbox whose servers are not where its domain says they are.
+      </P>
+      <P>
+        Both halves are proved before anything is stored: Genosyn logs in over IMAP and verifies
+        SMTP separately, because they fail independently and for different reasons. A mailbox that
+        can read but not send is still connected, with the sending failure spelled out on the
+        Connection rather than discovered the first time somebody presses Send.
+      </P>
+      <P>
+        This connector carries the credential and exposes <em>no</em> AI-employee tools of its own.
+        An employee reaches mail through a mailbox <Strong>Grant</Strong> at{" "}
+        <Strong>Email → Settings → AI access</Strong>, which is ranked read &lt; draft &lt; send per
+        mailbox; a second set of tools hanging off the Connection grant would let an employee
+        granted the connection send mail without anyone granting it the mailbox. See{" "}
+        <DocLink to="/docs/email">Email</DocLink> for the mailbox side, including which providers
+        need which kind of password.
+      </P>
+
+      <H3 id="twilio">Twilio</H3>
+      <P>
+        Connect a Twilio account with its Account SID and Auth Token, then reserve numbers at{" "}
+        <Strong>Settings → Phone numbers</Strong> and give each to an AI Employee. Like the IMAP
+        connector, the Twilio Connection carries the credential and exposes no tools of its own: an
+        employee texts and calls from the numbers it has been given, under each number&apos;s daily
+        limits, and a Grant on the Connection would reach every number on the account. The Auth
+        Token also verifies every webhook Twilio sends. See{" "}
+        <DocLink to="/docs/phone-numbers">Phone numbers</DocLink>.
+      </P>
+
+      <H3 id="gmail-search-pagination">Searching busy Gmail inboxes</H3>
+      <P>
+        Gmail search results are paginated. If a call to <Code>gmail_search_messages</Code> returns
+        a <Code>nextPageToken</Code>, the employee passes that value back as <Code>pageToken</Code>{" "}
+        with the same query and labels. It repeats this until Gmail omits <Code>nextPageToken</Code>
+        , so busy date windows are scanned in full instead of stopping at the first 100 messages.
+      </P>
+      <P>
+        Gmail searches, message reads in every supported format, and label lists automatically
+        retry temporary network failures, timeouts, rate limits, and service errors, with short
+        pauses and up to four attempts per read request. If those attempts fail, the tool returns
+        the error and the unread work remains unfinished. Sending mail and creating drafts are
+        single-attempt operations to avoid duplicates.
+      </P>
+
+      <H3 id="gmail-attachments">Emailing files from Resources</H3>
+      <P>
+        An employee drafting or sending mail through the <Strong>Google Workspace</Strong> connector
+        can attach <DocLink to="/docs/vocabulary">Resources</DocLink> it has been granted — the
+        ebook you uploaded, a contract, a report. It names the resource by slug and Genosyn reads
+        the bytes server-side, so the file never has to travel through the model. Attachments work
+        the same on a draft as on a send: the draft lands in Gmail with the files already on it,
+        ready for a human to review before it goes out.
+      </P>
+      <P>
+        Each attachment picks a <Code>format</Code>. The default, <Code>original</Code>, sends the
+        file exactly as it was uploaded — that is what you want for a PDF or EPUB that already
+        exists. The other four (<Code>pdf</Code>, <Code>html</Code>, <Code>md</Code>,{" "}
+        <Code>txt</Code>) render the resource&apos;s extracted text into a new document, the same
+        rendering the Download menu on the resource page produces. Those are the only options for
+        link- and paste-kind resources, which never keep an original file.
+      </P>
+      <Callout kind="warn" title="A grant says which file, not who receives it.">
+        Genosyn checks the employee&apos;s grant on every attachment, so it cannot email a Resource
+        nobody shared with it. It does <em>not</em> check the recipient. An employee that reads
+        untrusted text — a support inbox, a scraped page — can be talked into mailing a document it
+        legitimately holds to an address of the attacker&apos;s choosing. Grant document access the
+        way you&apos;d hand someone a printout, and keep employees that read the open internet away
+        from Resources you would not want forwarded.
+      </Callout>
+      <P>
+        Who may send at all is a separate question, and the{" "}
+        <DocLink to="/docs/email">Email</DocLink> section owns it. Once you connect a mailbox there,
+        the <Code>gmail_*</Code> tools honour that mailbox&apos;s{" "}
+        <Strong>Read / Draft / Send</Strong> level — so an employee on the default{" "}
+        <Strong>Draft</Strong> can attach a Resource to a draft for you to review, but cannot send
+        it itself. Until a mailbox is connected there is no level to honour, and a Connection grant
+        alone lets an employee send.
+      </P>
+
+      <H3 id="google-analytics-search-console">Google Analytics &amp; Search Console</H3>
+      <P>
+        Two <em>read-only</em> Google integrations for the team&apos;s growth work, listed under{" "}
+        <Strong>Analytics</Strong> in the catalog and separate from the Gmail / Drive{" "}
+        <Strong>Google Workspace</Strong> connector. <Strong>Google Analytics</Strong> exposes GA4
+        accounts and properties plus report tools (sessions, users, conversions, channels, realtime,
+        and the dimension/metric catalog). <Strong>Google Search Console</Strong> exposes verified
+        sites, Search Analytics (clicks, impressions, CTR, position), sitemaps, and URL inspection.
+      </P>
+      <P>
+        Connect either with your own <Strong>OAuth client</Strong> (add the callback URI the modal
+        shows to your Google Cloud OAuth client) or a <Strong>service-account JSON key</Strong> —
+        for a service account, add its email as a viewer/user on the GA4 property or Search Console
+        site; no domain-wide delegation is needed. Both request only the read-only scope (
+        <Code>analytics.readonly</Code> / <Code>webmasters.readonly</Code>), so employees can report
+        on traffic and search performance but never change settings.
+      </P>
+
+      <H3 id="linkedin">LinkedIn</H3>
+      <P>
+        Create an app in the{" "}
+        <ExtLink href="https://www.linkedin.com/developers/apps">LinkedIn Developer Portal</ExtLink>
+        , add the callback URL shown by Genosyn under <Strong>Auth</Strong>, then enable{" "}
+        <Strong>Sign In with LinkedIn using OpenID Connect</Strong> and{" "}
+        <Strong>Share on LinkedIn</Strong> under <Strong>Products</Strong>. The default{" "}
+        <Strong>Post on member&apos;s behalf</Strong> choice requests only those self-service
+        permissions.
+      </P>
+      <Callout kind="warn" title="Company-page posting needs LinkedIn approval.">
+        Leave <Strong>Post as company pages</Strong> unchecked unless LinkedIn has approved the app
+        for the <Strong>Community Management API</Strong>. Selecting it requests reviewed
+        organization permissions; LinkedIn rejects the entire connection with{" "}
+        <Code>unauthorized_scope_error</Code> when the app does not have them.
+      </Callout>
+
+      <H3 id="paid-marketing">Ad platforms (paid marketing)</H3>
+      <P>
+        Four ad-platform integrations —{" "}
+        <Strong>Google Ads, Meta Ads, Microsoft Advertising, Reddit Ads</Strong> — give AI Employees
+        read-first campaign visibility plus a tiny, approval-gated mutation surface (pause / enable
+        / budget change) bounded by per-Connection spending caps and a kill switch. Spend increases
+        queue in the Approvals inbox by default; pausing never does. Setup recipes, the full safety
+        model, and the built-in Browser path for the LinkedIn / X / TikTok ads UIs live on the{" "}
+        <DocLink to="/docs/marketing">Paid Marketing</DocLink> page.
+      </P>
+    </>
+  );
+}

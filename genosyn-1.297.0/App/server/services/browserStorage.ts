@@ -1,0 +1,297 @@
+import path from "node:path";
+import fs from "node:fs/promises";
+import { AppDataSource } from "../db/datasource.js";
+import { Company } from "../db/entities/Company.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  dataRoot,
+  employeeBrowserProfileDir,
+  employeeBrowserStateFile,
+  legacyEmployeeBrowserStateFile,
+} from "./paths.js";
+
+/**
+ * On-disk browser state for each AI Employee, kept App-private under
+ * `.private/browser-state/<company-id>/` rather than in the employee's
+ * model-visible workspace (see `paths.ts`).
+ *
+ * The Chrome profile, `<employee-id>.profile/`, is the source of truth:
+ * cookies, localStorage, IndexedDB, cache and history all live in it and
+ * survive restarts on their own. The `<employee-id>.json` beside it is a
+ * one-way export of Playwright's `storageState()` (cookies and localStorage
+ * only), which `browserChromium.ts` writes on a debounce after navigation and
+ * whenever it closes Chrome, `SIGTERM` included. A working profile never
+ * reads it back. It is read only to seed a brand-new profile once, so an
+ * upgrade from the ephemeral browser keeps every employee's sign-ins, and as
+ * the cookie jar for the ephemeral fallback when the profile cannot be used.
+ */
+
+export type StorageState = {
+  cookies: unknown[];
+  origins: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>;
+};
+
+type BrowserStorageIdentity = {
+  companySlug: string;
+  employeeSlug: string;
+};
+
+async function resolveIdentity(
+  companyId: string,
+  employeeId: string,
+): Promise<BrowserStorageIdentity | null> {
+  const co = await AppDataSource.getRepository(Company).findOneBy({ id: companyId });
+  if (!co) return null;
+  const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: employeeId,
+    companyId,
+  });
+  if (!emp) return null;
+  return { companySlug: co.slug, employeeSlug: emp.slug };
+}
+
+async function ensurePrivateDirectory(directory: string): Promise<void> {
+  const root = dataRoot();
+  await fs.mkdir(root, { recursive: true });
+  const relative = path.relative(root, directory);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error("Browser storage directory must stay inside the App data directory");
+  }
+  let current = root;
+  for (const component of relative.split(path.sep)) {
+    current = path.join(current, component);
+    try {
+      const stat = await fs.lstat(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error("Browser storage directory is not a private directory");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await fs.mkdir(current, { mode: 0o700 }).catch((mkdirError) => {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+      });
+      const created = await fs.lstat(current);
+      if (!created.isDirectory() || created.isSymbolicLink()) {
+        throw new Error("Browser storage directory is not a private directory");
+      }
+    }
+    await fs.chmod(current, 0o700);
+  }
+}
+
+async function assertPrivateStateFile(file: string): Promise<boolean> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("Browser storage state is not a private regular file");
+    }
+    await fs.chmod(file, 0o600);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+const legacyMigrationTails = new Map<string, Promise<void>>();
+
+/**
+ * Move the legacy workspace-visible snapshot before any coding tool is built.
+ * Temporary/torn legacy snapshots are deleted too, so no coding tool finds an
+ * old cookie file in the workspace after an upgrade.
+ */
+export async function migrateLegacyBrowserStorage(
+  companyId: string,
+  employeeId: string,
+): Promise<void> {
+  // Two launches for the same employee must not inspect an inode while the
+  // other migration moves or unlinks it. Unrelated employees remain independent.
+  const key = employeeBrowserStateFile(companyId, employeeId);
+  const previous = legacyMigrationTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  legacyMigrationTails.set(key, tail);
+  await previous;
+  try {
+    await migrateLegacyBrowserStorageUnlocked(companyId, employeeId);
+  } finally {
+    // The tail always resolves even when this caller receives a migration
+    // error, so a later attempt can recheck repaired storage and retry safely.
+    release();
+    if (legacyMigrationTails.get(key) === tail) legacyMigrationTails.delete(key);
+  }
+}
+
+async function migrateLegacyBrowserStorageUnlocked(
+  companyId: string,
+  employeeId: string,
+): Promise<void> {
+  const identity = await resolveIdentity(companyId, employeeId);
+  if (!identity) return;
+  const destination = employeeBrowserStateFile(companyId, employeeId);
+  await ensurePrivateDirectory(path.dirname(destination));
+  let destinationExists = await assertPrivateStateFile(destination);
+  const legacy = legacyEmployeeBrowserStateFile(identity.companySlug, identity.employeeSlug);
+  const legacyDirectory = path.dirname(legacy);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(legacyDirectory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const artifacts = entries.filter((entry) => entry.startsWith(".browser-state.json"));
+  for (const artifact of artifacts) {
+    const source = path.join(legacyDirectory, artifact);
+    let stat;
+    try {
+      stat = await fs.lstat(source);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isFile() && stat.nlink !== 1) {
+      throw new Error("Legacy Browser storage has an unsafe hard link");
+    }
+    if (artifact === ".browser-state.json" && !destinationExists && stat.isFile()) {
+      try {
+        await fs.rename(source, destination);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      destinationExists = await assertPrivateStateFile(destination);
+      if (destinationExists) continue;
+    }
+    if (!stat.isFile() && !stat.isSymbolicLink()) {
+      throw new Error("Legacy Browser storage artifact is not a regular file");
+    }
+    await fs.unlink(source).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    });
+  }
+}
+
+export async function removeBrowserStorageForEmployee(
+  companyId: string,
+  employeeId: string,
+): Promise<void> {
+  await fs.rm(employeeBrowserStateFile(companyId, employeeId), { force: true });
+  // The Chrome profile holds the same logins in a richer form — cookies,
+  // IndexedDB, service worker registrations, cache. Deleting the employee has
+  // to take it too, or the row is gone while a live session for every site
+  // they ever signed into stays on disk with nothing left to reference it.
+  await fs.rm(employeeBrowserProfileDir(companyId, employeeId), {
+    recursive: true,
+    force: true,
+  });
+}
+
+/**
+ * Create (and harden) the employee's Chrome profile directory, returning the
+ * path to hand to `launchPersistentContext`.
+ *
+ * Goes through the same {@link ensurePrivateDirectory} walk the cookie
+ * snapshot uses, so every component is asserted to be a real 0700 directory
+ * inside the data root and not a symlink, *before* Chrome is pointed at it. A
+ * symlinked profile dir would let anything that can write the data tree
+ * redirect a browser that holds every one of the employee's sessions.
+ */
+export async function ensureBrowserProfileDir(
+  companyId: string,
+  employeeId: string,
+): Promise<string> {
+  const dir = employeeBrowserProfileDir(companyId, employeeId);
+  await ensurePrivateDirectory(dir);
+  return dir;
+}
+
+/** True when this employee has no Chrome profile yet, so it needs seeding. */
+export async function browserProfileIsNew(
+  companyId: string,
+  employeeId: string,
+): Promise<boolean> {
+  const dir = employeeBrowserProfileDir(companyId, employeeId);
+  try {
+    const entries = await fs.readdir(dir);
+    // `ensureBrowserProfileDir` creates the directory before Chrome runs, so
+    // "exists" is not the question — "has Chrome ever written to it" is.
+    return entries.length === 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+/**
+ * Read the exported storage state for this employee, or `undefined` if no
+ * snapshot exists yet (or the file is unreadable / unparseable). Only the
+ * one-time seed of a brand-new profile and the ephemeral fallback's
+ * `newContext({ storageState })` read it.
+ */
+export async function loadStorageState(
+  companyId: string,
+  employeeId: string,
+): Promise<StorageState | undefined> {
+  const identity = await resolveIdentity(companyId, employeeId);
+  if (!identity) return undefined;
+  await migrateLegacyBrowserStorage(companyId, employeeId);
+  const file = employeeBrowserStateFile(companyId, employeeId);
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch {
+    // No snapshot yet — first launch for this employee.
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as StorageState;
+    if (!parsed || !Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) {
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    // Corrupt file — start clean rather than crash the browser launch.
+    return undefined;
+  }
+}
+
+/**
+ * Snapshot the live context's storage state and write it to disk. Best-
+ * effort: any failure (slug missing, fs error, context already torn down)
+ * is swallowed so it can't break the shutdown path it's called from.
+ *
+ * Atomic via tmp + rename so a crash mid-write can't leave a half-written
+ * file that fails to load next time.
+ */
+export async function saveStorageState(
+  companyId: string,
+  employeeId: string,
+  context: unknown,
+): Promise<void> {
+  try {
+    const identity = await resolveIdentity(companyId, employeeId);
+    if (!identity) return;
+    await migrateLegacyBrowserStorage(companyId, employeeId);
+    const cx = context as { storageState: () => Promise<StorageState> } | null;
+    if (!cx) return;
+    const state = await cx.storageState();
+    const file = employeeBrowserStateFile(companyId, employeeId);
+    await ensurePrivateDirectory(path.dirname(file));
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+    await fs.rename(tmp, file);
+    // Best-effort tighten on the final file too — ensureDir doesn't touch
+    // its mode and the tmp file's mode only applies on first create on
+    // some filesystems.
+    try {
+      await fs.chmod(file, 0o600);
+    } catch {
+      // ignore
+    }
+  } catch {
+    // Persistence is a UX optimization, not a correctness gate. Don't let
+    // a stat / write hiccup take down the browser teardown path.
+  }
+}

@@ -1,0 +1,386 @@
+import React from "react";
+import { useOutletContext } from "react-router-dom";
+import { Download, Lock, Plus, Trash2, Unlock } from "lucide-react";
+import { AccountingPeriod, api } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { canWriteFinance } from "../lib/subpages";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { Button } from "../components/ui/Button";
+import { Spinner } from "../components/ui/Spinner";
+import { Modal } from "../components/ui/Modal";
+import { Input } from "../components/ui/Input";
+import { FormError } from "../components/ui/FormError";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { FinanceOutletCtx } from "./FinanceLayout";
+
+/**
+ * Periods + accountant exports. Phase F of the Finance milestone (M19).
+ *
+ * Two sections:
+ *   - Periods: define fiscal months/quarters/years, then close them
+ *     to roll P&L into Retained Earnings and lock the window.
+ *   - Exports: download CSVs of customers / invoices / general
+ *     journal / trial balance for handing off to the company's
+ *     external accountant.
+ *
+ * A read-only Member sees both, but only the exports do anything for them:
+ * creating, closing, re-opening, and deleting periods need Full access.
+ */
+export default function FinancePeriods() {
+  const { company } = useOutletContext<FinanceOutletCtx>();
+  const canWrite = canWriteFinance(company);
+  const background = useBackgroundAction();
+  const dialog = useDialog();
+
+  const [periods, setPeriods] = React.useState<AccountingPeriod[] | null>(null);
+  const [showNew, setShowNew] = React.useState(false);
+
+  const reload = React.useCallback(async () => {
+    const list = await api.get<AccountingPeriod[]>(`/api/companies/${company.id}/periods`);
+    setPeriods(list);
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload().catch(() => setPeriods([]));
+  }, [reload]);
+
+  useLiveRefetch("period", reload);
+
+  async function close(p: AccountingPeriod) {
+    const ok = await dialog.confirm({
+      title: `Close ${p.name}?`,
+      message:
+        "Posts a closing entry that rolls revenue and expenses into 3100 Retained Earnings, then locks every entry dated inside the period.",
+      confirmLabel: "Close period",
+    });
+    if (!ok) return;
+    setPeriods(
+      (current) =>
+        current?.map((item) =>
+          item.id === p.id
+            ? { ...item, status: "closed", closedAt: new Date().toISOString() }
+            : item,
+        ) ?? current,
+    );
+    background(
+      () => api.post<AccountingPeriod>(`/api/companies/${company.id}/periods/${p.id}/close`),
+      {
+        title: "Couldn’t close the period",
+        error: (error) => `${errorMessage(error)} It remains open.`,
+        onSuccess: (updated) => {
+          setPeriods(
+            (current) =>
+              current?.map((item) => (item.id === updated.id ? updated : item)) ?? current,
+          );
+        },
+        onError: () => {
+          setPeriods((current) => current?.map((item) => (item.id === p.id ? p : item)) ?? current);
+        },
+      },
+    );
+  }
+
+  async function reopen(p: AccountingPeriod) {
+    const ok = await dialog.confirm({
+      title: `Re-open ${p.name}?`,
+      message: "Removes the closing entry and unlocks the window for edits.",
+      variant: "danger",
+      confirmLabel: "Re-open",
+    });
+    if (!ok) return;
+    setPeriods(
+      (current) =>
+        current?.map((item) =>
+          item.id === p.id
+            ? { ...item, status: "open", closedAt: null, closedById: null, closingEntryId: null }
+            : item,
+        ) ?? current,
+    );
+    background(
+      () => api.post<AccountingPeriod>(`/api/companies/${company.id}/periods/${p.id}/reopen`),
+      {
+        title: "Couldn’t re-open the period",
+        error: (error) => `${errorMessage(error)} It remains closed.`,
+        onSuccess: (updated) => {
+          setPeriods(
+            (current) =>
+              current?.map((item) => (item.id === updated.id ? updated : item)) ?? current,
+          );
+        },
+        onError: () => {
+          setPeriods((current) => current?.map((item) => (item.id === p.id ? p : item)) ?? current);
+        },
+      },
+    );
+  }
+
+  async function remove(p: AccountingPeriod) {
+    const ok = await dialog.confirm({
+      title: `Delete ${p.name}?`,
+      variant: "danger",
+      confirmLabel: "Delete",
+    });
+    if (!ok) return;
+    const originalIndex = periods?.findIndex((item) => item.id === p.id) ?? -1;
+    setPeriods((current) => current?.filter((item) => item.id !== p.id) ?? current);
+    background(() => api.del(`/api/companies/${company.id}/periods/${p.id}`), {
+      title: "Couldn’t delete the period",
+      error: (error) => `${errorMessage(error)} It has been restored.`,
+      onError: () => {
+        setPeriods((current) => {
+          if (!current || current.some((item) => item.id === p.id)) return current;
+          const next = [...current];
+          next.splice(Math.max(0, Math.min(originalIndex, next.length)), 0, p);
+          return next;
+        });
+      },
+    });
+  }
+
+  const exports = [
+    {
+      key: "customers",
+      label: "Customers",
+      desc: "All customer records with billing address and tax number.",
+      url: `/api/companies/${company.id}/exports/customers.csv`,
+    },
+    {
+      key: "invoices",
+      label: "Invoices",
+      desc: "Invoice ledger with status, totals, and balances.",
+      url: `/api/companies/${company.id}/exports/invoices.csv`,
+    },
+    {
+      key: "journal",
+      label: "General journal",
+      desc: "Every ledger entry line in chronological order.",
+      url: `/api/companies/${company.id}/exports/journal.csv`,
+    },
+    {
+      key: "trial-balance",
+      label: "Trial balance",
+      desc: "Snapshot of debits, credits, and balances per account.",
+      url: `/api/companies/${company.id}/exports/trial-balance.csv`,
+    },
+  ];
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <div className="mb-6">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Periods & exports" },
+          ]}
+        />
+      </div>
+      <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">
+        Periods & exports
+      </h1>
+      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+        Close a month or quarter once its books are final: nothing can be posted into a closed
+        period until someone reopens it. The CSV exports below are what most outside accountants
+        ask for.
+      </p>
+
+      <div className="mt-6 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+            Accounting periods
+          </h2>
+          {canWrite && (
+            <Button onClick={() => setShowNew(true)} size="sm">
+              <Plus size={14} /> New period
+            </Button>
+          )}
+        </div>
+        {periods === null ? (
+          <div className="flex justify-center p-8">
+            <Spinner size={20} />
+          </div>
+        ) : periods.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-slate-400">
+            No periods defined yet.
+            {canWrite && " Create your first one to start closing books at month-end."}
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="border-b border-slate-200 bg-slate-50/80 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-800/40 dark:text-slate-400">
+              <tr>
+                <th className="px-4 py-2 text-left font-medium">Name</th>
+                <th className="w-32 px-4 py-2 text-left font-medium">Start</th>
+                <th className="w-32 px-4 py-2 text-left font-medium">End</th>
+                <th className="w-24 px-4 py-2 text-left font-medium">Status</th>
+                {canWrite && <th className="w-48 px-4 py-2 text-right font-medium">&nbsp;</th>}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+              {periods.map((p) => (
+                <tr key={p.id}>
+                  <td className="px-4 py-2 font-medium text-slate-900 dark:text-slate-100">
+                    {p.name}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">
+                    {p.startDate.slice(0, 10)}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">
+                    {p.endDate.slice(0, 10)}
+                  </td>
+                  <td className="px-4 py-2">
+                    <span
+                      className={
+                        "inline-block rounded-full px-2 py-0.5 text-xs font-medium first-letter:uppercase " +
+                        (p.status === "closed"
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+                          : "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300")
+                      }
+                    >
+                      {p.status}
+                    </span>
+                  </td>
+                  {canWrite && (
+                    <td className="px-4 py-2 text-right">
+                      <div className="flex justify-end gap-2">
+                        {p.status === "open" ? (
+                          <>
+                            <Button onClick={() => close(p)} size="sm">
+                              <Lock size={12} /> Close
+                            </Button>
+                            <button
+                              onClick={() => remove(p)}
+                              className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                              aria-label="Delete"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </>
+                        ) : (
+                          <Button onClick={() => reopen(p)} variant="secondary" size="sm">
+                            <Unlock size={12} /> Re-open
+                          </Button>
+                        )}
+                      </div>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="mt-6 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+        <div className="border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-200">CSV exports</h2>
+        </div>
+        <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+          {exports.map((e) => (
+            <li key={e.key} className="flex items-center justify-between gap-3 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                  {e.label}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">{e.desc}</div>
+              </div>
+              <a href={e.url} download>
+                <Button variant="secondary" size="sm">
+                  <Download size={14} /> Download
+                </Button>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {showNew && (
+        <NewPeriodModal
+          companyId={company.id}
+          onClose={() => setShowNew(false)}
+          onSaved={() => {
+            setShowNew(false);
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function NewPeriodModal({
+  companyId,
+  onClose,
+  onSaved,
+}: {
+  companyId: string;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0));
+  const [name, setName] = React.useState(
+    monthStart.toLocaleString("en-US", { month: "long", year: "numeric" }),
+  );
+  const [startDate, setStartDate] = React.useState(monthStart.toISOString().slice(0, 10));
+  const [endDate, setEndDate] = React.useState(monthEnd.toISOString().slice(0, 10));
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/api/companies/${companyId}/periods`, {
+        name: name.trim(),
+        startDate: new Date(startDate).toISOString(),
+        endDate: new Date(endDate + "T23:59:59.999Z").toISOString(),
+      });
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="New accounting period">
+      <form onSubmit={save} className="space-y-4">
+        <Input
+          label="Name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          required
+          placeholder="e.g. May 2026 or Q2 2026"
+        />
+        <div className="grid grid-cols-2 gap-3">
+          <Input
+            label="Start date"
+            type="date"
+            value={startDate}
+            onChange={(e) => setStartDate(e.target.value)}
+            required
+          />
+          <Input
+            label="End date"
+            type="date"
+            value={endDate}
+            onChange={(e) => setEndDate(e.target.value)}
+            required
+          />
+        </div>
+        <FormError message={error} />
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy} disabled={!name.trim()}>
+            Create period
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

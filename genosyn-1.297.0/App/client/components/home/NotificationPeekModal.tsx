@@ -1,0 +1,119 @@
+import React from "react";
+import { Link } from "react-router-dom";
+import { ExternalLink } from "lucide-react";
+
+import { Avatar, employeeAvatarUrl, memberAvatarUrl } from "@/components/ui/Avatar";
+import { Button, buttonClassName } from "@/components/ui/Button";
+import type { Company, Notification, NotificationEntityKind } from "@/lib/api";
+import { Modal } from "@/components/ui/Modal";
+import { companyNotificationLink } from "../../../shared/notificationLink";
+
+/**
+ * What a notification actually says, without leaving Home to find out.
+ *
+ * Two things were wrong with the old row. It threw `body` away — the sentence
+ * that answers "what happened?" was already in the payload and never rendered.
+ * And it marked the notification read *and then* navigated, so a mis-click
+ * silently removed a row from a card that only ever lists unread ones: you
+ * could lose the thing that was trying to reach you by brushing it.
+ *
+ * Now the click opens this, reading marks read, and the destination is a
+ * button you press on purpose.
+ */
+
+/** What the "go there" button should call the destination. */
+function destinationLabel(entityKind: NotificationEntityKind | null, link: string | null): string {
+  switch (entityKind) {
+    case "todo":
+      return "Open the todo";
+    case "approval":
+      return /^\/c\/[^/]+\/decisions(?:[/#?]|$)/.test(link ?? "")
+        ? "Open Decision stack"
+        : "Open approvals";
+    case "decision":
+      return "Open Decision stack";
+    case "run":
+      return "Open the run";
+    case "channel_message":
+      return "Open the conversation";
+    case "revision_proposal":
+      return "Open the proposal";
+    case "handoff":
+      return "Open the handover";
+    case "goal":
+      return "Open the goal";
+    case "initiative":
+      return "Open the initiative";
+    default:
+      return "Open";
+  }
+}
+
+export function NotificationPeekModal({
+  company,
+  notification,
+  onClose,
+}: {
+  company: Company;
+  notification: Notification;
+  onClose: () => void;
+}) {
+  const actor = notification.actor;
+  const actorSrc = actor?.id
+    ? actor.kind === "user"
+      ? memberAvatarUrl(company.id, actor.id, actor.avatarKey)
+      : actor.kind === "ai"
+        ? employeeAvatarUrl(company.id, actor.id, actor.avatarKey)
+        : null
+    : null;
+
+  const when = new Date(notification.createdAt);
+  const href = companyNotificationLink(company.slug, notification.link);
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={notification.title}
+      description={when.toLocaleString()}
+      size="lg"
+      footer={
+        <>
+          {href && (
+            <Link
+              to={href}
+              className={buttonClassName({ variant: "secondary", size: "sm" })}
+              onClick={onClose}
+            >
+              <ExternalLink size={14} />
+              {destinationLabel(notification.entityKind, href)}
+            </Link>
+          )}
+          <Button size="sm" onClick={onClose}>
+            Done
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {actor && (
+          <div className="flex items-center gap-2">
+            <Avatar
+              name={actor.name}
+              src={actorSrc}
+              kind={actor.kind === "ai" ? "ai" : "human"}
+              size="sm"
+            />
+            <span className="text-sm text-slate-700 dark:text-slate-200">{actor.name}</span>
+          </div>
+        )}
+
+        {notification.body && (
+          <p className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-700 dark:text-slate-200">
+            {notification.body}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}

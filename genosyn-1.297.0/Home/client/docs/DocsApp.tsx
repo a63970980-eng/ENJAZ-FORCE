@@ -1,0 +1,174 @@
+import { usePathname } from "@/lib/router";
+import { DocsShell } from "@/docs/DocsShell";
+import { Introduction } from "@/docs/pages/Introduction";
+import { Install } from "@/docs/pages/Install";
+import { GettingStarted } from "@/docs/pages/GettingStarted";
+import { Help } from "@/docs/pages/Help";
+import { MobileApp } from "@/docs/pages/MobileApp";
+import { Security } from "@/docs/pages/Security";
+import { Employees } from "@/docs/pages/Employees";
+import { Collaboration } from "@/docs/pages/Collaboration";
+import { Soul } from "@/docs/pages/Soul";
+import { Skills } from "@/docs/pages/Skills";
+import { Routines } from "@/docs/pages/Routines";
+import { Resources } from "@/docs/pages/Resources";
+import { Notes } from "@/docs/pages/Notes";
+import { Tags } from "@/docs/pages/Tags";
+import { ToolDiscovery } from "@/docs/pages/ToolDiscovery";
+import { Models } from "@/docs/pages/Models";
+import { OpenSourceModels } from "@/docs/pages/OpenSourceModels";
+import { Integrations } from "@/docs/pages/Integrations";
+import { Browser } from "@/docs/pages/Browser";
+import { MemberBrowsers } from "@/docs/pages/MemberBrowsers";
+import { Repositories } from "@/docs/pages/Repositories";
+import { Explore } from "@/docs/pages/Explore";
+import { Marketing } from "@/docs/pages/Marketing";
+import { Revenue } from "@/docs/pages/Revenue";
+import { RevenueOperations } from "@/docs/pages/RevenueOperations";
+import { RevenueDataQuality } from "@/docs/pages/RevenueDataQuality";
+import { Sequences } from "@/docs/pages/Sequences";
+import { Signals } from "@/docs/pages/Signals";
+import { Deliverability } from "@/docs/pages/Deliverability";
+import { WorkspaceChat } from "@/docs/pages/WorkspaceChat";
+import { Chat } from "@/docs/pages/Chat";
+import { AskAi } from "@/docs/pages/AskAi";
+import { ChatSurfaces } from "@/docs/pages/ChatSurfaces";
+import { CustomerChannels } from "@/docs/pages/CustomerChannels";
+import { PhoneNumbers } from "@/docs/pages/PhoneNumbers";
+import { Tldrs } from "@/docs/pages/Tldrs";
+import { BoardLetters } from "@/docs/pages/BoardLetters";
+import { Recruiting } from "@/docs/pages/Recruiting";
+import { Vault } from "@/docs/pages/Vault";
+import { VaultSources } from "@/docs/pages/VaultSources";
+import { Connect } from "@/docs/pages/Connect";
+import { Email } from "@/docs/pages/Email";
+import { Support } from "@/docs/pages/Support";
+import { SupportChatWidget } from "@/docs/pages/SupportChatWidget";
+import { HelpCenter } from "@/docs/pages/HelpCenter";
+import { Meetings } from "@/docs/pages/Meetings";
+import { Tasks } from "@/docs/pages/Tasks";
+import { Decisions } from "@/docs/pages/Decisions";
+import { Goals } from "@/docs/pages/Goals";
+import { Verification } from "@/docs/pages/Verification";
+import { Improvement } from "@/docs/pages/Improvement";
+import { Autonomy } from "@/docs/pages/Autonomy";
+import { Standdowns } from "@/docs/pages/Standdowns";
+import { Policies } from "@/docs/pages/Policies";
+import { Reactivity } from "@/docs/pages/Reactivity";
+import { Pipelines } from "@/docs/pages/Pipelines";
+import { Bases } from "@/docs/pages/Bases";
+import { Forms } from "@/docs/pages/Forms";
+import { Customers } from "@/docs/pages/Customers";
+import { PdfForms } from "@/docs/pages/PdfForms";
+import { WordDocuments } from "@/docs/pages/WordDocuments";
+import { ExcelWorkbooks } from "@/docs/pages/ExcelWorkbooks";
+import { Signatures } from "@/docs/pages/Signatures";
+import { DataRooms } from "@/docs/pages/DataRooms";
+import { Finance } from "@/docs/pages/Finance";
+import { Banking } from "@/docs/pages/Banking";
+import { SelfHosting } from "@/docs/pages/SelfHosting";
+import { Backups } from "@/docs/pages/Backups";
+import { Cli } from "@/docs/pages/Cli";
+import { Kubernetes } from "@/docs/pages/Kubernetes";
+import { Api } from "@/docs/pages/Api";
+import { ApiCli } from "@/docs/pages/ApiCli";
+import { McpServer } from "@/docs/pages/McpServer";
+import { ConnectedApps } from "@/docs/pages/ConnectedApps";
+import { Vocabulary } from "@/docs/pages/Vocabulary";
+import { NotFound } from "@/docs/pages/NotFound";
+
+const PAGES: Record<string, () => JSX.Element> = {
+  "/docs": Introduction,
+  "/docs/install": Install,
+  "/docs/getting-started": GettingStarted,
+  "/docs/help": Help,
+  "/docs/ask-ai": AskAi,
+  "/docs/mobile": MobileApp,
+  "/docs/security": Security,
+  "/docs/employees": Employees,
+  "/docs/collaboration": Collaboration,
+  "/docs/soul": Soul,
+  "/docs/skills": Skills,
+  "/docs/routines": Routines,
+  "/docs/resources": Resources,
+  "/docs/notes": Notes,
+  "/docs/tags": Tags,
+  "/docs/tool-discovery": ToolDiscovery,
+  "/docs/models": Models,
+  "/docs/open-source-models": OpenSourceModels,
+  "/docs/integrations": Integrations,
+  "/docs/browser": Browser,
+  "/docs/member-browsers": MemberBrowsers,
+  "/docs/repositories": Repositories,
+  "/docs/explore": Explore,
+  "/docs/marketing": Marketing,
+  "/docs/revenue": Revenue,
+  "/docs/revenue-operations": RevenueOperations,
+  "/docs/revenue-data-quality": RevenueDataQuality,
+  "/docs/sequences": Sequences,
+  "/docs/signals": Signals,
+  "/docs/deliverability": Deliverability,
+  "/docs/workspace-chat": WorkspaceChat,
+  "/docs/chat": Chat,
+  "/docs/chat-surfaces": ChatSurfaces,
+  "/docs/customer-channels": CustomerChannels,
+  "/docs/phone-numbers": PhoneNumbers,
+  "/docs/tldrs": Tldrs,
+  "/docs/board-letters": BoardLetters,
+  "/docs/recruiting": Recruiting,
+  "/docs/vault": Vault,
+  "/docs/vault-sources": VaultSources,
+  "/docs/connect": Connect,
+  "/docs/email": Email,
+  "/docs/support": Support,
+  "/docs/support-chat-widget": SupportChatWidget,
+  "/docs/help-center": HelpCenter,
+  "/docs/meetings": Meetings,
+  "/docs/tasks": Tasks,
+  "/docs/decisions": Decisions,
+  "/docs/goals": Goals,
+  "/docs/verification": Verification,
+  "/docs/improvement": Improvement,
+  "/docs/autonomy": Autonomy,
+  "/docs/standdowns": Standdowns,
+  "/docs/policies": Policies,
+  "/docs/reactivity": Reactivity,
+  "/docs/pipelines": Pipelines,
+  "/docs/bases": Bases,
+  "/docs/forms": Forms,
+  "/docs/customers": Customers,
+  "/docs/pdf-forms": PdfForms,
+  "/docs/word-documents": WordDocuments,
+  "/docs/excel-workbooks": ExcelWorkbooks,
+  "/docs/signatures": Signatures,
+  "/docs/data-rooms": DataRooms,
+  "/docs/finance": Finance,
+  "/docs/banking": Banking,
+  "/docs/self-hosting": SelfHosting,
+  "/docs/backups": Backups,
+  "/docs/cli": Cli,
+  "/docs/kubernetes": Kubernetes,
+  "/docs/api": Api,
+  "/docs/api-cli": ApiCli,
+  "/docs/mcp-server": McpServer,
+  "/docs/connected-apps": ConnectedApps,
+  "/docs/vocabulary": Vocabulary,
+};
+
+function normalizePath(pathname: string): string {
+  const trimmed = pathname.replace(/\/+$/, "");
+  return trimmed === "" ? "/docs" : trimmed;
+}
+
+// Head metadata (title, description, canonical, JSON-LD) is handled centrally
+// in App.tsx via lib/siteMeta.ts, which derives docs entries from nav.ts.
+export function DocsApp() {
+  const path = normalizePath(usePathname());
+  const Page = PAGES[path] ?? NotFound;
+
+  return (
+    <DocsShell pathname={path}>
+      <Page />
+    </DocsShell>
+  );
+}

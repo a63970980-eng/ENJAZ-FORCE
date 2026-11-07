@@ -1,0 +1,177 @@
+import React from "react";
+import { Outlet, useLocation } from "react-router-dom";
+import {
+  Activity,
+  Archive,
+  Building2,
+  Database,
+  KeyRound,
+  Layers,
+  LayoutDashboard,
+  Mail,
+  Plug2,
+  Settings,
+  SlidersHorizontal,
+  UserPlus,
+  Users,
+} from "lucide-react";
+import { Company, Me } from "../lib/api";
+import { Breadcrumbs, ContextualLayout, SidebarLink } from "../components/AppShell";
+import { RailAdvancedGroup, SectionRailHeader } from "../components/SectionRail";
+
+/**
+ * Sidebar + layout for `/c/:slug/admin/*`. The Admin section holds surfaces that
+ * describe the whole deployment rather than a single company — the instance
+ * health dashboard and install-wide backups. It mirrors the company Settings
+ * section so the two feel consistent, but its pages are deliberately system-
+ * wide. Child routes read `company` (for URL context) and `me` from Outlet
+ * context; the health + backup data itself is not company-scoped.
+ */
+
+export type AdminOutletCtx = {
+  company: Company;
+  me: Me;
+  /** Refetch the signed-in user's company list — call after mutating companies
+   *  (e.g. deleting one) so the top switcher and route resolver stay in sync. */
+  onCompaniesChanged: () => void;
+};
+
+const ADMIN_TAB_LABEL: Record<string, string> = {
+  overview: "Overview",
+  general: "General",
+  "instance-health": "Instance Health",
+  db: "Database",
+  migrations: "Migrations",
+  email: "Email transport",
+  runtime: "Runtime",
+  integrations: "Integrations",
+  signups: "Sign-ups",
+  sso: "SSO",
+  backup: "Backups",
+  users: "Users",
+  companies: "Companies",
+};
+
+export default function AdminLayout({
+  company,
+  me,
+  onCompaniesChanged,
+}: {
+  company: Company;
+  me: Me;
+  onCompaniesChanged: () => void;
+}) {
+  const location = useLocation();
+  const base = `/c/${company.slug}/admin`;
+
+  const sidebar = (
+    <div className="flex h-full flex-col">
+      <SectionRailHeader section="admin" label="Admin" />
+      <nav className="flex-1 overflow-y-auto p-2">
+        <div className="px-2 pb-1 pt-2 text-xs font-medium text-slate-500 dark:text-slate-400">
+          Instance
+        </div>
+        <SidebarLink
+          to={`${base}/overview`}
+          icon={<LayoutDashboard size={14} />}
+          label="Overview"
+        />
+        <SidebarLink
+          to={`${base}/general`}
+          icon={<Settings size={14} />}
+          label="General"
+        />
+        <SidebarLink
+          to={`${base}/instance-health`}
+          icon={<Activity size={14} />}
+          label="Instance Health"
+        />
+        <SidebarLink
+          to={`${base}/email`}
+          icon={<Mail size={14} />}
+          label="Email transport"
+        />
+        <SidebarLink
+          to={`${base}/runtime`}
+          icon={<SlidersHorizontal size={14} />}
+          label="Runtime"
+        />
+        <SidebarLink
+          to={`${base}/integrations`}
+          icon={<Plug2 size={14} />}
+          label="Integrations"
+        />
+        <SidebarLink
+          to={`${base}/signups`}
+          icon={<UserPlus size={14} />}
+          label="Sign-ups"
+        />
+        <SidebarLink to={`${base}/sso`} icon={<KeyRound size={14} />} label="SSO" />
+        <SidebarLink to={`${base}/backup`} icon={<Archive size={14} />} label="Backups" />
+
+        <div className="px-2 pb-1 pt-4 text-xs font-medium text-slate-500 dark:text-slate-400">
+          Directory
+        </div>
+        <SidebarLink to={`${base}/users`} icon={<Users size={14} />} label="Users" />
+        <SidebarLink
+          to={`${base}/companies`}
+          icon={<Building2 size={14} />}
+          label="Companies"
+        />
+
+        {/* Developer tools — a raw SQL console and the migration ledger — are
+            not where an operator should land by accident, so they wait under
+            the same closed Advanced group the other rails keep. */}
+        <RailAdvancedGroup
+          names={["Database", "Migrations"]}
+          here={["db", "migrations"].some(
+            (seg) =>
+              location.pathname === `${base}/${seg}` ||
+              location.pathname.startsWith(`${base}/${seg}/`),
+          )}
+        >
+          <SidebarLink to={`${base}/db`} icon={<Database size={14} />} label="Database" />
+          <SidebarLink
+            to={`${base}/migrations`}
+            icon={<Layers size={14} />}
+            label="Migrations"
+          />
+        </RailAdvancedGroup>
+      </nav>
+    </div>
+  );
+
+  const afterBase = location.pathname.startsWith(base)
+    ? location.pathname.slice(base.length).replace(/^\/+/, "")
+    : "";
+  const segments = afterBase ? afterBase.split("/").filter(Boolean) : [];
+  const tabCrumbs: { label: string; to?: string }[] = [];
+  let acc = base;
+  segments.forEach((seg, i) => {
+    acc = `${acc}/${seg}`;
+    const label = ADMIN_TAB_LABEL[seg];
+    if (!label) return;
+    const isLast = i === segments.length - 1;
+    tabCrumbs.push({ label, to: isLast ? undefined : acc });
+  });
+
+  // The query console uses tighter responsive padding for its schema browser
+  // and result grid; every admin page can otherwise use the full main pane.
+  const isConsole = segments[0] === "db";
+
+  return (
+    <ContextualLayout sidebar={sidebar}>
+      <div className={isConsole ? "page-shell p-4 sm:p-6" : "page-shell p-4 sm:p-8"}>
+        <div className="mb-4">
+          <Breadcrumbs
+            items={[
+              { label: "Admin", to: tabCrumbs.length ? `${base}/overview` : undefined },
+              ...tabCrumbs,
+            ]}
+          />
+        </div>
+        <Outlet context={{ company, me, onCompaniesChanged } satisfies AdminOutletCtx} />
+      </div>
+    </ContextualLayout>
+  );
+}

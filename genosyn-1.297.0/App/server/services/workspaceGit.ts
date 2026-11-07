@@ -1,0 +1,325 @@
+import { execFile, spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+import { config } from "../../config.js";
+import { requireCodingRuntime, type CodingExecutionMode } from "./agent/codingAvailability.js";
+
+const exec = promisify(execFile);
+const GIT_TIMEOUT_MS = 5 * 60 * 1_000;
+const SAFE_PATH = "/usr/local/bin:/usr/bin:/bin";
+// Connection materialization uses FORGE, Repository credentials use REPO,
+// and legacy GitHub callers use GH. Keep validation and redaction on the same
+// allowlist so an accepted credential is also scrubbed from child failures.
+const TOKEN_ENV = /^GENOSYN_(?:GH|FORGE|REPO)_TOKEN_[A-Z0-9_]+$/;
+
+export type WorkspaceGitOptions = {
+  /**
+   * Employee workspace (or a server-owned temp dir): Git's `HOME`, and the root
+   * every `.git` pointer must stay inside.
+   */
+  workspaceRoot: string;
+  cwd: string;
+  args: string[];
+  extraEnv?: Record<string, string>;
+  /** Trusted command-scoped helper; repository-local helpers are ignored. */
+  credentialHelper?: string;
+  /** Optional standard input for plumbing commands such as update-ref. */
+  stdin?: string;
+  /**
+   * The tree is App-owned: it lives under `.private/` (or is a temporary
+   * directory the server just created for one command), no model process can
+   * write to it, and every change goes through an authenticated Member
+   * request. Such a tree skips {@link requireCodingRuntime}.
+   *
+   * The coding-runtime gate exists because Git reads executable configuration
+   * out of the tree it runs in, so running it over a *model-writable*
+   * checkout is a command-execution surface and has to be an operator
+   * decision. That reasoning does not reach a tree the model cannot touch —
+   * and gating it there would leave the Repository UI (browse, edit, history,
+   * commit) dead on any install that disabled command execution.
+   *
+   * The hardening is unchanged either way: no App environment inheritance,
+   * hooks off, no system or global config, `ext`/`file` protocols denied, no
+   * interactive credentials, and containment checks on every `.git` pointer.
+   */
+  serverOwned?: boolean;
+};
+
+export type GitInvocation = {
+  executable: string;
+  args: string[];
+  env: Record<string, string>;
+  /**
+   * Every secret value handed to the child. Anything scrubbing output for
+   * credentials takes them from here rather than guessing from `env`.
+   */
+  secrets: string[];
+};
+
+/**
+ * Construct a Git child with no App environment inheritance. Command-scoped
+ * config also blocks executable local config.
+ */
+export function buildWorkspaceGitInvocation(
+  options: WorkspaceGitOptions,
+  executionMode: CodingExecutionMode = config.agent.codingTools.executionMode,
+  allowUnsafeHostExecution: boolean = config.agent.codingTools.allowUnsafeHostExecution,
+  platform: NodeJS.Platform = process.platform,
+): GitInvocation {
+  if (!options.serverOwned) {
+    requireCodingRuntime({
+      enabled: config.agent.codingTools.enabled,
+      executionMode,
+      allowUnsafeHostExecution,
+    });
+  }
+
+  const extraEnv = validateExtraEnv(options.extraEnv ?? {});
+  const gitConfig: Array<[string, string]> = [
+    ["core.hooksPath", "/dev/null"],
+    ["core.fsmonitor", "false"],
+    ["protocol.ext.allow", "never"],
+    ["protocol.file.allow", "never"],
+    ["credential.interactive", "never"],
+    ["credential.helper", ""],
+  ];
+  if (options.credentialHelper) {
+    if (options.credentialHelper.includes("\0")) {
+      throw new Error("Invalid Git credential helper.");
+    }
+    // A scoped HTTPS helper needs Git to include the repository path in the
+    // credential request. This is command-scoped for clone / connection tests;
+    // the persisted helper configures the same setting repository-locally.
+    gitConfig.push(["credential.useHttpPath", "true"]);
+    gitConfig.push(["credential.helper", options.credentialHelper]);
+  }
+
+  const childEnv: Record<string, string> = {
+    // Apple Silicon Homebrew supplies a standalone Git without relying on
+    // Apple's developer-tool setup.
+    PATH: platform === "darwin" ? `/opt/homebrew/bin:${SAFE_PATH}` : SAFE_PATH,
+    HOME: options.workspaceRoot,
+    LANG: "C.UTF-8",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "/bin/false",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    // A repository-local core.sshCommand must never execute. Legitimate SSH
+    // repositories replace this with a trusted command in `extraEnv`.
+    GIT_SSH_COMMAND: "/bin/false",
+    ...extraEnv,
+    GIT_CONFIG_COUNT: String(gitConfig.length),
+  };
+  gitConfig.forEach(([key, value], index) => {
+    childEnv[`GIT_CONFIG_KEY_${index}`] = key;
+    childEnv[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
+
+  return {
+    executable: "git",
+    args: options.args,
+    env: childEnv,
+    secrets: secretValuesOf(childEnv),
+  };
+}
+
+/**
+ * The values in a child environment that must never appear in output.
+ *
+ * Only the entries that can carry a credential, and only ones long enough to
+ * be one: blanket-replacing `1`, `never`, or a path would shred ordinary Git
+ * output and tell the reader nothing.
+ */
+function secretValuesOf(childEnv: Record<string, string>): string[] {
+  const values: string[] = [];
+  for (const [name, value] of Object.entries(childEnv)) {
+    if (!value || value.length < 8) continue;
+    if (!TOKEN_ENV.test(name) && !name.startsWith("GIT_CONFIG_VALUE_")) continue;
+    values.push(value);
+  }
+  return values;
+}
+
+export async function runWorkspaceGit(options: WorkspaceGitOptions): Promise<{ stdout: string }> {
+  assertWorkspaceGitMetadataContained(options.workspaceRoot, options.cwd);
+  const invocation = buildWorkspaceGitInvocation(options);
+  try {
+    const { stdout } =
+      options.stdin !== undefined
+        ? await execWithInput(invocation, options.cwd, options.stdin)
+        : await exec(invocation.executable, invocation.args, {
+            cwd: options.cwd,
+            env: invocation.env,
+            timeout: GIT_TIMEOUT_MS,
+            maxBuffer: 16 * 1024 * 1024,
+          });
+    return { stdout };
+  } catch (error) {
+    const command = options.args[0] ?? "(unknown)";
+    if ((error as { code?: string }).code === "ENOENT") {
+      throw new Error(`git is not installed on the Genosyn server, so "git ${command}" could not run.`);
+    }
+    const detail = error as {
+      stderr?: string;
+      stdout?: string;
+      killed?: boolean;
+      signal?: string;
+    };
+    const output = (detail.stderr || detail.stdout || "").toString().trim();
+    if (!output) {
+      // Deliberately NOT `error.message`. Node builds that as
+      // `Command failed: <argv>`, and this string travels all the way to the
+      // browser. This branch is reached exactly when Git printed nothing, which
+      // is the timeout and signal path.
+      if (detail.killed || detail.signal) {
+        throw new Error(
+          `git ${command} did not finish in time and was stopped. A very large repository can exceed the limit; try again, and check the server can reach the remote.`,
+        );
+      }
+      throw new Error(`git ${command} failed without reporting a reason.`);
+    }
+    const tail = redactSecrets(output, invocation.secrets).split("\n").slice(-3).join(" | ");
+    throw new Error(`git ${command} failed: ${tail}`);
+  }
+}
+
+/**
+ * Remove anything the child was given as a secret from text about to be shown.
+ *
+ * Git does not normally echo a credential, but a remote helper, a proxy, or a
+ * misconfigured URL can put one in stderr, and this string travels all the way
+ * to the browser. Redaction is by value, taken from
+ * {@link GitInvocation.secrets}.
+ */
+export function redactSecrets(text: string, secrets: string[]): string {
+  let safe = text;
+  for (const value of secrets) {
+    safe = safe.split(value).join("«redacted»");
+  }
+  return safe;
+}
+
+/**
+ * Git follows `.git` and `commondir` pointers before applying local config.
+ * Validate those pointers before every command so an AI-writable checkout
+ * cannot make the App process mutate another repository's configuration.
+ */
+export function assertWorkspaceGitMetadataContained(workspaceRoot: string, cwd: string): void {
+  const resolvedWorkspace = fs.realpathSync(workspaceRoot);
+  const resolvedCwd = fs.realpathSync(cwd);
+  assertContained(resolvedWorkspace, resolvedCwd, "Git checkout");
+  const gitEntry = path.join(resolvedCwd, ".git");
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(gitEntry);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  let unresolvedGitDir: string;
+  if (stat.isDirectory()) {
+    unresolvedGitDir = gitEntry;
+  } else if (stat.isFile()) {
+    const pointer = fs.readFileSync(gitEntry, "utf8");
+    const match = pointer.match(/^gitdir: ([^\0\r\n]+)\r?\n?$/);
+    if (!match?.[1]) throw new Error("Git checkout has an invalid gitdir pointer.");
+    unresolvedGitDir = path.resolve(resolvedCwd, match[1]);
+  } else {
+    throw new Error("Git checkout has an unsupported .git entry.");
+  }
+  const gitDir = fs.realpathSync(unresolvedGitDir);
+  assertContained(resolvedWorkspace, gitDir, "Git directory");
+  const commonDirFile = path.join(gitDir, "commondir");
+  if (!fs.existsSync(commonDirFile)) return;
+  const pointer = fs.readFileSync(commonDirFile, "utf8");
+  if (/\0|\r|\n.*\S/s.test(pointer)) {
+    throw new Error("Git checkout has an invalid common directory pointer.");
+  }
+  const commonDir = fs.realpathSync(path.resolve(gitDir, pointer.trim()));
+  assertContained(resolvedWorkspace, commonDir, "Git common directory");
+}
+
+function assertContained(root: string, candidate: string, label: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} escapes the employee workspace.`);
+  }
+}
+
+function execWithInput(
+  invocation: GitInvocation,
+  cwd: string,
+  stdin: string,
+): Promise<{ stdout: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(invocation.executable, invocation.args, {
+      cwd,
+      env: invocation.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(
+        Object.assign(new Error("Git command timed out."), {
+          stdout,
+          stderr,
+        }),
+      );
+    }, GIT_TIMEOUT_MS);
+
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve({ stdout });
+    };
+    const append = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      if (stream === "stdout") stdout += chunk.toString();
+      else stderr += chunk.toString();
+      if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > 16 * 1024 * 1024) {
+        child.kill("SIGKILL");
+        finish(
+          Object.assign(new Error("Git command output exceeded the limit."), { stdout, stderr }),
+        );
+      }
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => append("stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer) => append("stderr", chunk));
+    child.stdin.on("error", () => {
+      // The process error / close event carries the useful Git diagnostic.
+    });
+    child.on("error", (error) => finish(Object.assign(error, { stdout, stderr })));
+    child.on("close", (code) => {
+      if (code === 0) finish();
+      else
+        finish(
+          Object.assign(new Error(`Git exited with status ${code ?? "unknown"}.`), {
+            stdout,
+            stderr,
+          }),
+        );
+    });
+    child.stdin.end(stdin);
+  });
+}
+
+function validateExtraEnv(extraEnv: Record<string, string>): Record<string, string> {
+  const clean: Record<string, string> = {};
+  for (const [name, value] of Object.entries(extraEnv)) {
+    if (name !== "GIT_SSH_COMMAND" && !TOKEN_ENV.test(name)) {
+      throw new Error(`Git environment variable is not allowed: ${name}`);
+    }
+    if (value.includes("\0")) throw new Error(`Invalid Git environment value: ${name}`);
+    if (TOKEN_ENV.test(name) && /[\r\n]/.test(value)) {
+      throw new Error(`Invalid Git token environment value: ${name}`);
+    }
+    clean[name] = value;
+  }
+  return clean;
+}

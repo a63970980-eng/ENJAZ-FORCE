@@ -1,0 +1,844 @@
+import { Router } from "express";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  requireAuth,
+  requireBrowserSession,
+  requireCompanyMember,
+  requireCompanyRoleForMutations,
+} from "../middleware/auth.js";
+import { validateBody } from "../middleware/validate.js";
+import {
+  assertIntegrationAllowed,
+  getProvider,
+  listCatalog,
+  providerSupportsApiKey,
+} from "../integrations/index.js";
+import { registeredOauthApps } from "../services/oauthApps.js";
+import {
+  createApiKeyConnection,
+  createGithubAppConnection,
+  createServiceAccountConnection,
+  decryptConnectionConfig,
+  deleteConnection,
+  getConnection,
+  grantAccess,
+  listConnections,
+  listGrantsForConnection,
+  listGrantsForEmployee,
+  persistConnectionConfigIfCurrent,
+  refreshConnectionStatus,
+  revokeAccess,
+  serializeConnection,
+  updateApiKeyCredentials,
+  updateConnectionLabel,
+  updateGithubAppCredentials,
+  updateServiceAccountCredentials,
+} from "../services/integrations.js";
+import { startOauth, startOauthReconnect } from "../services/oauth.js";
+import {
+  cancelHostedOauth,
+  hostedSignInOffers,
+  pollHostedOauth,
+} from "../services/hostedOauth.js";
+import { HOSTED_OAUTH_APPS } from "../services/hostedOauthApps.js";
+import { recordAudit } from "../services/audit.js";
+import { publicOriginFromRequest } from "../services/publicUrl.js";
+import { assertSafeOutboundConfig } from "../lib/outboundUrl.js";
+import {
+  isForgeProvider,
+  forgeProviderName,
+  readForgeRepos,
+  resolveForgeCredentials,
+  writeForgeRepos,
+} from "../integrations/providers/forge/connection.js";
+import { listAccessibleForgeRepos } from "../integrations/providers/forge/discovery.js";
+import { discoverAppInstallations } from "../integrations/providers/github-app.js";
+import { countPhoneNumbersForConnection } from "../services/phone/numbers.js";
+
+/**
+ * Company-scoped routes for the Integrations + Connections feature.
+ * Mounted under `/api/companies/:cid/integrations`.
+ *
+ * Sub-routes:
+ *   GET  /catalog                               — available integration types
+ *   GET  /connections                           — list connections
+ *   POST /connections                           — create API-key connection
+ *   POST /connections/:connId/check             — refresh status
+ *   DELETE /connections/:connId                 — remove connection + grants
+ *   POST /oauth/start                           — begin OAuth handshake
+ *   GET  /connections/:connId/grants            — list employees granted on a connection
+ *   GET  /employees/:eid/grants                 — list an employee's grants
+ *   POST /employees/:eid/grants                 — grant connection to employee
+ *   DELETE /employees/:eid/grants/:connId       — revoke grant
+ *
+ * The *public* OAuth callback (`/api/integrations/oauth/callback/:app`) is
+ * mounted separately on purpose — Google redirects the user's browser there
+ * without our session cookie, so it can't be gated by `requireAuth`.
+ */
+export const integrationsRouter = Router({ mergeParams: true });
+integrationsRouter.use(requireAuth);
+integrationsRouter.use(requireCompanyMember);
+integrationsRouter.use(requireBrowserSession);
+integrationsRouter.use(requireCompanyRoleForMutations("admin"));
+
+integrationsRouter.get("/catalog", async (_req, res, next) => {
+  try {
+    // Fold in the install-wide OAuth apps so the connect form can hide the
+    // client id / secret fields for providers that already have one.
+    const registered = await registeredOauthApps();
+    res.json(listCatalog({
+      registeredOauthApps: registered,
+      // What Genosyn Connect offers for each OAuth app nobody registered here.
+      hostedSignIn: await hostedSignInOffers(registered, Object.keys(HOSTED_OAUTH_APPS)),
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+integrationsRouter.get("/connections", async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const conns = await listConnections(cid);
+  res.json(conns.map(serializeConnection));
+});
+
+const createConnectionSchema = z.object({
+  provider: z.string().min(1).max(64),
+  label: z.string().min(1).max(80),
+  fields: z.record(z.string().max(20_000)),
+});
+
+integrationsRouter.post("/connections", validateBody(createConnectionSchema), async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const body = req.body as z.infer<typeof createConnectionSchema>;
+  const provider = getProvider(body.provider);
+  if (!provider) return res.status(400).json({ error: "Unknown integration" });
+  if (!providerSupportsApiKey(provider)) {
+    return res.status(400).json({
+      error: `${provider.catalog.name} can't be connected with an API key — use OAuth instead.`,
+    });
+  }
+  try {
+    assertIntegrationAllowed(body.provider);
+    await assertSafeOutboundConfig(body.fields);
+    const row = await createApiKeyConnection({
+      companyId: cid,
+      provider: body.provider,
+      label: body.label,
+      fields: body.fields,
+    });
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "connection.create",
+      targetType: "connection",
+      targetId: row.id,
+      targetLabel: `${provider.catalog.name} · ${row.label}`,
+      metadata: { provider: row.provider, authMode: "apikey" },
+    });
+    res.json(serializeConnection(row));
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : "Failed to create connection",
+    });
+  }
+});
+
+const updateConnectionSchema = z.object({
+  label: z.string().min(1).max(80),
+});
+
+integrationsRouter.patch(
+  "/connections/:connId",
+  validateBody(updateConnectionSchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof updateConnectionSchema>;
+    const updated = await updateConnectionLabel(cid, connId, body.label);
+    if (!updated) return res.status(404).json({ error: "Connection not found" });
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "connection.update",
+      targetType: "connection",
+      targetId: updated.id,
+      targetLabel: `${updated.provider} · ${updated.label}`,
+      metadata: { provider: updated.provider, label: updated.label },
+    });
+    res.json(serializeConnection(updated));
+  },
+);
+
+integrationsRouter.post("/connections/:connId/check", async (req, res) => {
+  const { cid, connId } = req.params as Record<string, string>;
+  const existing = await getConnection(cid, connId);
+  if (!existing) return res.status(404).json({ error: "Connection not found" });
+  const updated = await refreshConnectionStatus(existing);
+  res.json(serializeConnection(updated));
+});
+
+integrationsRouter.delete("/connections/:connId", async (req, res) => {
+  const { cid, connId } = req.params as Record<string, string>;
+  const existing = await getConnection(cid, connId);
+  if (!existing) return res.status(404).json({ error: "Connection not found" });
+  // Twilio numbers bill every month and are managed only through this
+  // Connection, so it cannot be deleted from under them.
+  const numbers = await countPhoneNumbersForConnection(connId);
+  if (numbers > 0) {
+    return res.status(409).json({
+      error: `This Twilio account still has ${numbers} phone number${numbers === 1 ? "" : "s"} in Genosyn. Remove ${numbers === 1 ? "it" : "them"} at Settings → Phone numbers first.`,
+    });
+  }
+  await deleteConnection(cid, connId);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "connection.delete",
+    targetType: "connection",
+    targetId: existing.id,
+    targetLabel: `${existing.provider} · ${existing.label}`,
+    metadata: { provider: existing.provider },
+  });
+  res.json({ ok: true });
+});
+
+const oauthStartSchema = z.object({
+  provider: z.string().min(1).max(64),
+  label: z.string().min(1).max(80),
+  /** Optional: omitted when the install has a registered OAuth app for this
+   *  provider, in which case `startOauth` resolves the credentials itself. */
+  clientId: z.string().max(512).optional(),
+  clientSecret: z.string().max(512).optional(),
+  scopeGroups: z.array(z.string().min(1).max(64)).max(64).default([]),
+  /** Values for the catalog's `oauth.extraFields` (developer tokens,
+   *  account ids, safety caps). Validated against the catalog server-side. */
+  extraFields: z.record(z.string().max(512)).optional(),
+  /** Set by the Email section: link the resulting Connection to a mailbox
+   *  the moment consent lands, so "connect my email" is one round trip. */
+  linkMailbox: z.boolean().optional(),
+});
+
+integrationsRouter.post("/oauth/start", validateBody(oauthStartSchema), async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const { cid } = req.params as Record<string, string>;
+  const body = req.body as z.infer<typeof oauthStartSchema>;
+  try {
+    const out = await startOauth({
+      companyId: cid,
+      userId: req.userId!,
+      provider: body.provider,
+      label: body.label,
+      clientId: body.clientId?.trim(),
+      clientSecret: body.clientSecret?.trim(),
+      scopeGroups: body.scopeGroups,
+      extraFields: body.extraFields,
+      linkMailbox: body.linkMailbox,
+      // The global trusted-origin middleware already checked this browser
+      // header against the configured proxy host. Preserve the external
+      // origin when the proxy rewrites Host for its internal upstream.
+      installationOrigin: req.get("Origin") ?? publicOriginFromRequest(req) ?? undefined,
+    });
+    res.json(out);
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : "Failed to start OAuth",
+    });
+  }
+});
+
+const hostedOauthAttemptSchema = z.object({
+  attempt: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+});
+
+integrationsRouter.post("/oauth/hosted/poll", validateBody(hostedOauthAttemptSchema), async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const { attempt } = req.body as z.infer<typeof hostedOauthAttemptSchema>;
+  res.set("Cache-Control", "no-store");
+  try {
+    res.json(await pollHostedOauth({ companyId: cid, userId: req.userId!, attempt }));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Sign-in could not finish." });
+  }
+});
+
+integrationsRouter.post("/oauth/hosted/cancel", validateBody(hostedOauthAttemptSchema), async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const { attempt } = req.body as z.infer<typeof hostedOauthAttemptSchema>;
+  res.set("Cache-Control", "no-store");
+  try {
+    await cancelHostedOauth({ companyId: cid, userId: req.userId!, attempt });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Sign-in could not be cancelled." });
+  }
+});
+
+const serviceAccountSchema = z.object({
+  provider: z.string().min(1).max(64),
+  label: z.string().min(1).max(80),
+  // The full JSON the user downloaded from Google Cloud Console. Pasted as
+  // a string and parsed server-side so we can reject malformed JSON with a
+  // clean error.
+  keyJson: z.string().min(1).max(20_000),
+  impersonationEmail: z.string().email().max(254).optional(),
+  scopeGroups: z.array(z.string().min(1).max(64)).max(64).default([]),
+});
+
+integrationsRouter.post(
+  "/connections/service-account",
+  validateBody(serviceAccountSchema),
+  async (req, res) => {
+    const { cid } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof serviceAccountSchema>;
+    let keyJson: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(body.keyJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("expected an object");
+      }
+      keyJson = parsed as Record<string, unknown>;
+    } catch (err) {
+      return res.status(400).json({
+        error: `Could not parse service-account JSON: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    const provider = getProvider(body.provider);
+    if (!provider) {
+      return res.status(400).json({ error: "Unknown integration" });
+    }
+    if (!provider.catalog.serviceAccount) {
+      return res.status(400).json({
+        error: `${provider.catalog.name} does not support service accounts.`,
+      });
+    }
+    try {
+      const row = await createServiceAccountConnection({
+        companyId: cid,
+        provider: body.provider,
+        label: body.label,
+        keyJson,
+        impersonationEmail: body.impersonationEmail,
+        scopeGroups: body.scopeGroups,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "connection.create",
+        targetType: "connection",
+        targetId: row.id,
+        targetLabel: `${provider.catalog.name} · ${row.label}`,
+        metadata: { provider: row.provider, authMode: "service_account" },
+      });
+      res.json(serializeConnection(row));
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to add service account",
+      });
+    }
+  },
+);
+
+// ---------- GitHub App ----------
+//
+// Two-step connect flow:
+//   1. POST /github-app/discover with the App ID + PEM → returns the
+//      App's metadata and a list of its installations.
+//   2. POST /connections/github-app with {appId, privateKey, installationId}
+//      → mints an installation token eagerly and persists the Connection.
+
+const githubAppDiscoverSchema = z.object({
+  appId: z.string().min(1).max(64),
+  privateKey: z.string().min(20).max(20_000),
+});
+
+integrationsRouter.post(
+  "/github-app/discover",
+  validateBody(githubAppDiscoverSchema),
+  async (req, res) => {
+    const body = req.body as z.infer<typeof githubAppDiscoverSchema>;
+    try {
+      const out = await discoverAppInstallations({
+        appId: body.appId.trim(),
+        privateKey: body.privateKey.trim(),
+      });
+      res.json(out);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to discover installations",
+      });
+    }
+  },
+);
+
+const githubAppCreateSchema = z.object({
+  provider: z.string().min(1).max(64),
+  label: z.string().min(1).max(80),
+  appId: z.string().min(1).max(64),
+  privateKey: z.string().min(20).max(20_000),
+  installationId: z.string().min(1).max(64),
+});
+
+integrationsRouter.post(
+  "/connections/github-app",
+  validateBody(githubAppCreateSchema),
+  async (req, res) => {
+    const { cid } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof githubAppCreateSchema>;
+    const provider = getProvider(body.provider);
+    if (!provider) {
+      return res.status(400).json({ error: "Unknown integration" });
+    }
+    if (!provider.catalog.githubApp) {
+      return res.status(400).json({
+        error: `${provider.catalog.name} does not support GitHub Apps.`,
+      });
+    }
+    try {
+      const row = await createGithubAppConnection({
+        companyId: cid,
+        provider: body.provider,
+        label: body.label,
+        appId: body.appId,
+        privateKey: body.privateKey,
+        installationId: body.installationId,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "connection.create",
+        targetType: "connection",
+        targetId: row.id,
+        targetLabel: `${provider.catalog.name} · ${row.label}`,
+        metadata: { provider: row.provider, authMode: "github_app" },
+      });
+      res.json(serializeConnection(row));
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to create connection",
+      });
+    }
+  },
+);
+
+const githubAppReconnectSchema = z.object({
+  appId: z.string().min(1).max(64),
+  privateKey: z.string().min(20).max(20_000),
+  installationId: z.string().min(1).max(64),
+});
+
+integrationsRouter.put(
+  "/connections/:connId/github-app",
+  validateBody(githubAppReconnectSchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof githubAppReconnectSchema>;
+    try {
+      const updated = await updateGithubAppCredentials({
+        companyId: cid,
+        connectionId: connId,
+        appId: body.appId,
+        privateKey: body.privateKey,
+        installationId: body.installationId,
+      });
+      if (!updated) return res.status(404).json({ error: "Connection not found" });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "connection.reconnect",
+        targetType: "connection",
+        targetId: updated.id,
+        targetLabel: `${updated.provider} · ${updated.label}`,
+        metadata: { provider: updated.provider, authMode: "github_app" },
+      });
+      res.json(serializeConnection(updated));
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to reconnect",
+      });
+    }
+  },
+);
+
+// ---------- Reconnect ----------
+//
+// Reconnect = replace credentials on an existing connection in place.
+// Keeping the row id stable preserves every employee grant and the audit
+// history; deleting + recreating would silently revoke access for the
+// whole team. Three sub-routes, one per auth mode.
+
+const reconnectOauthSchema = z.object({
+  scopeGroups: z.array(z.string().min(1).max(64)).max(64).optional(),
+});
+
+integrationsRouter.post(
+  "/connections/:connId/reconnect/oauth",
+  validateBody(reconnectOauthSchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof reconnectOauthSchema>;
+    res.set("Cache-Control", "no-store");
+    try {
+      const out = await startOauthReconnect({
+        companyId: cid,
+        userId: req.userId!,
+        connectionId: connId,
+        scopeGroups: body.scopeGroups,
+        installationOrigin: req.get("Origin") ?? publicOriginFromRequest(req) ?? undefined,
+      });
+      res.json(out);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to start reconnect",
+      });
+    }
+  },
+);
+
+const reconnectApiKeySchema = z.object({
+  fields: z.record(z.string().max(20_000)),
+});
+
+integrationsRouter.put(
+  "/connections/:connId/credentials",
+  validateBody(reconnectApiKeySchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof reconnectApiKeySchema>;
+    try {
+      await assertSafeOutboundConfig(body.fields);
+      const updated = await updateApiKeyCredentials({
+        companyId: cid,
+        connectionId: connId,
+        fields: body.fields,
+      });
+      if (!updated) return res.status(404).json({ error: "Connection not found" });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "connection.reconnect",
+        targetType: "connection",
+        targetId: updated.id,
+        targetLabel: `${updated.provider} · ${updated.label}`,
+        metadata: { provider: updated.provider, authMode: "apikey" },
+      });
+      res.json(serializeConnection(updated));
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to reconnect",
+      });
+    }
+  },
+);
+
+const reconnectServiceAccountSchema = z.object({
+  keyJson: z.string().min(1).max(20_000),
+  impersonationEmail: z.string().email().max(254).optional(),
+  scopeGroups: z.array(z.string().min(1).max(64)).max(64).optional(),
+});
+
+integrationsRouter.put(
+  "/connections/:connId/service-account",
+  validateBody(reconnectServiceAccountSchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof reconnectServiceAccountSchema>;
+    let keyJson: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(body.keyJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("expected an object");
+      }
+      keyJson = parsed as Record<string, unknown>;
+    } catch (err) {
+      return res.status(400).json({
+        error: `Could not parse service-account JSON: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    try {
+      // If the client didn't send scopeGroups, fall back to whatever was
+      // last persisted on this connection (so reconnect can be a pure
+      // key-rotation without needing to re-pick scopes).
+      let scopeGroups = body.scopeGroups;
+      if (!scopeGroups) {
+        const existing = await getConnection(cid, connId);
+        if (!existing) return res.status(404).json({ error: "Connection not found" });
+        const dto = serializeConnection(existing);
+        scopeGroups = dto.scopeGroups;
+      }
+      const updated = await updateServiceAccountCredentials({
+        companyId: cid,
+        connectionId: connId,
+        keyJson,
+        impersonationEmail: body.impersonationEmail,
+        scopeGroups,
+      });
+      if (!updated) return res.status(404).json({ error: "Connection not found" });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "connection.reconnect",
+        targetType: "connection",
+        targetId: updated.id,
+        targetLabel: `${updated.provider} · ${updated.label}`,
+        metadata: { provider: updated.provider, authMode: "service_account" },
+      });
+      res.json(serializeConnection(updated));
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Failed to reconnect",
+      });
+    }
+  },
+);
+
+// ---------- Grants ----------
+
+async function loadEmployee(companyId: string, eid: string) {
+  return AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: eid,
+    companyId,
+  });
+}
+
+integrationsRouter.get("/connections/:connId/grants", async (req, res) => {
+  const { cid, connId } = req.params as Record<string, string>;
+  const conn = await getConnection(cid, connId);
+  if (!conn) return res.status(404).json({ error: "Connection not found" });
+  const rows = await listGrantsForConnection(conn.id);
+  res.json(
+    rows
+      .filter((r) => r.employee.companyId === cid)
+      .map((r) => ({
+        id: r.id,
+        employeeId: r.employeeId,
+        connectionId: r.connectionId,
+        createdAt: r.createdAt.toISOString(),
+        employee: {
+          id: r.employee.id,
+          name: r.employee.name,
+          slug: r.employee.slug,
+          role: r.employee.role,
+          avatarKey: r.employee.avatarKey,
+        },
+      })),
+  );
+});
+
+integrationsRouter.get("/employees/:eid/grants", async (req, res) => {
+  const { cid, eid } = req.params as Record<string, string>;
+  const emp = await loadEmployee(cid, eid);
+  if (!emp) return res.status(404).json({ error: "Employee not found" });
+  const rows = await listGrantsForEmployee(emp.id);
+  res.json(
+    rows
+      .filter((r) => r.connection.companyId === cid)
+      .map((r) => ({
+        id: r.id,
+        employeeId: r.employeeId,
+        connectionId: r.connectionId,
+        createdAt: r.createdAt.toISOString(),
+        connection: serializeConnection(r.connection),
+      })),
+  );
+});
+
+const createGrantSchema = z.object({
+  connectionId: z.string().uuid(),
+});
+
+integrationsRouter.post(
+  "/employees/:eid/grants",
+  validateBody(createGrantSchema),
+  async (req, res) => {
+    const { cid, eid } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof createGrantSchema>;
+    const emp = await loadEmployee(cid, eid);
+    if (!emp) return res.status(404).json({ error: "Employee not found" });
+    const conn = await getConnection(cid, body.connectionId);
+    if (!conn) return res.status(404).json({ error: "Connection not found" });
+    const grant = await grantAccess(emp.id, conn.id);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "grant.create",
+      targetType: "connection",
+      targetId: conn.id,
+      targetLabel: `${conn.provider} · ${conn.label} → ${emp.name}`,
+      metadata: { employeeId: emp.id, connectionId: conn.id },
+    });
+    res.json({
+      id: grant.id,
+      employeeId: grant.employeeId,
+      connectionId: grant.connectionId,
+      createdAt: grant.createdAt.toISOString(),
+      connection: serializeConnection(conn),
+    });
+  },
+);
+
+integrationsRouter.delete("/employees/:eid/grants/:connId", async (req, res) => {
+  const { cid, eid, connId } = req.params as Record<string, string>;
+  const emp = await loadEmployee(cid, eid);
+  if (!emp) return res.status(404).json({ error: "Employee not found" });
+  const conn = await getConnection(cid, connId);
+  if (!conn) return res.status(404).json({ error: "Connection not found" });
+  const ok = await revokeAccess(emp.id, conn.id);
+  if (!ok) return res.status(404).json({ error: "Grant not found" });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "grant.delete",
+    targetType: "connection",
+    targetId: conn.id,
+    targetLabel: `${conn.provider} · ${conn.label} → ${emp.name}`,
+    metadata: { employeeId: emp.id, connectionId: conn.id },
+  });
+  res.json({ ok: true });
+});
+
+// ---------- GitHub-specific: repo allowlist ----------
+//
+// Engineering AI employees with a grant on a github Connection get every
+// repo in `allowed[]` materialized as a real `git clone` inside their
+// working directory before each spawn (see `services/repoSync.ts`). These
+// two endpoints power the per-Connection repo picker in the UI:
+//
+//   GET  …/connections/:connId/github/repos  → { allowed, discoverable }
+//   PUT  …/connections/:connId/github/repos  → updates `allowed`
+//
+// `discoverable` is fetched live from GitHub each call (no caching) — the
+// list rarely changes and a stale cache would silently hide newly-created
+// repos. One page (per_page=100) is the MVP cap; users with more accessible
+// repos will see a search box on the client side that filters within the
+// page (a future "fetch more" pagination is a UI follow-up).
+
+integrationsRouter.get("/connections/:connId/forge/repos", async (req, res) => {
+  const { cid, connId } = req.params as Record<string, string>;
+  const conn = await getConnection(cid, connId);
+  if (!conn) return res.status(404).json({ error: "Connection not found" });
+  if (!isForgeProvider(conn.provider)) {
+    return res.status(400).json({ error: "Connection is not a git forge Connection" });
+  }
+  let cfg;
+  try {
+    cfg = decryptConnectionConfig(conn);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to decrypt connection",
+    });
+  }
+  const name = forgeProviderName(conn.provider);
+  let creds;
+  try {
+    // Not only the network. `forgeEndpointFor` throws by design for a Forgejo
+    // row whose stored server URL is missing or no longer usable — a database
+    // restored from before the field existed, a connect that failed halfway —
+    // and Express 4 does not turn a rejected async handler into a response, so
+    // without this the picker request never answers at all.
+    creds = await resolveForgeCredentials(conn.provider, cfg, conn.authMode);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : `Failed to read the ${name} credentials`,
+    });
+  }
+  if (!creds) {
+    return res.status(400).json({
+      error: "Connection is missing credentials. Reconnect from Settings → Integrations.",
+    });
+  }
+  if (creds.refreshedConfig) {
+    const persisted = await persistConnectionConfigIfCurrent({
+      connectionId: conn.id,
+      companyId: conn.companyId,
+      previousEncryptedConfig: conn.encryptedConfig,
+      config: creds.refreshedConfig,
+      healthy: true,
+    });
+    if (!persisted) {
+      return res.status(409).json({
+        error: "Connection changed while its credentials were refreshing. Try again.",
+      });
+    }
+  }
+  let discoverable;
+  try {
+    discoverable = await listAccessibleForgeRepos(creds.endpoint, creds.accessToken);
+  } catch (err) {
+    return res.status(502).json({
+      error: err instanceof Error ? err.message : `Failed to reach ${name}`,
+    });
+  }
+  const allowed = readForgeRepos(conn.provider, cfg, conn.authMode);
+  res.json({ allowed, discoverable });
+});
+
+const updateReposSchema = z.object({
+  repos: z
+    .array(
+      z.object({
+        owner: z.string().min(1).max(100),
+        name: z.string().min(1).max(100),
+        defaultBranch: z.string().min(1).max(120),
+      }),
+    )
+    .max(200),
+});
+
+integrationsRouter.put(
+  "/connections/:connId/forge/repos",
+  validateBody(updateReposSchema),
+  async (req, res) => {
+    const { cid, connId } = req.params as Record<string, string>;
+    const body = req.body as z.infer<typeof updateReposSchema>;
+    const conn = await getConnection(cid, connId);
+    if (!conn) return res.status(404).json({ error: "Connection not found" });
+    if (!isForgeProvider(conn.provider)) {
+      return res.status(400).json({ error: "Connection is not a git forge Connection" });
+    }
+    let cfg;
+    try {
+      cfg = decryptConnectionConfig(conn);
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : "Failed to decrypt connection",
+      });
+    }
+    // Dedupe by owner/name. Same `defaultBranch` wins, last-write semantics.
+    const seen = new Set<string>();
+    const deduped = [];
+    for (const r of body.repos) {
+      const key = `${r.owner.toLowerCase()}/${r.name.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push({
+        owner: r.owner,
+        name: r.name,
+        defaultBranch: r.defaultBranch,
+      });
+    }
+    const next = writeForgeRepos(conn.provider, cfg, conn.authMode, deduped);
+    const persisted = await persistConnectionConfigIfCurrent({
+      connectionId: conn.id,
+      companyId: conn.companyId,
+      previousEncryptedConfig: conn.encryptedConfig,
+      config: next,
+    });
+    if (!persisted) {
+      return res.status(409).json({
+        error: "Connection credentials changed while repositories were updated. Please try again.",
+      });
+    }
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "connection.update",
+      targetType: "connection",
+      targetId: conn.id,
+      targetLabel: `${conn.provider} · ${conn.label}`,
+      metadata: { provider: conn.provider, repos: deduped.length },
+    });
+    res.json({ allowed: deduped });
+  },
+);

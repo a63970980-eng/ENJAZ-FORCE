@@ -1,0 +1,682 @@
+import { In } from "typeorm";
+import { AppDataSource } from "../../../db/datasource.js";
+import { STATIC_TOOLS } from "../../../mcp/toolManifest.js";
+import { EmployeeBaseGrant } from "../../../db/entities/EmployeeBaseGrant.js";
+import {
+  EmployeeMailAccountGrant,
+  MAIL_ACCESS_RANK,
+  type MailAccessLevel,
+} from "../../../db/entities/EmployeeMailAccountGrant.js";
+import { EmployeeCalendarGrant } from "../../../db/entities/EmployeeCalendarGrant.js";
+import {
+  EmployeeFinanceGrant,
+  FINANCE_ACCESS_RANK,
+  type FinanceAccessLevel,
+} from "../../../db/entities/EmployeeFinanceGrant.js";
+import {
+  EmployeeRevenueGrant,
+  REVENUE_ACCESS_RANK,
+  type RevenueAccessLevel,
+} from "../../../db/entities/EmployeeRevenueGrant.js";
+import {
+  EmployeeSigningGrant,
+  SIGNING_ACCESS_RANK,
+  type SigningAccessLevel,
+} from "../../../db/entities/EmployeeSigningGrant.js";
+import {
+  EMPLOYEE_VAULT_ACCESS_RANK,
+  EmployeeVaultGrant,
+  type EmployeeVaultAccessLevel,
+} from "../../../db/entities/EmployeeVaultGrant.js";
+import { EmployeeConnectionGrant } from "../../../db/entities/EmployeeConnectionGrant.js";
+import {
+  EmployeeRecruitingGrant,
+  RECRUITING_ACCESS_RANK,
+  type RecruitingAccessLevel,
+} from "../../../db/entities/EmployeeRecruitingGrant.js";
+import {
+  DATA_ROOM_ACCESS_RANK,
+  EmployeeDataRoomGrant,
+  type DataRoomAccessLevel,
+} from "../../../db/entities/EmployeeDataRoomGrant.js";
+import {
+  EmployeeSupportGrant,
+  SUPPORT_ACCESS_RANK,
+  type SupportAccessLevel,
+} from "../../../db/entities/EmployeeSupportGrant.js";
+import { EmployeeResourceLibraryGrant } from "../../../db/entities/EmployeeResourceLibraryGrant.js";
+import { EmployeeRoutineGrant } from "../../../db/entities/EmployeeRoutineGrant.js";
+import { IntegrationConnection } from "../../../db/entities/IntegrationConnection.js";
+import { PhoneNumber } from "../../../db/entities/PhoneNumber.js";
+import { EXPLORE_PROVIDERS } from "../../explore.js";
+import { RESOURCE_WRITE_TOOLS } from "../../resourceLibraryAccess.js";
+import { ROUTINE_TRIGGER_WRITE_TOOLS, ROUTINE_WRITE_TOOLS } from "../../routineAccess.js";
+
+/**
+ * Which of an employee's tools can only ever answer "No grant".
+ *
+ * Grants are enforced when a tool is *called*, not when it's offered: an
+ * employee with no Base grants still gets handed every `base_*` tool, and
+ * `loadGrantedBase` in `routes/mcpInternal.ts` turns each call into a 403.
+ *
+ * ## Two consumers, one source
+ *
+ * 1. `sinkGrantDeadTools` in `tools/index.ts` sorts these to the back, so that
+ *    if `trimToProviderCap` ever has to cut, it cuts the tools that could only
+ *    have returned 403 anyway.
+ * 2. `find_tools` (see `discovery.ts`) applies the same set as a **rank
+ *    penalty and an annotation**. That is the consumer that matters now: once
+ *    the catalogue is deferred, ordering an array is nearly a no-op, but
+ *    telling the model "you hold no grant for this today" before it spends a
+ *    call is not.
+ *
+ * ## Never a filter
+ *
+ * Demote, annotate, deprioritise — never remove. `create_base` auto-grants its
+ * creator, so an employee with no Bases at assembly time can hold one two steps
+ * later, and a tool filtered out at build time would stay gone for the rest of
+ * the run. Wrongly calling a live tool dead loses a capability; wrongly calling
+ * a dead tool live costs a rank position. When in doubt, live.
+ *
+ * Integration tools never appear here: `/integrations/_list` only discovers
+ * tools for connections the employee already holds a grant on, so they are
+ * grant-scoped before they reach us.
+ */
+
+/**
+ * Tools whose every path routes through `loadGrantedBase` / `loadGrantedRecord`.
+ *
+ * Manifest names, now that the collapsed families are retired. Deliberately
+ * excludes `list_bases` (it filters to what you hold), `get_base` and
+ * `create_base` (which auto-grants its creator) — those work on a bare
+ * employee, which is exactly why the old family-level set was so small.
+ */
+const BASE_GATED_TOOLS = new Set([
+  "create_base_table",
+  "update_base_table",
+  "delete_base_table",
+  "add_base_field",
+  "update_base_field",
+  "delete_base_field",
+  "list_base_rows",
+  "create_base_row",
+  "update_base_row",
+  "delete_base_row",
+  "get_base_record",
+  "list_record_comments",
+  "create_record_comment",
+  "delete_record_comment",
+  "list_record_attachments",
+  "attach_file_to_record",
+  "read_record_attachment",
+  "delete_record_attachment",
+]);
+
+/**
+ * The mail surface (Email section, M25): every tool needs an
+ * `EmployeeMailAccountGrant`. There is no ungated create to keep it alive, so
+ * even `list_mail_accounts` and `search_mail` can only answer "no grant" for an
+ * employee with zero mailboxes.
+ */
+const MAIL_TOOL_ACCESS: Record<string, MailAccessLevel> = {
+  list_mail_accounts: "read",
+  search_mail: "read",
+  get_mail_thread: "read",
+  get_mail_message: "read",
+  read_mail_attachment: "read",
+  request_mail_review: "draft",
+  revise_mail_review: "draft",
+  create_mail_draft: "draft",
+  edit_mail_draft: "draft",
+  update_mail_thread: "draft",
+  send_mail: "send",
+  list_scheduling_calendars: "read",
+  check_calendar_availability: "read",
+  schedule_meeting: "send",
+  mail_block_sender: "draft",
+  mail_unsubscribe: "draft",
+  suggest_mail_actions: "read",
+  scan_revenue_mail_documents: "read",
+  list_revenue_document_candidates: "read",
+  review_revenue_document_candidate: "read",
+};
+const MAIL_GATED_TOOLS = new Set(Object.keys(MAIL_TOOL_ACCESS));
+
+/**
+ * The meetings surface (M44): every tool answers to an
+ * `EmployeeCalendarGrant`. An employee with no calendar granted can still be
+ * handed an ad-hoc meeting by a human, so these are a ranking hint like every
+ * other set here — the route gate is what actually refuses.
+ */
+const MEETING_GATED_TOOLS = new Set([
+  "list_meetings",
+  "get_meeting",
+  "get_meeting_transcript",
+  "start_notetaker",
+]);
+
+/**
+ * The finance surface (Finance section, M19): every tool — reads included —
+ * answers to an `EmployeeFinanceGrant`.
+ */
+const FINANCE_TOOL_ACCESS: Record<string, FinanceAccessLevel> = {
+  list_subsidiaries: "read",
+  list_finance_accounts: "read",
+  create_finance_account: "full",
+  update_finance_account: "full",
+  list_finance_transactions: "read",
+  get_finance_transaction: "read",
+  review_finance_transaction: "full",
+  review_finance_transactions: "full",
+  get_finance_report: "read",
+  list_tax_rates: "read",
+  update_invoice: "invoice",
+  issue_invoice: "invoice",
+  delete_invoice: "invoice",
+  convert_estimate_to_invoice: "invoice",
+  create_finance_transaction: "full",
+  list_vendors: "read",
+  list_bills: "read",
+  get_bill: "read",
+  create_vendor: "full",
+  update_vendor: "full",
+  create_bill: "full",
+  update_bill: "full",
+  issue_bill: "full",
+  void_bill: "full",
+  delete_bill: "full",
+  record_bill_payment: "full",
+  reverse_bill_payment: "full",
+  list_banking_accounts: "read",
+  list_banking_transactions: "read",
+  get_bank_transaction_matches: "read",
+  categorize_banking_transactions: "full",
+  mark_banking_transactions_reviewed: "full",
+  send_banking_transactions_to_review: "full",
+  match_bank_transaction: "full",
+  undo_bank_transaction: "full",
+  pay_invoices_from_bank_transaction: "invoice",
+  retry_card_transaction: "full",
+  sync_banking_account: "full",
+  list_invoices: "read",
+  get_invoice: "read",
+  list_customers: "read",
+  get_customer: "read",
+  create_customer: "invoice",
+  update_customer: "invoice",
+  list_recurring_invoices: "read",
+  get_recurring_invoice: "read",
+  create_recurring_invoice: "invoice",
+  update_recurring_invoice: "invoice",
+  list_estimates: "read",
+  get_estimate: "read",
+  list_finance_products: "read",
+  create_estimate: "invoice",
+  issue_estimate: "invoice",
+  send_estimate: "invoice",
+  create_invoice: "invoice",
+  send_invoice: "invoice",
+  record_payment: "invoice",
+  void_invoice: "invoice",
+  list_commercial_value_backlog: "read",
+  propose_finance_commercial_values: "full",
+};
+const FINANCE_GATED_TOOLS = new Set(Object.keys(FINANCE_TOOL_ACCESS));
+
+/**
+ * Every signing action is company-wide and answers to one EmployeeSigningGrant.
+ * Recipient signing itself deliberately has no AI tool and therefore cannot
+ * appear in this set.
+ */
+const SIGNING_TOOL_ACCESS: Record<string, SigningAccessLevel> = {
+  list_signature_envelopes: "read",
+  get_signature_envelope: "read",
+  draft_signature_envelope: "draft",
+  update_signature_envelope_draft: "draft",
+  send_signature_envelope: "send",
+  remind_signature_recipient: "send",
+  void_signature_envelope: "send",
+};
+
+const SIGNING_GATED_TOOLS = new Set(Object.keys(SIGNING_TOOL_ACCESS));
+
+/** Vault reads and metadata writes are item-granted. Creating a generated
+ * login stays live because it auto-grants its creator. */
+const VAULT_TOOL_ACCESS: Record<string, EmployeeVaultAccessLevel> = {
+  list_vault_items: "use",
+  update_vault_login: "manage",
+};
+const VAULT_GATED_TOOLS = new Set(Object.keys(VAULT_TOOL_ACCESS));
+
+/**
+ * The revenue surface (Revenue section, M32): every tool — reads included —
+ * answers to an `EmployeeRevenueGrant`. Same shape as finance: one grant row
+ * per employee over one company-wide subsystem, and no ungated create that
+ * could bring the surface to life for an employee holding nothing.
+ */
+const REVENUE_TOOL_ACCESS: Record<string, RevenueAccessLevel> = {
+  list_contacts: "read",
+  search_contacts: "read",
+  get_contact: "read",
+  get_contact_timeline: "read",
+  list_deals: "read",
+  get_deal: "read",
+  get_deal_board: "read",
+  list_deal_stages: "read",
+  create_deal_stage: "write",
+  update_deal_stage: "write",
+  reorder_deal_stages: "write",
+  archive_deal_stage: "write",
+  list_sequences: "read",
+  list_sequence_enrollments: "read",
+  stop_sequence_enrollment: "write",
+  get_sequence: "read",
+  create_sequence: "write",
+  update_sequence: "write",
+  replace_sequence_steps: "write",
+  archive_sequence: "write",
+  list_signals: "read",
+  get_signal: "read",
+  create_signal: "write",
+  update_signal: "write",
+  list_signal_events: "read",
+  test_signal: "write",
+  archive_signal: "write",
+  restore_signal: "write",
+  get_revenue_report: "read",
+  create_contact: "write",
+  update_contact: "write",
+  create_deal: "write",
+  update_deal: "write",
+  move_deal_stage: "write",
+  list_activities: "read",
+  get_activity: "read",
+  update_activity: "write",
+  delete_activity: "write",
+  export_activities: "read",
+  log_activity: "write",
+  add_deal_contact: "write",
+  list_follow_ups: "read",
+  list_follow_up_views: "read",
+  create_follow_up_view: "write",
+  update_follow_up_view: "write",
+  delete_follow_up_view: "write",
+  create_follow_up: "write",
+  update_follow_up: "write",
+  list_revenue_accounts: "read",
+  get_revenue_account: "read",
+  create_revenue_account: "write",
+  update_revenue_account: "write",
+  archive_revenue_account: "write",
+  merge_revenue_accounts: "write",
+  list_revenue_classifications: "read",
+  create_revenue_classification: "write",
+  update_revenue_classification: "write",
+  list_revenue_custom_fields: "read",
+  create_revenue_custom_field: "write",
+  update_revenue_custom_field: "write",
+  install_base_migration_custom_fields: "write",
+  set_revenue_custom_fields: "write",
+  list_partnerships: "read",
+  get_partnership: "read",
+  create_partnership: "write",
+  update_partnership: "write",
+  add_partnership_contact: "write",
+  list_revenue_documents: "read",
+  link_revenue_document: "write",
+  get_revenue_document: "read",
+  update_revenue_document: "write",
+  delete_revenue_document: "write",
+  download_revenue_document: "read",
+  list_revenue_imports: "read",
+  get_revenue_import: "read",
+  list_revenue_import_rows: "read",
+  export_revenue_import_reconciliation: "read",
+  preview_base_revenue_import: "write",
+  run_base_revenue_import: "write",
+  preview_linked_base_revenue_import: "write",
+  run_linked_base_revenue_import: "write",
+  preview_revenue_rows_import: "write",
+  run_revenue_rows_import: "write",
+  preview_linked_revenue_rows_import: "write",
+  run_linked_revenue_rows_import: "write",
+  migrate_base_revenue_attachments: "write",
+  rollback_revenue_import: "write",
+  preview_revenue_record_merge: "read",
+  merge_revenue_records: "write",
+  resolve_revenue_record_redirect: "read",
+  list_revenue_operations: "read",
+  get_revenue_operation: "read",
+  undo_revenue_operation: "write",
+  preview_revenue_bulk_operation: "write",
+  start_revenue_bulk_job: "write",
+  get_revenue_bulk_job: "read",
+  export_revenue_bulk_reconciliation: "read",
+  preview_historical_deal_import: "write",
+  run_historical_deal_import: "write",
+  list_deal_history: "read",
+  list_deal_history_coverage: "read",
+  preview_deal_history_backfill: "write",
+  backfill_deal_history: "write",
+  export_revenue_snapshot: "read",
+  propose_revenue_account_domains: "write",
+  list_commercial_value_backlog: "read",
+  propose_finance_commercial_values: "write",
+  propose_stripe_commercial_values: "write",
+  create_commercial_value_proposal: "write",
+  list_revenue_field_evidence: "read",
+  review_revenue_field_evidence: "write",
+  scan_revenue_duplicates: "write",
+  list_revenue_duplicate_candidates: "read",
+  dismiss_revenue_duplicate_candidate: "write",
+  scan_revenue_mail_documents: "write",
+  list_revenue_document_candidates: "read",
+  review_revenue_document_candidate: "write",
+  enroll_in_sequence: "write",
+  lookup_suppression: "read",
+  suppress_email: "write",
+};
+const REVENUE_GATED_TOOLS = new Set(Object.keys(REVENUE_TOOL_ACCESS));
+
+/**
+ * The Recruiting surface: every tool answers to an `EmployeeRecruitingGrant`,
+ * one row per employee, with no ungated create. `move_application` needs
+ * `hire` for the life-changing stages; it is listed at `screen` here because
+ * the early stages are reachable with that, and the route gate decides per
+ * call — a ranking hint prefers a wasted call to a hidden tool.
+ */
+const RECRUITING_TOOL_ACCESS: Record<string, RecruitingAccessLevel> = {
+  list_openings: "read",
+  get_opening: "read",
+  create_opening: "screen",
+  update_opening: "screen",
+  publish_opening: "hire",
+  close_opening: "hire",
+  list_applications: "read",
+  get_application: "read",
+  score_application: "screen",
+  move_application: "screen",
+  add_application_note: "screen",
+  add_candidate: "screen",
+};
+const RECRUITING_GATED_TOOLS = new Set(Object.keys(RECRUITING_TOOL_ACCESS));
+
+/** Data rooms: one company-wide `EmployeeDataRoomGrant`, reads included. */
+const DATA_ROOM_TOOL_ACCESS: Record<string, DataRoomAccessLevel> = {
+  list_data_rooms: "read",
+  get_data_room: "read",
+  read_data_room_document: "read",
+  list_data_room_questions: "read",
+  get_data_room_activity: "read",
+  create_data_room: "prepare",
+  add_data_room_document: "prepare",
+  update_data_room_document: "prepare",
+  remove_data_room_document: "prepare",
+  draft_data_room_answer: "prepare",
+  answer_data_room_question: "share",
+  invite_data_room_guest: "share",
+};
+const DATA_ROOM_GATED_TOOLS = new Set(Object.keys(DATA_ROOM_TOOL_ACCESS));
+
+/** Support: one company-wide `EmployeeSupportGrant`, reads included. */
+const SUPPORT_TOOL_ACCESS: Record<string, SupportAccessLevel> = {
+  list_support_tickets: "read",
+  get_support_ticket: "read",
+  search_support_articles: "read",
+  get_support_article: "read",
+  get_support_overview: "read",
+  add_support_note: "prepare",
+  update_support_ticket: "prepare",
+  draft_support_reply: "prepare",
+  create_support_article: "prepare",
+  update_support_article: "prepare",
+  reply_to_support_ticket: "reply",
+};
+const SUPPORT_GATED_TOOLS = new Set(Object.keys(SUPPORT_TOOL_ACCESS));
+
+/**
+ * The Resources library ceiling (Resources → AI access). The opposite shape to
+ * every set above: an employee with no row holds `write`, so these are dead
+ * only for one explicitly set to `read`. The read tools never appear — they
+ * answer to per-Resource Grants, which a hire receives for the whole library.
+ */
+const RESOURCE_WRITE_GATED_TOOLS = new Set<string>(RESOURCE_WRITE_TOOLS);
+
+/**
+ * Routines → AI access, the same shape as the Resources ceiling above: an
+ * employee with no row holds `write`, so the Routine writers are dead only for
+ * one explicitly set to `run` (read + run). Unlike the Resource writers these
+ * three are resident in every working set, and `gatherEmployeeTools` drops a
+ * dead one from the resident defaults — still discoverable, never shown on
+ * every step to an employee that can only be refused it. The read tools never
+ * appear: both levels read every Routine and Run.
+ */
+const ROUTINE_WRITE_GATED_TOOLS = new Set<string>([
+  ...ROUTINE_WRITE_TOOLS,
+  ...ROUTINE_TRIGGER_WRITE_TOOLS,
+]);
+
+/**
+ * The phone tools: every one of them starts from the numbers assigned to the
+ * employee, so an employee with none can only be told it has no number.
+ */
+const PHONE_GATED_TOOLS = new Set([
+  "list_phone_numbers",
+  "send_text_message",
+  "list_text_messages",
+  "wait_for_text_message",
+  "place_phone_call",
+  "get_phone_call",
+  "list_phone_calls",
+]);
+
+/** Explore's ad-hoc database tools need at least one Connection Grant. */
+const EXPLORE_CONNECTION_GATED_TOOLS = new Set(["get_explore_schema", "run_explore_query"]);
+
+/** A Chart is authored over a granted database Connection or a granted Base. */
+const CHART_AUTHORING_TOOLS = new Set(["create_chart"]);
+
+/**
+ * Fail at boot if any gated name has drifted away from the manifest.
+ *
+ * This module's own doc comment used to admit that nothing linked these sets to
+ * the tools they name, so a rename would silently stop demoting a dead tool.
+ * That mattered little when the sets held eight family names; it matters now
+ * that they hold sixty-one granular ones and feed `find_tools`' rank penalty as
+ * well as the trim ordering.
+ */
+export function assertGrantSetsResolve(): void {
+  const known = new Set(STATIC_TOOLS.map((t) => t.name));
+  const unknown = [
+    ...BASE_GATED_TOOLS,
+    ...MAIL_GATED_TOOLS,
+    ...MEETING_GATED_TOOLS,
+    ...FINANCE_GATED_TOOLS,
+    ...SIGNING_GATED_TOOLS,
+    ...VAULT_GATED_TOOLS,
+    ...REVENUE_GATED_TOOLS,
+    ...RECRUITING_GATED_TOOLS,
+    ...DATA_ROOM_GATED_TOOLS,
+    ...SUPPORT_GATED_TOOLS,
+    ...RESOURCE_WRITE_GATED_TOOLS,
+    ...ROUTINE_WRITE_GATED_TOOLS,
+    ...EXPLORE_CONNECTION_GATED_TOOLS,
+    ...CHART_AUTHORING_TOOLS,
+    ...PHONE_GATED_TOOLS,
+  ].filter((n) => !known.has(n));
+  if (unknown.length > 0) {
+    throw new Error(
+      `grantDead.ts names ${unknown.length} tool(s) that are not in STATIC_TOOLS: ` +
+        `${unknown.join(", ")}. Fix the rename — a stale entry here means a tool that can ` +
+        `only answer 403 is never demoted, and one that works may be.`,
+    );
+  }
+}
+
+assertGrantSetsResolve();
+
+/**
+ * The model-facing names that are dead weight for this employee right now.
+ *
+ * Fails safe: any error means we return an empty set and treat everything as
+ * live. Wrongly calling a tool dead could drop one the employee needs, whereas
+ * wrongly calling a dead tool live only wastes a slot — so when in doubt, live.
+ */
+export async function deadToolNames(employeeId: string, strict = false): Promise<Set<string>> {
+  try {
+    const dead = new Set<string>();
+    const bases = await AppDataSource.getRepository(EmployeeBaseGrant).count({
+      where: { employeeId },
+    });
+    if (bases === 0) for (const t of BASE_GATED_TOOLS) dead.add(t);
+    const mailboxes = await AppDataSource.getRepository(EmployeeMailAccountGrant).count({
+      where: { employeeId },
+    });
+    if (mailboxes === 0) for (const t of MAIL_GATED_TOOLS) dead.add(t);
+    const calendars = await AppDataSource.getRepository(EmployeeCalendarGrant).count({
+      where: { employeeId },
+    });
+    if (calendars === 0) for (const t of MEETING_GATED_TOOLS) dead.add(t);
+    const finance = await AppDataSource.getRepository(EmployeeFinanceGrant).count({
+      where: { employeeId },
+    });
+    if (finance === 0) for (const t of FINANCE_GATED_TOOLS) dead.add(t);
+    const signing = await AppDataSource.getRepository(EmployeeSigningGrant).findOne({
+      where: { employeeId },
+    });
+    if (!signing) {
+      for (const tool of SIGNING_GATED_TOOLS) dead.add(tool);
+    } else {
+      const have = SIGNING_ACCESS_RANK[signing.accessLevel];
+      // Unknown levels stay live here (the route gate still fails closed):
+      // grant-dead is a ranking hint, so its own fail-safe rule prefers a
+      // wasted call over hiding a capability that may work after deployment.
+      if (typeof have === "number") {
+        for (const [tool, required] of Object.entries(SIGNING_TOOL_ACCESS)) {
+          if (have < SIGNING_ACCESS_RANK[required]) dead.add(tool);
+        }
+      }
+    }
+    const revenue = await AppDataSource.getRepository(EmployeeRevenueGrant).count({
+      where: { employeeId },
+    });
+    if (revenue === 0) for (const t of REVENUE_GATED_TOOLS) dead.add(t);
+    const recruiting = await AppDataSource.getRepository(EmployeeRecruitingGrant).findOne({
+      where: { employeeId },
+    });
+    if (!recruiting) {
+      for (const tool of RECRUITING_GATED_TOOLS) dead.add(tool);
+    } else {
+      const have = RECRUITING_ACCESS_RANK[recruiting.accessLevel];
+      // An unknown level stays live, as for signing: the route gate fails closed.
+      if (typeof have === "number") {
+        for (const [tool, required] of Object.entries(RECRUITING_TOOL_ACCESS)) {
+          if (have < RECRUITING_ACCESS_RANK[required]) dead.add(tool);
+        }
+      }
+    }
+    const dataRooms = await AppDataSource.getRepository(EmployeeDataRoomGrant).findOne({
+      where: { employeeId },
+    });
+    if (!dataRooms) {
+      for (const tool of DATA_ROOM_GATED_TOOLS) dead.add(tool);
+    } else {
+      const have = DATA_ROOM_ACCESS_RANK[dataRooms.accessLevel];
+      // An unknown level stays live, as for signing: the route gate fails closed.
+      if (typeof have === "number") {
+        for (const [tool, required] of Object.entries(DATA_ROOM_TOOL_ACCESS)) {
+          if (have < DATA_ROOM_ACCESS_RANK[required]) dead.add(tool);
+        }
+      }
+    }
+    const support = await AppDataSource.getRepository(EmployeeSupportGrant).findOne({
+      where: { employeeId },
+    });
+    if (!support) {
+      for (const tool of SUPPORT_GATED_TOOLS) dead.add(tool);
+    } else {
+      const have = SUPPORT_ACCESS_RANK[support.accessLevel];
+      // An unknown level stays live, as for signing: the route gate fails closed.
+      if (typeof have === "number") {
+        for (const [tool, required] of Object.entries(SUPPORT_TOOL_ACCESS)) {
+          if (have < SUPPORT_ACCESS_RANK[required]) dead.add(tool);
+        }
+      }
+    }
+    const resourceLibrary = await AppDataSource.getRepository(EmployeeResourceLibraryGrant).findOne(
+      { where: { employeeId } },
+    );
+    // Exactly `read`, not "anything that is not write": an unknown level stays
+    // live here like the signing branch above — the route gate fails closed on
+    // it anyway, and a ranking hint prefers a wasted call to a hidden tool.
+    if (resourceLibrary?.accessLevel === "read") {
+      for (const t of RESOURCE_WRITE_GATED_TOOLS) dead.add(t);
+    }
+    const routineAccess = await AppDataSource.getRepository(EmployeeRoutineGrant).findOne({
+      where: { employeeId },
+    });
+    // Exactly `run`, for the same reason as the Resources branch above.
+    if (routineAccess?.accessLevel === "run") {
+      for (const t of ROUTINE_WRITE_GATED_TOOLS) dead.add(t);
+    }
+    const vaultGrants = await AppDataSource.getRepository(EmployeeVaultGrant).find({
+      where: { employeeId },
+    });
+    if (vaultGrants.length === 0) {
+      for (const t of VAULT_GATED_TOOLS) dead.add(t);
+    } else {
+      const ranks = vaultGrants
+        .map((grant) => EMPLOYEE_VAULT_ACCESS_RANK[grant.accessLevel])
+        .filter((rank): rank is number => typeof rank === "number");
+      const best = ranks.length > 0 ? Math.max(...ranks) : undefined;
+      if (typeof best === "number") {
+        for (const [tool, required] of Object.entries(VAULT_TOOL_ACCESS)) {
+          if (best < EMPLOYEE_VAULT_ACCESS_RANK[required]) dead.add(tool);
+        }
+      }
+    }
+    const connectionGrants = await AppDataSource.getRepository(EmployeeConnectionGrant).find({
+      where: { employeeId },
+      select: ["connectionId"],
+    });
+    const exploreConnections = connectionGrants.length
+      ? await AppDataSource.getRepository(IntegrationConnection).count({
+          where: {
+            id: In(connectionGrants.map((grant) => grant.connectionId)),
+            provider: In(EXPLORE_PROVIDERS as readonly string[]),
+          },
+        })
+      : 0;
+    if (exploreConnections === 0) {
+      for (const tool of EXPLORE_CONNECTION_GATED_TOOLS) dead.add(tool);
+      if (bases === 0) for (const tool of CHART_AUTHORING_TOOLS) dead.add(tool);
+    }
+    const phoneNumbers = await AppDataSource.getRepository(PhoneNumber).count({
+      where: { employeeId },
+    });
+    if (phoneNumbers === 0) for (const tool of PHONE_GATED_TOOLS) dead.add(tool);
+    return dead;
+  } catch (error) {
+    if (strict) throw error;
+    return new Set();
+  }
+}
+
+/** Minimum standing Grant levels; target-specific and input-dependent gates still run at dispatch. */
+export function toolGrantRequirements(name: string): Array<{
+  family: "mail" | "finance" | "revenue";
+  rank: number;
+}> {
+  const mail = MAIL_TOOL_ACCESS[name];
+  const finance = FINANCE_TOOL_ACCESS[name];
+  const revenue = REVENUE_TOOL_ACCESS[name];
+  return [
+    ...(mail !== undefined ? [{ family: "mail" as const, rank: MAIL_ACCESS_RANK[mail] }] : []),
+    ...(finance !== undefined
+      ? [{ family: "finance" as const, rank: FINANCE_ACCESS_RANK[finance] }]
+      : []),
+    ...(revenue !== undefined
+      ? [{ family: "revenue" as const, rank: REVENUE_ACCESS_RANK[revenue] }]
+      : []),
+  ];
+}

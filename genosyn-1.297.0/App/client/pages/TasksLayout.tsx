@@ -1,0 +1,158 @@
+import React from "react";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { FolderKanban, Plus, Search, ShieldCheck } from "lucide-react";
+import { api, Company, Project } from "../lib/api";
+import { ContextualLayout, sidebarLinkClassName } from "../components/AppShell";
+import { RailIconButton, railHeadingClassName } from "../components/SectionRail";
+import { CountBadge } from "../components/ui/Badge";
+import { Spinner } from "../components/ui/Spinner";
+import { useLiveRefetch } from "../components/CompanySocket";
+
+export type TasksContextValue = {
+  projects: Project[];
+  reload: () => Promise<void>;
+};
+
+export const TasksContext = React.createContext<TasksContextValue | null>(null);
+
+export function useTasks(): TasksContextValue {
+  const ctx = React.useContext(TasksContext);
+  if (!ctx) throw new Error("useTasks must be used inside TasksLayout");
+  return ctx;
+}
+
+/**
+ * Sidebar: list of projects in the current company. Mirrors the shape of
+ * EmployeesLayout so the app feels consistent when jumping between sections.
+ */
+export default function TasksLayout({ company }: { company: Company }) {
+  const navigate = useNavigate();
+  const [projects, setProjects] = React.useState<Project[] | null>(null);
+
+  const reload = React.useCallback(async () => {
+    try {
+      const list = await api.get<Project[]>(`/api/companies/${company.id}/projects`);
+      setProjects(list);
+    } catch {
+      setProjects([]);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  useLiveRefetch(["project", "todo"], reload);
+
+  const ctx = React.useMemo(
+    () => ({ projects: projects ?? [], reload }),
+    [projects, reload],
+  );
+
+  const [query, setQuery] = React.useState("");
+  const filtered = React.useMemo(() => {
+    if (!projects) return null;
+    const q = query.trim().toLowerCase();
+    if (!q) return projects;
+    return projects.filter(
+      (p) =>
+        p.name.toLowerCase().includes(q) || p.key.toLowerCase().includes(q),
+    );
+  }, [projects, query]);
+
+  // Cross-project count for the "Review queue" badge. Derived from the same
+  // list we fetch for the project sidebar — no extra round-trip.
+  const reviewCount = React.useMemo(
+    () => (projects ?? []).reduce((sum, p) => sum + (p.reviewTodos ?? 0), 0),
+    [projects],
+  );
+
+  const sidebar = (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-slate-100 px-2 py-2 dark:border-slate-800">
+        <NavLink
+          to={`/c/${company.slug}/tasks/review`}
+          className={({ isActive }) =>
+            sidebarLinkClassName(isActive)
+          }
+        >
+          <ShieldCheck size={14} />
+          <span className="flex-1 truncate font-medium">Review queue</span>
+          {reviewCount > 0 && <CountBadge count={reviewCount} tone="accent" />}
+        </NavLink>
+      </div>
+      <div className="flex items-center justify-between border-b border-slate-100 py-1.5 pl-4 pr-2 dark:border-slate-800">
+        <div className={`flex items-center gap-1.5 ${railHeadingClassName}`}>
+          <FolderKanban size={13} aria-hidden="true" /> Projects
+        </div>
+        <RailIconButton label="New project" onClick={() => navigate(`/c/${company.slug}/tasks/new`)}>
+          <Plus size={16} />
+        </RailIconButton>
+      </div>
+      {projects && projects.length > 3 && (
+        <div className="relative border-b border-slate-100 px-2 py-2 dark:border-slate-800">
+          <Search
+            size={13}
+            className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500"
+          />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+              const first = filtered?.[0];
+              if (!first) return;
+              e.preventDefault();
+              navigate(`/c/${company.slug}/tasks/p/${first.slug}`);
+            }}
+            aria-label="Filter projects"
+            placeholder="Filter projects…"
+            className="w-full rounded-md border border-slate-200 bg-slate-50 py-1 pl-7 pr-2 text-xs text-slate-700 placeholder:text-slate-400 focus:border-indigo-400 focus:bg-white focus:outline-none dark:bg-slate-900 dark:border-slate-700 dark:text-slate-200"
+          />
+        </div>
+      )}
+      <div className="flex-1 overflow-y-auto p-2">
+        {filtered === null ? (
+          <div className="flex justify-center p-4">
+            <Spinner size={16} />
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="px-3 py-6 text-center text-xs text-slate-500 dark:text-slate-400">
+            {query ? "No matches." : "No projects yet."}
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-0.5">
+            {filtered.map((p) => (
+              <li key={p.id}>
+                <NavLink
+                  to={`/c/${company.slug}/tasks/p/${p.slug}`}
+                  className={({ isActive }) =>
+                    sidebarLinkClassName(isActive)
+                  }
+                >
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="truncate text-sm font-medium">{p.name}</span>
+                    <span className="truncate text-xs text-slate-500 dark:text-slate-400">
+                      {p.openTodos ?? 0} open · {p.totalTodos ?? 0} total
+                    </span>
+                  </span>
+                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                    {p.key}
+                  </span>
+                </NavLink>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <TasksContext.Provider value={ctx}>
+      <ContextualLayout sidebar={sidebar}>
+        <Outlet />
+      </ContextualLayout>
+    </TasksContext.Provider>
+  );
+}

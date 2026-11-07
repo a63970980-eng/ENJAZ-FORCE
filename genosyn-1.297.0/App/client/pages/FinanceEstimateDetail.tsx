@@ -1,0 +1,780 @@
+import { RecordTasks } from "@/components/todos/RecordTasks";
+import React from "react";
+import { Link, useLocation, useNavigate, useOutletContext, useParams } from "react-router-dom";
+import {
+  Archive,
+  ArchiveRestore,
+  ArrowLeft,
+  ArrowRight,
+  Ban,
+  CheckCircle2,
+  Copy,
+  Download,
+  Mail,
+  MoreHorizontal,
+  Pencil,
+  Repeat,
+  Send,
+  Trash2,
+  XCircle,
+} from "lucide-react";
+import {
+  api,
+  canEditEstimate,
+  changedSinceEmailed,
+  displayEstimateStatus,
+  type DocumentRevision,
+  Estimate,
+  EstimateBulkAction,
+  EstimateBulkResult,
+  formatMoney,
+  Invoice,
+  wantsRevisedResend,
+} from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { recurringInvoiceFromDocumentPath } from "../lib/recurringInvoiceForm";
+import { canWriteFinance } from "../lib/subpages";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { Button } from "../components/ui/Button";
+import { Menu, MenuItem, MenuSeparator } from "../components/ui/Menu";
+import { Spinner } from "../components/ui/Spinner";
+import { useDialog } from "../components/ui/Dialog";
+import { InvoiceIssuerDetails } from "@/components/finance/InvoiceIssuer";
+import { ArchivedBadge, ArchivedBanner } from "@/components/finance/ArchiveControls";
+import { DocumentLinesTable } from "@/components/finance/DocumentLinesTable";
+import { SendDocumentModal } from "@/components/finance/SendDocumentModal";
+import { RecordHistory } from "@/components/RecordHistory";
+import { FinanceOutletCtx } from "./FinanceLayout";
+import { discountLabel } from "../../shared/documentDiscount";
+
+const STATUS_BADGE: Record<string, string> = {
+  draft: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  sent: "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300",
+  expired: "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
+  accepted: "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
+  declined: "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300",
+  invoiced: "bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300",
+  void: "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300",
+};
+
+/** Pre-filled in the resend dialog after an edit; the Member can change it. */
+const REVISED_MESSAGE = "We've updated this estimate — this copy replaces the one we sent earlier.";
+
+/**
+ * Estimate detail. Renders the line items and exposes the lifecycle
+ * actions (Issue / Send / Accept / Decline / Convert / Void / Delete)
+ * appropriate to the current status, plus Archive / Restore, which files the
+ * estimate in or out of the lists without touching any of that. The printable HTML lives at a
+ * separate route so File → Print gives a clean PDF without app chrome.
+ * Issue & send emails a draft to the customer's billing email; a sent or
+ * accepted estimate is resent from the send dialog, which confirms who it
+ * goes to — the same dialog an invoice is resent from.
+ * A read-only Member gets the estimate and its PDF, and none of the actions
+ * the server would refuse them.
+ */
+export default function FinanceEstimateDetail() {
+  const { company } = useOutletContext<FinanceOutletCtx>();
+  const canWrite = canWriteFinance(company);
+  const { estimateSlug } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const dialog = useDialog();
+  const [estimate, setEstimate] = React.useState<Estimate | null>(null);
+  const [revision, setRevision] = React.useState<DocumentRevision | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState<
+    | null
+    | "issue"
+    | "send"
+    | "accept"
+    | "decline"
+    | "convert"
+    | "void"
+    | "duplicate"
+    | "delete"
+    | EstimateBulkAction
+  >(null);
+  const [showResend, setShowResend] = React.useState(false);
+  const [resendMessage, setResendMessage] = React.useState("");
+
+  // True once this slug has loaded. Issuing a draft re-slugs the estimate from
+  // `edraft-…` to `est-nnnn`, and the socket refetch that write triggers can
+  // land in the moment before we navigate to the new URL. Reading that 404 as
+  // "deleted" is what made Issue & send blank the page out from under the
+  // estimate it had just issued — so once we have something on screen, a
+  // failed background refetch leaves it there and waits for the next one.
+  const shown = React.useRef(false);
+
+  const reload = React.useCallback(async () => {
+    if (!estimateSlug) return;
+    try {
+      const est = await api.get<Estimate>(`/api/companies/${company.id}/estimates/${estimateSlug}`);
+      setEstimate(est);
+      setRevision(est.revision ?? null);
+      shown.current = true;
+      setLoadError(null);
+    } catch (err) {
+      if (shown.current) return;
+      setLoadError(errorMessage(err, "Could not load the estimate"));
+    }
+  }, [company.id, estimateSlug]);
+
+  React.useEffect(() => {
+    // A different estimate is a fresh page: its own 404 is worth showing.
+    shown.current = false;
+    reload();
+  }, [reload]);
+
+  useLiveRefetch("estimate", reload);
+
+  // Save & resend on the edit page lands here to confirm the email. The state
+  // is cleared first, so a reload never reopens the dialog.
+  React.useEffect(() => {
+    if (!wantsRevisedResend(location.state)) return;
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+    setResendMessage(REVISED_MESSAGE);
+    setShowResend(true);
+  }, [location, navigate]);
+
+  function openResend(message = "") {
+    setResendMessage(message);
+    setShowResend(true);
+  }
+
+  async function issue() {
+    if (!estimate) return;
+    setBusy("issue");
+    try {
+      const fresh = await api.post<Estimate>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/issue`,
+      );
+      setEstimate(fresh);
+      navigate(`/c/${company.slug}/finance/estimates/${fresh.slug}`, {
+        replace: true,
+      });
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t issue the estimate" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Issue & send: a draft goes to the customer's billing email. Issuing it
+  // repaints the badge, the action row and the History feed, which is all the
+  // confirmation it needs.
+  async function send() {
+    if (!estimate) return;
+    setBusy("send");
+    try {
+      const result = await api.post<{
+        estimate: Estimate;
+        send: { status: string; errorMessage: string };
+      }>(`/api/companies/${company.id}/estimates/${estimate.slug}/send`);
+      setEstimate(result.estimate);
+      if (result.estimate.slug !== estimate.slug) {
+        navigate(`/c/${company.slug}/finance/estimates/${result.estimate.slug}`, { replace: true });
+      }
+      if (result.send.status === "skipped") {
+        void dialog.error("Set one in Settings → Notification email, then send again.", {
+          title: "No email transport configured",
+        });
+      } else if (result.send.status !== "sent") {
+        void dialog.error(result.send.errorMessage || "Unknown error", {
+          title: "Couldn’t email the estimate",
+        });
+      }
+      // The customer now holds this version; refresh what the page says about it.
+      if (result.send.status === "sent") void reload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t send the estimate" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function accept() {
+    if (!estimate) return;
+    setBusy("accept");
+    try {
+      const fresh = await api.post<Estimate>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/accept`,
+      );
+      setEstimate(fresh);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t mark the estimate as accepted" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function decline() {
+    if (!estimate) return;
+    const ok = await dialog.confirm({
+      title: `Mark ${estimate.number || "estimate"} as declined?`,
+      message: "The customer has chosen not to proceed. You can still void it later if needed.",
+      confirmLabel: "Mark declined",
+    });
+    if (!ok) return;
+    setBusy("decline");
+    try {
+      const fresh = await api.post<Estimate>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/decline`,
+      );
+      setEstimate(fresh);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t mark the estimate as declined" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function convert() {
+    if (!estimate) return;
+    const ok = await dialog.confirm({
+      title: `Convert ${estimate.number || "estimate"} to an invoice?`,
+      message:
+        "A new invoice will be created from these line items and immediately issued. The estimate stays linked to the new invoice.",
+      confirmLabel: "Convert",
+    });
+    if (!ok) return;
+    setBusy("convert");
+    try {
+      const result = await api.post<{ estimate: Estimate; invoice: Invoice }>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/convert`,
+        {},
+      );
+      setEstimate(result.estimate);
+      navigate(`/c/${company.slug}/finance/invoices/${result.invoice.slug}`);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t convert the estimate" });
+      setBusy(null);
+    }
+  }
+
+  async function voidEstimate() {
+    if (!estimate) return;
+    const ok = await dialog.confirm({
+      title: `Void ${estimate.number}?`,
+      message:
+        "Voiding cannot be undone. The estimate stays in records but is marked as cancelled.",
+      variant: "danger",
+      confirmLabel: "Void",
+    });
+    if (!ok) return;
+    setBusy("void");
+    try {
+      const fresh = await api.post<Estimate>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/void`,
+      );
+      setEstimate(fresh);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t void the estimate" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function duplicate() {
+    if (!estimate) return;
+    setBusy("duplicate");
+    try {
+      const draft = await api.post<Estimate>(
+        `/api/companies/${company.id}/estimates/${estimate.slug}/duplicate`,
+      );
+      navigate(`/c/${company.slug}/finance/estimates/${draft.slug}/edit`);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t duplicate the estimate" });
+      setBusy(null);
+    }
+  }
+
+  // Archiving is undone by restoring, so neither direction asks to confirm.
+  async function setArchived(action: EstimateBulkAction) {
+    if (!estimate) return;
+    setBusy(action);
+    try {
+      await api.post<EstimateBulkResult>(`/api/companies/${company.id}/estimates/bulk`, {
+        action,
+        ids: [estimate.id],
+      });
+      await reload();
+    } catch (err) {
+      void dialog.error(err, {
+        title:
+          action === "archive" ? "Couldn’t archive the estimate" : "Couldn’t restore the estimate",
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteDraft() {
+    if (!estimate) return;
+    const ok = await dialog.confirm({
+      title: "Delete this draft?",
+      variant: "danger",
+      confirmLabel: "Delete",
+    });
+    if (!ok) return;
+    setBusy("delete");
+    try {
+      await api.del(`/api/companies/${company.id}/estimates/${estimate.slug}`);
+      navigate(`/c/${company.slug}/finance/estimates`);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t delete the draft" });
+      setBusy(null);
+    }
+  }
+
+  if (loadError) {
+    return (
+      <div className="mx-auto max-w-3xl p-8 text-sm text-slate-500">
+        <p>
+          {loadError === "Estimate not found"
+            ? "This estimate doesn't exist or was deleted."
+            : loadError}
+        </p>
+        {/* A dead URL should not be a dead end — an estimate that was issued
+            under an older link is still sitting in the list. */}
+        <Link
+          to={`/c/${company.slug}/finance/estimates`}
+          className="mt-3 inline-block text-slate-600 underline hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
+        >
+          Back to estimates
+        </Link>
+      </div>
+    );
+  }
+  if (!estimate) {
+    return (
+      <div className="flex justify-center p-16">
+        <Spinner size={20} />
+      </div>
+    );
+  }
+
+  const ds = displayEstimateStatus(estimate);
+  const number = estimate.number || "DRAFT";
+  const isConverted = !!estimate.invoiceId;
+  const isTerminal = estimate.status === "void" || estimate.status === "declined" || isConverted;
+  const isArchived = !!estimate.archivedAt;
+  const archivedOn = estimate.archivedAt
+    ? new Date(estimate.archivedAt).toISOString().slice(0, 10)
+    : null;
+  // Sent or accepted, not converted: still the customer's live quote.
+  const revisable = estimate.status !== "draft" && canEditEstimate(estimate);
+  const emailedOn = revision?.emailedAt
+    ? new Date(revision.emailedAt).toISOString().slice(0, 10)
+    : null;
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <div className="mb-6">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Estimates", to: `/c/${company.slug}/finance/estimates` },
+            { label: number },
+          ]}
+        />
+      </div>
+
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Link
+            to={`/c/${company.slug}/finance/estimates`}
+            className="touch-target relative rounded-md p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            <ArrowLeft size={18} />
+          </Link>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">{number}</h1>
+          <span
+            className={
+              "inline-block rounded-full px-2 py-0.5 text-xs font-medium first-letter:uppercase " +
+              STATUS_BADGE[ds]
+            }
+          >
+            {ds}
+          </span>
+          {isArchived && <ArchivedBadge />}
+        </div>
+        {canWrite ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {estimate.status === "draft" && (
+              <>
+                <Link to={`/c/${company.slug}/finance/estimates/${estimate.slug}/edit`}>
+                  <Button variant="secondary" disabled={busy !== null}>
+                    <Pencil size={14} /> Edit
+                  </Button>
+                </Link>
+                <Button onClick={send} loading={busy === "send"} disabled={busy !== null}>
+                  <Send size={14} /> Issue & send
+                </Button>
+              </>
+            )}
+            {revisable && (
+              <Link to={`/c/${company.slug}/finance/estimates/${estimate.slug}/edit`}>
+                <Button variant="secondary" disabled={busy !== null}>
+                  <Pencil size={14} /> Edit
+                </Button>
+              </Link>
+            )}
+            {estimate.status === "sent" && !isConverted && (
+              <>
+                <Button
+                  variant="secondary"
+                  onClick={accept}
+                  loading={busy === "accept"}
+                  disabled={busy !== null}
+                >
+                  <CheckCircle2 size={14} /> Mark accepted
+                </Button>
+                <Button onClick={convert} loading={busy === "convert"} disabled={busy !== null}>
+                  <ArrowRight size={14} /> Convert to invoice
+                </Button>
+              </>
+            )}
+            {estimate.status === "accepted" && !isConverted && (
+              <Button onClick={convert} loading={busy === "convert"} disabled={busy !== null}>
+                <ArrowRight size={14} /> Convert to invoice
+              </Button>
+            )}
+
+            <Menu
+              align="right"
+              width={208}
+              trigger={({ ref, onClick }) => (
+                <Button
+                  ref={ref}
+                  variant="secondary"
+                  onClick={onClick}
+                  disabled={busy !== null}
+                  aria-label="More actions"
+                >
+                  <MoreHorizontal size={14} />
+                </Button>
+              )}
+            >
+              {(close) => (
+                <>
+                  {estimate.status === "draft" && (
+                    <MenuItem
+                      icon={<CheckCircle2 size={14} />}
+                      label="Issue without sending"
+                      onSelect={() => {
+                        close();
+                        issue();
+                      }}
+                    />
+                  )}
+                  {(estimate.status === "sent" || estimate.status === "accepted") &&
+                    !isConverted && (
+                      <MenuItem
+                        icon={<Mail size={14} />}
+                        label="Resend email"
+                        onSelect={() => {
+                          close();
+                          openResend();
+                        }}
+                      />
+                    )}
+                  {estimate.status === "sent" && !isConverted && (
+                    <MenuItem
+                      icon={<XCircle size={14} />}
+                      label="Mark declined"
+                      onSelect={() => {
+                        close();
+                        decline();
+                      }}
+                    />
+                  )}
+                  <MenuItem
+                    icon={<Download size={14} />}
+                    label="Download PDF"
+                    onSelect={() => {
+                      close();
+                      window.location.href = `/api/companies/${company.id}/estimates/${estimate.slug}/pdf`;
+                    }}
+                  />
+                  <MenuItem
+                    icon={<Copy size={14} />}
+                    label="Duplicate"
+                    onSelect={() => {
+                      close();
+                      duplicate();
+                    }}
+                  />
+                  <MenuItem
+                    icon={<Repeat size={14} />}
+                    label="Make recurring"
+                    onSelect={() => {
+                      close();
+                      navigate(
+                        recurringInvoiceFromDocumentPath(`/c/${company.slug}/finance`, {
+                          kind: "estimate",
+                          slug: estimate.slug,
+                        }),
+                      );
+                    }}
+                  />
+                  <MenuItem
+                    icon={isArchived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+                    label={isArchived ? "Restore" : "Archive"}
+                    onSelect={() => {
+                      close();
+                      void setArchived(isArchived ? "restore" : "archive");
+                    }}
+                  />
+                  {!isTerminal && estimate.status !== "draft" && (
+                    <>
+                      <MenuSeparator />
+                      <MenuItem
+                        icon={<Ban size={14} className="text-red-500" />}
+                        label={<span className="text-red-600 dark:text-red-400">Void</span>}
+                        onSelect={() => {
+                          close();
+                          voidEstimate();
+                        }}
+                      />
+                    </>
+                  )}
+                  {estimate.status === "draft" && (
+                    <>
+                      <MenuSeparator />
+                      <MenuItem
+                        icon={<Trash2 size={14} className="text-red-500" />}
+                        label={<span className="text-red-600 dark:text-red-400">Delete</span>}
+                        onSelect={() => {
+                          close();
+                          deleteDraft();
+                        }}
+                      />
+                    </>
+                  )}
+                </>
+              )}
+            </Menu>
+          </div>
+        ) : (
+          <a href={`/api/companies/${company.id}/estimates/${estimate.slug}/pdf`}>
+            <Button variant="secondary">
+              <Download size={14} /> Download PDF
+            </Button>
+          </a>
+        )}
+      </div>
+
+      {revisable && emailedOn && changedSinceEmailed(revision) && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm dark:border-amber-500/30 dark:bg-amber-500/10">
+          <div className="flex min-w-[16rem] flex-1 items-start gap-2 text-amber-900 dark:text-amber-200">
+            <Pencil size={15} className="mt-0.5 shrink-0" />
+            <span>
+              Edited since it was last emailed on {emailedOn}. The customer still has the earlier
+              copy.
+            </span>
+          </div>
+          {canWrite && estimate.emailDetails && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => openResend(REVISED_MESSAGE)}
+              disabled={busy !== null}
+            >
+              <Mail size={14} /> Resend
+            </Button>
+          )}
+        </div>
+      )}
+
+      {archivedOn && (
+        <ArchivedBanner
+          onRestore={canWrite ? () => void setArchived("restore") : undefined}
+          restoring={busy === "restore"}
+          disabled={busy !== null}
+        >
+          Archived on {archivedOn}. It is listed under Estimates → Archived instead of the status
+          tabs and the customer&apos;s page; its status, number, and PDF are unchanged.
+        </ArchivedBanner>
+      )}
+
+      {isConverted && estimate.invoice && (
+        <div className="mb-4 rounded-xl border border-violet-200 bg-violet-50 p-4 text-sm dark:border-violet-500/30 dark:bg-violet-500/10">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-slate-700 dark:text-slate-200">
+              Converted to invoice{" "}
+              <Link
+                to={`/c/${company.slug}/finance/invoices/${estimate.invoice.slug}`}
+                className="font-mono font-semibold text-violet-700 hover:underline dark:text-violet-300"
+              >
+                {estimate.invoice.number}
+              </Link>
+              {estimate.convertedAt &&
+                ` on ${new Date(estimate.convertedAt).toISOString().slice(0, 10)}`}
+              .
+            </div>
+            <Link to={`/c/${company.slug}/finance/invoices/${estimate.invoice.slug}`}>
+              <Button variant="secondary">
+                Open invoice <ArrowRight size={14} />
+              </Button>
+            </Link>
+          </div>
+        </div>
+      )}
+
+      <RecordTasks
+        className="mb-6"
+        companyId={company.id}
+        companySlug={company.slug}
+        kind="estimate"
+        targetId={estimate.id}
+        what="this estimate"
+        suggestedTitle={`Follow up on estimate ${estimate.number || ""}`.trim()}
+      />
+
+      <div className="space-y-6">
+        <div>
+          <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+            <InvoiceIssuerDetails issuer={estimate.issuerSnapshot} companyName={company.name} />
+            <div className="grid grid-cols-2 gap-6 text-sm">
+              <div>
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Prepared for
+                </div>
+                <div className="mt-1 font-medium text-slate-900 dark:text-slate-100">
+                  {estimate.customer ? (
+                    <Link
+                      to={`/c/${company.slug}/customers/${estimate.customer.slug}`}
+                      className="hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
+                    >
+                      {estimate.customer.name}
+                    </Link>
+                  ) : (
+                    "—"
+                  )}
+                </div>
+                <div className="text-slate-500 dark:text-slate-400">{estimate.customer?.email}</div>
+                {estimate.customer?.billingAddress.trim() && (
+                  <div className="mt-1 whitespace-pre-line text-slate-500 dark:text-slate-400">
+                    {estimate.customer.billingAddress}
+                  </div>
+                )}
+              </div>
+              <div className="text-right">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Issued
+                </div>
+                <div className="mt-1 text-slate-700 dark:text-slate-200">
+                  {new Date(estimate.issueDate).toISOString().slice(0, 10)}
+                </div>
+                <div className="text-xs font-medium mt-2 text-slate-500 dark:text-slate-400">
+                  Valid until
+                </div>
+                <div className="text-slate-700 dark:text-slate-200">
+                  {new Date(estimate.validUntil).toISOString().slice(0, 10)}
+                </div>
+              </div>
+            </div>
+
+            <DocumentLinesTable lines={estimate.lines} currency={estimate.currency} />
+
+            <div className="mt-4 ml-auto w-72 space-y-1 text-sm">
+              <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                <span>Subtotal</span>
+                <span className="tabular-nums">
+                  {formatMoney(estimate.subtotalCents + estimate.discountCents, estimate.currency)}
+                </span>
+              </div>
+              {estimate.discountCents > 0 && (
+                <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                  <span>{discountLabel(estimate)}</span>
+                  <span className="tabular-nums">
+                    -{formatMoney(estimate.discountCents, estimate.currency)}
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                <span>Tax</span>
+                <span className="tabular-nums">
+                  {formatMoney(estimate.taxCents, estimate.currency)}
+                </span>
+              </div>
+              <div className="flex justify-between border-t border-slate-200 pt-2 text-base font-semibold text-slate-900 dark:border-slate-700 dark:text-slate-100">
+                <span>Total</span>
+                <span className="tabular-nums">
+                  {formatMoney(estimate.totalCents, estimate.currency)}
+                </span>
+              </div>
+            </div>
+
+            {(estimate.notes || estimate.footer || estimate.issuerSnapshot?.footer) && (
+              <div className="mt-6 space-y-3 border-t border-slate-100 pt-4 dark:border-slate-800">
+                {estimate.notes && (
+                  <div>
+                    <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                      Notes
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap text-sm text-slate-700 dark:text-slate-200">
+                      {estimate.notes}
+                    </div>
+                  </div>
+                )}
+                {(estimate.footer || estimate.issuerSnapshot?.footer) && (
+                  <div>
+                    <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                      Footer
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap text-sm text-slate-500 dark:text-slate-400">
+                      {estimate.footer || estimate.issuerSnapshot?.footer}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <RecordHistory
+          companyId={company.id}
+          companySlug={company.slug}
+          targetType="estimate"
+          targetId={estimate.id}
+          noun="this estimate"
+          currency={estimate.currency}
+          milestones={[
+            { label: "Estimate created", at: estimate.createdAt, covers: ["create"] },
+            { label: "Estimate sent", at: estimate.sentAt, covers: ["issue", "send"] },
+            { label: "Estimate accepted", at: estimate.acceptedAt, covers: ["accept"] },
+            { label: "Estimate declined", at: estimate.declinedAt, covers: ["decline"] },
+            {
+              label: "Estimate converted to an invoice",
+              at: estimate.convertedAt,
+              covers: ["convert", "convert.invoice"],
+            },
+            { label: "Estimate voided", at: estimate.voidedAt, covers: ["void"] },
+            { label: "Estimate archived", at: estimate.archivedAt, covers: ["archive"] },
+          ]}
+        />
+      </div>
+
+      {showResend && estimate.emailDetails && (
+        <SendDocumentModal
+          companyId={company.id}
+          kind="estimate"
+          title={`Resend ${estimate.number || "estimate"}`}
+          number={estimate.number}
+          customer={estimate.customer}
+          details={estimate.emailDetails}
+          sendPath={`/api/companies/${company.id}/estimates/${estimate.slug}/send`}
+          initialMessage={resendMessage}
+          submitLabel="Resend email"
+          onClose={() => setShowResend(false)}
+          onFinished={() => {
+            setShowResend(false);
+            void reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}

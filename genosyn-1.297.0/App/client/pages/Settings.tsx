@@ -1,0 +1,867 @@
+import React from "react";
+import { Select } from "@/components/ui/Select";
+import { useOutletContext } from "react-router-dom";
+import { Pencil, Trash2 } from "lucide-react";
+import { api, Company, FinanceAccess, Member, Secret } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { browserTimeZone, groupTimeZones, listTimeZones } from "../lib/timeZones";
+import { Button } from "../components/ui/Button";
+import { Input } from "../components/ui/Input";
+import { Textarea } from "../components/ui/Textarea";
+import { FormError, FormSuccess } from "../components/ui/FormError";
+import { Avatar, memberAvatarUrl } from "../components/ui/Avatar";
+import { Card, CardBody, CardHeader } from "../components/ui/Card";
+import { Disclosure } from "../components/ui/Disclosure";
+import { Spinner } from "../components/ui/Spinner";
+import { describeCompanyAdvanced } from "../lib/companySettingsSummary";
+import { Modal } from "../components/ui/Modal";
+import { EmptyState } from "../components/ui/EmptyState";
+import { TopBar } from "../components/AppShell";
+import { useDialog } from "../components/ui/Dialog";
+import { StanddownBanner, StanddownControl } from "../components/StanddownBanner";
+import type { SettingsOutletCtx } from "./SettingsLayout";
+import { useLiveRefetch } from "../components/CompanySocket";
+
+/**
+ * Company-level settings split into sidebar-addressable sub-pages. Each page
+ * reads `company` + the companies-changed callback from SettingsLayout's
+ * Outlet context, so pages don't re-fetch the company on mount.
+ *
+ * Account-global pages (Profile) live under the Account section; install-wide
+ * pages (Backups, Instance Health) live under the Admin section. This file is
+ * deliberately company-scoped only.
+ */
+
+function useCtx(): SettingsOutletCtx {
+  return useOutletContext<SettingsOutletCtx>();
+}
+
+function normalizeSlugInput(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function SettingsCompany() {
+  const { company, onCompaniesChanged } = useCtx();
+  const [name, setName] = React.useState(company.name);
+  const [slug, setSlug] = React.useState(company.slug);
+  const [mission, setMission] = React.useState(company.mission);
+  const [vision, setVision] = React.useState(company.vision);
+  const [timezone, setTimezone] = React.useState(company.timezone ?? "");
+  const [requireTwoFactor, setRequireTwoFactor] = React.useState(company.requireTwoFactor);
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setName(company.name);
+    setSlug(company.slug);
+    setMission(company.mission);
+    setVision(company.vision);
+    setTimezone(company.timezone ?? "");
+    setRequireTwoFactor(company.requireTwoFactor);
+  }, [
+    company.id,
+    company.mission,
+    company.name,
+    company.requireTwoFactor,
+    company.slug,
+    company.timezone,
+    company.vision,
+  ]);
+
+  const normalizedSlug = normalizeSlugInput(slug);
+  const dirty =
+    name.trim() !== company.name ||
+    (normalizedSlug.length > 0 && normalizedSlug !== company.slug) ||
+    mission.trim() !== company.mission ||
+    vision.trim() !== company.vision ||
+    timezone !== (company.timezone ?? "") ||
+    requireTwoFactor !== company.requireTwoFactor;
+  const canAdminister = company.role === "owner" || company.role === "admin";
+
+  return (
+    // A form reads best at a line length people can scan; the pane is wider
+    // than any of these fields needs.
+    <div className="max-w-3xl">
+      <TopBar title="Company" />
+      <Card>
+        <CardHeader>
+          <h2 className="text-sm font-semibold">General</h2>
+          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+            Who the company is and what it is for. Your AI Employees read the mission and vision
+            when they suggest work.
+          </p>
+        </CardHeader>
+        <CardBody>
+          <form
+            className="flex flex-col gap-3"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (!dirty || saving) return;
+              const patch: {
+                name?: string;
+                slug?: string;
+                mission?: string;
+                vision?: string;
+                timezone?: string;
+                requireTwoFactor?: boolean;
+              } = {};
+              if (name.trim() !== company.name) patch.name = name.trim();
+              if (normalizedSlug && normalizedSlug !== company.slug) {
+                patch.slug = normalizedSlug;
+              }
+              if (mission.trim() !== company.mission) patch.mission = mission.trim();
+              if (vision.trim() !== company.vision) patch.vision = vision.trim();
+              if (timezone !== (company.timezone ?? "")) patch.timezone = timezone;
+              if (requireTwoFactor !== company.requireTwoFactor) {
+                patch.requireTwoFactor = requireTwoFactor;
+              }
+              setError(null);
+              setSaving(true);
+              try {
+                const updated = await api.patch<Company>(`/api/companies/${company.id}`, patch);
+                if (updated.slug !== company.slug) {
+                  // URL / workspace paths changed — reload at the new slug so
+                  // every open tab + route lines up with the renamed company.
+                  window.location.assign(`/c/${updated.slug}/settings/company`);
+                  return;
+                }
+                onCompaniesChanged();
+              } catch (err) {
+                setError(errorMessage(err));
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            <FormError message={error} />
+            <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+            <div className="grid gap-3 lg:grid-cols-2">
+              <div>
+                <Textarea
+                  label="Mission"
+                  value={mission}
+                  onChange={(event) => setMission(event.target.value)}
+                  placeholder="Why the company exists and who it serves."
+                  rows={4}
+                  maxLength={2_000}
+                  className="min-h-28"
+                />
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  Grounds AI Employee recommendations in what matters now.
+                </p>
+              </div>
+              <div>
+                <Textarea
+                  label="Vision"
+                  value={vision}
+                  onChange={(event) => setVision(event.target.value)}
+                  placeholder="What should be true when the company succeeds?"
+                  rows={4}
+                  maxLength={2_000}
+                  className="min-h-28"
+                />
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  Helps suggested work pull the company toward its destination.
+                </p>
+              </div>
+            </div>
+            {canAdminister ? (
+              <CompanyTimeZoneField value={timezone} onChange={setTimezone} />
+            ) : null}
+            {canAdminister ? (
+              // Set once and rarely touched: the address every link uses, and
+              // the sign-in rule. Its line names both, so neither hides.
+              <Disclosure
+                title="Advanced"
+                summary={describeCompanyAdvanced({ slug: normalizedSlug, requireTwoFactor })}
+                keepMounted
+              >
+                <div className="flex flex-col gap-3">
+                  <div>
+                    <Input
+                      label="Web address"
+                      value={slug}
+                      onChange={(e) => setSlug(e.target.value)}
+                      // No `required`/`pattern`: the field can be hidden when
+                      // the form is sent, and a browser cannot point at a
+                      // hidden field. Typing is normalized instead, and an
+                      // emptied address is simply not sent.
+                      onBlur={() => setSlug((s) => normalizeSlugInput(s))}
+                      placeholder="acme"
+                      title="Lowercase letters, digits, and single dashes"
+                    />
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                      Links to this company start with{" "}
+                      <code className="font-mono">/c/{normalizedSlug || "…"}</code>. Changing it
+                      changes every link, and old links stop working.
+                    </p>
+                  </div>
+                  <label className="flex items-start gap-3 rounded-lg border border-slate-200 p-3 dark:border-slate-700">
+                    <input
+                      className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      type="checkbox"
+                      checked={requireTwoFactor}
+                      onChange={(event) => setRequireTwoFactor(event.target.checked)}
+                    />
+                    <span>
+                      <span className="block text-sm font-medium">
+                        Require two-factor authentication
+                      </span>
+                      <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+                        Members must enroll an authenticator app, passkey, or security key before
+                        accessing this company.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </Disclosure>
+            ) : null}
+            <div className="flex justify-end pt-1">
+              <Button type="submit" loading={saving} disabled={!canAdminister || !dirty}>
+                {saving ? "Saving…" : "Save"}
+              </Button>
+            </div>
+          </form>
+        </CardBody>
+      </Card>
+      <CompanyStanddownCard />
+      <DangerZoneCard />
+    </div>
+  );
+}
+
+/**
+ * The clock this company's Routines are scheduled on.
+ *
+ * Empty is "Server time" — the machine's own clock, usually UTC in Docker —
+ * which is what every Routine ran on before a company could choose, so an
+ * existing company changes nothing until someone picks a zone here. Picking one
+ * re-times every enabled Routine at once (the server does it on save). Memoized
+ * because its list is four hundred options long and the form around it
+ * re-renders on every keystroke in the other fields.
+ */
+const CompanyTimeZoneField = React.memo(function CompanyTimeZoneField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (timezone: string) => void;
+}) {
+  const browserZone = React.useMemo(() => browserTimeZone(), []);
+  const groups = React.useMemo(
+    () => groupTimeZones(listTimeZones([value, browserZone])),
+    [value, browserZone],
+  );
+  return (
+    <div>
+      <Select label="Time zone" value={value} onChange={(event) => onChange(event.target.value)}>
+        <option value="">Server time</option>
+        {groups.map((group) => (
+          <optgroup key={group.region} label={group.region}>
+            {group.zones.map((zone) => (
+              <option key={zone} value={zone}>
+                {zone}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </Select>
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+        Routines run on this clock, so &ldquo;every morning at 8&rdquo; means 8 AM here. Server time
+        is the clock of the machine running Genosyn, often UTC. Pipelines and recurring invoices
+        always use server time.
+        {value === "" && browserZone ? ` Your browser is in ${browserZone}.` : null}
+      </p>
+    </div>
+  );
+});
+
+/**
+ * The company-wide stop.
+ *
+ * It lives on the company settings page rather than in a corner of the Admin
+ * section because the person who needs it is not debugging an installation —
+ * they have just watched the roster do something they do not trust, and the
+ * page they are already on is the company. The banner it produces renders for
+ * every Member, not only admins: everybody is entitled to know that the work
+ * they depend on has stopped, and why.
+ *
+ * It is not the Danger zone and is deliberately not styled as one. Deleting a
+ * company is irreversible; a Standdown is the opposite — it exists to be
+ * lifted, and hesitating over it is the failure mode, not pressing it.
+ */
+function CompanyStanddownCard() {
+  const { company } = useCtx();
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <h2 className="text-sm font-semibold">Standdown</h2>
+        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+          Stop every AI Employee in {company.name} at once. Work in progress stops, no Routine
+          starts, and chat with every employee is refused until someone lifts it. Nothing is deleted
+          or changed, and lifting it does not replay the work that was skipped.
+        </p>
+      </CardHeader>
+      <CardBody className="flex flex-wrap items-center justify-between gap-3">
+        <StanddownBanner company={company} className="w-full" />
+        <div className="text-xs text-slate-500 dark:text-slate-400">
+          Only owners and admins can place or lift it, and each is recorded with who did it. No AI
+          Employee can do either.
+        </div>
+        <StanddownControl company={company} scope="company" label={company.name} />
+      </CardBody>
+    </Card>
+  );
+}
+
+function DangerZoneCard() {
+  const { company, me, onCompaniesChanged } = useCtx();
+  const [open, setOpen] = React.useState(false);
+  const [confirmText, setConfirmText] = React.useState("");
+  const [deleting, setDeleting] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  // Only the owner can hard-delete. Admins/members get nothing — the row
+  // would otherwise be a footgun for someone with limited authority.
+  if (company.role !== "owner") return null;
+
+  async function doDelete() {
+    if (confirmText !== company.name || deleting) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      await api.del<{ ok: true }>(`/api/companies/${company.id}`);
+      // The current company is gone — bounce to the company switcher in
+      // AppShell. We refresh first so the dropdown reflects the new list.
+      onCompaniesChanged();
+      // Pick a destination that won't 404. The shell's redirect logic
+      // sends users with no companies to /onboarding; users with at least
+      // one will be re-routed to that company's home.
+      window.location.assign("/");
+    } catch (err) {
+      setError(errorMessage(err));
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <>
+      <Card className="mt-4 border-rose-200 dark:border-rose-500/40">
+        <CardHeader>
+          <h2 className="text-sm font-semibold text-rose-700 dark:text-rose-300">Danger zone</h2>
+          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+            Permanently delete <strong>{company.name}</strong> and everything inside it — employees,
+            channels, bases, finance data, notes, and uploaded files. This cannot be undone.
+          </p>
+        </CardHeader>
+        <CardBody>
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              Signed in as <span className="font-mono">{me.email}</span> · owner of this company.
+            </div>
+            <Button
+              variant="danger"
+              onClick={() => {
+                setConfirmText("");
+                setError(null);
+                setOpen(true);
+              }}
+            >
+              <Trash2 size={14} /> Delete company
+            </Button>
+          </div>
+        </CardBody>
+      </Card>
+      <Modal
+        open={open}
+        onClose={() => (deleting ? null : setOpen(false))}
+        title={`Delete ${company.name}?`}
+      >
+        <div className="flex flex-col gap-3">
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            This will permanently remove the company, all AI employees, channels, bases, finance
+            data, notes, attachments, and the on-disk directory at{" "}
+            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs dark:bg-slate-800">
+              data/companies/{company.slug}/
+            </code>
+            . It cannot be undone.
+          </p>
+          <FormError message={error} />
+          <Input
+            label={`Type "${company.name}" to confirm`}
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            autoFocus
+            placeholder={company.name}
+          />
+          <div className="flex justify-end gap-2 pt-1">
+            <Button variant="secondary" onClick={() => setOpen(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={doDelete}
+              loading={deleting}
+              disabled={confirmText !== company.name}
+            >
+              {deleting ? "Deleting…" : "Delete forever"}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+export function SettingsMembers() {
+  const { company, me } = useCtx();
+  const [members, setMembers] = React.useState<Member[] | null>(null);
+  const [inviteEmail, setInviteEmail] = React.useState("");
+  const [inviteError, setInviteError] = React.useState<string | null>(null);
+  const [inviteNotice, setInviteNotice] = React.useState<string | null>(null);
+  const [inviting, setInviting] = React.useState(false);
+  const [removingId, setRemovingId] = React.useState<string | null>(null);
+  const dialog = useDialog();
+  const canManage = company.role === "owner" || company.role === "admin";
+
+  async function changeRole(member: Member, role: "member" | "admin") {
+    try {
+      await api.patch(`/api/companies/${company.id}/members/${member.userId}`, { role });
+      await reload();
+    } catch (error) {
+      await dialog.error(error, { title: "Couldn’t change the role" });
+    }
+  }
+
+  async function changeFinanceAccess(member: Member, financeAccess: FinanceAccess) {
+    try {
+      await api.patch(`/api/companies/${company.id}/members/${member.userId}/finance-access`, {
+        financeAccess,
+      });
+      await reload();
+    } catch (error) {
+      await dialog.error(error, { title: "Couldn’t change finance access" });
+    }
+  }
+
+  async function removeMember(member: Member) {
+    const self = member.userId === me.id;
+    const confirmed = await dialog.confirm({
+      title: self ? "Leave company?" : "Remove member?",
+      message: self
+        ? `You will lose access to ${company.name}.`
+        : `${member.name ?? member.email ?? "This member"} will lose access to ${company.name}.`,
+      confirmLabel: self ? "Leave" : "Remove",
+      variant: "danger",
+    });
+    if (!confirmed) return;
+    setRemovingId(member.userId);
+    try {
+      await api.del(`/api/companies/${company.id}/members/${member.userId}`);
+      if (self) {
+        window.location.assign("/");
+        return;
+      }
+      await reload();
+    } catch (error) {
+      void dialog.error(error, {
+        title: self ? "Couldn’t leave the company" : "Couldn’t remove the member",
+      });
+    } finally {
+      setRemovingId(null);
+    }
+  }
+
+  const reload = React.useCallback(async () => {
+    try {
+      const m = await api.get<Member[]>(`/api/companies/${company.id}/members`);
+      setMembers(m);
+    } catch {
+      setMembers([]);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  useLiveRefetch("member", reload);
+
+  return (
+    <>
+      <TopBar title="Members" />
+      <Card>
+        <CardBody className="flex flex-col gap-4">
+          {members === null ? (
+            <Spinner />
+          ) : members.length === 0 ? (
+            <EmptyState
+              title="No members yet"
+              description="Invite teammates by email to collaborate on this company."
+            />
+          ) : (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {members.map((m) => (
+                <li key={m.userId} className="flex items-center justify-between gap-3 py-2 text-sm">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <Avatar
+                      name={m.name ?? m.email ?? "unknown"}
+                      size="md"
+                      src={memberAvatarUrl(company.id, m.userId, m.avatarKey)}
+                    />
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{m.name ?? "(unknown)"}</div>
+                      <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                        {m.email}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {canManage && m.role === "member" ? (
+                      <Select
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                        value={m.financeAccess}
+                        onChange={(event) =>
+                          void changeFinanceAccess(m, event.target.value as FinanceAccess)
+                        }
+                        aria-label={`Finance access for ${m.name ?? m.email ?? "member"}`}
+                        title="Finance access"
+                      >
+                        <option value="none">No finance</option>
+                        <option value="read">Finance: read-only</option>
+                        <option value="full">Finance: full</option>
+                      </Select>
+                    ) : null}
+                    {company.role === "owner" && m.role !== "owner" && m.userId !== me.id ? (
+                      <Select
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900"
+                        value={m.role}
+                        onChange={(event) =>
+                          void changeRole(m, event.target.value as "member" | "admin")
+                        }
+                        aria-label={`Role for ${m.name ?? m.email ?? "member"}`}
+                      >
+                        <option value="member">Member</option>
+                        <option value="admin">Admin</option>
+                      </Select>
+                    ) : (
+                      <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                        {m.role}
+                      </span>
+                    )}
+                    {m.role !== "owner" &&
+                    (m.userId === me.id ||
+                      company.role === "owner" ||
+                      (company.role === "admin" && m.role === "member")) ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        loading={removingId === m.userId}
+                        onClick={() => void removeMember(m)}
+                        aria-label={m.userId === me.id ? "Leave company" : "Remove member"}
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {canManage ? (
+            <form
+              className="flex flex-col gap-3 border-t border-slate-100 pt-4 dark:border-slate-800"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setInviteError(null);
+                setInviteNotice(null);
+                setInviting(true);
+                try {
+                  await api.post(`/api/companies/${company.id}/invitations`, {
+                    email: inviteEmail,
+                  });
+                  setInviteEmail("");
+                  setInviteNotice("Invite sent");
+                } catch (err) {
+                  setInviteError(errorMessage(err));
+                } finally {
+                  setInviting(false);
+                }
+              }}
+            >
+              <FormError message={inviteError} />
+              <FormSuccess message={inviteNotice} />
+              <div className="flex items-end gap-3">
+                <div className="flex-1">
+                  <Input
+                    label="Invite by email"
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    required
+                  />
+                </div>
+                <Button type="submit" loading={inviting}>
+                  Send invite
+                </Button>
+              </div>
+            </form>
+          ) : null}
+        </CardBody>
+      </Card>
+    </>
+  );
+}
+
+export function SettingsSecrets() {
+  const { company } = useCtx();
+  return (
+    <>
+      <TopBar title="Environment secrets" />
+      <SecretsCard company={company} />
+    </>
+  );
+}
+
+/**
+ * Per-company environment secrets. These developer values are distinct from
+ * the structured Vault: runtime policy may expose them to AI Employee
+ * coding shells as environment variables. The plaintext value is never
+ * returned by the API — only a masked preview.
+ */
+function SecretsCard({ company }: { company: Company }) {
+  const [rows, setRows] = React.useState<Secret[] | null>(null);
+  const [creating, setCreating] = React.useState(false);
+  const [editing, setEditing] = React.useState<Secret | null>(null);
+  const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const dialog = useDialog();
+
+  const reload = React.useCallback(async () => {
+    try {
+      const list = await api.get<Secret[]>(`/api/companies/${company.id}/secrets`);
+      setRows(list);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the secrets"));
+      setRows([]);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  useLiveRefetch("secret", reload);
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold">Environment secrets</h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              Encrypted developer values for AI Employee coding shells where runtime policy allows.
+            </p>
+          </div>
+          <Button size="sm" onClick={() => setCreating(true)}>
+            Add secret
+          </Button>
+        </div>
+      </CardHeader>
+      <CardBody>
+        {loadError ? (
+          <FormError message={loadError} />
+        ) : rows === null ? (
+          <Spinner />
+        ) : rows.length === 0 ? (
+          <EmptyState
+            title="No secrets yet"
+            description="Store developer tokens as environment variables for AI Employee coding tools. Use Vault for company logins and their authenticators."
+          />
+        ) : (
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+            {rows.map((s) => (
+              <li key={s.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-800 dark:bg-slate-800 dark:text-slate-100">
+                      {s.name}
+                    </code>
+                    <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
+                      {s.preview}
+                    </span>
+                  </div>
+                  {s.description && (
+                    <div className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+                      {s.description}
+                    </div>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <Button variant="ghost" size="sm" onClick={() => setEditing(s)}>
+                    <Pencil size={12} /> Edit
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    loading={deletingId === s.id}
+                    onClick={async () => {
+                      const ok = await dialog.confirm({
+                        title: `Delete "${s.name}"?`,
+                        message: "Employees lose access to this secret on their next run.",
+                        confirmLabel: "Delete secret",
+                        variant: "danger",
+                      });
+                      if (!ok) return;
+                      setDeletingId(s.id);
+                      try {
+                        await api.del(`/api/companies/${company.id}/secrets/${s.id}`);
+                        await reload();
+                      } catch (err) {
+                        void dialog.error(err, { title: `Couldn’t delete ${s.name}` });
+                      } finally {
+                        setDeletingId(null);
+                      }
+                    }}
+                  >
+                    <Trash2 size={12} />
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardBody>
+
+      <SecretModal
+        open={creating}
+        onClose={() => setCreating(false)}
+        onSaved={async () => {
+          setCreating(false);
+          await reload();
+        }}
+        companyId={company.id}
+      />
+      <SecretModal
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        onSaved={async () => {
+          setEditing(null);
+          await reload();
+        }}
+        companyId={company.id}
+        secret={editing ?? undefined}
+      />
+    </Card>
+  );
+}
+
+function SecretModal({
+  open,
+  onClose,
+  onSaved,
+  companyId,
+  secret,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+  companyId: string;
+  secret?: Secret;
+}) {
+  const isEdit = !!secret;
+  const [name, setName] = React.useState(secret?.name ?? "");
+  const [value, setValue] = React.useState("");
+  const [description, setDescription] = React.useState(secret?.description ?? "");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (open) {
+      setName(secret?.name ?? "");
+      setValue("");
+      setDescription(secret?.description ?? "");
+      setError(null);
+    }
+  }, [open, secret]);
+
+  return (
+    <Modal open={open} onClose={onClose} title={isEdit ? `Edit ${secret?.name}` : "Add secret"}>
+      <form
+        className="flex flex-col gap-3"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setError(null);
+          setBusy(true);
+          try {
+            if (isEdit) {
+              const body: { value?: string; description?: string } = { description };
+              if (value.length > 0) body.value = value;
+              await api.patch(`/api/companies/${companyId}/secrets/${secret!.id}`, body);
+            } else {
+              await api.post(`/api/companies/${companyId}/secrets`, {
+                name: name.trim(),
+                value,
+                description,
+              });
+            }
+            onSaved();
+          } catch (err) {
+            setError(errorMessage(err));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <FormError message={error} />
+        {!isEdit && (
+          <Input
+            label="Name"
+            value={name}
+            onChange={(e) => setName(e.target.value.toUpperCase())}
+            placeholder="STRIPE_API_KEY"
+            pattern="[A-Z_][A-Z0-9_]*"
+            title="Uppercase letters, digits, and underscores; must start with a letter or underscore"
+            required
+          />
+        )}
+        <div>
+          <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+            Value{" "}
+            {isEdit && (
+              <span className="text-slate-400 dark:text-slate-500">
+                (leave blank to keep current)
+              </span>
+            )}
+          </label>
+          <input
+            type="password"
+            className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            autoComplete="off"
+            required={!isEdit}
+          />
+        </div>
+        <Input
+          label="Description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="What is this for?"
+        />
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy}>
+            {isEdit ? "Save" : "Add secret"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

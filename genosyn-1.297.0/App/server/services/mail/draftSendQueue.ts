@@ -1,0 +1,655 @@
+import { In, LessThanOrEqual } from "typeorm";
+import { AppDataSource } from "../../db/datasource.js";
+import { MailAccount } from "../../db/entities/MailAccount.js";
+import {
+  MailDraftSendBatch,
+  type MailDraftSendBatchStatus,
+} from "../../db/entities/MailDraftSendBatch.js";
+import { MailMessage } from "../../db/entities/MailMessage.js";
+import { recordAudit } from "../audit.js";
+import { withSchedulerLease, type SchedulerLeaseContext } from "../schedulerLeases.js";
+import { notifyMailChanged, sendMailDraft } from "./actions.js";
+
+export const MAX_QUEUED_DRAFT_IDS = 2_000;
+export const MIN_SEND_DELAY_MS = 60_000;
+export const MAX_SEND_DELAY_MS = 120_000;
+export const EXPECTED_SEND_DELAY_MS = (MIN_SEND_DELAY_MS + MAX_SEND_DELAY_MS) / 2;
+
+const ACTIVE_STATUSES: MailDraftSendBatchStatus[] = ["queued", "running"];
+const DISCOVERY_INTERVAL_MS = 5_000;
+const LEASE_TTL_MS = 45_000;
+
+type DraftSendItemStatus = "queued" | "sending" | "sent" | "failed";
+
+type DraftSendItem = {
+  draftId: string;
+  status: DraftSendItemStatus;
+  errorMessage: string;
+};
+
+export type DraftSendBatchView = {
+  id: string;
+  status: MailDraftSendBatchStatus;
+  total: number;
+  sent: number;
+  failed: number;
+  remaining: number;
+  nextSendAt: string | null;
+  estimatedCompletionAt: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+  queuedDraftIds: string[];
+  failures: { id: string; reason: string }[];
+};
+
+type QueueTiming = {
+  now?: () => Date;
+  delayMs?: () => number;
+};
+
+type ProcessOptions = QueueTiming & {
+  sendDraft?: (account: MailAccount, draft: MailMessage) => Promise<MailMessage>;
+};
+
+let discoveryTimer: NodeJS.Timeout | null = null;
+const activeBatchIds = new Set<string>();
+const creatingAccountIds = new Set<string>();
+const creatingAccountPromises = new Map<string, Promise<void>>();
+const batchMutationTails = new Map<string, Promise<void>>();
+const disconnectingAccountIds = new Set<string>();
+
+export class DraftSendQueueBusyError extends Error {}
+
+export class DraftSendDisconnectBusyError extends DraftSendQueueBusyError {}
+
+/** Random whole-millisecond pause in the inclusive one-to-two minute range. */
+export function randomSendDelayMs(random: () => number = Math.random): number {
+  return MIN_SEND_DELAY_MS + Math.floor(random() * (MAX_SEND_DELAY_MS - MIN_SEND_DELAY_MS + 1));
+}
+
+function parseItems(value: string): DraftSendItem[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): DraftSendItem[] => {
+      if (
+        typeof item !== "object" ||
+        item === null ||
+        typeof (item as { draftId?: unknown }).draftId !== "string"
+      ) {
+        return [];
+      }
+      const candidate = item as Partial<DraftSendItem>;
+      const status: DraftSendItemStatus = ["queued", "sending", "sent", "failed"].includes(
+        String(candidate.status),
+      )
+        ? (candidate.status as DraftSendItemStatus)
+        : "queued";
+      return [
+        {
+          draftId: candidate.draftId as string,
+          status,
+          errorMessage: typeof candidate.errorMessage === "string" ? candidate.errorMessage : "",
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function itemCounts(items: DraftSendItem[]): { sent: number; failed: number } {
+  let sent = 0;
+  let failed = 0;
+  for (const item of items) {
+    if (item.status === "sent") sent += 1;
+    if (item.status === "failed") failed += 1;
+  }
+  return { sent, failed };
+}
+
+export function serializeDraftSendBatch(
+  batch: MailDraftSendBatch,
+  now: Date = new Date(),
+): DraftSendBatchView {
+  const items = parseItems(batch.itemsJson);
+  const remaining = Math.max(0, batch.total - batch.sent - batch.failed);
+  const estimatedCompletionAt =
+    remaining > 0 && batch.nextSendAt
+      ? new Date(
+          Math.max(now.getTime(), batch.nextSendAt.getTime()) +
+            Math.max(0, remaining - 1) * EXPECTED_SEND_DELAY_MS,
+        ).toISOString()
+      : null;
+  return {
+    id: batch.id,
+    status: batch.status,
+    total: batch.total,
+    sent: batch.sent,
+    failed: batch.failed,
+    remaining,
+    nextSendAt: batch.nextSendAt?.toISOString() ?? null,
+    estimatedCompletionAt,
+    createdAt: batch.createdAt.toISOString(),
+    finishedAt: batch.finishedAt?.toISOString() ?? null,
+    queuedDraftIds: items
+      .filter((item) => item.status === "queued" || item.status === "sending")
+      .map((item) => item.draftId),
+    failures: items
+      .filter((item) => item.status === "failed")
+      .map((item) => ({ id: item.draftId, reason: item.errorMessage })),
+  };
+}
+
+async function latestBatch(
+  accountId: string,
+  statuses?: MailDraftSendBatchStatus[],
+): Promise<MailDraftSendBatch | null> {
+  return AppDataSource.getRepository(MailDraftSendBatch).findOne({
+    where: statuses?.length ? { accountId, status: In(statuses) } : { accountId },
+    order: { createdAt: "DESC" },
+  });
+}
+
+export async function getLatestDraftSendBatch(
+  account: MailAccount,
+): Promise<DraftSendBatchView | null> {
+  // SQLite timestamps have one-second precision, so a new active batch and the
+  // terminal batch before it can tie on `createdAt`. Active work must always
+  // win that tie or the client would briefly hide real progress.
+  const batch = (await latestBatch(account.id, ACTIVE_STATUSES)) ?? (await latestBatch(account.id));
+  return batch ? serializeDraftSendBatch(batch) : null;
+}
+
+/** Draft ids already owned by the active queue, used to disable duplicate sends. */
+export async function activeDraftQueueIds(accountId: string): Promise<Set<string>> {
+  const batch = await latestBatch(accountId, ACTIVE_STATUSES);
+  if (!batch) return new Set();
+  return new Set(
+    parseItems(batch.itemsJson)
+      .filter((item) => item.status === "queued" || item.status === "sending")
+      .map((item) => item.draftId),
+  );
+}
+
+function reportBackgroundError(label: string, error: unknown): void {
+  // eslint-disable-next-line no-console
+  console.error(`[mail] ${label}:`, error);
+}
+
+async function recordAuditSafely(args: Parameters<typeof recordAudit>[0]): Promise<void> {
+  try {
+    await recordAudit(args);
+  } catch (error) {
+    reportBackgroundError("could not record draft-send audit", error);
+  }
+}
+
+async function createDraftSendBatchUnlocked(
+  account: MailAccount,
+  ids: string[],
+  actorUserId: string | null,
+  timing: QueueTiming,
+  assertLeaseHeld: () => void,
+): Promise<{ batch: MailDraftSendBatch; added: number }> {
+  const activeBatch = await latestBatch(account.id, ACTIVE_STATUSES);
+  const orderedIds = [...new Set(ids)].slice(0, MAX_QUEUED_DRAFT_IDS);
+  const existingIds = activeBatch
+    ? new Set(parseItems(activeBatch.itemsJson).map((item) => item.draftId))
+    : new Set<string>();
+  const capacity = activeBatch
+    ? Math.max(0, MAX_QUEUED_DRAFT_IDS - activeBatch.total)
+    : MAX_QUEUED_DRAFT_IDS;
+  const candidateIds = orderedIds.filter((id) => !existingIds.has(id)).slice(0, capacity);
+  const rows =
+    candidateIds.length > 0
+      ? await AppDataSource.getRepository(MailMessage).find({
+          where: {
+            id: In(candidateIds),
+            companyId: account.companyId,
+            accountId: account.id,
+          },
+        })
+      : [];
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const eligibleIds = candidateIds.filter((id) => {
+    const row = byId.get(id);
+    return Boolean(
+      row?.gmailDraftId && `${row.toEmails} ${row.ccEmails} ${row.bccEmails}`.trim() !== "",
+    );
+  });
+  if (eligibleIds.length === 0) {
+    throw new Error(
+      capacity === 0
+        ? `This send queue already contains the maximum of ${MAX_QUEUED_DRAFT_IDS.toLocaleString()} emails.`
+        : "None of those drafts can be added to the send queue.",
+    );
+  }
+
+  const now = timing.now?.() ?? new Date();
+  const delayMs = timing.delayMs?.() ?? randomSendDelayMs();
+  const addedItems: DraftSendItem[] = eligibleIds.map((draftId) => ({
+    draftId,
+    status: "queued",
+    errorMessage: "",
+  }));
+  const repo = AppDataSource.getRepository(MailDraftSendBatch);
+  const batch =
+    activeBatch ??
+    repo.create({
+      companyId: account.companyId,
+      accountId: account.id,
+      status: "queued",
+      total: 0,
+      sent: 0,
+      failed: 0,
+      itemsJson: "[]",
+      nextSendAt: new Date(now.getTime() + delayMs),
+      finishedAt: null,
+      createdByUserId: actorUserId,
+    });
+  const items = [...parseItems(batch.itemsJson), ...addedItems];
+  batch.itemsJson = JSON.stringify(items);
+  batch.total = items.length;
+  assertLeaseHeld();
+  await repo.save(batch);
+  await recordAuditSafely({
+    companyId: account.companyId,
+    actorUserId,
+    action: activeBatch ? "mail.draft.bulk_send_added" : "mail.draft.bulk_send_queued",
+    targetType: "mail_draft_send_batch",
+    targetId: batch.id,
+    targetLabel: account.address,
+    metadata: {
+      added: addedItems.length,
+      total: batch.total,
+      minimumDelaySeconds: 60,
+      maximumDelaySeconds: 120,
+    },
+  });
+  notifyMailChanged(account);
+  return { batch, added: addedItems.length };
+}
+
+/**
+ * Serialize mutations within this process as well as across Postgres replicas.
+ * `withSchedulerLease` deliberately skips database leases for SQLite, and a
+ * separate callers in this process still need to wait for one another.
+ */
+async function withBatchMutationLease<T>(
+  batchId: string,
+  fn: (lease: SchedulerLeaseContext) => Promise<T>,
+): Promise<T | null> {
+  const previous = batchMutationTails.get(batchId) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  batchMutationTails.set(batchId, tail);
+  await previous;
+  try {
+    return await withSchedulerLease(`mail-draft-send:${batchId}`, LEASE_TTL_MS, fn);
+  } finally {
+    release();
+    if (batchMutationTails.get(batchId) === tail) batchMutationTails.delete(batchId);
+  }
+}
+
+export type QueueDraftsForSendResult = { batch: DraftSendBatchView; added: number };
+
+/** Start a durable paced queue, or append a confirmed selection to the active one. */
+export async function createDraftSendBatch(
+  account: MailAccount,
+  ids: string[],
+  actorUserId: string | null,
+  timing: QueueTiming = {},
+): Promise<QueueDraftsForSendResult> {
+  if (disconnectingAccountIds.has(account.id)) {
+    throw new DraftSendDisconnectBusyError("The mailbox is being disconnected.");
+  }
+  if (creatingAccountIds.has(account.id)) {
+    throw new DraftSendQueueBusyError("The send queue is being updated. Please try again.");
+  }
+  creatingAccountIds.add(account.id);
+  let releaseCreating = (): void => undefined;
+  const creating = new Promise<void>((resolve) => {
+    releaseCreating = resolve;
+  });
+  creatingAccountPromises.set(account.id, creating);
+  try {
+    const result = await withSchedulerLease(
+      `mail-draft-send-create:${account.id}`,
+      15_000,
+      async (lease) => {
+        const activeBatch = await latestBatch(account.id, ACTIVE_STATUSES);
+        lease.assertHeld();
+        if (!activeBatch) return createDraftSendBatchUnlocked(account, ids, actorUserId, timing, lease.assertHeld);
+        const appended = await withBatchMutationLease(activeBatch.id, (batchLease) =>
+          createDraftSendBatchUnlocked(account, ids, actorUserId, timing, () => {
+            lease.assertHeld();
+            batchLease.assertHeld();
+          }),
+        );
+        if (!appended) {
+          throw new DraftSendQueueBusyError(
+            "The send queue is sending an email. Please try again.",
+          );
+        }
+        return appended;
+      },
+    );
+    if (!result) {
+      throw new DraftSendQueueBusyError("The send queue is being updated. Please try again.");
+    }
+    return {
+      batch: serializeDraftSendBatch(result.batch, timing.now?.() ?? new Date()),
+      added: result.added,
+    };
+  } finally {
+    creatingAccountIds.delete(account.id);
+    if (creatingAccountPromises.get(account.id) === creating) {
+      creatingAccountPromises.delete(account.id);
+    }
+    releaseCreating();
+  }
+}
+
+function finishBatch(batch: MailDraftSendBatch, items: DraftSendItem[], now: Date): void {
+  const counts = itemCounts(items);
+  batch.sent = counts.sent;
+  batch.failed = counts.failed;
+  batch.itemsJson = JSON.stringify(items);
+  batch.nextSendAt = null;
+  batch.finishedAt = now;
+  batch.status = counts.failed > 0 ? "completed_with_errors" : "completed";
+}
+
+async function processDraftSendBatchUnlocked(
+  batchId: string,
+  options: ProcessOptions,
+  lease: SchedulerLeaseContext,
+): Promise<DraftSendBatchView | null> {
+  const repo = AppDataSource.getRepository(MailDraftSendBatch);
+  const batch = await repo.findOneBy({ id: batchId });
+  if (!batch || !ACTIVE_STATUSES.includes(batch.status))
+    return batch ? serializeDraftSendBatch(batch, options.now?.() ?? new Date()) : null;
+
+  const now = options.now?.() ?? new Date();
+  if (!batch.nextSendAt || batch.nextSendAt > now) return serializeDraftSendBatch(batch, now);
+
+  const items = parseItems(batch.itemsJson);
+  // Acquiring this lease means no healthy sender owns these items. The old
+  // process may have sent one before losing its database connection; retrying
+  // that ambiguous send automatically could mail the recipient twice.
+  const interrupted = markInterruptedSends(items);
+  lease.assertHeld();
+  const current = items.find((item) => item.status === "queued");
+  if (interrupted && current) {
+    const counts = itemCounts(items);
+    batch.sent = counts.sent;
+    batch.failed = counts.failed;
+    batch.itemsJson = JSON.stringify(items);
+    batch.nextSendAt = new Date(now.getTime() + (options.delayMs?.() ?? randomSendDelayMs()));
+    await repo.save(batch);
+    return serializeDraftSendBatch(batch, now);
+  }
+  if (!current) {
+    finishBatch(batch, items, now);
+    await repo.save(batch);
+    return serializeDraftSendBatch(batch, now);
+  }
+
+  current.status = "sending";
+  batch.status = "running";
+  batch.itemsJson = JSON.stringify(items);
+  await repo.save(batch);
+
+  const account = disconnectingAccountIds.has(batch.accountId)
+    ? null
+    : await AppDataSource.getRepository(MailAccount).findOneBy({
+        id: batch.accountId,
+        companyId: batch.companyId,
+      });
+  let sentMessage: MailMessage | null = null;
+  let errorMessage = "";
+
+  if (!account) {
+    errorMessage = "The mailbox is no longer connected.";
+    for (const item of items) {
+      if (item.status === "queued" || item.status === "sending") {
+        item.status = "failed";
+        item.errorMessage = errorMessage;
+      }
+    }
+  } else {
+    const draft = await AppDataSource.getRepository(MailMessage).findOneBy({
+      id: current.draftId,
+      companyId: batch.companyId,
+      accountId: batch.accountId,
+    });
+    if (!draft?.gmailDraftId) {
+      errorMessage = "The draft is no longer available.";
+    } else if (`${draft.toEmails} ${draft.ccEmails} ${draft.bccEmails}`.trim() === "") {
+      errorMessage = "The draft no longer has a recipient.";
+    } else {
+      try {
+        lease.assertHeld();
+        sentMessage = options.sendDraft
+          ? await options.sendDraft(account, draft)
+          : await sendMailDraft(account, draft, { silent: true, assertCanSend: lease.assertHeld });
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : "Gmail refused the send.";
+      }
+    }
+    current.status = sentMessage ? "sent" : "failed";
+    current.errorMessage = errorMessage;
+  }
+
+  const completedAt = options.now?.() ?? new Date();
+  const next = items.find((item) => item.status === "queued");
+  const counts = itemCounts(items);
+  batch.sent = counts.sent;
+  batch.failed = counts.failed;
+  batch.itemsJson = JSON.stringify(items);
+  if (next) {
+    const delayMs = options.delayMs?.() ?? randomSendDelayMs();
+    batch.nextSendAt = new Date(completedAt.getTime() + delayMs);
+    batch.finishedAt = null;
+    batch.status = "running";
+  } else {
+    finishBatch(batch, items, completedAt);
+  }
+  // Keep an accepted send's mirror/audit work, but never overwrite the queue
+  // state now owned by a replacement worker.
+  lease.assertHeld();
+  await repo.save(batch);
+
+  if (account && sentMessage) {
+    notifyMailChanged(account);
+    await recordAuditSafely({
+      companyId: account.companyId,
+      actorUserId: batch.createdByUserId,
+      action: "mail.send",
+      targetType: "mail_message",
+      targetId: sentMessage.id,
+      targetLabel: sentMessage.subject || "(no subject)",
+      metadata: { fromDraft: true, bulk: true, batchId: batch.id },
+    });
+  }
+
+  if (!next) {
+    await recordAuditSafely({
+      companyId: batch.companyId,
+      actorUserId: batch.createdByUserId,
+      actorKind: batch.createdByUserId ? "user" : "system",
+      action: "mail.draft.bulk_send",
+      targetType: "mail_account",
+      targetId: batch.accountId,
+      targetLabel: account?.address ?? "Disconnected mailbox",
+      metadata: { requested: batch.total, succeeded: batch.sent, skipped: batch.failed },
+    });
+  }
+  return serializeDraftSendBatch(batch, completedAt);
+}
+
+/** Process at most one mail from a batch, guarded across app replicas. */
+export async function processDraftSendBatch(
+  batchId: string,
+  options: ProcessOptions = {},
+): Promise<DraftSendBatchView | null> {
+  if (activeBatchIds.has(batchId)) return null;
+  activeBatchIds.add(batchId);
+  try {
+    return await withBatchMutationLease(batchId, (lease) =>
+      processDraftSendBatchUnlocked(batchId, options, lease),
+    );
+  } finally {
+    activeBatchIds.delete(batchId);
+  }
+}
+
+type DisconnectFenceResult<T> = { acquired: true; value: T } | { acquired: false };
+
+async function holdBatchDisconnectLeases<T>(
+  batches: MailDraftSendBatch[],
+  index: number,
+  fn: () => Promise<T>,
+): Promise<DisconnectFenceResult<T>> {
+  if (index >= batches.length) return { acquired: true, value: await fn() };
+  const batch = batches[index];
+  const nested = await withBatchMutationLease(batch.id, async (lease) => {
+    const current = await AppDataSource.getRepository(MailDraftSendBatch).findOneBy({
+      id: batch.id,
+      accountId: batch.accountId,
+    });
+    if (current && parseItems(current.itemsJson).some((item) => item.status === "sending")) {
+      throw new DraftSendDisconnectBusyError(
+        "The mailbox is still finishing a draft send. Please try Disconnect again shortly.",
+      );
+    }
+    lease.assertHeld();
+    return holdBatchDisconnectLeases(batches, index + 1, () => {
+      lease.assertHeld();
+      return fn();
+    });
+  });
+  return nested ?? { acquired: false };
+}
+
+/** Hold the account's queue-creation and every active batch lease through the
+ * destructive callback. This closes both the local and cross-process windows
+ * where a late send/create could resurrect rows after Disconnect. */
+export async function withDraftSendDisconnectFence<T>(
+  accountId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (disconnectingAccountIds.has(accountId)) {
+    throw new DraftSendDisconnectBusyError("The mailbox is already being disconnected.");
+  }
+  disconnectingAccountIds.add(accountId);
+  try {
+    await creatingAccountPromises.get(accountId);
+    const deadline = Date.now() + LEASE_TTL_MS;
+    for (;;) {
+      const result = await withSchedulerLease(
+        `mail-draft-send-create:${accountId}`,
+        LEASE_TTL_MS,
+        async (lease) => {
+          const batches = await AppDataSource.getRepository(MailDraftSendBatch).find({
+            where: { accountId, status: In(ACTIVE_STATUSES) },
+            order: { id: "ASC" },
+          });
+          lease.assertHeld();
+          return holdBatchDisconnectLeases(batches, 0, () => {
+            lease.assertHeld();
+            return fn();
+          });
+        },
+      );
+      if (result?.acquired) return result.value;
+      if (Date.now() >= deadline) {
+        throw new DraftSendDisconnectBusyError(
+          "The mailbox is still finishing a draft send. Please try Disconnect again shortly.",
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
+  } finally {
+    disconnectingAccountIds.delete(accountId);
+  }
+}
+
+async function tickDraftSendQueue(): Promise<void> {
+  const due = await AppDataSource.getRepository(MailDraftSendBatch).find({
+    where: {
+      status: In(ACTIVE_STATUSES),
+      nextSendAt: LessThanOrEqual(new Date()),
+    },
+    order: { nextSendAt: "ASC" },
+    take: 25,
+  });
+  await Promise.all(
+    due.map((batch) =>
+      processDraftSendBatch(batch.id).catch((error) => {
+        reportBackgroundError(`draft-send batch ${batch.id} crashed`, error);
+        return null;
+      }),
+    ),
+  );
+}
+
+function markInterruptedSends(items: DraftSendItem[]): boolean {
+  let interrupted = false;
+  for (const item of items) {
+    if (item.status !== "sending") continue;
+    interrupted = true;
+    item.status = "failed";
+    item.errorMessage = "The send was interrupted. Check Sent before sending this draft again.";
+  }
+  return interrupted;
+}
+
+/** Recover only unowned batches. An interrupted send has an unknown external
+ * outcome and needs review; untouched drafts retain the normal pacing. */
+export async function recoverDraftSendBatches(timing: QueueTiming = {}): Promise<void> {
+  const repo = AppDataSource.getRepository(MailDraftSendBatch);
+  const batches = await repo.find({ where: { status: In(ACTIVE_STATUSES) } });
+  for (const candidate of batches) {
+    await withBatchMutationLease(candidate.id, async (lease) => {
+      const batch = await repo.findOneBy({ id: candidate.id });
+      if (!batch || !ACTIVE_STATUSES.includes(batch.status)) return;
+      const now = timing.now?.() ?? new Date();
+      const items = parseItems(batch.itemsJson);
+      const interrupted = markInterruptedSends(items);
+      const next = items.find((item) => item.status === "queued");
+      if (!next) {
+        finishBatch(batch, items, now);
+      } else {
+        const counts = itemCounts(items);
+        batch.sent = counts.sent;
+        batch.failed = counts.failed;
+        batch.itemsJson = JSON.stringify(items);
+        if (interrupted || !batch.nextSendAt) {
+          const delayMs = timing.delayMs?.() ?? randomSendDelayMs();
+          batch.nextSendAt = new Date(now.getTime() + delayMs);
+        }
+      }
+      lease.assertHeld();
+      await repo.save(batch);
+    });
+  }
+}
+
+export async function bootMailDraftSendQueue(): Promise<void> {
+  await recoverDraftSendBatches();
+
+  if (discoveryTimer) clearInterval(discoveryTimer);
+  discoveryTimer = setInterval(() => {
+    void tickDraftSendQueue().catch((error) => {
+      reportBackgroundError("draft-send queue heartbeat failed", error);
+    });
+  }, DISCOVERY_INTERVAL_MS);
+  if (typeof discoveryTimer.unref === "function") discoveryTimer.unref();
+  await tickDraftSendQueue();
+}

@@ -1,0 +1,371 @@
+import { maskSecret } from "../../lib/secret.js";
+import { ProviderRequestError, parseRetryAfter } from "../providerErrors.js";
+import type { IntegrationProvider } from "../types.js";
+
+const BREX_API = "https://api.brex.com";
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Brex refused a request, or never answered it (`status` 0). The message is
+ * Brex's own words, as it always was; the status and `Retry-After` let
+ * Banking's sync tell a rejected token from a busy API.
+ */
+export class BrexApiError extends ProviderRequestError {
+  constructor(message: string, status: number, retryAfterMs: number | null = null, request = "") {
+    super(message, "Brex", status, retryAfterMs, request);
+    this.name = "BrexApiError";
+  }
+}
+
+export type BrexConfig = {
+  userToken: string;
+};
+
+export type BrexMoney = {
+  amount: number;
+  currency: string | null;
+};
+
+export type BrexCashAccount = {
+  id: string;
+  name: string;
+  status?: string | null;
+  current_balance: BrexMoney;
+  available_balance: BrexMoney;
+  account_number: string;
+  routing_number: string;
+  primary: boolean;
+};
+
+export type BrexCashTransaction = {
+  id: string;
+  description: string;
+  amount: BrexMoney | null;
+  initiated_at_date: string;
+  posted_at_date: string;
+  type?: string | null;
+  transfer_id?: string | null;
+};
+
+export type BrexCardTransaction = {
+  id: string;
+  card_id?: string | null;
+  description: string;
+  amount: BrexMoney | null;
+  initiated_at_date?: string | null;
+  posted_at_date: string;
+  type?: string | null;
+  card_transaction_operation_reference_id?: string | null;
+};
+
+type BrexPage<T> = {
+  next_cursor?: string | null;
+  items: T[];
+};
+
+export type BrexCashAccountSummary = {
+  id: string;
+  name: string;
+  status: string | null;
+  primary: boolean;
+  accountNumberLast4: string;
+  currentBalance: BrexMoney;
+  availableBalance: BrexMoney;
+};
+
+/**
+ * A moment the way Brex reads a date-time filter such as `posted_at_start`:
+ * the UTC date and time with no offset, `2022-12-12T23:59:59.999` — the
+ * example Brex gives for every date-time filter in its API reference.
+ *
+ * Brex refuses a value that carries an offset, the `Z` that `toISOString()`
+ * ends with included, with a bare 400 "Bad request". Sending `toISOString()`
+ * as it was is how every Brex sync after an account's first came to fail: the
+ * first asks for the whole history and sends no date at all.
+ */
+export function brexDateTime(at: Date): string {
+  return at.toISOString().slice(0, -1);
+}
+
+/** A date and time with no offset, as Brex writes its examples. */
+const WITHOUT_OFFSET = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+/**
+ * A date-time an AI Employee passed to a tool, or null when it isn't one.
+ * One written without an offset is UTC, as Brex reads it — never the
+ * server's local time, which is how JavaScript would read it.
+ */
+export function parseBrexDateTimeInput(value: string): Date | null {
+  const text = value.trim();
+  if (!text) return null;
+  const at = new Date(WITHOUT_OFFSET.test(text) ? `${text.replace(" ", "T")}Z` : text);
+  return Number.isNaN(at.getTime()) ? null : at;
+}
+
+async function brexGet<T>(
+  userToken: string,
+  path: string,
+  params?: Record<string, string | number | undefined>,
+): Promise<T> {
+  const url = new URL(path, BREX_API);
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (value !== undefined) url.searchParams.set(key, String(value));
+  }
+  const request = `GET ${url.pathname}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: {
+        accept: "application/json",
+        Authorization: `Bearer ${userToken}`,
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new BrexApiError(
+        `Brex didn't answer within ${REQUEST_TIMEOUT_MS / 1000} seconds. Try again.`,
+        0,
+        null,
+        request,
+      );
+    }
+    throw err;
+  }
+  const text = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = text;
+  }
+  if (!res.ok) {
+    const detail =
+      (parsed && typeof parsed === "object" && "message" in parsed
+        ? String((parsed as { message: unknown }).message)
+        : null) ??
+      (parsed && typeof parsed === "object" && "error" in parsed
+        ? String((parsed as { error: unknown }).error)
+        : null) ??
+      (typeof parsed === "string" && parsed.trim() && !parsed.trim().startsWith("<")
+        ? parsed.trim().slice(0, 300)
+        : null) ??
+      `Brex ${res.status} ${res.statusText}`.trim();
+    throw new BrexApiError(
+      detail,
+      res.status,
+      parseRetryAfter(res.headers.get("retry-after")),
+      request,
+    );
+  }
+  return parsed as T;
+}
+
+export function summarizeBrexCashAccount(account: BrexCashAccount): BrexCashAccountSummary {
+  return {
+    id: account.id,
+    name: account.name,
+    status: account.status ?? null,
+    primary: account.primary,
+    accountNumberLast4: account.account_number.slice(-4),
+    currentBalance: account.current_balance,
+    availableBalance: account.available_balance,
+  };
+}
+
+export async function listBrexCashAccounts(userToken: string): Promise<BrexCashAccount[]> {
+  const accounts: BrexCashAccount[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await brexGet<BrexPage<BrexCashAccount>>(userToken, "/v2/accounts/cash", {
+      limit: 100,
+      cursor,
+    });
+    accounts.push(...(page.items ?? []));
+    const next = page.next_cursor ?? undefined;
+    if (!next) break;
+    if (seenCursors.has(next)) throw new Error("Brex returned a repeated account cursor");
+    seenCursors.add(next);
+    cursor = next;
+  }
+  return accounts;
+}
+
+export async function getBrexCashTransactionsPage(
+  userToken: string,
+  accountId: string,
+  options: {
+    cursor?: string;
+    limit?: number;
+    /** Only transactions posted on or after this moment. */
+    postedAtStart?: Date;
+  } = {},
+): Promise<BrexPage<BrexCashTransaction>> {
+  return brexGet<BrexPage<BrexCashTransaction>>(
+    userToken,
+    `/v2/transactions/cash/${encodeURIComponent(accountId)}`,
+    {
+      cursor: options.cursor,
+      limit: options.limit ?? 100,
+      posted_at_start: options.postedAtStart && brexDateTime(options.postedAtStart),
+    },
+  );
+}
+
+export async function getBrexCardTransactionsPage(
+  userToken: string,
+  options: {
+    cursor?: string;
+    limit?: number;
+    /** Only transactions posted on or after this moment. */
+    postedAtStart?: Date;
+  } = {},
+): Promise<BrexPage<BrexCardTransaction>> {
+  return brexGet<BrexPage<BrexCardTransaction>>(
+    userToken,
+    "/v2/transactions/card/primary",
+    {
+      cursor: options.cursor,
+      limit: options.limit ?? 100,
+      posted_at_start: options.postedAtStart && brexDateTime(options.postedAtStart),
+    },
+  );
+}
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" ? Math.trunc(value) : fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+export const brexProvider: IntegrationProvider = {
+  catalog: {
+    provider: "brex",
+    name: "Brex",
+    category: "Payments",
+    tagline: "Cash accounts, corporate cards, and settled transactions.",
+    description:
+      "Connect your Brex account with a user token from Brex Developer → Settings. Cash reconciliation uses accounts.cash.readonly and transactions.cash.readonly; corporate card accounting also needs transactions.card.readonly.",
+    icon: "CreditCard",
+    authMode: "apikey",
+    fields: [
+      {
+        key: "userToken",
+        label: "User token",
+        type: "password",
+        placeholder: "bxt_…",
+        required: true,
+        hint: "Use a read-only token with Cash Accounts, Cash Transactions, and Card Transactions access.",
+      },
+    ],
+    enabled: true,
+  },
+
+  tools: [
+    {
+      name: "list_cash_accounts",
+      description:
+        "List Brex Cash accounts and their current and available balances. Account and routing numbers are masked or omitted.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "list_cash_transactions",
+      description: "List one page of settled transactions for a Brex Cash account.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          accountId: { type: "string", description: "Brex Cash account id." },
+          limit: { type: "integer", minimum: 1, maximum: 100 },
+          cursor: { type: "string", description: "Pagination cursor from the prior page." },
+          postedAtStart: {
+            type: "string",
+            description: "Optional RFC 3339 lower bound for the posted date.",
+          },
+        },
+        required: ["accountId"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "list_card_transactions",
+      description:
+        "List one page of settled transactions for the primary Brex card account.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", minimum: 1, maximum: 100 },
+          cursor: { type: "string", description: "Pagination cursor from the prior page." },
+        },
+        additionalProperties: false,
+      },
+    },
+  ],
+
+  async validateApiKey(input) {
+    const userToken = (input.userToken ?? "").trim();
+    if (!userToken) throw new Error("User token is required");
+    const accounts = await listBrexCashAccounts(userToken);
+    if (accounts.length === 0) {
+      throw new Error(
+        "Brex returned no Cash accounts. Check that the token has accounts.cash.readonly access.",
+      );
+    }
+    const primary = accounts.find((account) => account.primary) ?? accounts[0];
+    await getBrexCashTransactionsPage(userToken, primary.id, { limit: 1 });
+    return {
+      config: { userToken } satisfies BrexConfig,
+      accountHint: `${primary.name} · ${maskSecret(userToken)}`,
+    };
+  },
+
+  async checkStatus(ctx) {
+    const cfg = ctx.config as BrexConfig;
+    try {
+      const accounts = await listBrexCashAccounts(cfg.userToken);
+      const primary = accounts.find((account) => account.primary) ?? accounts[0];
+      if (!primary) throw new Error("Brex returned no Cash accounts");
+      await getBrexCashTransactionsPage(cfg.userToken, primary.id, { limit: 1 });
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+
+  async invokeTool(name, args, ctx) {
+    const cfg = ctx.config as BrexConfig;
+    const input = (args as Record<string, unknown>) ?? {};
+    if (name === "list_cash_accounts") {
+      const accounts = await listBrexCashAccounts(cfg.userToken);
+      return { items: accounts.map(summarizeBrexCashAccount) };
+    }
+    if (name === "list_cash_transactions") {
+      const accountId = typeof input.accountId === "string" ? input.accountId.trim() : "";
+      if (!accountId) throw new Error("accountId is required");
+      let postedAtStart: Date | undefined;
+      if (typeof input.postedAtStart === "string" && input.postedAtStart.trim()) {
+        const parsed = parseBrexDateTimeInput(input.postedAtStart);
+        if (!parsed) throw new Error("postedAtStart must be an RFC 3339 date-time");
+        postedAtStart = parsed;
+      }
+      return getBrexCashTransactionsPage(cfg.userToken, accountId, {
+        limit: clampInt(input.limit, 1, 100, 50),
+        cursor: typeof input.cursor === "string" ? input.cursor : undefined,
+        postedAtStart,
+      });
+    }
+    if (name === "list_card_transactions") {
+      return getBrexCardTransactionsPage(cfg.userToken, {
+        limit: clampInt(input.limit, 1, 100, 50),
+        cursor: typeof input.cursor === "string" ? input.cursor : undefined,
+      });
+    }
+    throw new Error(`Unknown Brex tool: ${name}`);
+  },
+};

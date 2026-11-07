@@ -1,0 +1,6723 @@
+import type { TodoLinkView } from "../../shared/todoLinks";
+import type { EmployeeTodoQueue } from "../../shared/todoPickups";
+import type { TodoPickupView, TodoWaitKind } from "../../shared/todoPickups";
+import type { BaseFilterOperator } from "../../shared/baseFilters";
+import type { EntryCategoryLock } from "../../shared/entryCategory";
+import type { ModelEffort } from "../../shared/modelEffort";
+import type { PublicModelAvailability } from "../../shared/modelAvailability";
+export type { PublicModelAvailability } from "../../shared/modelAvailability";
+import type { RoutinePriority } from "../../shared/routinePriority";
+import { dayOf, documentDay } from "../../shared/documentDays";
+export type { EntryCategoryLock } from "../../shared/entryCategory";
+export type { ModelEffort } from "../../shared/modelEffort";
+import type { TurnActivitySummary } from "../../shared/chatActivity";
+export type { ChatActivityEvent, TurnActivitySummary } from "../../shared/chatActivity";
+import type { ModelThinking, TurnThinking } from "../../shared/thinkingLevels";
+export type { ModelThinking, TurnThinking } from "../../shared/thinkingLevels";
+
+/**
+ * A refused API request: the sentence to show, plus the status and the JSON
+ * body for a page that acts on what the server said — a 409 that names the
+ * customer already using a domain, say.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly data: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method,
+    credentials: "same-origin",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(errorMessageFrom(text, res.status, res.statusText), res.status, jsonOrNull(text));
+  }
+  return (text ? JSON.parse(text) : null) as T;
+}
+
+/**
+ * A GET whose answer is not JSON — a CSV part of an export — with the headers
+ * that say what follows it. A refusal throws the same {@link ApiError} as
+ * every other request, so the page can show the server's sentence.
+ */
+async function requestText(
+  url: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ text: string; headers: Headers }> {
+  const res = await fetch(url, { method: "GET", credentials: "same-origin", signal: opts.signal });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(errorMessageFrom(text, res.status, res.statusText), res.status, jsonOrNull(text));
+  }
+  return { text, headers: res.headers };
+}
+
+function jsonOrNull(text: string): unknown {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The sentence to show for a failed response.
+ *
+ * Parsing before checking `res.ok` is what this replaces: a 502 from a proxy,
+ * a 413, or any unhandled 500 answers with an HTML page, `JSON.parse` threw on
+ * it, and the SyntaxError became the message — so every infrastructure failure
+ * in the product surfaced as `Unexpected token '<'`. The status is always
+ * worth more than that.
+ */
+function errorMessageFrom(text: string, status: number, statusText: string): string {
+  if (text) {
+    try {
+      const data = JSON.parse(text);
+      const message = data && (data.error || data.message);
+      if (typeof message === "string" && message) return message;
+    } catch {
+      // Not JSON — an HTML error page from something in front of the app.
+      // Its markup is no use to anyone; the status is.
+    }
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return `The server did not respond (${status}). It may still be starting, or the request took too long.`;
+  }
+  return statusText ? `${statusText} (${status})` : `Request failed with status ${status}`;
+}
+
+/**
+ * Consume a server-sent event stream from a POST endpoint. `onEvent` is
+ * called with each `(event, data)` pair as they arrive. Resolves when the
+ * server closes the stream. Throws on non-OK responses or on `abort`.
+ *
+ * Uses `fetch` + ReadableStream rather than EventSource so we can POST a
+ * JSON body and send credentials — EventSource is GET-only.
+ */
+export async function streamPost(
+  url: string,
+  body: unknown,
+  onEvent: (event: string, data: unknown) => void,
+  opts: { signal?: AbortSignal } = {},
+): Promise<void> {
+  return streamRequest("POST", url, body, onEvent, opts);
+}
+
+/** The same server-sent event reader over a GET, for streams a page re-attaches to. */
+export async function streamGet(
+  url: string,
+  onEvent: (event: string, data: unknown) => void,
+  opts: { signal?: AbortSignal } = {},
+): Promise<void> {
+  return streamRequest("GET", url, undefined, onEvent, opts);
+}
+
+async function streamRequest(
+  method: "GET" | "POST",
+  url: string,
+  body: unknown,
+  onEvent: (event: string, data: unknown) => void,
+  opts: { signal?: AbortSignal },
+): Promise<void> {
+  const res = await fetch(url, {
+    method,
+    credentials: "same-origin",
+    headers:
+      method === "POST"
+        ? { "content-type": "application/json", accept: "text/event-stream" }
+        : { accept: "text/event-stream" },
+    body: method === "POST" ? JSON.stringify(body) : undefined,
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let msg = res.statusText;
+    if (text) {
+      try {
+        const data = JSON.parse(text);
+        msg = data.error ?? data.message ?? msg;
+      } catch {
+        msg = text;
+      }
+    }
+    throw new Error(msg);
+  }
+  if (!res.body) throw new Error("Stream response had no body");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line. Split on that boundary and
+    // keep the trailing (possibly-incomplete) frame in the buffer.
+    const frames = buf.split("\n\n");
+    buf = frames.pop() ?? "";
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+      let event = "message";
+      let sawField = false;
+      const dataLines: string[] = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+          sawField = true;
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+          sawField = true;
+        }
+        // ignore comments and id/retry fields — we don't use them
+      }
+      // A frame with no event/data field is a server keepalive comment
+      // (`: ...`) sent to hold the connection open during long replies.
+      // It carries nothing to dispatch, so skip it.
+      if (!sawField) continue;
+      const raw = dataLines.join("\n");
+      let data: unknown = null;
+      if (raw) {
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          data = raw;
+        }
+      }
+      onEvent(event, data);
+    }
+  }
+}
+
+export const api = {
+  get: <T>(url: string) => request<T>("GET", url),
+  post: <T>(url: string, body?: unknown) => request<T>("POST", url, body),
+  put: <T>(url: string, body?: unknown) => request<T>("PUT", url, body),
+  patch: <T>(url: string, body?: unknown) => request<T>("PATCH", url, body),
+  del: <T>(url: string) => request<T>("DELETE", url),
+  getText: requestText,
+  stream: streamPost,
+  streamGet,
+  /** Multipart upload of a single file under field name `file`, with
+   *  optional extra text fields appended to the same form (e.g. a title or
+   *  customer id alongside a contract). */
+  uploadFile: async <T>(url: string, file: File, fields?: Record<string, string>): Promise<T> => {
+    const form = new FormData();
+    form.append("file", file);
+    if (fields) {
+      for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    }
+    const res = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      body: form,
+    });
+    const text = await res.text();
+    // Same order as `request`: an upload is the likeliest request in the
+    // product to be answered by a proxy's HTML 413 rather than by the app.
+    if (!res.ok) {
+      throw new Error(errorMessageFrom(text, res.status, res.statusText));
+    }
+    return (text ? JSON.parse(text) : null) as T;
+  },
+};
+
+export type Me = {
+  id: string;
+  email: string;
+  name: string;
+  handle: string | null;
+  avatarKey: string | null;
+  /** Instance-level operator flag — gates the install-wide Admin dashboard. */
+  isMasterAdmin: boolean;
+  emailVerified: boolean;
+  emailVerificationRequired: boolean;
+};
+export type TwoFactorLoginMethods = {
+  enabled: boolean;
+  totp: boolean;
+  webAuthn: boolean;
+  recovery: boolean;
+};
+export type LoginResponse =
+  | {
+      id: string;
+      email: string;
+      name: string;
+      requiresTwoFactor: false;
+      emailVerificationRequired: boolean;
+    }
+  | { requiresTwoFactor: true; methods: TwoFactorLoginMethods };
+export type TwoFactorLoginStatus =
+  | { requiresTwoFactor: false }
+  | { requiresTwoFactor: true; methods: TwoFactorLoginMethods };
+export type TwoFactorCredential = {
+  id: string;
+  name: string;
+  kind: "passkey" | "security_key";
+  deviceType: "singleDevice" | "multiDevice";
+  backedUp: boolean;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+export type TotpCredential = {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+export type TwoFactorStatus = {
+  enabled: boolean;
+  totpCredentials: TotpCredential[];
+  webAuthnCredentials: TwoFactorCredential[];
+  recoveryCodesRemaining: number;
+};
+export type Company = {
+  id: string;
+  name: string;
+  slug: string;
+  mission: string;
+  vision: string;
+  /**
+   * Whether the company has written a Goal: an active one at the top of the
+   * tree. A Goal, or a mission and a vision, is the direction an AI Employee
+   * needs before it is hired (`lib/onboardingFlow.ts`). Every response from the
+   * server carries it; it is optional here so a fixture need not.
+   */
+  hasGoal?: boolean;
+  /**
+   * The IANA time zone (`Europe/Berlin`) this company's Routine schedules are
+   * read in, so "every weekday at 9" means 9 AM there. Empty means *server
+   * time*, the machine's own clock, which is what Routines used before a zone
+   * could be chosen. Always sent by the server; optional here only so a
+   * fixture that predates it still describes a company.
+   */
+  timezone?: string;
+  role?: "owner" | "admin" | "member";
+  /**
+   * What this Member may do in Finance, already resolved server-side — owners
+   * and admins arrive as `"full"` whatever their membership row says. Carried
+   * on the company so surfaces outside Finance can decline to offer what the
+   * finance routes would refuse, rather than finding out on the click.
+   */
+  financeAccess: FinanceAccess;
+  requireTwoFactor: boolean;
+};
+export type Employee = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey?: string | null;
+  teamId?: string | null;
+  /**
+   * Whether the built-in `browser` MCP server is wired into this employee's
+   * provider config. False on a stock install — operator opts in per
+   * employee from the Settings → Browser page.
+   */
+  browserEnabled?: boolean;
+  /**
+   * Newline-separated host globs (e.g. `*.gmail.com`). Empty / null = no
+   * restriction. Enforced inside the browser MCP's `browser_open` tool.
+   */
+  browserAllowedHosts?: string | null;
+  /**
+   * When true, `browser_submit` queues an Approval and the model has to
+   * call `browser_resume(approvalId)` after a human approves.
+   */
+  browserApprovalRequired?: boolean;
+  /**
+   * Lightweight summary of the employee's *active* model, present only on the
+   * list endpoint. Null when no model is registered.
+   */
+  model?: {
+    provider: Provider;
+    model: string;
+    authMode?: AuthMode;
+    status: "connected" | "not_connected";
+  } | null;
+  /** How many models the employee has registered. Present on the list endpoint. */
+  modelCount?: number;
+  /**
+   * Whether any of the employee's models is connected, so Chat can answer.
+   * Unlike `model.status` it does not need the active model to be the one.
+   * Present on the list endpoint.
+   */
+  chatReady?: boolean;
+  /** When the employee was hired. Present on the detail endpoint. */
+  createdAt?: string;
+};
+
+export type Team = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  archivedAt: string | null;
+  memberCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TagColor =
+  | "slate"
+  | "red"
+  | "orange"
+  | "amber"
+  | "green"
+  | "teal"
+  | "cyan"
+  | "blue"
+  | "indigo"
+  | "violet"
+  | "pink";
+
+export type CompanyTag = {
+  id: string;
+  companyId: string;
+  name: string;
+  normalizedName: string;
+  color: TagColor;
+  usageCount?: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TaggableResourceType =
+  | "routine"
+  | "skill"
+  | "resource"
+  | "project"
+  | "base"
+  | "notebook"
+  | "note"
+  | "pipeline"
+  | "repository"
+  | "chart"
+  | "dashboard";
+
+export type HandoffStatus = "pending" | "completed" | "declined" | "cancelled";
+
+export type HandoffParty = {
+  id: string;
+  slug: string;
+  name: string;
+  role: string;
+};
+
+export type Handoff = {
+  id: string;
+  companyId: string;
+  fromEmployeeId: string;
+  toEmployeeId: string;
+  from: HandoffParty | null;
+  to: HandoffParty | null;
+  title: string;
+  body: string;
+  status: HandoffStatus;
+  resolutionNote: string | null;
+  dueAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+export type Skill = {
+  id: string;
+  employeeId: string;
+  name: string;
+  slug: string;
+  createdAt: string;
+  tags: CompanyTag[];
+  /** Tool names this playbook declares; loaded up-front when it applies. */
+  toolset: string[];
+};
+export type Routine = {
+  id: string;
+  employeeId: string;
+  name: string;
+  slug: string;
+  cronExpr: string;
+  enabled: boolean;
+  /**
+   * The folder this routine is filed under, or null when unfiled. Folders are
+   * company-scoped and exclusive — a routine sits in at most one. Tags stay the
+   * cross-cutting axis: a folder is where a routine lives, a tag is what it is
+   * about.
+   */
+  folderId: string | null;
+  /**
+   * The Goal this routine's work serves, or null when it serves none.
+   * Deleting the goal unlinks the routine rather than deleting it.
+   */
+  goalId: string | null;
+  lastRunAt: string | null;
+  /**
+   * When the schedule next fires. Null when the routine is paused, or when
+   * `cronExpr` parses for `node-cron` (which validates it) but not for
+   * `cron-parser` (which computes this) — so a null here on an *enabled*
+   * routine means the schedule never fires, and the UI says so.
+   */
+  nextRunAt: string | null;
+  timeoutSec: number;
+  requiresApproval: boolean;
+  webhookEnabled: boolean;
+  webhookToken: string | null;
+  /**
+   * The employee model this routine runs on. `null` inherits whichever model
+   * is active for the employee; a string pins one of the employee's own
+   * models to this routine's runs.
+   */
+  modelId?: string | null;
+  /**
+   * Per-routine override of `AIEmployee.browserEnabled`. Three states:
+   *   * `null` — inherit the employee setting.
+   *   * `true` — force-enable browser access for this routine only.
+   *   * `false` — force-disable browser access for this routine only.
+   */
+  browserEnabledOverride?: boolean | null;
+  /**
+   * Run this routine's browser work in a Member browser instead of the one
+   * inside Genosyn. Only browsers whose owner allowed unattended use are
+   * offered, since a routine fires with nobody watching.
+   */
+  memberBrowserId?: string | null;
+  /**
+   * What to do about slots missed while the server was unavailable.
+   *   * `"once"` (default) — one catch-up run however many were missed.
+   *   * `"skip"` — decline a catch-up that is already more than a minute late.
+   * Missed slots are never replayed one-for-one.
+   */
+  catchUpPolicy?: CatchUpPolicy;
+  /**
+   * Total attempts per scheduled occurrence, counting the first. `1` disables
+   * ordinary failure/timeout retries, but an initial scheduled Run on an
+   * enabled routine without an approval gate still receives one recovery
+   * attempt an hour after it is marked interrupted. Higher limits also bound
+   * interrupted retries in the same chain.
+   */
+  maxAttempts?: number;
+  /**
+   * Base for full-jitter exponential backoff. At `maxAttempts: 1` it is inert;
+   * the single interrupted-Run recovery uses a fixed one-hour delay instead.
+   */
+  retryBackoffSec?: number;
+  /**
+   * Whether a `timeout` is retryable. Off by default — a retry re-burns the
+   * routine's whole time budget.
+   */
+  retryOnTimeout?: boolean;
+  /**
+   * The Routine's definition of done. Empty means no outcome check runs;
+   * non-empty criteria are folded into every Run brief, and a completed Run
+   * is graded against them by a restricted checker (`Run.outcomeVerdict`).
+   */
+  acceptanceCriteria?: string;
+  /**
+   * Where this Routine's Runs wait while their AI Model is busy: a High
+   * Routine's waiting Runs start before Normal ones. Missing on responses from
+   * a server that predates it, which reads as Normal.
+   */
+  priority?: RoutinePriority;
+  tags: CompanyTag[];
+  createdAt?: string;
+};
+export type CatchUpPolicy = "once" | "skip";
+export type { RoutinePriority };
+
+/**
+ * A folder in the Routines filing tree, as `GET /routine-folders` returns it.
+ * The list is flat — every row carries its own `parentId` and `depth`, so the
+ * sidebar indents from `depth` and the index page can look one up by id
+ * without re-walking a nested payload.
+ */
+export type RoutineFolder = {
+  id: string;
+  companyId: string;
+  name: string;
+  /** Stable across renames — what `?folder=<slug>` in the URL refers to. */
+  slug: string;
+  parentId: string | null;
+  sortOrder: number;
+  /** Slash-joined ancestor names, this folder last. */
+  path: string;
+  /** 1 for a top-level folder. */
+  depth: number;
+  /** Routines filed directly here. */
+  routineCount: number;
+  /** Routines here and in everything nested beneath. */
+  totalRoutineCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RoutineFolderTree = {
+  folders: RoutineFolder[];
+  unfiledCount: number;
+  maxDepth: number;
+};
+
+// ─────────────────────────────── Goals ──────────────────────────────────
+
+export type GoalMetricKind = "manual" | "chart";
+export type GoalDirection = "increase_to" | "decrease_to";
+export type GoalStatus = "active" | "achieved" | "missed" | "archived";
+/** Who supplied the current value: a person, an AI Employee, or the chart. */
+export type GoalValueSource = "member" | "employee" | "chart";
+
+/**
+ * A measurable objective AI employees steer toward, as
+ * `GET /api/companies/:cid/goals` returns it. Goals nest (`parentGoalId`) and
+ * Routines link to one via `Routine.goalId`. Manual goals take reported
+ * progress (`POST /goals/:gid/progress`); chart goals read their current
+ * value from an Explore chart (`POST /goals/:gid/refresh` runs it now). A
+ * number an AI Employee reported never settles a goal: one that meets the
+ * target waits for `POST /goals/:gid/confirm`.
+ */
+export type Goal = {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  parentGoalId: string | null;
+  ownerEmployeeId: string | null;
+  metricKind: GoalMetricKind;
+  chartId: string | null;
+  startValue: number | null;
+  targetValue: number;
+  currentValue: number | null;
+  currentValueUpdatedAt: string | null;
+  currentValueSource: GoalValueSource | null;
+  direction: GoalDirection;
+  unit: string;
+  dueAt: string | null;
+  status: GoalStatus;
+  settledAt: string | null;
+  createdAt: string;
+  /** 0..1 toward the target, or null when it cannot be computed yet. */
+  progress: number | null;
+  met: boolean;
+  /** An AI Employee reported a number that meets the target; it settles once
+   * a person confirms it. */
+  awaitingConfirmation: boolean;
+};
+
+// ─────────────────────────── Improvement loop ───────────────────────────
+
+/**
+ * A graded Run's structured takeaway (M52), as
+ * `GET /api/companies/:cid/run-lessons/routine/:rid` returns it. A lesson is
+ * folded into the routine's future prompts until an admin dismisses it.
+ */
+export type RunLesson = {
+  id: string;
+  routineId: string;
+  runId: string;
+  cause: string;
+  advice: string;
+  dismissedAt: string | null;
+  createdAt: string;
+};
+
+export type RevisionProposalKind = "soul" | "skill" | "routine_body" | "routine_criteria";
+export type RevisionProposalStatus = "pending" | "applied" | "rejected";
+
+/**
+ * A staged Soul/Skill/Routine edit an AI employee proposed for itself,
+ * awaiting a human (M52). Served by `/api/companies/:cid/revision-proposals`.
+ * Apply re-reads the live target first: when it drifted from `baseBody` since
+ * the proposal was made, the server refuses with a 400 and stamps
+ * `errorMessage` on the row.
+ */
+export type RevisionProposal = {
+  id: string;
+  employeeId: string;
+  kind: RevisionProposalKind;
+  targetId: string | null;
+  targetLabel: string;
+  baseBody: string;
+  proposedBody: string;
+  rationale: string;
+  evidenceRunIds: string[];
+  status: RevisionProposalStatus;
+  errorMessage: string;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  reviewNote: string;
+  createdAt: string;
+};
+
+/**
+ * The slice of an AI employee a company-wide list shows as "assigned to" —
+ * enough for an avatar, a name, and a link. Mirrors `employeeSummary()` on
+ * the Routines and Skills routers.
+ */
+export type EmployeeSummary = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+};
+
+/**
+ * A routine as the company-wide Routines section sees it: the row plus the
+ * employee it belongs to and how its most recent run went. Served by
+ * `/api/companies/:cid/routines` (list, no `body`) and
+ * `/api/companies/:cid/routines/:rid` (one, `body` included).
+ */
+export type RoutineWithMeta = Routine & {
+  employee: EmployeeSummary | null;
+  lastRun: Run | null;
+  /** The active Standdown covering the company, AI Employee, or Routine. */
+  standdown: Standdown | null;
+  /** Only present on the single-routine endpoint. */
+  body?: string;
+};
+
+/**
+ * Routines → AI access: whether an AI Employee may change Routines at all.
+ * `write` (read + write) is the default; `run` (read + run) still reads every
+ * Routine and Run and keeps its own Routines running, but refuses every
+ * Routine write. See `EmployeeRoutineGrant` on the server.
+ */
+export type RoutineAccessLevel = "run" | "write";
+
+export type RoutineAccessRow = {
+  employee: EmployeeSummary;
+  accessLevel: RoutineAccessLevel;
+  /** True when nobody has set this employee's access, so the default applies. */
+  isDefault: boolean;
+};
+
+export type RoutineAccessResponse = { rows: RoutineAccessRow[] };
+
+/**
+ * A skill as the company-wide Skills section sees it: the row plus the
+ * employee whose playbook it is. Served by `/api/companies/:cid/skills`.
+ * `body` is not on the list — each playbook is fetched via
+ * `/skills/:sid/readme` when you open it.
+ */
+export type SkillWithMeta = Skill & {
+  employee: EmployeeSummary | null;
+};
+
+export type ApprovalStatus =
+  | "pending"
+  | "executing"
+  | "approved"
+  | "execution_failed"
+  | "rejected"
+  | "expired";
+export type ApprovalKind =
+  | "proactive_work"
+  | "routine"
+  | "lightning_payment"
+  | "browser_action"
+  | "mcp_tool"
+  | "ad_spend"
+  /**
+   * The eligibility sweep proposing earned autonomy: approving switches the
+   * named gate off (an `AutonomyWaiver` is granted). Title and summary — the
+   * evidence sentence — are server-set.
+   */
+  | "autonomy_promotion"
+  | "mail_send"
+  /**
+   * A high-risk call held because the turn had already read web content
+   * (M53b). Approving replays the recorded call verbatim.
+   */
+  | "tainted_tool";
+export type WorkApprovalReview = {
+  kind: "work";
+  revision: string;
+  context: string;
+  plan: string;
+  source: {
+    routineId: string | null;
+    runId: string | null;
+    conversationId: string | null;
+    mailThreadId: string | null;
+    mailAccountId: string | null;
+    mailHandoverId: string | null;
+  };
+};
+export type MailApprovalReview = {
+  kind: "mail";
+  revision: string;
+  context: string;
+  workSummary: string;
+  steps: Array<{ title: string; detail: string | null }>;
+  attachments: Array<{
+    index: number;
+    filename: string;
+    contentType: string;
+    sizeBytes: number;
+  }>;
+  source: {
+    accountId: string;
+    threadId: string | null;
+    mailHandoverId: string | null;
+    routineId: string | null;
+    runId: string | null;
+    conversationId: string | null;
+  };
+  draft: { to: string; cc: string; bcc: string; subject: string; bodyText: string };
+};
+export type ApprovalReview = WorkApprovalReview | MailApprovalReview;
+export type Approval = {
+  id: string;
+  companyId: string;
+  kind: ApprovalKind;
+  routineId: string;
+  employeeId: string;
+  title: string | null;
+  summary: string | null;
+  errorMessage: string | null;
+  status: ApprovalStatus;
+  /** Redacted report from the approved proactive work, when available. */
+  outcomeSummary?: string | null;
+  /** Actual approved Routine Run, separate from the initial proactive review. */
+  outcomeRunId?: string | null;
+  /** Structured, redacted content for the chronological Decision-stack card. */
+  review?: ApprovalReview | null;
+  /** Exact provider send recorded after a reviewed email is approved. */
+  mailOutcome?: {
+    sentMessageId: string | null;
+    providerMessageRef: string;
+    sentAt: string;
+  } | null;
+  /** Whether a reviewed send succeeded, stopped before delivery, or may have reached the mailbox. */
+  mailDeliveryStatus?: "sent" | "not_sent" | "unverified" | null;
+  requestedAt: string;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  routine: { id: string; name: string; slug: string } | null;
+  employee: { id: string; name: string; slug: string } | null;
+};
+export type DecisionStatus = "pending" | "decided" | "cancelled" | "expired";
+export type DecisionUrgency = "low" | "normal" | "high";
+export type DecisionOption = {
+  id: string;
+  label: string;
+  detail: string | null;
+  tone: "primary" | "neutral" | "danger";
+};
+/**
+ * One question an AI Employee stopped to ask a human. Unlike an `Approval`,
+ * nothing is queued behind it — answering records the choice so the employee
+ * can read it back and carry on.
+ */
+/**
+ * Where the employee was working when it stacked the question. `kind` picks the
+ * label; the sibling fields are what the stack links to, and any of them can be
+ * null when the thing has since been deleted.
+ */
+export type DecisionSourceKind = "routine" | "mail" | "chat" | "unknown";
+export type DecisionSource = {
+  kind: DecisionSourceKind;
+  routine: { id: string; name: string; slug: string; employeeSlug: string | null } | null;
+  run: { id: string; status: string; startedAt: string; triggerKind: string } | null;
+  conversation: { id: string; title: string | null } | null;
+  mailThread: { id: string; subject: string | null; accountId: string } | null;
+};
+
+/** How far the employee has got with the answer. See `Decision.pickupStatus`. */
+export type DecisionPickupStatus = "none" | "running" | "waiting" | "done" | "failed" | "skipped";
+
+export type Decision = {
+  id: string;
+  companyId: string;
+  title: string;
+  body: string;
+  /**
+   * The asking employee's one or two plain sentences for a busy owner. Null
+   * on older rows, where the stack derives a line (`shared/decisionSummary.ts`).
+   */
+  summary: string | null;
+  /** Its recommended answer and why, in one sentence. Null on older rows. */
+  recommendation: string | null;
+  options: DecisionOption[];
+  status: DecisionStatus;
+  urgency: DecisionUrgency;
+  routineId: string | null;
+  runId: string | null;
+  conversationId: string | null;
+  mailThreadId: string | null;
+  source: DecisionSource;
+  chosenOptionId: string | null;
+  chosenOptionLabel: string | null;
+  note: string | null;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  decidedBy: { id: string; name: string } | null;
+  /** Set when an AI employee answered under a decision-policy rule (M53a). */
+  decidedByEmployee: { id: string; name: string; slug: string } | null;
+  /** On a pending question: the AI decider currently holding it. */
+  routedToEmployee: { id: string; name: string; slug: string } | null;
+  pickupStatus: DecisionPickupStatus;
+  /** Everything the pickup session said, step by step — or why none ran. */
+  pickupSummary: string | null;
+  /** The pickup's final report alone. Null on older rows and unfinished pickups. */
+  pickupReport: string | null;
+  pickupStartedAt: string | null;
+  pickupFinishedAt: string | null;
+  /** While future, the pending Decision is hidden from human attention surfaces. */
+  snoozedUntil: string | null;
+  expiresAt: string | null;
+  createdAt: string;
+  employee: { id: string; name: string; slug: string; avatarKey: string | null } | null;
+  assignee: { id: string; name: string } | null;
+};
+
+/**
+ * One row of the decision-rights matrix (M53a): which AI decider a question
+ * from `askingEmployeeId` (null = any employee) is routed to before the human
+ * bell rings. Every rule is created as `employee` and names its
+ * `deciderEmployeeId`. `manager` only appears on a rule saved before reporting
+ * lines were removed: it names nobody, still matches, and leaves its askers'
+ * questions with people. Served by `/api/companies/:cid/decision-policies`;
+ * reads are member-level, mutations admin-gated. Live-sync rides the
+ * "decision" kind.
+ */
+/**
+ * Decision stack → Settings. Served by
+ * `/api/companies/:cid/decision-stack/settings`: reads are member-level,
+ * changes owner/admin. `instructions` is what the box shows — the company's
+ * own text, or the default while `usingDefaultInstructions`. Live-sync rides
+ * the "decision" kind.
+ */
+export type DecisionStackSettings = {
+  /** Whether AI Employees may raise new Decisions. On by default. */
+  enabled: boolean;
+  instructions: string;
+  usingDefaultInstructions: boolean;
+  /** Decisions still waiting — they stay answerable while the stack is off. */
+  pendingDecisions: number;
+  /** Whether this viewer may change these settings. */
+  canManage: boolean;
+};
+
+/** How long a snoozed Decision stays off the stack. */
+export type DecisionSnoozeDuration = "one_hour" | "one_day" | "two_days" | "one_week" | "one_month";
+
+/** What the stack's bulk bar can do to a selection — never answer, send or approve. */
+export type DecisionBulkRequest =
+  | { action: "dismiss"; ids: string[] }
+  | { action: "snooze"; ids: string[]; duration: DecisionSnoozeDuration };
+
+/** Which rows of a bulk request changed, and why the others were left as they were. */
+export type StackBulkResult = {
+  succeeded: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
+export const decisionStackApi = {
+  settings: (companyId: string) =>
+    api.get<DecisionStackSettings>(`/api/companies/${companyId}/decision-stack/settings`),
+  /** `instructions: null` puts the company back on the default text. */
+  update: (companyId: string, patch: { enabled?: boolean; instructions?: string | null }) =>
+    api.patch<DecisionStackSettings>(`/api/companies/${companyId}/decision-stack/settings`, patch),
+  /** Dismiss or snooze up to 200 Decisions; each keeps its own row's rules. */
+  bulkDecisions: (companyId: string, body: DecisionBulkRequest) =>
+    api.post<StackBulkResult>(`/api/companies/${companyId}/decisions/bulk`, body),
+  /**
+   * Discard up to 200 email reviews and decline work reviews (owner/admin).
+   * Each sends the revision that was read; one that changed is skipped.
+   */
+  rejectReviews: (companyId: string, items: Array<{ id: string; reviewRevision?: string }>) =>
+    api.post<StackBulkResult>(`/api/companies/${companyId}/approvals/bulk`, {
+      action: "reject",
+      items,
+    }),
+};
+
+export type DecisionPolicyDeciderKind = "employee" | "manager";
+export type DecisionPolicyRule = {
+  id: string;
+  askingEmployeeId: string | null;
+  deciderKind: DecisionPolicyDeciderKind;
+  deciderEmployeeId: string | null;
+  sortOrder: number;
+  enabled: boolean;
+  createdAt: string;
+};
+
+/**
+ * Earned autonomy (M53a). A waiver is a gate an admin switched off after an
+ * approved `autonomy_promotion` — revoking re-arms it. Served by
+ * `/api/companies/:cid/employees/:eid/autonomy`; revoke via
+ * `DELETE /autonomy-waivers/:wid` (admin, 409 when already revoked).
+ * Live-sync rides the "employee" kind, scoped by employeeId.
+ */
+export type AutonomyWaiverKind = "browser_approval" | "routine_approval";
+export type AutonomyWaiver = {
+  id: string;
+  kind: AutonomyWaiverKind;
+  /** Set on `routine_approval` waivers scoped to one Routine. */
+  routineId: string | null;
+  grantedAt: string;
+  grantedByUserId: string | null;
+  /** The server-computed evidence sentence the promotion cited. */
+  evidence: string;
+  revokedAt: string | null;
+  /** Empty string while the waiver is active. */
+  revokedReason: string;
+};
+export type AutonomyStats = {
+  windowDays: number;
+  terminalRuns: number;
+  failed: number;
+  offGoal: number;
+  browserApprovalsApproved: number;
+  browserApprovalsRejected: number;
+};
+export type AutonomyOverview = {
+  stats: AutonomyStats;
+  waivers: AutonomyWaiver[];
+};
+
+/**
+ * A monthly (UTC calendar) envelope over authorized ad-spend increases
+ * (M53b). Null `connectionId` + `employeeId` = the whole company; the
+ * tightest applicable budget binds. Exhaustion refuses the AI's mutation and
+ * pages owners once per month. Served by `/api/companies/:cid/budgets` —
+ * reads member-level, mutations admin-gated. Live-sync rides the "budget"
+ * kind.
+ */
+export type Budget = {
+  id: string;
+  name: string;
+  /** The monthly cap, in minor units (cents). */
+  amountMinor: number;
+  /** Three-letter code, e.g. "USD". */
+  currency: string;
+  /** Scopes the envelope to one Connection; null = any. */
+  connectionId: string | null;
+  /** Scopes the envelope to one AI Employee; null = any. */
+  employeeId: string | null;
+  enabled: boolean;
+  /** Authorized increases so far this UTC calendar month, in minor units. */
+  spentThisMonthMinor: number;
+  createdAt: string;
+};
+
+/**
+ * A company policy (M53b). `body` prose is injected into every employee's
+ * system prompt above the Soul; `blockedRecipientDomains` is enforced at the
+ * mail-send choke for every sender; `forbiddenTools` is refused at AI tool
+ * dispatch with an audit row (`find_tools` / `call_tool` cannot be
+ * forbidden). Served by `/api/companies/:cid/company-policies` — reads
+ * member-level, mutations admin-gated. Live-sync rides the "policy" kind.
+ */
+export type CompanyPolicy = {
+  id: string;
+  title: string;
+  body: string;
+  /** Newline-separated domains. */
+  blockedRecipientDomains: string;
+  /** Newline-separated tool names. */
+  forbiddenTools: string;
+  sortOrder: number;
+  enabled: boolean;
+  createdAt: string;
+};
+
+/**
+ * An event subscription that fires a Routine (M54): when the named resource
+ * family changes anywhere in the company, the routine fires — an Approval for
+ * gated routines, a Run (trigger "event") otherwise — at most once per
+ * `minIntervalSec`. Served by
+ * `GET /api/companies/:cid/routine-triggers/routine/:rid` as
+ * `RoutineTriggerList`; reads member-level, mutations admin-gated. Live-sync
+ * rides the "routine" kind, scoped by routineId.
+ */
+export type RoutineTrigger = {
+  id: string;
+  routineId: string;
+  kind: string;
+  /** Narrows the subscription to one parent resource; null = the whole family. */
+  scopeId: string | null;
+  minIntervalSec: number;
+  enabled: boolean;
+  lastFiredAt: string | null;
+  createdAt: string;
+};
+/** `kinds` is the server's subscribable event vocabulary — feed the picker from it. */
+export type RoutineTriggerList = {
+  kinds: string[];
+  triggers: RoutineTrigger[];
+};
+
+/**
+ * A timed follow-up session an employee scheduled for itself (M54). Served by
+ * `GET /api/companies/:cid/wakeups/employee/:eid`; cancel via
+ * `POST /wakeups/:wid/cancel` (admin, 409 when no longer pending). Live-sync
+ * rides the "employee" kind, scoped by employeeId.
+ */
+export type EmployeeWakeupStatus = "pending" | "fired" | "cancelled";
+export type EmployeeWakeup = {
+  id: string;
+  employeeId: string;
+  /** When the follow-up session fires. */
+  at: string;
+  /** What the employee told itself to pick back up. */
+  brief: string;
+  status: EmployeeWakeupStatus;
+  firedAt: string | null;
+  /** What the fired session reported back. Empty until then. */
+  outcomeNote: string;
+  createdAt: string;
+};
+
+/**
+ * A persistent state document for work spanning many Runs (M54). Served by
+ * `GET /api/companies/:cid/workstreams?employeeId=`; close via
+ * `POST /workstreams/:wid/close` (admin). Live-sync rides the "workstream"
+ * kind.
+ */
+export type WorkstreamStatus = "active" | "archived" | "done" | "abandoned";
+export type Workstream = {
+  id: string;
+  employeeId: string;
+  title: string;
+  objective: string;
+  /** The living state document the employee rewrites as the work advances. */
+  stateDoc: string;
+  routineId: string | null;
+  status: WorkstreamStatus;
+  /** Empty while active. */
+  closeReason: string;
+  lastRunId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * Standing work an employee proposed and a human accepts (M54). Served by
+ * `GET /api/companies/:cid/initiatives?status=`; accept/decline are
+ * admin-gated — accepting CREATES the spec'd Routine, owned by the proposer.
+ * Live-sync rides the "initiative" kind.
+ */
+export type InitiativeStatus = "pending" | "accepted" | "declined";
+/** The Routine that accepting creates, exactly as proposed. */
+export type InitiativeRoutineSpec = {
+  name: string;
+  cronExpr: string;
+  body: string;
+  acceptanceCriteria?: string;
+};
+export type Initiative = {
+  id: string;
+  employeeId: string;
+  title: string;
+  evidence: string;
+  proposal: string;
+  /** Null when the stored spec is malformed — accept would refuse it too. */
+  routineSpec: InitiativeRoutineSpec | null;
+  status: InitiativeStatus;
+  decidedByUserId: string | null;
+  decidedAt: string | null;
+  reviewNote: string;
+  /** Set on accepted rows: the Routine the acceptance created. */
+  createdRoutineId: string | null;
+  createdAt: string;
+};
+
+export type RunStatus =
+  | "queued"
+  | "running"
+  /** Proactive review finished; proposed work requires a separate Approval. */
+  | "reviewed"
+  | "completed"
+  /**
+   * The Run saved its progress and an automatic continuation took over its
+   * unfinished work. Not a failure: the last Run in the chain has the outcome.
+   */
+  | "continued"
+  /** A model request or runtime problem prevented the Run from finishing. */
+  | "error"
+  /** The Run did not complete its intended work. */
+  | "failed"
+  | "skipped"
+  /** Legacy timeout history, displayed as Error. */
+  | "timeout"
+  /**
+   * Legacy interrupted history, displayed as Error. New interruptions use
+   * status error with errorKind interrupted and retain automatic recovery.
+   */
+  | "interrupted";
+export type RunErrorKind = "runtime" | "timeout" | "interrupted";
+/** A continuation resumes saved progress independently of whole-Routine retries. */
+export type RunTrigger =
+  | "schedule"
+  | "manual"
+  | "webhook"
+  | "approval"
+  | "retry"
+  | "event"
+  | "continuation";
+export type Run = {
+  id: string;
+  routineId: string;
+  /** When this Run was accepted for dispatch. */
+  queuedAt?: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  status: RunStatus;
+  errorKind?: RunErrorKind | null;
+  /** Why the intended work could not be completed, including employee reports. */
+  failureReason?: string | null;
+  exitCode: number | null;
+  createdAt: string;
+  triggerKind?: RunTrigger;
+  /** 1-based attempt within a retry chain. */
+  attempt?: number;
+  /**
+   * Durable due time for a retry or saved-work continuation. At the default attempt limit, an
+   * eligible interrupted initial scheduled Run receives exactly one due an
+   * hour later. Null when no attempt is owed or the chain has spent its attempt
+   * budget.
+   */
+  retryAt?: string | null;
+  /** Unfinished work has a saved checkpoint and a continuation is queued. */
+  continuationPending?: boolean;
+  /** A saved checkpoint records unfinished work that an admin can explicitly resume. */
+  hasUnfinishedWork?: boolean;
+  /** Continuation Runs already started for this occurrence. */
+  continuationCount?: number;
+  /** Why automatic continuation stopped, when intervention may be needed. */
+  continuationStopReason?: string | null;
+  /** Same-Routine follow-up metadata; undefined until relationships have been loaded. */
+  followUpRun?: RunFollowUp | null;
+  /** More scheduled occurrences this run stands in for: missed during downtime or due while it waited. */
+  missedSlots?: number;
+  /** How the run measured against its Routine's acceptance criteria. */
+  outcomeVerdict?: RunOutcomeVerdict | null;
+  /** The checker's one-or-two-sentence reason for the verdict. */
+  outcomeNote?: string | null;
+  /** How the run measured against its Routine's Checks. */
+  checksVerdict?: RunChecksVerdict | null;
+  /** Remediation rounds the runner spent trying to turn a failed Check green. */
+  checkRemediations?: number;
+  /** Prompt tokens billed across every model turn of this run. */
+  tokensIn?: number;
+  /** Completion tokens billed across every model turn of this run. */
+  tokensOut?: number;
+  /** When Genosyn last paused this Run; null when it never was. */
+  pausedAt?: string | null;
+  /** How many times this Run was paused. A queued Run with any is paused. */
+  pauseCount?: number;
+  /** Why it was last paused: a restart, or its AI Model being unavailable. */
+  pauseReason?: RunPauseReason | null;
+};
+/** Why a Run was paused: Genosyn restarting, or its AI Model unavailable (`outage`). */
+export type RunPauseReason = "upgrade" | "restart" | "outage";
+export type RunFollowUp = Pick<
+  Run,
+  | "id"
+  | "routineId"
+  | "status"
+  | "errorKind"
+  | "createdAt"
+  | "startedAt"
+  | "finishedAt"
+  | "exitCode"
+  | "triggerKind"
+  | "continuationCount"
+> & {
+  retryPending: boolean;
+  awaitingOutcome: boolean;
+  isLatest: boolean;
+};
+/**
+ * `achieved` — the transcript shows the criteria were met. `off_goal` — the
+ * run finished but missed them. `unclear` — the grader read the evidence and
+ * could not tell either way. `unverified` — no grader ever reached a
+ * judgement: it errored, the model was gone, the process died inside the
+ * verdict window. Null/absent when the Routine declares no criteria.
+ *
+ * `unclear` and `unverified` used to be the same value, which is the bug M58
+ * exists to remove: "we looked and could not tell" and "nobody looked" are
+ * different facts, and collapsing them let an ungraded Run bank the same
+ * credit as a graded one.
+ */
+export type RunOutcomeVerdict = "achieved" | "unclear" | "off_goal" | "unverified";
+/** `expired`: deleted on schedule once older than the window at Admin → Runtime → Browser. */
+export type RunBrowserRecordingStatus = "recording" | "finalizing" | "ready" | "failed" | "expired";
+export type RunBrowserRecording = {
+  /** BrowserSession id; one Run may have several when it delegates browser work. */
+  id: string;
+  status: RunBrowserRecordingStatus;
+  startedAt: string | null;
+  finishedAt: string | null;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  filename: string | null;
+};
+export type RunDiagnosticFailure = {
+  category:
+    | "authorization"
+    | "timeout"
+    | "tool"
+    | "application"
+    | "model"
+    | "interrupted"
+    | "work"
+    | "check"
+    | "unknown";
+  phase: "setup" | "preflight" | "work" | "checks" | "finalize";
+  message: string;
+  exception: string | null;
+  at: string;
+  step: { tool: string; callId: string | null; startedAt: string } | null;
+};
+export type RunLog = {
+  queuedAt?: string | null;
+  content: string;
+  truncated?: boolean;
+  size?: number;
+  live?: boolean;
+  status?: RunStatus;
+  errorKind?: RunErrorKind | null;
+  failureReason?: string | null;
+  diagnostics?: {
+    version: 1;
+    failure: RunDiagnosticFailure | null;
+    toolErrors: RunDiagnosticFailure[];
+  };
+  exitCode?: number | null;
+  startedAt?: string;
+  finishedAt?: string | null;
+  retryAt?: string | null;
+  continuationPending?: boolean;
+  hasUnfinishedWork?: boolean;
+  continuationCount?: number;
+  continuationStopReason?: string | null;
+  followUpRun?: RunFollowUp | null;
+  attempt?: number;
+  outcomeVerdict?: RunOutcomeVerdict | null;
+  outcomeNote?: string | null;
+  checksVerdict?: RunChecksVerdict | null;
+  checkRemediations?: number;
+  tokensIn?: number;
+  tokensOut?: number;
+  /** When Genosyn last paused this Run; null when it never was. */
+  pausedAt?: string | null;
+  /** How many times this Run was paused. */
+  pauseCount?: number;
+  /** Why it was last paused: a restart, or its AI Model being unavailable. */
+  pauseReason?: RunPauseReason | null;
+  /** A verdict is still owed: the run completed and its check hasn't landed. */
+  awaitingOutcome?: boolean;
+  /**
+   * Silent visual recordings captured by browser sessions that actually ran.
+   * There can be several when a Run delegates parallel browser work.
+   */
+  browserRecordings: RunBrowserRecording[];
+};
+export type Provider = "anthropic" | "openai" | "custom";
+export type AuthMode = "apikey" | "subscription" | "customEndpoint";
+export type SubscriptionCredentialKind = "chatgptSession" | "accessToken";
+export type SubscriptionDeviceSession = {
+  id: string;
+  status: "running" | "succeeded" | "failed" | "cancelled";
+  output: string | null;
+  loginUrl: string | null;
+  userCode: string | null;
+  error: string | null;
+};
+/** Why a provider refused one of an AI Model's API keys. */
+export type ApiKeyFailureKind = "auth" | "permission" | "billing" | "quota" | "rate_limit";
+/**
+ * One of an API-key AI Model's keys — an equal member of the pool its sessions
+ * are spread across — as a masked preview with its health. The key itself
+ * never leaves the server.
+ */
+export type AIModelApiKey = {
+  id: string;
+  /** e.g. `sk-…c123`. */
+  preview: string;
+  addedAt: string | null;
+  /** When a request on it last succeeded. */
+  lastUsedAt: string | null;
+  /** When a provider last refused it — the status, why, and in its words. */
+  lastErrorAt: string | null;
+  lastErrorStatus: number | null;
+  lastErrorKind: ApiKeyFailureKind | null;
+  lastError: string | null;
+  /** While in the future, sessions skip it and requests try the other keys first. */
+  restingUntil: string | null;
+  /** Sessions it carried in the last 24 hours — opened on it in turn, or moved to it. */
+  sessionsLast24h: number;
+};
+/** One AI Employee using an AI Model, and whether it is that employee's active model. */
+export type ModelUser = {
+  id: string;
+  name: string;
+  slug: string;
+  avatarKey: string | null;
+  isActive: boolean;
+};
+/**
+ * One of the company's AI Models. A model belongs to the company — one set of
+ * keys, settings and health — and is attached to any number of AI Employees
+ * (`employees`). Its keys and endpoint never reach the browser, only previews.
+ */
+export type AIModel = {
+  id: string;
+  companyId: string;
+  provider: Provider;
+  model: string;
+  authMode: AuthMode;
+  /**
+   * In an AI Employee's list: whether it is the brain that employee's Routines
+   * and chat use. Always false in the company's list — see `employees`.
+   */
+  isActive: boolean;
+  /** When the model was added to the company. */
+  createdAt: string;
+  connectedAt: string | null;
+  status: "not_connected" | "connected";
+  apiKeyMasked: string | null;
+  /**
+   * An API-key model's keys, the pool its sessions are spread across, in the
+   * order they are stored. Empty for subscription and custom-endpoint models.
+   */
+  apiKeys: AIModelApiKey[];
+  /** Env var the provider conventionally reads (informational), or null. */
+  apiKeyEnv: string | null;
+  supportsApiKey: boolean;
+  /** Whether this provider can authenticate with a consumer subscription. */
+  supportsSubscription: boolean;
+  /** Whether subscription sign-in is available on this Genosyn install. */
+  subscriptionAvailable: boolean;
+  /** Human-readable reason device sign-in is unavailable, when applicable. */
+  subscriptionUnavailableReason: string | null;
+  /** The stored subscription credential shape, without exposing the secret. */
+  subscriptionCredentialKind: SubscriptionCredentialKind | null;
+  /** Whether subscription turns can use commands in the configured execution mode. */
+  subscriptionShellAvailable: boolean;
+  supportsCustomEndpoint: boolean;
+  customEndpointHost: string | null;
+  customEndpointModelId: string | null;
+  customEndpointHasApiKey: boolean;
+  /**
+   * Tokens this model accepts, or null when nobody knows. Null isn't cosmetic:
+   * without it a run can't budget its context and only finds out it overflowed
+   * when the provider rejects a turn.
+   */
+  contextWindow: number | null;
+  /** Whether `contextWindow` was probed from the provider or typed in by hand. */
+  contextWindowSource: "probed" | "manual" | null;
+  /** False when the provider can't be asked at all (OpenAI reports no window). */
+  contextWindowProbeable: boolean;
+  /**
+   * Thinking levels this model offers, lowest first (`none` is Off). Empty
+   * when it always runs at its own default: a model without known support, or
+   * a custom endpoint whose owners have not turned levels on.
+   */
+  effortLevels: ModelEffort[];
+  /**
+   * What a thinking-level picker needs: the levels, what the model does by
+   * itself, its owners' default for chat and the highest level Members may
+   * choose. See `shared/thinkingLevels.ts`.
+   */
+  thinking: ModelThinking;
+  /** A custom endpoint whose owners turned thinking levels on. */
+  customThinkingLevels: boolean;
+  /** Stored concurrent-Run setting: null is the default, 0 is no limit. */
+  maxConcurrentRuns: number | null;
+  /** How many Routine Runs may use this model at once; null means no limit. */
+  effectiveMaxConcurrentRuns: number | null;
+  /** Why that limit applies. */
+  concurrencySource: "configured" | "local-default" | "subscription-default" | "unlimited";
+  /** Every AI Employee the model is attached to, by name. */
+  employees: ModelUser[];
+  /**
+   * Other company AI Models that are exactly this one — same service, model,
+   * endpoint and keys — and could be merged into it. Only the company's list
+   * fills it in.
+   */
+  duplicateIds: string[];
+  /**
+   * Whether it is available right now, or unavailable — its service down,
+   * failing, overloaded or rate-limited — and what waits for it. Older
+   * servers leave it out.
+   */
+  availability?: PublicModelAvailability;
+};
+export type FinanceAccess = "none" | "read" | "full";
+
+export type Member = {
+  userId: string;
+  role: "owner" | "admin" | "member";
+  /** Per-member finance access, orthogonal to `role` (owners/admins are always
+   *  effectively full). See server/db/entities/Membership.ts. */
+  financeAccess: FinanceAccess;
+  email: string | null;
+  name: string | null;
+  avatarKey?: string | null;
+};
+
+export type ChatResult =
+  | { status: "ok"; reply: string }
+  | { status: "skipped"; reply: string }
+  | { status: "error"; reply: string };
+
+export type ConversationSummary = {
+  id: string;
+  employeeId: string;
+  source?: "web" | "help" | "telegram";
+  title: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  lastMessageAt: string | null;
+  /**
+   * AI Model this thread last ran a turn on, while that model is still attached
+   * to the employee and connected. The chat composer reopens the thread on it
+   * so a past conversation keeps the brain it was held with; null means fall
+   * back to the employee's active model.
+   */
+  lastModelId: string | null;
+  /**
+   * The level the newest turn was sent at, or null. Kept for older clients;
+   * the thread's own level is `effort`.
+   */
+  lastEffort: ModelEffort | null;
+  /**
+   * The thread's thinking level — how hard the AI Model thinks before each
+   * reply — or null for Default. It sticks to the thread across AI Models;
+   * each message resolves it against the model it goes to.
+   */
+  effort?: ModelEffort | null;
+  /**
+   * The Member browser this thread's browser work runs in, or null for the
+   * one inside Genosyn. Chosen by the thread's owner from the chat header.
+   */
+  memberBrowserId?: string | null;
+  /** Upgrade-only direct thread that an owner/admin may explicitly claim. */
+  legacyUnclaimed?: boolean;
+  /**
+   * The Decision this thread discusses, when the Member opened it on that
+   * Decision. Every turn in it is a read-only discussion of the Decision.
+   */
+  discussedDecisionId?: string | null;
+};
+export type ConversationMessageRole = "user" | "assistant";
+/** `interrupted` — a Member stopped this turn; the partial reply is kept. */
+export type ConversationMessageStatus =
+  | "working"
+  | "ok"
+  | "skipped"
+  | "error"
+  | "busy"
+  | "interrupted";
+/** Tool-driven write the AI employee performed during this chat turn. */
+export type MessageAction = {
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  targetLabel: string;
+  metadata?: MessageActionMetadata;
+};
+
+export type MessageActionMetadata = {
+  via?: string;
+  provider?: string;
+  connectionId?: string;
+  connectionLabel?: string;
+  toolName?: string;
+  status?: "ok" | "error";
+  durationMs?: number;
+  argsPreview?: string;
+  resultPreview?: string;
+  error?: string;
+};
+export type ChatAttachment = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  isImage: boolean;
+};
+export type ChatProgress = {
+  percent: number;
+  label: string;
+};
+/**
+ * How full the model's context window was on the last model turn behind a
+ * reply, measured from the provider's own token counts.
+ *
+ * `window` and `percent` are null together whenever the AI Model has no known
+ * context window — the normal state for an OpenAI subscription model, and for
+ * any custom endpoint that publishes nothing. Surfaces show the token count
+ * alone in that case rather than implying a ceiling.
+ */
+export type ChatContextUsage = {
+  tokens: number;
+  window: number | null;
+  percent: number | null;
+};
+export type ConversationMessage = {
+  id: string;
+  conversationId: string;
+  role: ConversationMessageRole;
+  content: string;
+  status: ConversationMessageStatus | null;
+  progress?: ChatProgress | null;
+  context?: ChatContextUsage | null;
+  /** How the turn behind this reply went: "Worked for 2m 14s · 9 steps". */
+  activity?: TurnActivitySummary | null;
+  /** The thinking level this reply ran at, and why it moved if it did. */
+  thinking?: TurnThinking | null;
+  actions?: MessageAction[];
+  attachments?: ChatAttachment[];
+  createdAt: string;
+  updatedAt?: string;
+  /**
+   * Browser-only: a message that never reached the server, kept so its error
+   * bubble can offer to send it again.
+   */
+  retry?: {
+    content: string;
+    attachments: ChatAttachment[];
+    modelId: string | null;
+    effort: ModelEffort | null;
+  };
+};
+export type ConversationDetail = {
+  conversation: ConversationSummary;
+  messages: ConversationMessage[];
+};
+/**
+ * A Member's own discussion of one Decision with the AI Employee who asked
+ * it, served by `/api/companies/:cid/decisions/:id/discussion`. The
+ * conversation is null until the Member sends the first message.
+ */
+export type DecisionDiscussion = {
+  conversation: ConversationSummary | null;
+  messages: ConversationMessage[];
+};
+export type SendMessageResult = {
+  conversation: ConversationSummary;
+  userMessage: ConversationMessage;
+  assistantMessage: ConversationMessage;
+};
+
+export type McpTransport = "stdio" | "http";
+export type McpServer = {
+  id: string;
+  employeeId: string;
+  name: string;
+  transport: McpTransport;
+  command: string | null;
+  args: string[];
+  env: Record<string, string>;
+  url: string | null;
+  /** Glob patterns of tool names that queue an Approval instead of running. */
+  guardedTools: string[];
+  enabled: boolean;
+  createdAt: string;
+};
+
+export type JournalKind = "run" | "note" | "system";
+export type JournalEntry = {
+  id: string;
+  employeeId: string;
+  kind: JournalKind;
+  title: string;
+  body: string;
+  runId: string | null;
+  routineId: string | null;
+  authorUserId: string | null;
+  createdAt: string;
+};
+
+/**
+ * A durable "memory item" — a short fact or preference that is injected
+ * into every chat turn and routine run for this employee. Editable by
+ * humans (at Settings → Memory) and by the AI itself (via MCP).
+ */
+export type MemoryItem = {
+  id: string;
+  employeeId: string;
+  title: string;
+  body: string;
+  authorUserId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type EmployeeTemplate = {
+  id: string;
+  name: string;
+  role: string;
+  category: string;
+  tagline: string;
+  skills: string[];
+  routines: { name: string; cronExpr: string }[];
+};
+
+export type OnboardingRecommendationContext = {
+  companyName: string;
+  /** The company's top-level Goal, in the words it was written in; empty when it has none. */
+  goal: string;
+  mission: string;
+  vision: string;
+  employeeName: string;
+  employeeRole: string;
+};
+
+export type OnboardingRoutineRecommendation = {
+  id: string;
+  name: string;
+  summary: string;
+  cronExpr: string;
+  body: string;
+  reasons: string[];
+  status: "suggested" | "ready";
+  routineId: string | null;
+};
+
+export type OnboardingIntegrationConnection = {
+  id: string;
+  label: string;
+  status: IntegrationConnectionStatus;
+  granted: boolean;
+};
+
+export type OnboardingIntegrationRecommendation = IntegrationCatalogEntry & {
+  reason: string;
+  status: "ready" | "grant_needed" | "connection_attention" | "connect_needed";
+  connections: OnboardingIntegrationConnection[];
+};
+
+export type OnboardingRecommendations = {
+  context: OnboardingRecommendationContext;
+  routines: OnboardingRoutineRecommendation[];
+  integrations: OnboardingIntegrationRecommendation[];
+};
+
+export type CreateRecommendedRoutinesResponse = {
+  created: Array<Routine & { recommendationId: string }>;
+  existing: Array<{ recommendationId: string; routineId: string }>;
+};
+
+/**
+ * What the setup guide shows under "Also set up for {name}", as
+ * `GET /api/companies/:cid/proactive/preview` returns it — see
+ * `server/services/proactive/preview.ts`. The server asks the same planner
+ * Automatic setup uses, so the list is what that switch does, not a copy of it.
+ */
+export type ProactiveDefaultsPreview = {
+  /** Company.proactiveAutoSetup, the switch the Proactive page also owns. */
+  automaticSetup: boolean;
+  /** The employee's active AI Model is connected, so standing work starts right away. */
+  employeeReady: boolean;
+  /** Standing work for this employee, in the order of the Proactive starter library. */
+  starters: ProactiveDefaultsPreviewRow[];
+  /** The company's TLDR briefing when it is on and has someone to write it. */
+  briefing: ProactiveDefaultsPreviewBriefing | null;
+};
+export type ProactiveDefaultsPreviewRow = {
+  recipeId: string;
+  name: string;
+  /** In plain words: "Weekdays at 08:00", "Every 30 minutes". */
+  schedule: string;
+  /** Already set up, rather than something Automatic setup is about to add. */
+  installed: boolean;
+};
+export type ProactiveDefaultsPreviewBriefing = {
+  schedule: string;
+  /** The AI Employee who writes it; null when its writer has since been removed. */
+  writerName: string | null;
+  /** The writer is the employee the preview is about. */
+  writerIsEmployee: boolean;
+};
+
+/**
+ * First-run progress, derived server-side from the company's real state — see
+ * `server/services/onboardingStatus.ts`. Never a stored flag, so it stays true
+ * when setup happens outside the guide.
+ */
+export type OnboardingStatus = {
+  complete: boolean;
+  employee: { id: string; name: string; slug: string; role: string } | null;
+  modelConnected: boolean;
+  routineCount: number;
+  scheduledRoutineCount: number;
+  /**
+   * Of the scheduled Routines, how many are standing work that Automatic setup
+   * assigned. The rest are Routines somebody chose. Optional so a fixture need
+   * not carry it.
+   */
+  standingRoutineCount?: number;
+  /** Whether new standing work is assigned automatically. */
+  automaticSetup?: boolean;
+  nextRunAt: string | null;
+  skillCount: number;
+  mailGranted: boolean;
+  mailAccessLevel: "read" | "draft" | "send" | null;
+  nextStep: "company" | "employee" | "recommendations" | "email" | "first_request" | "done";
+};
+
+export type UsageBucket = {
+  runs: number;
+  completed: number;
+  /** Evidence-review Runs consume resources without counting as delivered work. */
+  reviewed: number;
+  /** Hand-offs to a continuation, which carries the outcome; not counted as delivered or failed. */
+  continued?: number;
+  error: number;
+  failed: number;
+  skipped: number;
+  timeout: number;
+  interrupted: number;
+  durationMs: number;
+  /** Provider-billed prompt tokens across the window's runs. */
+  tokensIn: number;
+  /** Provider-billed completion tokens across the window's runs. */
+  tokensOut: number;
+};
+export type UsageEmployeeRow = UsageBucket & {
+  employeeId: string;
+  name: string;
+  slug: string;
+};
+export type UsageRoutineRow = UsageBucket & {
+  routineId: string;
+  name: string;
+  slug: string;
+  employeeId: string;
+  employeeName: string;
+  employeeSlug: string;
+};
+export type UsageSummary = {
+  windowDays: number;
+  totals: UsageBucket;
+  byEmployee: UsageEmployeeRow[];
+  byRoutine: UsageRoutineRow[];
+};
+
+/** `"ai"` was missing here, which is why every AI Employee's action rendered
+ *  as "System" on the audit page — the column has carried `actorEmployeeId`
+ *  since M2 and no reader knew to look at it. */
+export type AuditActorKind = "user" | "system" | "webhook" | "cron" | "ai";
+export type AuditEvent = {
+  id: string;
+  companyId: string;
+  actorKind: AuditActorKind;
+  actorUserId: string | null;
+  actor: { id: string; name: string; email: string } | null;
+  actorEmployeeId: string | null;
+  actorEmployee: { id: string; slug: string; name: string; role: string } | null;
+  /** The Run this mutation happened inside (M58). Null for human and chat work. */
+  runId: string | null;
+  conversationId: string | null;
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  targetLabel: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+};
+
+export type AuditPage = { items: AuditEvent[]; nextCursor: string | null };
+
+export type AuditFilters = {
+  actorKind?: AuditActorKind;
+  actorEmployeeId?: string;
+  actorUserId?: string;
+  /** Prefix match over the dotted action namespace, e.g. `invoice.`. */
+  action?: string;
+  runId?: string;
+  since?: string;
+  until?: string;
+  cursor?: string;
+  take?: number;
+};
+
+/** Build the audit query string, dropping empty values so a cleared filter
+ *  control does not narrow the list to nothing. */
+export function auditQuery(filters: AuditFilters): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
+// ──────────────────────────── Checks (M58) ─────────────────────────────────
+// A **Check** is a machine-verifiable assertion a Run must pass before it may
+// finalize green. It sits beside the acceptance criteria on the Routine and is
+// the other half of the same question: the criteria are the bar a model judges,
+// a Check is the bar the server judges. The graded party cannot author one —
+// every mutation here is admin-gated at the route and no MCP tool writes them.
+
+export type RoutineCheckKind = "command" | "effect";
+
+/**
+ * The `effect` predicate, stored as JSON in `RoutineCheck.spec`.
+ *
+ * Deliberately arithmetic rather than expressive: it counts rows the server
+ * wrote in the Run's effect ledger and compares the count to a window. A
+ * predicate language would invite Checks that are themselves programs needing
+ * their own review.
+ */
+export type EffectCheckSpec = {
+  action: string;
+  targetType?: string;
+  min: number;
+  max?: number;
+};
+
+export type RoutineCheck = {
+  id: string;
+  routineId: string;
+  name: string;
+  kind: RoutineCheckKind;
+  /** The command verbatim, or a JSON {@link EffectCheckSpec}. */
+  spec: string;
+  /** A failed required Check fails the Run. A non-required one only reports. */
+  required: boolean;
+  enabled: boolean;
+  /** Wall-clock ceiling for a `command` Check. Inert for `effect`. */
+  timeoutSec: number;
+  position: number;
+  createdById: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+/**
+ * Whether a `command` Check can run on this installation, and why not.
+ *
+ * Command Checks use the configured execution mode. The editor disables
+ * the option and shows this reason rather than letting somebody author a Check
+ * that is guaranteed to fail.
+ */
+export type CommandChecksAvailability = { available: boolean; reason?: string | null };
+
+export type RoutineCheckList = {
+  checks: RoutineCheck[];
+  commandChecks: CommandChecksAvailability;
+};
+
+/** Mirrors `MAX_CHECKS_PER_ROUTINE` on the server. */
+export const MAX_CHECKS_PER_ROUTINE = 10;
+
+/**
+ * One Check's result on one Run. `name` / `kind` / `required` are denormalized
+ * server-side so a result stays readable after its Check is edited or deleted —
+ * which is also why `checkId` can be null on an old row.
+ */
+export type RunCheckResult = {
+  id: string;
+  runId: string;
+  checkId: string | null;
+  name: string;
+  kind: RoutineCheckKind;
+  required: boolean;
+  passed: boolean;
+  /** Exit status for a `command` Check; null for `effect` and for one that
+   *  could not be run at all. */
+  exitCode: number | null;
+  detail: string;
+  durationMs: number;
+  /** 0 is the first pass; 1 and 2 are the bounded remediation rounds. */
+  attempt: number;
+  createdAt: string | null;
+};
+
+export type RunCheckResultList = {
+  results: RunCheckResult[];
+  runStatus?: RunStatus;
+  currentConfiguration?: {
+    enabled: number;
+    required: number;
+    configurationPath: string;
+    appliesTo: "current_routine";
+  };
+};
+
+/**
+ * `passed` / `failed` — the server ran this Run's Checks and they did or did
+ * not hold. `not_run` — the Routine declares none, so nothing was asserted.
+ */
+export type RunChecksVerdict = "passed" | "failed" | "not_run";
+
+// ─────────────────────────── Effects (M58) ─────────────────────────────────
+// One row per write the server recorded while the Run held its token. Not a
+// model narration — the ledger is written at each write seam, which is the
+// entire reason a Check can assert over it.
+
+export type RunEffect = {
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  targetLabel: string;
+  at: string;
+};
+
+export type RunEffectList = {
+  effects: RunEffect[];
+  /** Rows recorded, which exceeds `effects.length` on a capped read. */
+  total: number;
+};
+
+// ────────────────────────── Standdowns (M58) ───────────────────────────────
+// A **Standdown** is a revocable stop on all AI work at one scope. Reads are
+// member-level — everybody is entitled to know the work they depend on has
+// stopped, and why — while placing and lifting are admin-only.
+
+export type StanddownScope = "company" | "employee" | "routine";
+/** `breaker` identifies Standdowns placed by the former failure breaker. */
+export type StanddownSource = "human" | "breaker";
+
+export type Standdown = {
+  id: string;
+  scope: StanddownScope;
+  /** The employee or Routine id. Null for `company` scope. */
+  scopeId: string | null;
+  reason: string;
+  source: StanddownSource;
+  placedByUserId: string | null;
+  placedAt: string;
+  liftedAt: string | null;
+  liftedByUserId: string | null;
+  liftedReason: string;
+  active: boolean;
+  createdAt: string;
+};
+
+export type StanddownList = { standdowns: Standdown[] };
+
+/** The banner's query: the widest Standdown covering one target, or none. */
+export type ActiveStanddown = { standdown: Standdown | null };
+
+export type IntegrationAuthMode =
+  | "apikey"
+  | "oauth2"
+  | "service_account"
+  | "github_app"
+  /** Retired mode. Nothing creates one any more, but Connections made
+   *  before it was removed still serialize with it. */
+  | "browser";
+export type IntegrationCatalogField = {
+  key: string;
+  label: string;
+  type: "text" | "password" | "url" | "textarea";
+  placeholder?: string;
+  required: boolean;
+  hint?: string;
+};
+export type IntegrationScopeGroup = {
+  key: string;
+  label: string;
+  description: string;
+  scopes: string[];
+  defaultSelected?: boolean;
+  required?: boolean;
+  workspaceOnly?: boolean;
+};
+export type IntegrationCategory =
+  | "Databases"
+  | "Analytics"
+  | "Productivity"
+  | "Communication"
+  | "Payments"
+  | "Developer";
+
+export const INTEGRATION_CATEGORY_ORDER: IntegrationCategory[] = [
+  "Databases",
+  "Analytics",
+  "Productivity",
+  "Communication",
+  "Payments",
+  "Developer",
+];
+
+export type IntegrationCatalogEntry = {
+  provider: string;
+  name: string;
+  category: IntegrationCategory;
+  tagline: string;
+  description?: string;
+  icon: string;
+  authMode: IntegrationAuthMode;
+  fields?: IntegrationCatalogField[];
+  oauth?: {
+    app: "google" | "x" | "github" | "reddit" | "linkedin" | "microsoft";
+    /** True when this instance has a registered OAuth app for this provider
+     *  (Admin → Integrations). The connect form then asks for no credentials
+     *  at all — the handshake uses the instance's client. */
+    instanceApp?: boolean;
+    /** Genosyn Connect can sign in to this Integration with no client here. */
+    hostedSignIn?: boolean;
+    /** The scope groups Genosyn Connect offers; the rest need an own client. */
+    hostedScopeGroups?: string[];
+    scopes: string[];
+    scopeGroups?: IntegrationScopeGroup[];
+    /** Extra create-time inputs (developer tokens, account ids, safety
+     *  caps) rendered on the connect form after client id/secret. */
+    extraFields?: IntegrationCatalogField[];
+    setupDocs?: string;
+  };
+  serviceAccount?: {
+    scopes: string[];
+    scopeGroups?: IntegrationScopeGroup[];
+    impersonation: boolean;
+    setupDocs?: string;
+  };
+  githubApp?: {
+    setupDocs?: string;
+  };
+  enabled: boolean;
+  disabledReason?: string;
+};
+export type IntegrationConnectionStatus = "connected" | "error" | "expired";
+export type IntegrationConnection = {
+  hostedSignIn?: boolean;
+  id: string;
+  companyId: string;
+  provider: string;
+  label: string;
+  authMode: IntegrationAuthMode;
+  accountHint: string;
+  status: IntegrationConnectionStatus;
+  statusMessage: string;
+  lastCheckedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  scopeGroups: string[];
+  /** Set when the connector behind this row was removed from the catalog.
+   * The connection survives so its credential is not silently orphaned. */
+  retired: RetiredIntegration | null;
+};
+export type RetiredIntegration = {
+  provider: string;
+  name: string;
+  retiredIn: string;
+  reason: string;
+};
+export type ConnectionGrant = {
+  id: string;
+  employeeId: string;
+  connectionId: string;
+  createdAt: string;
+  connection: IntegrationConnection;
+};
+
+/**
+ * Inverse shape of `ConnectionGrant`. Returned by the per-connection grants
+ * endpoint so the Settings → Integrations page can show which employees
+ * already have access without a second roundtrip per row.
+ */
+export type ConnectionGrantWithEmployee = {
+  id: string;
+  employeeId: string;
+  connectionId: string;
+  createdAt: string;
+  employee: {
+    id: string;
+    name: string;
+    slug: string;
+    role: string;
+    avatarKey: string | null;
+  };
+};
+
+/**
+ * A Chrome a Member has connected from their own computer. `status` is derived
+ * from the live bridge socket, not the stored row, so a browser whose laptop
+ * went to sleep reads `offline` immediately rather than after a sweep.
+ *
+ * `pairingCode` is only ever present on the create/re-pair responses — the
+ * server keeps a hash and can never show it again.
+ */
+export type MemberBrowser = {
+  id: string;
+  name: string;
+  status: "pending" | "online" | "offline";
+  /** Has the bridge agent ever redeemed a pairing code for this browser? */
+  paired: boolean;
+  /** A session is driving it right now; a second one would be refused. */
+  busy: boolean;
+  tokenPrefix: string | null;
+  /** Newline-separated host globs. Empty means this browser opens nothing. */
+  allowedHosts: string | null;
+  approvalRequired: boolean;
+  allowUnattended: boolean;
+  /** Null for browsers whose unattended opt-in predates Routine recording consent. */
+  routineRecordingConsentAt: string | null;
+  /** True when a pre-recording unattended choice needs the owner to opt in again. */
+  routineRecordingConsentRequired: boolean;
+  browserVersion: string | null;
+  platform: string | null;
+  agentVersion: string | null;
+  lastSeenAt: string | null;
+  createdAt: string;
+  pairingCode?: string;
+};
+
+export type MemberBrowserGrantee = {
+  employeeId: string;
+  name: string;
+  slug: string;
+  role: string;
+};
+
+export type Secret = {
+  id: string;
+  companyId: string;
+  name: string;
+  description: string;
+  /** Masked preview of the plaintext value; full value is never returned. */
+  preview: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ApiKey = {
+  id: string;
+  name: string;
+  /** Display-only chip including the `gen_` prefix and first 8 chars of the
+   * random suffix. The full token is only ever returned once by `create`. */
+  prefix: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+};
+
+/** Returned by `POST /api-keys`. The `token` field is the plaintext value
+ * shown to the human exactly once — never persisted, never visible again. */
+export type ApiKeyCreated = ApiKey & { token: string };
+
+/**
+ * An app — claude.ai, ChatGPT — the Member approved through OAuth to use the
+ * Genosyn MCP server as them in this company. Listed beside API keys.
+ */
+export type ConnectedApp = {
+  id: string;
+  name: string;
+  /** The app's own address, where its sign-in returned: https://claude.ai. */
+  redirectOrigin: string;
+  scope: string;
+  lastUsedAt: string | null;
+  /** When it stops working unless it refreshes before then. */
+  expiresAt: string;
+  revokedAt: string | null;
+  revokedReason: "member" | "app" | "reuse" | null;
+  createdAt: string;
+};
+
+/** What the consent page shows for an app asking to connect (`GET /api/oauth/consent`). */
+export type AppConsentRequest = {
+  app: {
+    name: string;
+    clientUri: string | null;
+    redirectUri: string;
+    redirectOrigin: string;
+  };
+  member: { name: string; email: string };
+  /** Set when the app asked for one company's MCP server: the choice is made. */
+  requestedCompanyId: string | null;
+  companies: Array<{
+    id: string;
+    name: string;
+    slug: string;
+    role: "owner" | "admin" | "member";
+    financeAccess: "none" | "read" | "full";
+    canConnect: boolean;
+    reason: string | null;
+  }>;
+  expiresAt: string;
+};
+
+// ───────────────────────── Email providers + logs ──────────────────────────
+
+export type EmailProviderKind = "smtp" | "sendgrid" | "mailgun" | "resend" | "postmark";
+
+export type EmailProviderField = {
+  key: string;
+  label: string;
+  type: "text" | "password" | "number" | "checkbox" | "select";
+  required: boolean;
+  placeholder?: string;
+  hint?: string;
+  options?: { value: string; label: string }[];
+  defaultValue?: string | number | boolean;
+};
+
+export type EmailProviderCatalogEntry = {
+  kind: EmailProviderKind;
+  name: string;
+  tagline: string;
+  description: string;
+  icon: string;
+  fields: EmailProviderField[];
+  /** Non-secret prefill for the connect form (new providers only) — e.g.
+   *  the SMTP entry seeded from the install-wide global SMTP transport. */
+  prefill?: {
+    from?: string;
+    fields?: Record<string, string | number | boolean>;
+  };
+};
+
+export type EmailProviderTestStatus = "ok" | "failed";
+export type EmailProvider = {
+  id: string;
+  companyId: string;
+  name: string;
+  kind: EmailProviderKind;
+  fromAddress: string;
+  replyTo: string;
+  isDefault: boolean;
+  enabled: boolean;
+  configPreview: Record<string, string>;
+  lastTestedAt: string | null;
+  lastTestStatus: EmailProviderTestStatus | null;
+  lastTestMessage: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type EmailLogStatus = "sent" | "failed" | "skipped";
+export type EmailLogTransport =
+  | "smtp"
+  | "sendgrid"
+  | "mailgun"
+  | "resend"
+  | "postmark"
+  | "config_smtp"
+  | "console";
+export type EmailLogPurpose =
+  | "invitation"
+  | "password_reset"
+  | "welcome"
+  | "signature"
+  | "recruiting"
+  | "data_room"
+  | "backup_alert"
+  | "test"
+  | "other";
+
+export type EmailLog = {
+  id: string;
+  companyId: string | null;
+  providerId: string | null;
+  transport: EmailLogTransport;
+  purpose: EmailLogPurpose;
+  toAddress: string;
+  fromAddress: string;
+  subject: string;
+  bodyPreview: string;
+  status: EmailLogStatus;
+  errorMessage: string;
+  messageId: string;
+  triggeredByUserId: string | null;
+  createdAt: string;
+};
+
+export type EmailLogPage = {
+  total: number;
+  limit: number;
+  offset: number;
+  rows: EmailLog[];
+};
+
+export type BackupKind = "manual" | "scheduled" | "uploaded";
+export type BackupStatus = "running" | "completed" | "failed";
+export type Backup = {
+  id: string;
+  filename: string;
+  sizeBytes: number;
+  kind: BackupKind;
+  status: BackupStatus;
+  errorMessage: string;
+  /** Every attempt to copy it off-box is recorded. False for a backup taken
+   *  before that, whose copies read as "not recorded" until daily
+   *  verification looks for them. */
+  copiesTracked: boolean;
+  createdAt: string;
+  completedAt: string | null;
+};
+
+/** Where one backup's copy on one off-box destination stands. */
+export type BackupCopyStatus = "pending" | "copying" | "copied" | "failed" | "missing" | "removed";
+export type BackupCopy = {
+  destinationId: string;
+  status: BackupCopyStatus;
+  /** Why it isn't there, in the destination's own words; empty otherwise. */
+  error: string;
+  startedAt: string | null;
+  /** When it arrived; null when daily verification found it without seeing it arrive. */
+  copiedAt: string | null;
+  /** When daily verification last looked for it there. */
+  checkedAt: string | null;
+  updatedAt: string;
+};
+
+/** One History row (GET /api/backups): the backup and where it is right now. */
+export type BackupHistoryItem = Backup & {
+  /** Its archive is on this server. */
+  onServer: boolean;
+  /** This server's run for it is under way: writing it while `running`,
+   *  copying it off-box once `completed`. No new backup starts until it ends. */
+  inProgress: boolean;
+  copies: BackupCopy[];
+};
+
+/** POST /api/backups (Back up now): the backup's History row, answered at once. */
+export type BackupStarted = BackupHistoryItem & { alreadyRunning: boolean };
+
+/** POST /api/backups/:id/deliver: the copies, queued, or as they stand. */
+export type BackupCopiesStarted = { ok: true; alreadyRunning: boolean; copies: BackupCopy[] };
+
+export type BackupFrequency = "daily" | "weekly" | "monthly";
+/** `retentionEnabled` / `retentionDays` are the auto-delete policy for
+ *  archives on this server and are independent of `enabled` — archives pile up
+ *  whether or not the recurring backup is on. `offBoxRetentionEnabled` /
+ *  `offBoxRetentionDays` are the separate policy for copies on off-box
+ *  destinations, applied each time a backup is delivered there. `prunedNow` is
+ *  response-only: PUT /api/backups/schedule enforces on-box retention as it
+ *  saves and reports what that deleted. */
+export type BackupSchedule = {
+  enabled: boolean;
+  frequency: BackupFrequency;
+  hour: number;
+  dayOfWeek: number;
+  dayOfMonth: number;
+  cronExpr: string;
+  /** When the schedule next fires; null while it is off. */
+  nextRunAt: string | null;
+  /** The server's time zone, which `hour` is in. */
+  timeZone: string;
+  lastRunAt: string | null;
+  retentionEnabled: boolean;
+  retentionDays: number;
+  offBoxRetentionEnabled: boolean;
+  offBoxRetentionDays: number;
+  updatedAt: string;
+  prunedNow?: number;
+};
+
+export type BackupDestinationKind = "local" | "sftp" | "smb";
+export type BackupDestinationStatus = "unknown" | "ok" | "error";
+export type SftpAuthMode = "password" | "key";
+/** Off-box mirror target for backups (a mounted NAS path, an SFTP host, or an
+ *  SMB share). Secrets are never returned — only whether one is set
+ *  (`hasPassword` / `hasPrivateKey`). `host` / `port` / `username` /
+ *  `remoteDir` are shared by the sftp and smb kinds; `share` / `domain` /
+ *  `encrypt` are smb-only and null otherwise. */
+export type BackupDestination = {
+  id: string;
+  name: string;
+  kind: BackupDestinationKind;
+  enabled: boolean;
+  hint: string;
+  path: string | null;
+  host: string | null;
+  port: number | null;
+  username: string | null;
+  remoteDir: string | null;
+  authMode: SftpAuthMode | null;
+  share: string | null;
+  domain: string | null;
+  encrypt: boolean | null;
+  hasPassword: boolean;
+  hasPrivateKey: boolean;
+  configError: boolean;
+  lastStatus: BackupDestinationStatus;
+  lastError: string;
+  lastSyncedAt: string | null;
+  lastCheckedAt: string | null;
+  /** When a delivery was last attempted, whatever its outcome. */
+  lastAttemptAt: string | null;
+  /** When the current run of failed deliveries began; null once one succeeds. */
+  failingSince: string | null;
+  /** When master admins were last emailed about the current failures. */
+  lastAlertedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+/** What Test found on a destination (POST /api/backup-destinations/:id/test).
+ *  `message` is the destination's own reason when it failed; `stillFailing`
+ *  marks a pass on a destination whose copies of real backups still fail. */
+export type BackupDestinationTest = {
+  ok: boolean;
+  message: string;
+  stillFailing: boolean;
+  testedAt: string;
+};
+
+/** One thing daily backup verification found wrong. `key` stays the same from
+ *  one verification to the next for the same problem. */
+export type BackupVerificationProblem = {
+  key: string;
+  severity: "error" | "warn";
+  message: string;
+};
+/** One place verification looked: the schedule, this server, or a destination. */
+export type BackupVerificationArea = {
+  id: string;
+  title: string;
+  summary: string;
+  problems: BackupVerificationProblem[];
+};
+/** Daily backup verification: whether every backup the schedule and retention
+ *  policies promise is really there. GET/POST /api/backups/verification. */
+export type BackupVerification = {
+  verifiedAt: string;
+  areas: BackupVerificationArea[];
+};
+
+export type TodoStatus = "backlog" | "todo" | "in_progress" | "in_review" | "done" | "cancelled";
+export type TodoPriority = "none" | "low" | "medium" | "high" | "urgent";
+export type TodoRecurrence =
+  | "none"
+  | "daily"
+  | "weekdays"
+  | "weekly"
+  | "biweekly"
+  | "monthly"
+  | "yearly";
+/**
+ * Access lives on the Project, not on a view of it — "Board" is just a view
+ * mode, so the list and the board inherit the same rules.
+ *
+ *   - open       → everyone in the company can edit it (the default)
+ *   - restricted → only the people and AI employees explicitly added
+ */
+export type ProjectAccessMode = "open" | "restricted";
+export type ProjectAccessLevel = "read" | "write";
+/** Humans and AI employees share one member list. */
+export type ProjectMemberKind = "user" | "ai";
+
+/** A `ProjectMember` row hydrated with the principal's display fields. */
+export type ProjectMember = {
+  id: string;
+  memberKind: ProjectMemberKind;
+  accessLevel: ProjectAccessLevel;
+  userId: string | null;
+  employeeId: string | null;
+  name: string;
+  /** Set for humans only. */
+  email: string | null;
+  /** Set for AI employees only. */
+  slug: string | null;
+};
+
+export type ProjectAccessResponse = {
+  accessMode: ProjectAccessMode;
+  myAccessLevel: ProjectAccessLevel;
+  members: ProjectMember[];
+};
+
+export type Project = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  description: string;
+  key: string;
+  accessMode: ProjectAccessMode;
+  createdById: string | null;
+  todoCounter: number;
+  createdAt: string;
+  /**
+   * The level the current viewer was served with. Present on the list,
+   * single-project and todos endpoints; absent on what a create or an edit answers.
+   */
+  myAccessLevel?: ProjectAccessLevel;
+  totalTodos?: number;
+  openTodos?: number;
+  reviewTodos?: number;
+};
+export type TodoAssignee =
+  | { kind: "ai"; id: string; name: string; slug: string; role: string }
+  | { kind: "human"; id: string; name: string; email: string | null };
+export type TodoReviewer = TodoAssignee;
+
+export type Todo = {
+  id: string;
+  projectId: string;
+  number: number;
+  title: string;
+  description: string;
+  status: TodoStatus;
+  priority: TodoPriority;
+  assigneeEmployeeId: string | null;
+  assigneeUserId: string | null;
+  reviewerEmployeeId: string | null;
+  reviewerUserId: string | null;
+  createdById: string | null;
+  dueAt: string | null;
+  sortOrder: number;
+  completedAt: string | null;
+  recurrence: TodoRecurrence;
+  recurrenceParentId: string | null;
+  parentTodoId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  assignee: TodoAssignee | null;
+  reviewer: TodoReviewer | null;
+  /** Where it came from and what it is about, as this reader may see them. */
+  links?: TodoLinkView[];
+  /** What this `in_progress` Todo is waiting on, and when it checks back. */
+  /** Nobody at the company wrote its title and description: an AI or an email did. */
+  untrustedText?: boolean;
+  /**
+   * It started from outside words, so its AI Employee works within limits here, whoever
+   * asks. Only a person choosing to lend a session their access goes past them.
+   */
+  heldToLimits?: boolean;
+  /** What AI is doing on it now. A wait says itself, in `waitingOn`. */
+  aiState?: "working" | "queued" | null;
+  waitingOn?: TodoWaitKind | null;
+  waitingReason?: string;
+  waitingSince?: string | null;
+  waitingCheckAt?: string | null;
+};
+
+/**
+ * Todo hydrated with its project stub — returned by the `/reviews` endpoint
+ * so the reviewer queue can render "{project key}-{number}" and deep-link
+ * without an extra fetch per row.
+ */
+export type ReviewItem = Todo & {
+  project: { id: string; key: string; name: string; slug: string } | null;
+};
+
+export type TodoCommentAuthor =
+  | { kind: "human"; id: string; name: string; email: string | null }
+  | { kind: "ai"; id: string; name: string; slug: string; role: string };
+
+export type TodoComment = {
+  attachments?: ChatAttachment[];
+  id: string;
+  todoId: string;
+  authorUserId: string | null;
+  authorEmployeeId: string | null;
+  body: string;
+  pending: boolean;
+  createdAt: string;
+  updatedAt: string;
+  author: TodoCommentAuthor | null;
+  /** The server wrote this line: "New email on the linked thread." */
+  systemNote?: boolean;
+  /** The session this comment reports, when it is an AI Employee's report. */
+  pickup?: TodoPickupView | null;
+};
+
+// ───────────────────────── Bases (Airtable-style) ───────────────────────────
+
+export type BaseColor = "indigo" | "emerald" | "amber" | "rose" | "sky" | "violet" | "slate";
+
+export type Base = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  description: string;
+  icon: string;
+  color: BaseColor;
+  createdById: string | null;
+  createdAt: string;
+  tableCount?: number;
+};
+
+export type BaseTable = {
+  id: string;
+  baseId: string;
+  name: string;
+  slug: string;
+  sortOrder: number;
+  archivedAt: string | null;
+  createdAt: string;
+};
+
+export type BaseFieldType =
+  | "text"
+  | "longtext"
+  | "number"
+  | "checkbox"
+  | "date"
+  | "datetime"
+  | "email"
+  | "url"
+  | "select"
+  | "multiselect"
+  | "link"
+  | "customer"
+  | "invoice"
+  | "project"
+  | "employee"
+  | "member"
+  | "note"
+  | "pipeline";
+
+/** The Base field types that link to records elsewhere in Genosyn. */
+export const BASE_RESOURCE_FIELD_TYPES = [
+  "customer",
+  "invoice",
+  "project",
+  "employee",
+  "member",
+  "note",
+  "pipeline",
+] as const;
+
+export type BaseResourceFieldType = (typeof BASE_RESOURCE_FIELD_TYPES)[number];
+
+export function isBaseResourceFieldType(t: BaseFieldType): t is BaseResourceFieldType {
+  return (BASE_RESOURCE_FIELD_TYPES as readonly string[]).includes(t);
+}
+
+export type SelectOption = { id: string; label: string; color: string };
+
+export type BaseField = {
+  id: string;
+  tableId: string;
+  name: string;
+  type: BaseFieldType;
+  config: Record<string, unknown>;
+  isPrimary: boolean;
+  sortOrder: number;
+};
+
+export type BaseRecord = {
+  id: string;
+  tableId: string;
+  data: Record<string, unknown>;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BaseLinkOption = { id: string; label: string; tableId: string };
+
+/**
+ * A pickable target for a record-link column (customer, project, …).
+ * `url` is an app-relative deep link, or "" when the product has no
+ * per-record page. `archived` rows stay resolvable but are hidden from
+ * pickers.
+ */
+export type BaseResourceOption = {
+  id: string;
+  label: string;
+  sublabel: string;
+  url: string;
+  archived?: boolean;
+};
+
+export type BaseDetail = {
+  base: Base;
+  tables: BaseTable[];
+};
+
+/**
+ * Operators for a filter rule, by field type. One flat union, defined beside
+ * the evaluator in `shared/baseFilters.ts`; the picker offers only the ones
+ * that make sense for the chosen field's `type`.
+ */
+export type { BaseFilterOperator };
+
+export type BaseFilterRule = {
+  id: string;
+  fieldId: string;
+  operator: BaseFilterOperator;
+  value?: unknown;
+};
+
+export type BaseSortRule = {
+  id: string;
+  fieldId: string;
+  direction: "asc" | "desc";
+};
+
+export type BaseView = {
+  id: string;
+  tableId: string;
+  name: string;
+  slug: string;
+  sortOrder: number;
+  filters: BaseFilterRule[];
+  sorts: BaseSortRule[];
+  hiddenFieldIds: string[];
+  createdAt: string;
+};
+
+export type BaseTableContent = {
+  table: BaseTable;
+  fields: BaseField[];
+  records: BaseRecord[];
+  linkOptions: Record<string, BaseLinkOption[]>;
+  resourceOptions: Record<string, BaseResourceOption[]>;
+  views: BaseView[];
+};
+
+/** The columns of one table, without its rows. */
+export type BaseTableFields = { fields: BaseField[] };
+
+export type BaseTemplateSummary = {
+  id: string;
+  name: string;
+  tagline: string;
+  icon: string;
+  color: BaseColor;
+  description: string;
+  tableCount: number;
+  tableNames: string[];
+};
+
+export type BaseRecordCommentAuthor =
+  | {
+      kind: "human";
+      id: string;
+      name: string;
+      email: string | null;
+      avatarKey: string | null;
+      handle: string | null;
+    }
+  | {
+      kind: "ai";
+      id: string;
+      name: string;
+      slug: string;
+      role: string;
+      avatarKey: string | null;
+    };
+
+export type BaseRecordComment = {
+  id: string;
+  recordId: string;
+  body: string;
+  authorUserId: string | null;
+  authorEmployeeId: string | null;
+  author: BaseRecordCommentAuthor | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BaseRecordAttachmentUploader =
+  | { kind: "human"; id: string; name: string }
+  | { kind: "ai"; id: string; name: string; slug: string };
+
+export type BaseRecordAttachment = {
+  id: string;
+  recordId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  isImage: boolean;
+  uploadedByUserId: string | null;
+  uploadedByEmployeeId: string | null;
+  uploader: BaseRecordAttachmentUploader | null;
+  createdAt: string;
+};
+
+/**
+ * A grant giving one AI employee read/write access to one Base via their MCP
+ * tools. The server returns the pair plus a lightweight employee snapshot so
+ * the UI can render names without a second request.
+ */
+export type BaseGrant = {
+  id: string;
+  employeeId: string;
+  baseId: string;
+  createdAt: string;
+  employee: {
+    id: string;
+    name: string;
+    slug: string;
+    role: string;
+  } | null;
+};
+
+// ───────────────────────────── Base Forms ──────────────────────────────────
+
+/** A question in a Form maps one public prompt to one scalar Base field. */
+export type BaseFormQuestion = {
+  id: string;
+  fieldId: string;
+  label: string;
+  description: string;
+  required: boolean;
+};
+
+export type BaseForm = {
+  id: string;
+  tableId: string;
+  slug: string;
+  title: string;
+  description: string;
+  submitLabel: string;
+  successTitle: string;
+  successMessage: string;
+  allowAnotherResponse: boolean;
+  publishedAt: string | null;
+  acceptingResponses: boolean;
+  publicUrl: string | null;
+  /**
+   * False when the URL is only the install's localhost fallback. Older
+   * servers may omit it, so the share surface treats it as unknown rather
+   * than incorrectly warning on a correctly configured instance.
+   */
+  publicUrlConfigured?: boolean;
+  responseCount: number;
+  lastResponseAt: string | null;
+  questions: BaseFormQuestion[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** The member gallery uses the same stable metadata without loading fields. */
+export type BaseFormSummary = Omit<BaseForm, "questions">;
+
+export type BaseFormDetail = {
+  form: BaseForm;
+  fields: BaseField[];
+};
+
+export type PublicBaseFormFieldType = Extract<
+  BaseFieldType,
+  | "text"
+  | "longtext"
+  | "number"
+  | "checkbox"
+  | "date"
+  | "datetime"
+  | "email"
+  | "url"
+  | "select"
+  | "multiselect"
+>;
+
+export type PublicBaseFormQuestion = {
+  id: string;
+  label: string;
+  description: string;
+  required: boolean;
+  type: PublicBaseFormFieldType;
+  options: SelectOption[];
+};
+
+export type PublicBaseForm = {
+  companyName: string;
+  color: BaseColor;
+  title: string;
+  description: string;
+  submitLabel: string;
+  successTitle: string;
+  successMessage: string;
+  allowAnotherResponse: boolean;
+  acceptingResponses: boolean;
+  questions: PublicBaseFormQuestion[];
+};
+
+// ───────────────────────── Pipelines (n8n-style automation) ──────────────────
+
+export type PipelineNodeFamily = "trigger" | "action" | "logic" | "integration";
+export type PipelineNodeFieldType =
+  | "text"
+  | "longtext"
+  | "number"
+  | "boolean"
+  | "select"
+  | "code"
+  | "javascript";
+
+export type PipelineNodeField = {
+  key: string;
+  label: string;
+  type: PipelineNodeFieldType;
+  options?: { value: string; label: string }[];
+  placeholder?: string;
+  hint?: string;
+  required?: boolean;
+  default?: unknown;
+};
+
+export type PipelineNodeCatalogEntry = {
+  type: string;
+  family: PipelineNodeFamily;
+  label: string;
+  icon: string;
+  description: string;
+  fields: PipelineNodeField[];
+  outputs?: string[];
+};
+
+export type PipelineNode = {
+  id: string;
+  type: string;
+  label?: string;
+  x: number;
+  y: number;
+  config: Record<string, unknown>;
+};
+
+export type PipelineEdge = {
+  id: string;
+  fromNodeId: string;
+  toNodeId: string;
+  fromHandle?: string;
+};
+
+export type PipelineGraph = {
+  nodes: PipelineNode[];
+  edges: PipelineEdge[];
+};
+
+export type Pipeline = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  description: string;
+  enabled: boolean;
+  graph: PipelineGraph;
+  cronExpr: string | null;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PipelineRunStatus = "running" | "paused" | "completed" | "failed" | "skipped";
+export type PipelineTriggerKind = "manual" | "schedule" | "webhook" | "event";
+
+export type PipelineRunSummary = {
+  id: string;
+  pipelineId: string;
+  startedAt: string;
+  finishedAt: string | null;
+  status: PipelineRunStatus;
+  triggerKind: PipelineTriggerKind;
+  triggerLabel: string | null;
+  triggerNodeId: string | null;
+  errorMessage: string | null;
+};
+
+export type PipelineRunDetail = PipelineRunSummary & {
+  inputJson: string;
+  outputJson: string;
+  logContent: string;
+  truncated: boolean;
+};
+
+// ───────────────────────── Notes (Notion-style knowledge base) ───────────────
+
+export type NoteAuthor =
+  | { kind: "human"; id: string; name: string; email: string | null }
+  | { kind: "ai"; id: string; name: string; slug: string; role: string };
+
+export type Note = {
+  id: string;
+  companyId: string;
+  notebookId: string;
+  title: string;
+  slug: string;
+  body: string;
+  icon: string;
+  parentId: string | null;
+  sortOrder: number;
+  createdById: string | null;
+  createdByEmployeeId: string | null;
+  lastEditedById: string | null;
+  lastEditedByEmployeeId: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: NoteAuthor | null;
+  lastEditedBy: NoteAuthor | null;
+  /**
+   * One exact state of the page's content, on single-page responses. Sent
+   * back as `baseVersion` when saving, so a save never silently overwrites
+   * someone else's newer one.
+   */
+  version?: string;
+};
+
+/** A page without its body — what lists and the sidebar get (`?view=outline`). */
+export type NoteOutline = Omit<Note, "body" | "version"> & { preview: string };
+
+/** A search hit: the outline plus the stretch of text that matched. */
+export type NoteSearchHit = NoteOutline & { snippet: string };
+
+export type Notebook = {
+  id: string;
+  companyId: string;
+  title: string;
+  slug: string;
+  icon: string;
+  sortOrder: number;
+  createdById: string | null;
+  createdByEmployeeId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  noteCount: number;
+  archivedCount: number;
+};
+
+/** Per-note access an AI employee can hold. Humans always have full access. */
+export type NoteAccessLevel = "read" | "write";
+
+export type NoteGrantEmployee = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+};
+
+export type NoteGrant = {
+  id: string;
+  employeeId: string;
+  noteId: string;
+  accessLevel: NoteAccessLevel;
+  createdAt: string;
+  employee: NoteGrantEmployee | null;
+};
+
+/** A grant inherited from an ancestor note — read-only on this page. */
+export type InheritedNoteGrant = NoteGrant & {
+  source: { id: string; slug: string; title: string } | null;
+};
+
+/** A grant inherited from the notebook the note lives in. */
+export type NotebookInheritedGrant = {
+  id: string;
+  employeeId: string;
+  notebookId: string;
+  accessLevel: NoteAccessLevel;
+  createdAt: string;
+  employee: NoteGrantEmployee | null;
+  source: { id: string; slug: string; title: string } | null;
+};
+
+export type NoteGrantsResponse = {
+  direct: NoteGrant[];
+  inherited: InheritedNoteGrant[];
+  notebookInherited: NotebookInheritedGrant[];
+};
+
+export type NoteGrantCandidate = NoteGrantEmployee & {
+  alreadyGranted: boolean;
+};
+
+/** Direct grants on a Notebook (cascades into every note in the notebook). */
+export type NotebookGrant = {
+  id: string;
+  employeeId: string;
+  notebookId: string;
+  accessLevel: NoteAccessLevel;
+  createdAt: string;
+  employee: NoteGrantEmployee | null;
+};
+
+export type NotebookGrantsResponse = {
+  direct: NotebookGrant[];
+};
+
+export type NotebookGrantCandidate = NoteGrantCandidate;
+
+// ───────────────────────── Resources (M18) ──────────────────────────────
+
+export type ResourceSourceKind = "url" | "text" | "pdf" | "epub" | "video";
+export type ResourceStatus = "pending" | "ready" | "failed";
+
+export type ResourceAuthor =
+  | { kind: "human"; id: string; name: string; email: string | null }
+  | { kind: "ai"; id: string; name: string; slug: string; role: string };
+
+export type Resource = {
+  id: string;
+  companyId: string;
+  title: string;
+  slug: string;
+  sourceKind: ResourceSourceKind;
+  sourceUrl: string | null;
+  sourceFilename: string | null;
+  storageKey: string | null;
+  summary: string;
+  /** Full extracted text — present only on the detail endpoint. */
+  bodyText?: string;
+  /** Length of the extracted text in characters; cheap to surface in lists. */
+  bodyLength: number;
+  tags: CompanyTag[];
+  tagList: string[];
+  bytes: number;
+  status: ResourceStatus;
+  errorMessage: string;
+  createdById: string | null;
+  createdByEmployeeId: string | null;
+  createdBy: ResourceAuthor | null;
+  /** The folder it is filed in; null when it is unfiled. */
+  folderId: string | null;
+  /** "Research/Competitors" for a filed Resource; null when it is unfiled. */
+  folderPath: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * One folder of the Resources library's tree, as `GET /resource-folders`
+ * returns it: flat, each row carrying its own parent, depth, and path.
+ */
+export type ResourceFolder = {
+  id: string;
+  companyId: string;
+  name: string;
+  /** Stable across renames and moves — what `?folder=<slug>` refers to. */
+  slug: string;
+  parentId: string | null;
+  sortOrder: number;
+  /** Slash-joined ancestor names, this folder last. */
+  path: string;
+  /** 1 for a top-level folder. */
+  depth: number;
+  /** Resources filed directly here. */
+  resourceCount: number;
+  /** Resources here and in everything nested beneath. */
+  totalResourceCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ResourceFolderTree = {
+  folders: ResourceFolder[];
+  unfiledCount: number;
+  maxDepth: number;
+};
+
+export type ResourceGrantEmployee = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+};
+
+/**
+ * Resources have three escalating capabilities (vs. notes which only have
+ * read | write): read → edit → delete. The MCP tools check
+ * `RESOURCE_ACCESS_RANK[grant] >= RESOURCE_ACCESS_RANK[required]`, so an
+ * `edit` grant covers `update_resource` but not `delete_resource`.
+ */
+export type ResourceAccessLevel = "read" | "edit" | "delete";
+
+export type ResourceGrant = {
+  id: string;
+  employeeId: string;
+  resourceId: string;
+  accessLevel: ResourceAccessLevel;
+  createdAt: string;
+  employee: ResourceGrantEmployee | null;
+};
+
+export type ResourceGrantsResponse = { direct: ResourceGrant[] };
+
+export type ResourceGrantCandidate = ResourceGrantEmployee & {
+  alreadyGranted: boolean;
+};
+
+/**
+ * Resources → AI access: whether an AI Employee may write to the library at
+ * all. `write` (read + write) is the default and leaves each Resource's Share
+ * settings in charge; `read` (read only) refuses every write whatever they say.
+ * See `EmployeeResourceLibraryGrant` on the server.
+ */
+export type ResourceLibraryAccessLevel = "read" | "write";
+
+export type ResourceLibraryAccessRow = {
+  employee: ResourceGrantEmployee;
+  accessLevel: ResourceLibraryAccessLevel;
+  /** True when nobody has set this employee's access, so the default applies. */
+  isDefault: boolean;
+};
+
+export type ResourceLibraryAccessResponse = { rows: ResourceLibraryAccessRow[] };
+
+// ───────────────────────── Repositories ────────────────────────────
+
+export type RepositoryAuthMode = "none" | "https" | "ssh";
+export type RepositorySyncStatus = "unknown" | "ok" | "error";
+export type RepositoryAccessLevel = "read" | "write";
+
+/**
+ * `local` is a repository created empty inside Genosyn: no clone URL, no
+ * credentials, nothing to push to. Giving it a URL in settings promotes it.
+ */
+export type RepositoryOrigin = "remote" | "local";
+
+/**
+ * What the repository mostly holds. It changes nothing about git — only how
+ * the editor opens a file and how an AI Employee is briefed about the tree.
+ */
+export type RepositoryKind = "code" | "documents";
+
+/**
+ * What an AI Employee may run in a work session on this repository: nothing,
+ * only commands matching the repository's list, or anything at all. The
+ * execution mode is unchanged in every case — this expresses the company's command policy.
+ */
+export type RepositoryCommandMode = "off" | "allowlist" | "all";
+
+export type RepositoryAuthor = {
+  kind: "human";
+  id: string;
+  name: string;
+  email: string | null;
+};
+
+/**
+ * The git forge a repository's remote lives on, mirrored from
+ * `server/services/repositoryForge.ts`.
+ *
+ * The client used to work this out itself, by parsing the clone URL and
+ * comparing the hostname to `github.com`. That answer is no longer in the
+ * browser: whether a host is a forge Genosyn can talk to depends on the base
+ * URL configured on each Connection, and a Connection's config never leaves
+ * the server. Null means nothing here can speak for this remote — the
+ * repository still clones, commits, and pushes, it just has no pull requests.
+ */
+export type RepositoryForgeInfo = {
+  provider: "github" | "forgejo";
+  /** "GitHub" / "Forgejo" — what to call it in a sentence. */
+  name: string;
+  /**
+   * How a credential for this remote is found:
+   * `pinned` — a specific Connection is pinned on the repository;
+   * `sole` — exactly one Connection can reach this host;
+   * `ambiguous` — several could and none is pinned;
+   * `none` — a known forge no Connection covers (public, or the repository
+   * carries its own stored credential).
+   */
+  credential: "pinned" | "sole" | "ambiguous" | "none";
+};
+
+export type Repository = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  description: string;
+  /** Empty exactly when {@link origin} is `local`. */
+  gitUrl: string;
+  origin: RepositoryOrigin;
+  kind: RepositoryKind;
+  /**
+   * The forge Connection this repository publishes through, pinned when
+   * Genosyn created the remote for it.
+   *
+   * The name is the TypeORM property the server spreads onto the response, so
+   * it is also the wire key — renaming it here would simply stop matching.
+   */
+  githubConnectionId: string | null;
+  defaultBranch: string;
+  authMode: RepositoryAuthMode;
+  httpsUsername: string | null;
+  committerName: string | null;
+  committerEmail: string | null;
+  commandMode: RepositoryCommandMode;
+  /** One command pattern per line. Empty means Genosyn's built-in list. */
+  allowedCommands: string;
+  /** Whether a credential is stored — never the secret itself. */
+  hasToken: boolean;
+  hasSshKey: boolean;
+  grantCount: number;
+  /**
+   * The forge behind this remote, or null when no Connection can speak for it.
+   * Null is what hides the "Open pull request" button.
+   */
+  forge: RepositoryForgeInfo | null;
+  lastSyncedAt: string | null;
+  lastSyncStatus: RepositorySyncStatus;
+  lastSyncError: string;
+  createdById: string | null;
+  createdBy: RepositoryAuthor | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RepositoryGrantEmployee = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+  /**
+   * True when a write Grant plus the stored Repository token or exact granted
+   * forge Connection configures pull request delivery. Remote permissions are
+   * checked when the employee publishes.
+   */
+  pullRequestReady: boolean;
+};
+
+export type RepositoryGrant = {
+  id: string;
+  employeeId: string;
+  repositoryId: string;
+  accessLevel: RepositoryAccessLevel;
+  createdAt: string;
+  employee: RepositoryGrantEmployee | null;
+};
+
+export type RepositoryGrantsResponse = { direct: RepositoryGrant[] };
+
+export type RepositoryGrantCandidate = Omit<RepositoryGrantEmployee, "pullRequestReady"> & {
+  alreadyGranted: boolean;
+};
+
+export type RepositoryTestResult = {
+  ok: boolean;
+  message: string;
+  defaultBranch?: string;
+};
+
+/**
+ * A git forge Connection the company has already authorised. Listing them is
+ * what turns "give this repository somewhere to live" into a choice rather
+ * than another credential form — the token is already stored and never leaves
+ * the server.
+ *
+ * The list can now hold two kinds at once, so an option carries the forge it
+ * belongs to and the server it points at: two Connections on the same forge
+ * are told apart by their host and nothing else.
+ */
+export type RepositoryForgeConnection = {
+  id: string;
+  label: string;
+  provider: "github" | "forgejo";
+  /** "GitHub" / "Forgejo". */
+  providerName: string;
+  accountLogin: string | null;
+  /** `github.com`, or the self-hosted server's host. */
+  host: string;
+};
+
+export type RepositoryForgeConnectionsResponse = {
+  connections: RepositoryForgeConnection[];
+};
+
+export type RepositoryConnectForgeResult = {
+  gitUrl: string;
+  /** The browsable page, when the host exposes one. */
+  htmlUrl: string | null;
+  branch: string;
+  pushed: boolean;
+};
+
+export type RepositoryConnectRemoteResult = {
+  gitUrl: string;
+  branch: string;
+  pushed: boolean;
+};
+
+// ─────────────────────── Repository workspace ───────────────────────────
+
+/**
+ * The App-owned checkout behind the repository UI, mirrored by hand from
+ * `server/services/repositoryWorkspace.ts`. The client never imports server
+ * code, so these shapes are duplicated on purpose; keep them in step.
+ */
+
+export type RepositoryTreeEntry = {
+  name: string;
+  /** Repository-root-relative POSIX path. */
+  path: string;
+  type: "file" | "directory";
+  size: number;
+  /**
+   * Matched by a .gitignore rule. The tree omits these unless the request
+   * passes `showIgnored=1`, so a listing full of `node_modules` is opt-in.
+   */
+  ignored: boolean;
+};
+
+export type RepositoryFileContent = {
+  path: string;
+  /** Null when the file is binary or too large to hand to the editor. */
+  content: string | null;
+  size: number;
+  binary: boolean;
+  tooLarge: boolean;
+  /** Set when the content came from history rather than the working tree. */
+  ref: string | null;
+};
+
+export type RepositoryChangeStatus =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "untracked"
+  | "conflicted";
+
+export type RepositoryChange = {
+  path: string;
+  /** Renames carry where the file came from. */
+  fromPath: string | null;
+  status: RepositoryChangeStatus;
+  staged: boolean;
+};
+
+export type RepositoryStatus = {
+  branch: string | null;
+  /** True before the first commit, when HEAD points at a branch that has none. */
+  unborn: boolean;
+  detached: boolean;
+  ahead: number;
+  behind: number;
+  upstream: string | null;
+  changes: RepositoryChange[];
+};
+
+export type RepositoryCommit = {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  body: string;
+  authorName: string;
+  authorEmail: string;
+  authoredAt: string;
+  parents: string[];
+};
+
+export type RepositoryBranch = {
+  name: string;
+  remote: boolean;
+  current: boolean;
+  sha: string;
+  subject: string;
+  committedAt: string;
+};
+
+export type RepositoryDiff = {
+  /** Raw unified diff — the client parses and renders it itself. */
+  patch: string;
+  truncated: boolean;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+};
+
+/** One line of a checkout-wide text search, with its 1-based line number. */
+export type RepositorySearchMatch = {
+  path: string;
+  line: number;
+  text: string;
+};
+
+export type RepositorySearchResponse = {
+  matches: RepositorySearchMatch[];
+  /** The server stopped early — say so rather than implying this is all of it. */
+  truncated: boolean;
+};
+
+export type RepositoryTreeResponse = { entries: RepositoryTreeEntry[] };
+export type RepositoryHistoryResponse = { commits: RepositoryCommit[] };
+export type RepositoryBranchesResponse = { branches: RepositoryBranch[] };
+export type RepositoryCommitDiff = RepositoryDiff & { commit: RepositoryCommit | null };
+export type RepositoryCommitResult = { committed: true; sha: string };
+
+// ───────────────────── Repository AI work sessions ──────────────────────
+
+/**
+ * `empty` is not a failure — "I read it and there is nothing to change" is a
+ * legitimate outcome, and it needs its own state so the UI never offers to
+ * publish a branch with no commits on it.
+ */
+export type RepositoryWorkSessionStatus =
+  | "running"
+  | "ready"
+  | "empty"
+  | "proposed"
+  | "published"
+  | "discarded"
+  | "failed";
+
+/** Statuses a Member may send another instruction into. Mirrors the server. */
+export const REVISABLE_WORK_SESSION_STATUSES: RepositoryWorkSessionStatus[] = [
+  "ready",
+  "empty",
+  "proposed",
+  "failed",
+];
+
+export type RepositoryWorkSessionEmployee = {
+  id: string;
+  name: string;
+  slug: string;
+  avatarKey: string | null;
+};
+
+export type RepositoryWorkSession = {
+  id: string;
+  companyId: string;
+  repositoryId: string;
+  employeeId: string;
+  /** Chosen AI Model; null for sessions created before model selection existed. */
+  modelId: string | null;
+  /** Chosen reasoning effort for every turn; null uses the AI Model's default. */
+  effort: ModelEffort | null;
+  requestedByUserId: string | null;
+  /** Short label for the session list; renameable. */
+  title: string;
+  /** What the session was opened with, verbatim. */
+  instruction: string;
+  status: RepositoryWorkSessionStatus;
+  /** Branch the employee committed on, once its turn has ended. */
+  branch: string | null;
+  baseCommit: string | null;
+  headCommit: string | null;
+  /** The employee's report from the most recent turn. */
+  reply: string;
+  error: string;
+  /** How many instructions the session has had. */
+  turnCount: number;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  /** Set when the branch reached the remote, so the UI can say so. */
+  publishedBranch: string | null;
+  pullRequestUrl: string | null;
+  pullRequestNumber: number | null;
+  finishedAt: string | null;
+  /** Set once a Member filed the session away; it leaves the inbox, not the DB. */
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  employee: RepositoryWorkSessionEmployee | null;
+};
+
+/**
+ * `stopped` is a Member calling the turn off mid-way. Whatever was committed
+ * before the stop stays on the branch, and the session accepts another
+ * instruction — it is a pause with a chance to redirect, not a failure.
+ */
+export type RepositoryWorkSessionTurnStatus = "running" | "ok" | "stopped" | "failed";
+
+/** One instruction and what the employee did about it. */
+export type RepositoryWorkSessionTurn = {
+  attachments?: ChatAttachment[];
+  id: string;
+  sessionId: string;
+  ordinal: number;
+  instruction: string;
+  reply: string;
+  status: RepositoryWorkSessionTurnStatus;
+  error: string;
+  requestedByUserId: string | null;
+  baseCommit: string | null;
+  headCommit: string | null;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  finishedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RepositoryWorkSessionsResponse = { sessions: RepositoryWorkSession[] };
+export type RepositoryWorkSessionDetail = {
+  session: RepositoryWorkSession;
+  turns: RepositoryWorkSessionTurn[];
+};
+export type WorkSessionModel = Pick<
+  AIModel,
+  "id" | "provider" | "model" | "status" | "isActive"
+> & {
+  label: string;
+  /** The server supplies the thinking levels this model currently supports. */
+  effortLevels?: ModelEffort[];
+  /** Its owners' default and the highest level they allow, with the levels. */
+  thinking?: ModelThinking;
+};
+export type RepositoryWorkSessionCandidatesResponse = {
+  employees: Array<RepositoryWorkSessionEmployee & { role: string; models: WorkSessionModel[] }>;
+};
+export type RepositoryWorkSessionDiff = RepositoryDiff & { commits: RepositoryCommit[] };
+
+/**
+ * One thing that happened while an AI Employee worked on a turn — see the
+ * server's `RepositoryWorkSessionEvent` for what each kind means.
+ *
+ *   - `text`        → narration between tool calls; `detail.text`.
+ *   - `tool_use`    → a tool was called; `detail.input` holds its arguments,
+ *                     with long strings clipped.
+ *   - `tool_result` → that call returned, paired to its `tool_use` by
+ *                     `callId`; `detail.output` holds the clipped output.
+ *   - `steps`       → the employee's step list; `detail.steps`. The latest one
+ *                     is the current state.
+ *   - `progress`, `compact`, `retry`, `stopped` → one-line system notes.
+ */
+export type RepositoryWorkSessionEventKind =
+  | "text"
+  | "tool_use"
+  | "tool_result"
+  | "steps"
+  | "progress"
+  | "compact"
+  | "retry"
+  | "stopped";
+
+export type RepositoryWorkSessionStepStatus = "pending" | "in_progress" | "completed";
+
+export type RepositoryWorkSessionStep = {
+  text: string;
+  status: RepositoryWorkSessionStepStatus;
+};
+
+export type RepositoryWorkSessionEvent = {
+  id: string;
+  turnId: string;
+  /** Position in the session, across turns — the cursor for `?after=`. */
+  ordinal: number;
+  kind: RepositoryWorkSessionEventKind;
+  /** The tool name for `tool_use` / `tool_result`; empty otherwise. */
+  name: string;
+  /** Pairs a `tool_result` with its `tool_use`. Empty for other kinds. */
+  callId: string;
+  /** One line a person can read in a list. */
+  summary: string;
+  /**
+   * Bounded structured detail, shaped by `kind`. Left loose here and read
+   * through the accessors in `components/repositories/sessionState.ts`, which
+   * check the shape rather than trust it.
+   */
+  detail: unknown;
+  /** True when a `tool_result` reported an error. */
+  isError: boolean;
+  createdAt: string;
+};
+
+export type RepositoryWorkSessionEventsResponse = {
+  events: RepositoryWorkSessionEvent[];
+  /** More rows exist past the last one returned — ask again with `after`. */
+  more: boolean;
+};
+
+// ─────────────────────── the repository's AI work ───────────────────────
+
+/**
+ * How many sessions sit in each state.
+ *
+ * `running`, `attention` and `completed` partition the sessions that are not
+ * archived; `archived` is the rest. The four add up to `total` exactly once.
+ */
+export type RepositoryAiCounts = {
+  total: number;
+  running: number;
+  attention: number;
+  completed: number;
+  archived: number;
+};
+
+/**
+ * What AI work has actually put into this repository — accepted sessions only.
+ * A branch nobody merged changed nothing here, and counting it would measure
+ * how much the employees typed rather than how much of it was any good.
+ */
+export type RepositoryAiLanded = {
+  sessions: number;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+};
+
+/** One employee's tally here, joined onto its grant by `employeeId`. */
+export type RepositoryAiEmployeeWork = {
+  employeeId: string;
+  sessions: number;
+  landed: number;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  lastActiveAt: string | null;
+};
+
+/** Where a turn in flight has got to, from the employee's own step list. */
+export type RepositoryAiStepProgress = {
+  done: number;
+  total: number;
+  current: string | null;
+};
+
+/** The live line for one running session, scoped to the turn in flight. */
+export type RepositoryAiActivity = {
+  sessionId: string;
+  /** "Ran npm test → Exit 1", "Read src/app.ts" — empty before the first event. */
+  summary: string;
+  at: string | null;
+  steps: RepositoryAiStepProgress | null;
+  /** Tool calls the turn in flight has made. */
+  toolCalls: number;
+};
+
+/**
+ * A session as the Overview lists it.
+ *
+ * Deliberately not the whole row: the digest is re-read on every activity event
+ * of a running turn, and the three large fields on a session — the brief in
+ * full, the employee's report, the failure text — are all things this list
+ * never shows. `instruction` survives, clipped, because a session nobody
+ * renamed is titled from it.
+ */
+export type RepositoryAiSessionRow = Pick<
+  RepositoryWorkSession,
+  | "id"
+  | "employeeId"
+  | "status"
+  | "title"
+  | "branch"
+  | "turnCount"
+  | "filesChanged"
+  | "insertions"
+  | "deletions"
+  | "publishedBranch"
+  | "pullRequestUrl"
+  | "pullRequestNumber"
+  | "finishedAt"
+  | "archivedAt"
+  | "createdAt"
+  | "updatedAt"
+  | "employee"
+> & {
+  /** The opening instruction, clipped by the server to ~200 characters. */
+  instruction: string;
+};
+
+/** `GET /repositories/:slug/ai-overview` — the Overview page's whole subject. */
+export type RepositoryAiOverview = {
+  counts: RepositoryAiCounts;
+  landed: RepositoryAiLanded;
+  totals: { turns: number; discarded: number };
+  lastActiveAt: string | null;
+  employees: RepositoryAiEmployeeWork[];
+  /** True when the tallies stopped counting. Never let a cap go unsaid. */
+  capped: boolean;
+  /** The sessions the page lists, already in display order. */
+  sessions: RepositoryAiSessionRow[];
+  activity: RepositoryAiActivity[];
+};
+
+// ───────────────────────── Finance AI access ────────────────────────────
+
+/** read < invoice < full — see EmployeeFinanceGrant on the server. */
+export type FinanceAccessLevel = "read" | "invoice" | "full";
+
+export type FinanceGrantEmployee = {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+};
+
+export type FinanceGrant = {
+  id: string;
+  employeeId: string;
+  accessLevel: FinanceAccessLevel;
+  createdAt: string;
+  employee: FinanceGrantEmployee | null;
+};
+
+export type FinanceGrantsResponse = { direct: FinanceGrant[] };
+
+export type FinanceGrantCandidate = FinanceGrantEmployee & {
+  alreadyGranted: boolean;
+};
+
+// ───────────────────────── Notifications ────────────────────────────────
+
+export type NotificationKind =
+  | "mention"
+  | "todo_review_requested"
+  | "todo_needs_attention"
+  | "approval_pending"
+  | "decision_pending"
+  | "finance_review_ready"
+  | "mail_handover"
+  | "revenue_follow_up"
+  | "run_failed"
+  | "run_off_goal"
+  | "approval_stale"
+  | "decision_stale"
+  | "handoff_overdue"
+  | "goal_achieved"
+  | "goal_missed"
+  /** An AI Employee reported a goal's target met — it waits for a person. */
+  | "goal_confirmation_pending"
+  | "revision_pending"
+  | "revision_stale"
+  /** An employee's earned-autonomy waiver was revoked — the gate re-armed. */
+  | "autonomy_revoked"
+  /** A monthly ad-spend Budget refused an increase — the envelope is spent. */
+  | "budget_exhausted"
+  /** An employee filed an Initiative — standing work awaiting a human. */
+  | "initiative_pending"
+  /** The monthly letter to the board is written, traced and audited. */
+  | "board_letter_ready"
+  /** Someone applied to an Opening the recipient owns, and nobody screens it. */
+  | "recruiting_application"
+  /** The AI screener rated an applicant a strong match for the recipient's Opening. */
+  | "recruiting_strong_match"
+  /** A guest asked a question in a data room the recipient runs. */
+  | "data_room_question"
+  /** A guest opened a data room for the first time. */
+  | "data_room_visit"
+  /** A support ticket was assigned to the recipient. */
+  | "support_ticket_assigned"
+  /** A customer wrote again on a ticket the recipient holds. */
+  | "support_customer_replied"
+  /** A ticket the recipient holds missed its target. */
+  | "support_sla_breached"
+  /** A customer gave a low rating on a ticket the recipient holds. */
+  | "support_low_rating"
+  /** A group discussion the recipient started handed back its outcome. */
+  | "group_discussion"
+  /** An AI Model became unavailable; the work on it waits. */
+  | "model_unavailable"
+  /** An AI Model that was unavailable answers again. */
+  | "model_available";
+
+export type NotificationActorKind = "user" | "ai" | "system";
+
+export type NotificationEntityKind =
+  | "channel_message"
+  | "todo"
+  | "approval"
+  | "decision"
+  | "ledger_entry"
+  | "mail_handover"
+  | "revenue_follow_up"
+  | "run"
+  | "handoff"
+  | "goal"
+  | "revision_proposal"
+  | "employee"
+  | "budget"
+  | "initiative"
+  | "board_letter"
+  | "recruiting_application"
+  | "data_room"
+  | "support_ticket"
+  | "ai_model";
+
+export type NotificationActor = {
+  kind: NotificationActorKind;
+  id: string | null;
+  name: string;
+  avatarKey: string | null;
+  slug: string | null;
+};
+
+export type Notification = {
+  id: string;
+  kind: NotificationKind;
+  title: string;
+  body: string;
+  link: string | null;
+  actor: NotificationActor | null;
+  entityKind: NotificationEntityKind | null;
+  entityId: string | null;
+  readAt: string | null;
+  createdAt: string;
+};
+
+// ─────────────────────────── Home page ──────────────────────────────────
+
+export type HomeTodo = {
+  id: string;
+  number: number;
+  title: string;
+  status: TodoStatus;
+  priority: TodoPriority;
+  dueAt: string | null;
+  parentTodoId: string | null;
+  project: { id: string; key: string; name: string; slug: string };
+};
+
+export type HomeApproval = {
+  id: string;
+  kind: string;
+  title: string | null;
+  summary: string | null;
+  review?: ApprovalReview | null;
+  requestedAt: string;
+  employee: { id: string; name: string; slug: string } | null;
+  routine: { id: string; name: string; slug: string } | null;
+};
+
+export type HomeChannel = {
+  id: string;
+  kind: string;
+  label: string;
+  unreadCount: number;
+  /**
+   * When this Member last read the channel. The unread count is everything
+   * after it, so a peek can draw the "new messages" line in the right place
+   * rather than guessing from the tail of the page. Null = never opened.
+   */
+  lastReadAt: string | null;
+};
+
+export type HomeFailedRun = {
+  followUpRun?: RunFollowUp | null;
+  runId: string;
+  routineId: string;
+  routineName: string;
+  status: RunStatus;
+  errorKind?: RunErrorKind | null;
+  failureReason?: string | null;
+  hasUnfinishedWork?: boolean;
+  retryAt?: string | null;
+  continuationPending?: boolean;
+  exitCode: number | null;
+  startedAt: string;
+  employee: {
+    id: string;
+    name: string;
+    slug: string;
+    avatarKey: string | null;
+  };
+};
+
+// ─────────────────── AI Employee work timeline ──────────────────────────
+// What one AI Employee — or the whole roster — actually did in a window,
+// served by GET /api/companies/:cid/work-timeline. Mirrored by hand from
+// server/services/employeeWorkTimeline.ts; the client never imports server
+// code, so these shapes are duplicated on purpose. Keep them in step.
+
+/** One ledger row the timeline tied to an entry. Mirrors the Run effect row. */
+export type WorkEffect = {
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  targetLabel: string;
+  at: string;
+};
+
+export type WorkEntryKind =
+  | "run"
+  | "chat"
+  | "work_session"
+  | "pickup"
+  | "approval"
+  | "wakeup"
+  | "lesson"
+  | "effect";
+
+export type WorkEmployeeRef = {
+  id: string;
+  name: string;
+  slug: string;
+  avatarKey: string | null;
+};
+
+/** The source record a standalone timeline change can return to. */
+export type WorkEntrySource = {
+  kind: "mail_thread";
+  id: string;
+  accountId: string;
+  label: string;
+  detail: string;
+};
+
+/** Recorded result of this email analysis attempt, never executable actions. */
+export type WorkEntryAnalysis = {
+  kind: "email";
+  status: "started" | "completed" | "failed";
+  purpose: string;
+  category: string | null;
+  summary: string | null;
+  suggestedActions: string[];
+  error: string | null;
+  /** Whether this attempt's recorded result is available to display. */
+  resultAvailable: boolean;
+  durationMs: number | null;
+};
+
+/** A Run's concise outcome and status, without a second request. */
+export type WorkEntryRun = {
+  /** A short outcome from the recorded Run, or null when none is available. */
+  summary: string | null;
+  id: string;
+  routineId: string;
+  routineName: string;
+  status: RunStatus;
+  errorKind?: RunErrorKind | null;
+  failureReason?: string | null;
+  exitCode: number | null;
+  triggerKind: RunTrigger;
+  attempt: number;
+  outcomeVerdict: RunOutcomeVerdict | null;
+  outcomeNote: string | null;
+  checksVerdict: RunChecksVerdict | null;
+};
+
+/** One thing an AI Employee did. */
+export type WorkEntry = {
+  id: string;
+  kind: WorkEntryKind;
+  at: string;
+  endedAt: string | null;
+  /** Explicit source-backed live state. Never infer this from `endedAt` alone. */
+  active: boolean;
+  employee: WorkEmployeeRef;
+  title: string;
+  /**
+   * What the work was about on its own — the Routine's name, the
+   * conversation's subject, the record that changed. Already inside `title`,
+   * repeated so the client can compose a sentence around it instead of
+   * parsing English back out. Empty when the source names nothing.
+   */
+  subject: string;
+  detail: string;
+  /** Linked provenance for a standalone change, when its source still exists. */
+  source: WorkEntrySource | null;
+  /** The Todo a `pickup` entry worked on. */
+  todo?: { id: string; ref: string; projectSlug: string } | null;
+  /** A `pickup`'s report, bounded and redacted. */
+  report?: string | null;
+  /** A bounded result for an email analysis effect; optional for older responses. */
+  analysis?: WorkEntryAnalysis | null;
+  /** Present only on `kind: "run"`. */
+  run: WorkEntryRun | null;
+  effects: WorkEffect[];
+  /** What the ledger holds before the render cap, so "3 more" is honest. */
+  effectCount: number;
+};
+
+export type WorkEntryDigest = Pick<WorkEntry, "id" | "kind" | "at" | "title" | "detail" | "active">;
+
+export type WorkEmployeeSummary = {
+  employeeId: string;
+  entryCount: number;
+  latest: WorkEntryDigest | null;
+  current: WorkEntryDigest | null;
+  waiting: WorkEntryDigest | null;
+};
+
+export type WorkTimeline = {
+  since: string;
+  until: string;
+  /** The employee this was narrowed to, or null for the whole roster. */
+  employeeId: string | null;
+  entries: WorkEntry[];
+  /** Entries in the window before `limit` sliced them. */
+  entryCount: number;
+  /** Pre-response-limit rollups, so the 40 visible rows cannot crowd a bubble out. */
+  employeeSummaries: WorkEmployeeSummary[];
+};
+
+/** Live Routine work, independent of the day selected in the work timeline. */
+export type EmployeeQueueItem = {
+  id: string;
+  runId: string | null;
+  routine: { id: string; name: string; slug: string };
+  /** The Routine's priority; missing from a server that predates it. */
+  priority?: RoutinePriority;
+  triggerKind: RunTrigger;
+  queuedAt: string;
+  availableAt: string | null;
+  /**
+   * Its place in the company's queue of Runs waiting to start, 1 being next
+   * up. Null for a running Run, a follow-up scheduled for later, and work a
+   * Standdown holds.
+   */
+  position: number | null;
+  blockedReason: string | null;
+};
+
+export type EmployeeWorkQueue = {
+  employeeId: string;
+  /** First running item retained for older API clients. */
+  current: EmployeeQueueItem | null;
+  running: EmployeeQueueItem[];
+  runningCount: number;
+  pending: EmployeeQueueItem[];
+  pendingCount: number;
+  /** Its Todos. Older servers leave it out. */
+  todos?: EmployeeTodoQueue;
+};
+
+// ───────────────────────── System Health ────────────────────────────────
+export type HealthSeverity = "ok" | "warn" | "error";
+export type HealthItem = {
+  label: string;
+  sublabel?: string;
+  badge?: string;
+  link?: string;
+};
+export type HealthProbe = {
+  id: string;
+  title: string;
+  description: string;
+  severity: HealthSeverity;
+  count: number;
+  summary: string;
+  items: HealthItem[];
+};
+export type SystemHealthReport = {
+  generatedAt: string;
+  windowHours: number;
+  status: HealthSeverity;
+  issueCount: number;
+  checks: HealthProbe[];
+};
+export type SystemHealthSummary = {
+  status: HealthSeverity;
+  issueCount: number;
+  checks: {
+    id: string;
+    title: string;
+    severity: HealthSeverity;
+    count: number;
+  }[];
+};
+
+// ───────────────────────── Instance Health (Admin) ──────────────────────
+// Install-wide health (database, migrations, disk, runtime), distinct from the
+// company-scoped System Health above. Served by /api/admin/instance-health.
+export type InstanceSeverity = "ok" | "warn" | "error";
+export type InstanceFact = { label: string; value: string; mono?: boolean };
+export type InstanceProbe = {
+  id: string;
+  title: string;
+  description: string;
+  severity: InstanceSeverity;
+  summary: string;
+  facts: InstanceFact[];
+};
+export type InstanceInfo = {
+  nodeVersion: string;
+  platform: string;
+  uptimeSeconds: number;
+  dbDriver: "sqlite" | "postgres";
+  dataDir: string;
+  publicUrl: string;
+  memory: { rssBytes: number; heapUsedBytes: number; heapTotalBytes: number };
+  counts: { companies: number; users: number; employees: number };
+};
+export type InstanceHealthReport = {
+  generatedAt: string;
+  status: InstanceSeverity;
+  issueCount: number;
+  checks: InstanceProbe[];
+  instance: InstanceInfo;
+};
+
+// ─────────────────────────── Migrations (Admin) ─────────────────────────
+// The per-migration detail behind the Instance Health "migrations" check,
+// served read-only by /api/admin/migrations. Severity reuses InstanceSeverity
+// above so the two admin surfaces grade themselves on one scale.
+//
+// NOTE: there is no "applied at" here, and that is not an oversight. TypeORM's
+// migrations table records only id (execution ORDER), the migration's own
+// AUTHORED timestamp, and its name — nothing stores when a migration actually
+// ran. `authoredAt` is when the migration was WRITTEN; never label it "Applied
+// at" or "Ran at" in the UI. Use `batchId` for run order.
+export type MigrationState = "applied" | "pending" | "unknown";
+export type MigrationEntry = {
+  /** TypeORM migration class name, e.g. "Init1776188492090". */
+  name: string;
+  /** Human title with the timestamp suffix stripped, e.g. "Init". */
+  title: string;
+  /** Authored timestamp (ms epoch) parsed from the class-name suffix. */
+  timestamp: number;
+  /** ISO of `timestamp` — when the migration was WRITTEN, not when it ran. */
+  authoredAt: string;
+  state: MigrationState;
+  /** migrations.id — the execution order rank. null when pending. */
+  batchId: number | null;
+};
+export type MigrationIssue = {
+  /** Stable key: "pending" | "unknown" | "out_of_order". */
+  id: string;
+  severity: InstanceSeverity;
+  title: string;
+  detail: string;
+  /** Migration class names implicated by this issue. */
+  migrations: string[];
+};
+export type MigrationReport = {
+  generatedAt: string;
+  driver: "sqlite" | "postgres";
+  status: InstanceSeverity;
+  summary: string;
+  total: number;
+  appliedCount: number;
+  pendingCount: number;
+  unknownCount: number;
+  lastApplied: {
+    name: string;
+    title: string;
+    authoredAt: string;
+    batchId: number | null;
+  } | null;
+  issues: MigrationIssue[];
+  /** Every migration, sorted by `timestamp` DESC (newest first). */
+  migrations: MigrationEntry[];
+};
+
+/** The dashboard is the only place a global SMTP transport comes from — the
+ *  `config.ts` SMTP block is gone, so "none" means system emails log to the
+ *  server console. */
+export type GlobalSmtpSource = "database" | "none";
+/** Non-secret view of the install-wide global email transport (Admin → Email). */
+export type GlobalEmailTransport = {
+  configured: boolean;
+  source: GlobalSmtpSource;
+  overrideActive: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  fromName: string;
+  from: string;
+  hasPassword: boolean;
+};
+
+// ─────────────────────────── Admin runtime settings ────────────────────────
+// The operational knobs that used to live in `config.ts`, now one JSON
+// `AppSetting` row per group and edited at Admin → Runtime. Served by
+// /api/admin/runtime-settings; these shapes mirror
+// `server/services/runtimeSettings.ts` exactly. No secrets live in any group,
+// so the GET returns every value. PUT replaces a whole group — a body missing
+// any field of the group is rejected.
+export type RuntimeSettingsGroup =
+  | "web"
+  | "mail"
+  | "oauth"
+  | "meetings"
+  | "browser"
+  | "agent"
+  | "containment"
+  | "network"
+  | "banking"
+  | "emailVerification"
+  | "modelAvailability";
+
+/** Open-web tools (`search_web`, `fetch_web_page`, `download_web_file`). */
+export type RuntimeWebSettings = {
+  enabled: boolean;
+  searchProvider: "duckduckgo" | "searxng" | "disabled";
+  searxngUrl: string;
+  maxSearchResults: number;
+  maxDocumentBytes: number;
+  maxTextChars: number;
+};
+
+/** Gmail mailbox sync tuning. */
+export type RuntimeMailSettings = {
+  syncIntervalSec: number;
+  backfillThreadsPerPass: number;
+  backfillPassSeconds: number;
+  backfillDays: number;
+};
+
+export type RuntimeOauthSettings = {
+  hostedSignInEnabled: boolean;
+  hostedSignInUrl: string;
+};
+
+/** `GET /api/admin/hosted-sign-in` — what Genosyn Connect offers this installation now. */
+export type HostedSignInReport = {
+  enabled: boolean;
+  url: string;
+  apps: Array<{
+    app: string;
+    name: string;
+    status: "available" | "unreachable" | "unsupported" | "disabled" | "registered";
+    integrations: Array<{ provider: string; name: string; groups: string[] }>;
+  }>;
+};
+
+/** Calendar mirror + meeting transcription. */
+export type RuntimeMeetingsSettings = {
+  enabled: boolean;
+  syncIntervalSeconds: number;
+  transcriptionModel: string;
+  maxRecordingBytes: number;
+};
+
+/** The browser an AI Employee drives inside Genosyn's own container. */
+export type RuntimeBrowserSettings = {
+  executablePath: string;
+  /** "auto" runs headed whenever a display is available. */
+  headless: "auto" | boolean;
+  locale: string;
+  timezone: string;
+  humanize: boolean;
+  /** Days a Routine browser recording is kept once it finishes. 0 keeps them forever. */
+  recordingRetentionDays: number;
+};
+
+/** Agent knobs that are not part of the boot security posture. */
+export type RuntimeAgentSettings = {
+  maxConcurrentTurnsPerCompany: number;
+  taintPolicy: "web" | "off";
+  memberBrowsersEnabled: boolean;
+  toolDiscovery: { enabled: boolean; minCatalogueSize: number };
+};
+
+/** Settings for the sweep that finishes grading Runs with missing verdicts. */
+export type RuntimeContainmentSettings = {
+  /** How stale a Run's missing verdict must be before the sweep re-grades it. */
+  regradeAfterMinutes: number;
+  /** Runs re-graded per heartbeat pass. Each one is a model turn. */
+  regradePerPass: number;
+};
+
+/**
+ * Hosts Genosyn may reach even though they resolve to a private address. The
+ * server unions this list with the one in `config.security`, and ignores this
+ * half entirely on a multi-tenant install.
+ */
+export type RuntimeNetworkSettings = {
+  /** Exact hostnames or IP literals, normalized and deduped by the server. */
+  privateHostAllowlist: string[];
+};
+
+/** Banking's background sync of connected bank accounts and cards. */
+export type RuntimeBankingSettings = {
+  /** false stops the background sync; Sync now still works. */
+  syncEnabled: boolean;
+  /** How often a healthy account syncs, in minutes. */
+  syncIntervalMinutes: number;
+};
+
+/** The in-house email finder/verifier (`verify_email`, `find_contact_email`). */
+export type RuntimeEmailVerificationSettings = {
+  /** Master switch for both tools. */
+  enabled: boolean;
+  /** Perform the SMTP RCPT callout. Forced off on multi-tenant installs. */
+  smtpProbe: boolean;
+  /** MAIL FROM for a probe; empty sends the null sender `<>`. */
+  probeFromAddress: string;
+  /** Per-connection SMTP timeout, in milliseconds. */
+  probeTimeoutMs: number;
+  /** Name patterns `find_contact_email` tries per lookup. */
+  maxCandidates: number;
+};
+
+/** How an unavailable AI Model is waited out (`server/services/modelAvailability.ts`). */
+export type RuntimeModelAvailabilitySettings = {
+  /** Outage failures in a row that mark a model unavailable; one refused connection always does. */
+  failureThreshold: number;
+  /** Seconds before the first check once a model becomes unavailable. */
+  firstCheckSeconds: number;
+  /** The longest wait between checks, in minutes. */
+  maxCheckIntervalMinutes: number;
+  /** Seconds between the Runs a model starts once it is back; 0 starts them together. */
+  resumeIntervalSeconds: number;
+};
+
+export type RuntimeSettings = {
+  web: RuntimeWebSettings;
+  mail: RuntimeMailSettings;
+  oauth: RuntimeOauthSettings;
+  meetings: RuntimeMeetingsSettings;
+  browser: RuntimeBrowserSettings;
+  agent: RuntimeAgentSettings;
+  containment: RuntimeContainmentSettings;
+  network: RuntimeNetworkSettings;
+  banking: RuntimeBankingSettings;
+  emailVerification: RuntimeEmailVerificationSettings;
+  modelAvailability: RuntimeModelAvailabilitySettings;
+};
+
+export type RuntimeSettingsSnapshot = RuntimeSettings & {
+  /** Whether each group is backed by a stored row rather than the defaults. */
+  overridden: Record<RuntimeSettingsGroup, boolean>;
+};
+
+// ────────────────────── Admin install-wide OAuth apps ──────────────────────
+// One registration per OAuth provider, served by /api/admin/oauth-apps. The
+// client secret is write-only across this boundary: `hasClientSecret` says
+// whether one is on file, never what it is.
+export type OauthAppDescriptor = {
+  app: "google" | "x" | "github" | "reddit" | "linkedin" | "microsoft";
+  label: string;
+  /** Names of the integrations this one registration unlocks. */
+  unlocks: string[];
+  consoleUrl: string;
+  steps: string[];
+  configured: boolean;
+  clientId: string;
+  hasClientSecret: boolean;
+  redirectUri: string;
+  updatedAt: string | null;
+};
+
+// ───────────────────────── Admin instance settings ─────────────────────────
+// Installation-wide browser settings persisted in app_settings. The origin
+// and custom JavaScript use separate endpoints so saving one can never replace
+// a concurrent edit to the other.
+export type InstanceSettings = {
+  publicUrl: string;
+  configured: boolean;
+};
+export type CustomJavaScriptSettings = {
+  customJavaScript: string;
+  configured: boolean;
+};
+
+// ───────────────────────── Admin sign-up policy ─────────────────────────────
+// Instance-wide toggle for self-service registration, served by
+// /api/admin/signup-settings. The public sign-up page reads /api/auth/signup-status.
+export type SignupSettings = { signupsDisabled: boolean };
+export type SignupStatus = { open: boolean; setupRequired?: boolean };
+
+// ───────────────────────────── Admin SSO ────────────────────────────────────
+// Instance-wide single sign-on, served by /api/admin/sso. Disabled by default.
+// The login page reads the public probe at /api/auth/sso/status.
+export type SsoProvider = "google" | "oidc";
+export type SsoSettings = {
+  enabled: boolean;
+  provider: SsoProvider;
+  displayName: string;
+  issuer: string;
+  clientId: string;
+  hasClientSecret: boolean;
+  autoProvision: boolean;
+  configured: boolean;
+  callbackUrl: string;
+  /** Whether companies may sign Members in through their own identity
+   *  provider. Set with PUT /api/admin/sso/company. */
+  companySsoAllowed: boolean;
+};
+export type SsoPublicStatus = {
+  enabled: boolean;
+  buttonLabel: string | null;
+  /** True iff at least one company on this install has its own SSO enabled —
+   *  the login page uses it to offer company SSO sign-in. */
+  companySso: boolean;
+};
+export type SsoIssuerCheck = {
+  ok: boolean;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+  userinfoEndpoint?: string;
+};
+
+// ───────────────────────── Company SSO ──────────────────────────────────────
+// Per-company single sign-on, configured at Settings → Single sign-on and
+// served by /api/companies/:cid/sso. Members sign in at
+// /login/sso/<companySlug>; the public probe is
+// /api/auth/sso/company/:companySlug/status.
+export type CompanySsoSettings = {
+  enabled: boolean;
+  provider: SsoProvider;
+  displayName: string;
+  issuer: string;
+  clientId: string;
+  hasClientSecret: boolean;
+  /** A successful IdP sign-in may join this company (and may create a brand
+   *  new account for an unknown email). */
+  autoJoin: boolean;
+  /** Comma-separated lowercase email domains allowed to join or be
+   *  provisioned through SSO; empty means no restriction. */
+  allowedEmailDomains: string;
+  configured: boolean;
+  /** The redirect URI to register with the identity provider. */
+  callbackUrl: string;
+  /** The page members bookmark to sign in through this company's IdP. */
+  loginUrl: string;
+  /** Whether a master admin allows company SSO on this install at all. */
+  allowedByInstance: boolean;
+};
+export type CompanySsoPublicStatus = {
+  enabled: boolean;
+  buttonLabel: string | null;
+};
+/** POST /api/auth/sso/company/link — confirming an email-matched account with
+ *  its password. Mirrors the password login's 2FA handoff shape. */
+export type CompanySsoLinkResponse =
+  | { ok: true; requiresTwoFactor?: undefined }
+  | { requiresTwoFactor: true; methods: TwoFactorLoginMethods };
+/** POST /api/auth/sso/company/link/describe — the company whose SSO is asking
+ *  to link, for the confirm page. The account's email stays server-side. */
+export type CompanySsoLinkDescription = {
+  companyName: string;
+  companySlug: string;
+  issuerHost: string;
+};
+
+// ───────────────────── Admin directory (Users + Companies) ───────────────────
+// Instance-wide management surfaces served by /api/admin/users and
+// /api/admin/companies. Not company-scoped — see routes/admin.ts.
+export type OwnedCompanyRef = { id: string; name: string; slug: string };
+export type AdminUserRow = {
+  id: string;
+  email: string;
+  name: string;
+  handle: string | null;
+  avatarKey: string | null;
+  createdAt: string;
+  isMasterAdmin: boolean;
+  membershipCount: number;
+  ownedCompanies: OwnedCompanyRef[];
+};
+export type AdminCompanyRow = {
+  id: string;
+  name: string;
+  slug: string;
+  createdAt: string;
+  owner: { id: string; name: string; email: string } | null;
+  memberCount: number;
+  employeeCount: number;
+};
+
+// ───────────────────── Admin DB console (Admin → Database) ───────────────────
+// A raw query console over Genosyn's own application database, served by
+// /api/admin/db/*. Master-admin gated, read-only by default. See
+// server/services/adminDbConsole.ts.
+export type AdminDbColumn = {
+  name: string;
+  type: string;
+  nullable: boolean;
+  pk: boolean;
+};
+export type AdminDbTable = {
+  name: string;
+  columns: AdminDbColumn[];
+  rowCount: number | null;
+};
+export type AdminDbSchema = {
+  driver: "sqlite" | "postgres";
+  tables: AdminDbTable[];
+};
+export type AdminQueryResult = {
+  kind: "read" | "write";
+  columns: string[];
+  rows: Record<string, unknown>[];
+  rowCount: number;
+  affectedRows: number | null;
+  truncated: boolean;
+  elapsedMs: number;
+};
+
+export type HomeRepositoryWork = {
+  id: string;
+  title: string;
+  status: RepositoryWorkSessionStatus;
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  /** The confirmation must warn that discard leaves remote review work in place. */
+  hasPullRequest: boolean;
+  updatedAt: string;
+  repository: { id: string; name: string; slug: string; kind: RepositoryKind };
+  employee: { id: string; name: string; slug: string; avatarKey: string | null } | null;
+};
+
+export type HomeDraftEmail = {
+  id: string;
+  accountId: string;
+  threadId: string;
+  subject: string;
+  recipientSummary: string;
+  accountEmail: string;
+  updatedAt: string;
+};
+
+export type HomeData = {
+  repositoryWork: HomeRepositoryWork[];
+  repositoryWorkCount: number;
+  notifications: Notification[];
+  unreadNotificationCount: number;
+  /** The Decision Stack, highest urgency first. Empty on a clean day. */
+  decisions: Decision[];
+  pendingDecisionCount: number;
+  /** Action Approvals shown alongside questions in the Decision stack. */
+  decisionApprovals?: HomeApproval[];
+  pendingDecisionApprovalCount?: number;
+  myTodos: HomeTodo[];
+  myTodoCount: number;
+  reviewTodos: HomeTodo[];
+  reviewTodoCount: number;
+  approvals: HomeApproval[];
+  pendingApprovalCount: number;
+  /** Drafts awaiting review, excluding messages already queued for sending. */
+  draftEmailCount: number;
+  draftEmails: HomeDraftEmail[];
+  draftEmailAccounts: { id: string; email: string; count: number }[];
+  /** Starred conversations, matching the Email section's Starred view. */
+  starredEmailCount: number;
+  starredEmailAccounts: { id: string; email: string; count: number }[];
+  unreadChannels: HomeChannel[];
+  failedRuns: HomeFailedRun[];
+  failedRunCount: number;
+  /** The newest TLDRs this Member has not dismissed, newest first. */
+  tldrs: TldrItem[];
+  unreadTldrCount: number;
+  /**
+   * The newest letter to the board sent to this owner or admin that they have
+   * not read, and how many wait. Always null and 0 for a Member.
+   */
+  boardLetter: BoardLetterSummary | null;
+  unreadBoardLetterCount: number;
+  systemHealth: SystemHealthSummary;
+  counts: { employees: number; projects: number };
+};
+
+// ──────────────────────────────── TLDRs ──────────────────────────────────
+
+export type TldrCadence = "four_hours" | "eight_hours" | "twelve_hours" | "daily" | "weekly";
+
+export type TldrSourceStats = {
+  journalEntries: number;
+  routineRuns: number;
+  channelMessages: number;
+  channels: number;
+};
+
+export type TldrEmployeeSnapshot = {
+  id: string | null;
+  name: string;
+  slug: string;
+  role: string;
+  avatarKey: string | null;
+};
+
+export type TldrItem = {
+  id: string;
+  title: string;
+  summary: string;
+  body: string;
+  periodStart: string;
+  periodEnd: string;
+  createdAt: string;
+  sourceStats: TldrSourceStats;
+  employee: TldrEmployeeSnapshot;
+  /** Per-Member read state. The underlying company briefing is never deleted. */
+  dismissed: boolean;
+  triggerKind: "schedule" | "manual";
+  /** Question cards already asked about this briefing. */
+  questionCount: number;
+};
+
+export type TldrListResponse = {
+  items: TldrItem[];
+  total: number;
+  unreadCount: number;
+  /**
+   * Send back as `cursor` for the next, older page; null on the last. It names
+   * the last briefing shown, so briefings made in the same second are neither
+   * skipped nor repeated.
+   */
+  nextCursor?: string | null;
+};
+
+/**
+ * One question this company answers on every briefing. Configured at TLDR
+ * settings; each one posts its own card under the brief it answers.
+ */
+export type TldrStandingQuestion = {
+  id: string;
+  prompt: string;
+  enabled: boolean;
+  position: number;
+};
+
+export type TldrSettings = {
+  id: string | null;
+  enabled: boolean;
+  cadence: TldrCadence;
+  employeeId: string | null;
+  employee: TldrEmployeeSnapshot | null;
+  nextRunAt: string | null;
+  lastCoveredAt: string | null;
+  lastGeneratedAt: string | null;
+  lastAttemptAt: string | null;
+  lastError: string;
+  /** In answering order. Sent whole on save; omitting it leaves them alone. */
+  questions: TldrStandingQuestion[];
+};
+
+/** Mirrors `MAX_STANDING_QUESTIONS` — each one costs model turns per briefing. */
+export const MAX_STANDING_QUESTIONS = 8;
+
+export type TldrGenerateResponse = { status: "created"; tldr: TldrItem } | { status: "empty" };
+
+// ──────────────────────── Letters to the board ────────────────────────────
+
+export type BoardLetterStatus = "writing" | "auditing" | "ready" | "failed";
+
+/**
+ * The auditor's opinion. `unverified` and `not_appointed` both mean nobody
+ * audited the letter; neither is ever shown as clean.
+ */
+export type BoardLetterAuditStatus =
+  | "pending"
+  | "clean"
+  | "exceptions"
+  | "unverified"
+  | "not_appointed";
+
+export type BoardLetterEmployee = {
+  id: string | null;
+  name: string;
+  role: string;
+  slug: string;
+  avatarKey: string | null;
+};
+
+export type LetterFigureGroup = "goals" | "money" | "work" | "decisions";
+
+export type LetterFigure = {
+  key: string;
+  group: LetterFigureGroup;
+  label: string;
+  kind: "money" | "count" | "percent" | "number";
+  value: number;
+  display: string;
+  source: string;
+  /** A page under `/c/<slug>` that shows the same number. */
+  href: string | null;
+  note?: string;
+};
+
+export type LetterGoal = {
+  id: string;
+  title: string;
+  unit: string;
+  direction: "increase_to" | "decrease_to";
+  status: "active" | "achieved" | "missed" | "archived";
+  current: number | null;
+  target: number;
+  start: number | null;
+  progress: number | null;
+  met: boolean;
+  basis: "member" | "employee" | "chart" | null;
+  awaitingConfirmation: boolean;
+  updatedAt: string | null;
+  dueAt: string | null;
+  settledAt: string | null;
+};
+
+export type LetterFigures = {
+  version: 1;
+  computedAt: string;
+  month: string;
+  timeZone: string;
+  periodStart: string;
+  periodEnd: string;
+  ledgerFrom: string;
+  ledgerTo: string;
+  currency: string | null;
+  goals: LetterGoal[];
+  figures: LetterFigure[];
+};
+
+export type LetterEvidence = {
+  goals: Array<{ title: string; description: string; status: string }>;
+  briefings: Array<{ at: string; title: string; summary: string }>;
+  failures: Array<{
+    routine: string;
+    employee: string;
+    count: number;
+    lastAt: string;
+    lastStatus: string;
+    reasons: string[];
+  }>;
+  lessons: Array<{ at: string; employee: string; routine: string; cause: string; advice: string }>;
+  standdowns: Array<{
+    placedAt: string;
+    liftedAt: string | null;
+    scope: string;
+    reason: string;
+    liftedReason: string;
+  }>;
+  decisions: Array<{ at: string; title: string; status: string; answer: string | null }>;
+  truncated: boolean;
+};
+
+export type LetterTraceToken = {
+  text: string;
+  start: number;
+  end: number;
+  kind: "money" | "percent" | "plain";
+  value: number;
+};
+
+export type LetterTrace = {
+  traced: Array<LetterTraceToken & { figureKey: string }>;
+  untraced: LetterTraceToken[];
+};
+
+export type AuditFinding = { quote: string; problem: string };
+
+export type BoardLetterSummary = {
+  id: string;
+  number: number;
+  month: string;
+  monthLabel: string;
+  status: BoardLetterStatus;
+  auditStatus: BoardLetterAuditStatus;
+  summary: string;
+  untracedCount: number;
+  findingsCount: number;
+  writer: BoardLetterEmployee;
+  auditor: BoardLetterEmployee | null;
+  triggerKind: "schedule" | "manual";
+  attempts: number;
+  retryAt: string | null;
+  errorMessage: string;
+  createdAt: string;
+  writtenAt: string | null;
+  auditedAt: string | null;
+  deliveredAt: string | null;
+};
+
+export type BoardLetter = BoardLetterSummary & {
+  periodStart: string;
+  periodEnd: string;
+  timeZone: string;
+  body: string;
+  figures: LetterFigures | null;
+  evidence: LetterEvidence | null;
+  trace: { summary: LetterTrace; body: LetterTrace };
+  audit: { note: string; findings: AuditFinding[] };
+};
+
+export type BoardLetterSettings = {
+  enabled: boolean;
+  enabledAt: string | null;
+  writer: BoardLetterEmployee | null;
+  auditor: BoardLetterEmployee | null;
+  auditorAppointedAt: string | null;
+  auditorAppointedBy: { id: string; name: string } | null;
+  timeZone: string;
+  lastMonth: {
+    month: string;
+    label: string;
+    letterNumber: number | null;
+    status: BoardLetterStatus | null;
+    canWrite: boolean;
+  };
+  nextLetter: { month: string; label: string; dueAt: string } | null;
+  waiting: string | null;
+  lastError: string;
+};
+
+export type BoardLetterListResponse = {
+  settings: BoardLetterSettings;
+  letters: BoardLetterSummary[];
+};
+
+// ─────────────────────────── Finance (M19) ───────────────
+
+export type CustomerContact = {
+  id: string;
+  companyId: string;
+  customerId: string;
+  name: string;
+  email: string;
+  phone: string;
+  role: string;
+  isPrimary: boolean;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CustomerContactDraft = {
+  name: string;
+  email?: string;
+  phone?: string;
+  role?: string;
+  isPrimary?: boolean;
+  sortOrder?: number;
+};
+
+export type Customer = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  /** Revenue account lifecycle. A prospect is still a Customer row, but is
+   * not considered billable until its first invoice is issued. */
+  accountStatus: "prospect" | "customer" | "former";
+  domain: string;
+  websiteUrl: string;
+  industry: string;
+  employeeCount: number;
+  headquartersAddress: string;
+  parentCompanyName: string;
+  parentCompanyDomain: string;
+  ownerId: string | null;
+  ownerEmployeeId: string | null;
+  email: string;
+  phone: string;
+  billingAddress: string;
+  shippingAddress: string;
+  taxNumber: string;
+  currency: string;
+  /** Annual Contract Value in minor units of `currency`. 0 means unset. */
+  annualContractValueCents: number;
+  notes: string;
+  archivedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Additional people at this account. Populated by GET /customers and
+   *  GET /customers/:slug; empty array when none have been added. */
+  contacts: CustomerContact[];
+  /** GET /customers/:slug only: the customer a merged duplicate now lives in. */
+  mergedInto?: { id: string; slug: string; name: string } | null;
+};
+
+/** Why someone is in a send dialog's suggestions, strongest tie first. */
+export type RecipientSuggestionSource =
+  | "billing_email"
+  | "customer_contact"
+  | "revenue_contact"
+  | "deal"
+  | "domain";
+
+/** One of the customer's people, offered in an invoice or estimate's send dialog. */
+export type RecipientSuggestion = {
+  email: string;
+  /** "" when the address is all there is — the billing email. */
+  name: string;
+  /** Role or job title. */
+  role: string;
+  primary: boolean;
+  /** The billing email, or a billing or finance role, title or mailbox. */
+  billing: boolean;
+  sources: RecipientSuggestionSource[];
+  dealTitle: string | null;
+  lastEmailedAt: string | null;
+};
+
+/** GET /customers/:slug/recipient-suggestions — best first. */
+export type RecipientSuggestionList = {
+  suggestions: RecipientSuggestion[];
+  /** The domain people were matched at, or null (unset, free mail, or the company's own). */
+  domain: string | null;
+};
+
+/** What an invoice or estimate's send dialog shows before anything goes out. */
+export type DocumentEmailDetails = {
+  /** The customer's billing email, the To the dialog starts with. */
+  toAddress: string;
+  /** Finance → Settings → Always Cc, comma-separated; "" on estimates. */
+  alwaysCcAddress: string;
+  fromAddress: string;
+  replyTo: string;
+  configured: boolean;
+  source: "company_provider" | "global_smtp" | "console";
+};
+
+/** What `/invoices/:slug/send` and `/estimates/:slug/send` say about the email. */
+export type DocumentSendResult = {
+  status: "sent" | "skipped" | "failed";
+  errorMessage: string;
+  toAddress: string;
+  ccAddress: string;
+  pdfRequested: boolean;
+  pdfAttached: boolean;
+};
+
+/** One of the customer's people on a mail conversation. */
+export type CustomerMailPerson = {
+  email: string;
+  /** Contact name, else the sender's display name, else "". */
+  name: string;
+};
+
+/** A mail conversation with a customer — GET /customers/:slug/mail. */
+export type CustomerMailThread = {
+  id: string;
+  accountId: string;
+  mailboxAddress: string;
+  subject: string;
+  snippet: string;
+  participants: string;
+  unread: boolean;
+  messageCount: number;
+  hasAttachments: boolean;
+  lastMessageAt: string | null;
+  people: CustomerMailPerson[];
+  peopleTotal: number;
+};
+
+export type CustomerMailPage = {
+  threads: CustomerMailThread[];
+  total: number;
+  limit: number;
+  offset: number;
+  /** Exact addresses the server matched on. */
+  addresses: string[];
+  /** The domain matched on; null when unset, free mail, or the company's own. */
+  domain: string | null;
+  mailboxCount: number;
+  /** Mail mirrored before the address index existed is still being indexed. */
+  indexing: boolean;
+};
+
+/** A server-filtered window for the standalone Customers list. */
+export type CustomerListPage = {
+  customers: Customer[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+/** A signed agreement uploaded against a customer (the Customers section).
+ *  `customer` is a lightweight stub the list endpoint attaches; null when the
+ *  contract isn't linked to an account. */
+export type CustomerContract = {
+  id: string;
+  companyId: string;
+  customerId: string | null;
+  title: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  signedAt: string | null;
+  notes: string;
+  uploadedByUserId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  customer: { id: string; name: string; slug: string } | null;
+};
+
+// ───────────────────────── Customer statement ──────────────────────────
+
+export type StatementTxnKind = "invoice" | "payment" | "adjustment";
+
+export type StatementTxn = {
+  date: string;
+  kind: StatementTxnKind;
+  reference: string;
+  description: string;
+  invoiceSlug: string | null;
+  chargeCents: number;
+  paymentCents: number;
+  balanceCents: number;
+};
+
+export type StatementAging = {
+  currentCents: number;
+  d1to30Cents: number;
+  d31to60Cents: number;
+  d61to90Cents: number;
+  d90PlusCents: number;
+  totalCents: number;
+};
+
+export type CustomerStatement = {
+  currency: string;
+  fromDate: string | null;
+  toDate: string;
+  openingBalanceCents: number;
+  closingBalanceCents: number;
+  totalChargesCents: number;
+  totalPaymentsCents: number;
+  transactions: StatementTxn[];
+  aging: StatementAging;
+  availableCurrencies: string[];
+};
+
+export type CustomerStatementResponse = {
+  customer: { id: string; name: string; slug: string };
+  statement: CustomerStatement;
+};
+
+export type Product = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  description: string;
+  unitPriceCents: number;
+  currency: string;
+  defaultTaxRateId: string | null;
+  archivedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TaxRate = {
+  id: string;
+  companyId: string;
+  name: string;
+  ratePercent: number;
+  inclusive: boolean;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type InvoiceStatus = "draft" | "sent" | "paid" | "void";
+
+export type InvoicePaymentMethod = "cash" | "bank_transfer" | "stripe" | "lightning" | "other";
+
+export type InvoiceLineItem = {
+  id: string;
+  invoiceId: string;
+  productId: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId: string | null;
+  taxName: string;
+  taxPercent: number;
+  taxInclusive: boolean;
+  lineSubtotalCents: number;
+  lineTaxCents: number;
+  lineTotalCents: number;
+  sortOrder: number;
+};
+
+export type InvoicePayment = {
+  id: string;
+  invoiceId: string;
+  amountCents: number;
+  currency: string;
+  paidAt: string;
+  /** The rate into the home currency on the day it was paid, locked when it
+   *  posted. Null on a payment recorded before rates were locked. */
+  exchangeRate: number | null;
+  method: InvoicePaymentMethod;
+  reference: string;
+  notes: string;
+  /** The deposit on Banking this payment arrived in, when it is linked to one. */
+  bankTransactionId: string | null;
+  createdById: string | null;
+  createdAt: string;
+};
+
+export type InvoiceCustomerStub = {
+  id: string;
+  name: string;
+  slug: string;
+  email: string;
+};
+
+export type InvoiceIssuer = {
+  name: string;
+  address: string;
+  country: string;
+  taxNumber: string;
+  registrationNumber: string;
+  email: string;
+  phone: string;
+  website: string;
+  footer: string;
+};
+
+export type Subsidiary = InvoiceIssuer & {
+  id: string;
+  companyId: string;
+  archived: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export const financeSubsidiaries = {
+  list: (companyId: string) =>
+    api.get<Subsidiary[]>(`/api/companies/${companyId}/finance/subsidiaries`),
+  create: (companyId: string, body: InvoiceIssuer) =>
+    api.post<Subsidiary>(`/api/companies/${companyId}/finance/subsidiaries`, body),
+  update: (companyId: string, id: string, body: Partial<InvoiceIssuer> & { archived?: boolean }) =>
+    api.patch<Subsidiary>(`/api/companies/${companyId}/finance/subsidiaries/${id}`, body),
+};
+
+export type Invoice = {
+  id: string;
+  companyId: string;
+  customerId: string;
+  subsidiaryId: string | null;
+  issuerSnapshot: InvoiceIssuer | null;
+  slug: string;
+  numberSeq: number;
+  number: string;
+  status: InvoiceStatus;
+  issueDate: string;
+  dueDate: string;
+  currency: string;
+  /** The rate into the home currency the invoice was booked at, locked when
+   *  it was issued. Null on a draft, and on an invoice issued before rates
+   *  were locked. */
+  exchangeRate: number | null;
+  /** Pre-tax amount charged — already net of `discountCents`. */
+  subtotalCents: number;
+  /** Whole-invoice discount; see `shared/documentDiscount.ts`. */
+  discountPercent: number;
+  discountAmountCents: number;
+  discountCents: number;
+  taxCents: number;
+  totalCents: number;
+  paidCents: number;
+  creditedCents: number;
+  writtenOffCents: number;
+  balanceCents: number;
+  notes: string;
+  footer: string;
+  sentAt: string | null;
+  paidAt: string | null;
+  voidedAt: string | null;
+  /** Filed out of the default lists; status, payments, and balance are
+   *  unaffected. Only an invoice with nothing left to collect can be archived
+   *  (`shared/invoiceArchive.ts`). */
+  archivedAt: string | null;
+  /** The recurring invoice schedule that created this invoice, or null for
+   *  one made any other way. */
+  recurringInvoiceId: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  customer: InvoiceCustomerStub | null;
+  /** The schedule named by `recurringInvoiceId`. */
+  recurringInvoice: InvoiceScheduleStub | null;
+  lines: InvoiceLineItem[];
+  payments: InvoicePayment[];
+};
+
+/** The recurring invoice schedule that created an invoice. */
+export type InvoiceScheduleStub = {
+  id: string;
+  name: string;
+  slug: string;
+};
+
+export type InvoiceWriteOffKind = "bad_debt" | "residual";
+
+export type InvoiceWriteOff = {
+  id: string;
+  invoiceId: string;
+  kind: InvoiceWriteOffKind;
+  amountCents: number;
+  homeCents: number;
+  currency: string;
+  expenseAccountId: string;
+  writeOffDate: string;
+  note: string;
+  createdById: string | null;
+  reversedAt: string | null;
+  reversedById: string | null;
+  createdAt: string;
+};
+
+export type CustomerCreditKind = "credit_memo" | "deposit" | "overpayment";
+export type CustomerCreditStatus = "draft" | "issued" | "void";
+
+export type CustomerCredit = {
+  id: string;
+  companyId: string;
+  customerId: string;
+  kind: CustomerCreditKind;
+  status: CustomerCreditStatus;
+  numberSeq: number;
+  number: string;
+  slug: string;
+  sourceInvoiceId: string | null;
+  currency: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  appliedCents: number;
+  refundedCents: number;
+  openCents: number;
+  reason: string;
+  notes: string;
+  issueDate: string;
+  issuedAt: string | null;
+  voidedAt: string | null;
+  createdAt: string;
+};
+
+export type CustomerCreditLine = {
+  id: string;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxName: string;
+  lineSubtotalCents: number;
+  lineTaxCents: number;
+  lineTotalCents: number;
+};
+
+export type CustomerCreditApplicationRow = {
+  id: string;
+  creditId: string;
+  invoiceId: string;
+  amountCents: number;
+  appliedAt: string;
+  reversedAt: string | null;
+  invoiceNumber?: string | null;
+  invoiceSlug?: string | null;
+  creditNumber?: string | null;
+  creditSlug?: string | null;
+};
+
+export type CustomerRefundRow = {
+  id: string;
+  creditId: string;
+  amountCents: number;
+  currency: string;
+  refundedAt: string;
+  method: string;
+  reference: string;
+  reversedAt: string | null;
+};
+
+export type CreditNoteDetail = CustomerCredit & {
+  lines: CustomerCreditLine[];
+  applications: CustomerCreditApplicationRow[];
+  refunds: CustomerRefundRow[];
+};
+
+export type VendorCreditStatus = "draft" | "issued" | "void";
+
+export type VendorCredit = {
+  id: string;
+  companyId: string;
+  vendorId: string;
+  status: VendorCreditStatus;
+  number: string;
+  slug: string;
+  sourceBillId: string | null;
+  currency: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  appliedCents: number;
+  refundedCents: number;
+  openCents: number;
+  reason: string;
+  notes: string;
+  issueDate: string;
+  createdAt: string;
+};
+
+export type VendorCreditLineRow = {
+  id: string;
+  description: string;
+  lineTotalCents: number;
+};
+
+export type VendorCreditApplicationRow = {
+  id: string;
+  creditId: string;
+  billId: string;
+  amountCents: number;
+  appliedAt: string;
+  reversedAt: string | null;
+  billNumber?: string | null;
+  billSlug?: string | null;
+  creditNumber?: string | null;
+  creditSlug?: string | null;
+};
+
+export type VendorRefundRow = {
+  id: string;
+  amountCents: number;
+  currency: string;
+  refundedAt: string;
+  method: string;
+  reversedAt: string | null;
+};
+
+export type VendorCreditDetail = VendorCredit & {
+  lines: VendorCreditLineRow[];
+  applications: VendorCreditApplicationRow[];
+  refunds: VendorRefundRow[];
+};
+
+export type InvoiceListItem = Omit<Invoice, "lines" | "payments"> & {
+  linesCount: number;
+  paymentsCount: number;
+};
+
+export type InvoiceBulkAction = "archive" | "restore";
+
+export type InvoiceBulkResult = {
+  action: InvoiceBulkAction;
+  succeeded: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
+export type InvoiceLineDraft = {
+  productId?: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId?: string | null;
+  sortOrder?: number;
+};
+
+export function formatMoney(cents: number, currency: string): string {
+  const c = currency || "USD";
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: c,
+      currencyDisplay: "symbol",
+    }).format(cents / 100);
+  } catch {
+    return `${(cents / 100).toFixed(2)} ${c}`;
+  }
+}
+
+/** An exchange rate to six significant figures, the precision fetched rates keep: 1.1205, 0.00636756. */
+export function formatExchangeRate(rate: number): string {
+  return String(Number(rate.toPrecision(6)));
+}
+
+export function parseMoneyToCents(input: string): number {
+  const cleaned = input.replace(/[^0-9.-]/g, "");
+  const n = Number(cleaned);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100);
+}
+
+/**
+ * When an issued invoice or estimate was last edited and when an email of it
+ * last went out — the `revision` on `GET …/invoices/:slug` and
+ * `GET …/estimates/:slug`.
+ */
+export type DocumentRevision = {
+  revisedAt: string | null;
+  emailedAt: string | null;
+};
+
+/** Edited after the last email went out: the customer holds an older copy. */
+export function changedSinceEmailed(revision: DocumentRevision | null | undefined): boolean {
+  if (!revision?.revisedAt || !revision.emailedAt) return false;
+  return new Date(revision.revisedAt).getTime() > new Date(revision.emailedAt).getTime();
+}
+
+/** A draft, or an issued invoice that can still be corrected and resent. */
+export function canEditInvoice(inv: Pick<Invoice, "status">): boolean {
+  return inv.status !== "void";
+}
+
+/**
+ * The money already settled against an invoice — what an edit can't take its
+ * total below.
+ */
+export function invoiceSettledCents(
+  inv: Pick<Invoice, "paidCents" | "creditedCents" | "writtenOffCents">,
+): number {
+  return inv.paidCents + inv.creditedCents + inv.writtenOffCents;
+}
+
+/**
+ * An invoice's displayed status. Settled with no cash against it reads as
+ * written off or credited; a sent one is overdue once its due date has passed
+ * — from the day after it, not at midnight UTC on it — on `today`'s calendar:
+ * the viewer's day unless a page passes the company's, as the Invoices list
+ * does so its tabs agree with the figures above it (`shared/documentDays.ts`).
+ */
+export function displayInvoiceStatus(
+  inv: Pick<Invoice, "status" | "dueDate" | "paidCents" | "writtenOffCents" | "creditedCents">,
+  now: Date = new Date(),
+  today: string = dayOf(now),
+): InvoiceStatus | "overdue" | "written_off" | "credited" {
+  // Settled with no cash against it ⇒ cleared by a write-off or a credit.
+  // Mirrors the server's displayStatus so list and detail agree.
+  if (inv.status === "paid" && inv.paidCents === 0) {
+    if (inv.writtenOffCents > 0) return "written_off";
+    if (inv.creditedCents > 0) return "credited";
+  }
+  if (inv.status === "sent" && documentDay(inv.dueDate) < today) return "overdue";
+  return inv.status;
+}
+
+// ───────────────────────── Recurring invoices ──────────────────────────
+
+export type RecurringInvoiceStatus = "active" | "paused" | "ended";
+
+export type RecurringInvoiceFrequency = "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
+
+export type RecurringInvoiceLineItem = {
+  id: string;
+  recurringInvoiceId: string;
+  productId: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId: string | null;
+  sortOrder: number;
+};
+
+export type RecurringInvoiceCustomerStub = {
+  id: string;
+  name: string;
+  slug: string;
+  email: string;
+};
+
+export type RecurringInvoice = {
+  id: string;
+  companyId: string;
+  customerId: string;
+  subsidiaryId: string | null;
+  slug: string;
+  name: string;
+  cronExpr: string;
+  frequency: RecurringInvoiceFrequency;
+  intervalCount: number;
+  status: RecurringInvoiceStatus;
+  daysUntilDue: number;
+  autoSend: boolean;
+  currency: string;
+  notes: string;
+  footer: string;
+  /** Whole-invoice discount on every invoice the schedule creates; see
+   *  `shared/documentDiscount.ts`. */
+  discountPercent: number;
+  discountAmountCents: number;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastInvoiceSlug: string;
+  runsCreated: number;
+  maxRuns: number | null;
+  endsOn: string | null;
+  /** Filed out of the default lists. Only a paused or ended schedule can be
+   *  archived, and resuming one clears it (`shared/invoiceArchive.ts`). */
+  archivedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  customer: RecurringInvoiceCustomerStub | null;
+  lines: RecurringInvoiceLineItem[];
+  /** What one run bills, tax included: the generated invoice's total. */
+  totalCents: number;
+  /** What one run charges before tax, its discount taken: the revenue it books. */
+  subtotalCents: number;
+  /** What the discount takes off one run, pre-tax. 0 without one. */
+  discountCents: number;
+  /** The most recent scheduled run, so one that is retrying or failed shows. */
+  latestRun: RecurringInvoiceRunSummary | null;
+};
+
+/**
+ * The recurring revenue `GET …/recurring-invoices/metrics` reports, as
+ * `services/recurringInvoiceMetrics.ts` computes it. Every amount is in
+ * `currency`, the company's home currency.
+ */
+export type RecurringRevenueMetrics = {
+  currency: string;
+  /** Active schedules' amount per invoice, before tax and after discounts, over a year. */
+  arrCents: number;
+  mrrCents: number;
+  activeSchedules: number;
+  activeCustomers: number;
+  /** Shortest period first; cadences with no active schedule are left out. */
+  cadences: Array<{ frequency: RecurringInvoiceFrequency; schedules: number; arrCents: number }>;
+  largestCustomer: { id: string; name: string; slug: string; arrCents: number } | null;
+  /** What the active schedules will invoice over the next `days`, tax included. */
+  upcoming: { days: number; invoices: number; totalCents: number };
+  paused: { schedules: number; arrCents: number };
+  /** Active schedules that stop billing within `days`; `firstEndsAt` is the soonest. */
+  ending: { days: number; schedules: number; arrCents: number; firstEndsAt: string | null };
+  converted: Array<{ currency: string; rate: number; rateDate: string | null }>;
+  /** Currencies with no rate into `currency`, left out of every figure. */
+  unconverted: Array<{ currency: string; schedules: number; arrCents: number }>;
+};
+
+export type RecurringInvoiceRunStatus = "pending" | "succeeded" | "failed" | "cancelled";
+
+/** One scheduled run of a recurring invoice, as list and detail pages see it. */
+export type RecurringInvoiceRunSummary = {
+  status: RecurringInvoiceRunStatus;
+  scheduledFor: string;
+  attempts: number;
+  retryAt: string | null;
+  lastError: string;
+  emailStatus: "" | "sent" | "skipped" | "failed";
+  completedAt: string | null;
+  invoiceSlug: string | null;
+};
+
+export type RecurringInvoiceListItem = Omit<RecurringInvoice, "lines"> & {
+  linesCount: number;
+};
+
+export type RecurringInvoiceBulkAction = "archive" | "restore";
+
+export type RecurringInvoiceBulkResult = {
+  action: RecurringInvoiceBulkAction;
+  succeeded: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
+export type RecurringInvoiceLineDraft = {
+  productId?: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId?: string | null;
+  sortOrder?: number;
+};
+
+// ──────────────────────────── Estimates ─────────────────────────────────
+
+export type EstimateStatus = "draft" | "sent" | "accepted" | "declined" | "void";
+
+export type EstimateLineItem = {
+  id: string;
+  estimateId: string;
+  productId: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId: string | null;
+  taxName: string;
+  taxPercent: number;
+  taxInclusive: boolean;
+  lineSubtotalCents: number;
+  lineTaxCents: number;
+  lineTotalCents: number;
+  sortOrder: number;
+};
+
+export type EstimateCustomerStub = {
+  id: string;
+  name: string;
+  slug: string;
+  email: string;
+  billingAddress: string;
+};
+
+export type EstimateInvoiceStub = {
+  id: string;
+  slug: string;
+  number: string;
+  status: string;
+};
+
+export type Estimate = {
+  id: string;
+  companyId: string;
+  customerId: string;
+  subsidiaryId: string | null;
+  issuerSnapshot: InvoiceIssuer | null;
+  slug: string;
+  numberSeq: number;
+  number: string;
+  status: EstimateStatus;
+  issueDate: string;
+  validUntil: string;
+  currency: string;
+  /** Pre-tax amount charged — already net of `discountCents`. */
+  subtotalCents: number;
+  /** Whole-estimate discount; see `shared/documentDiscount.ts`. */
+  discountPercent: number;
+  discountAmountCents: number;
+  discountCents: number;
+  taxCents: number;
+  totalCents: number;
+  notes: string;
+  footer: string;
+  sentAt: string | null;
+  acceptedAt: string | null;
+  declinedAt: string | null;
+  voidedAt: string | null;
+  invoiceId: string | null;
+  convertedAt: string | null;
+  /** Filed out of the default lists; status and actions are unaffected. */
+  archivedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  customer: EstimateCustomerStub | null;
+  lines: EstimateLineItem[];
+  invoice: EstimateInvoiceStub | null;
+  /** Present on the detail read (`GET …/estimates/:slug`) only. */
+  revision?: DocumentRevision;
+  /** Present on the detail read only: what its send dialog shows. */
+  emailDetails?: DocumentEmailDetails;
+};
+
+export type EstimateListItem = Omit<Estimate, "lines"> & {
+  linesCount: number;
+};
+
+export type EstimateBulkAction = "archive" | "restore";
+
+export type EstimateBulkResult = {
+  action: EstimateBulkAction;
+  succeeded: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
+export type EstimateLineDraft = {
+  productId?: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId?: string | null;
+  sortOrder?: number;
+};
+
+/**
+ * A draft, or a sent or accepted estimate that can be revised and resent.
+ * Declined, void and converted estimates are closed — duplicate one instead.
+ */
+export function canEditEstimate(est: Pick<Estimate, "status" | "invoiceId">): boolean {
+  if (est.invoiceId) return false;
+  return est.status === "draft" || est.status === "sent" || est.status === "accepted";
+}
+
+/**
+ * Router state Save & resend hands an invoice or estimate's detail page: the
+ * edit is saved, and the page opens its send dialog with a note saying this
+ * copy replaces the earlier one, for the Member to confirm.
+ */
+export type ResendRevisedState = { resendRevised: true };
+
+export function wantsRevisedResend(state: unknown): boolean {
+  return (
+    typeof state === "object" &&
+    state !== null &&
+    (state as { resendRevised?: unknown }).resendRevised === true
+  );
+}
+
+export type DisplayEstimateStatus = EstimateStatus | "expired" | "invoiced";
+
+/**
+ * An estimate's displayed status: invoiced once converted, and expired once a
+ * sent one's valid-until date has passed — it can be accepted all of that day
+ * — on `today`'s calendar, as {@link displayInvoiceStatus} reads a due date.
+ * An accepted estimate never expires: its validity limited how long the
+ * customer had to accept, and it stays accepted until someone converts it.
+ */
+export function displayEstimateStatus(
+  est: Pick<Estimate, "status" | "validUntil" | "invoiceId">,
+  now: Date = new Date(),
+  today: string = dayOf(now),
+): DisplayEstimateStatus {
+  if (est.invoiceId) return "invoiced";
+  if (est.status === "sent" && documentDay(est.validUntil) < today) return "expired";
+  return est.status;
+}
+
+// ─────────────────────────── Ledger (M19 Phase B) ───────────────────────
+
+export type AccountType = "asset" | "liability" | "equity" | "revenue" | "expense";
+
+export type Account = {
+  id: string;
+  companyId: string;
+  code: string;
+  name: string;
+  type: AccountType;
+  parentId: string | null;
+  isSystem: boolean;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type LedgerEntrySource =
+  | "manual"
+  | "invoice_issue"
+  | "invoice_revision"
+  | "invoice_payment"
+  | "invoice_void"
+  // Mirror of server/db/entities/LedgerEntry.ts — keep the two in step.
+  | "credit_note_issue"
+  | "credit_note_apply"
+  | "credit_note_unapply"
+  | "credit_note_void"
+  | "customer_refund"
+  | "customer_refund_void"
+  | "invoice_writeoff"
+  | "invoice_writeoff_reversal"
+  | "vendor_credit_issue"
+  | "vendor_credit_apply"
+  | "vendor_credit_unapply"
+  | "vendor_credit_void"
+  | "vendor_refund"
+  | "vendor_refund_void"
+  | "bank_categorization"
+  | "bank_categorization_void"
+  | "brex_card_expense"
+  | "brex_card_refund"
+  | "brex_card_payment"
+  | "brex_card_reclass"
+  | "ledger_reclass";
+
+export type LedgerReviewStatus = "unreviewed" | "ai_reviewed" | "approved";
+
+export type LedgerReviewChange = {
+  lineId: string;
+  fromAccountId: string;
+  toAccountId: string;
+};
+
+export type LedgerLine = {
+  id: string;
+  ledgerEntryId: string;
+  companyId: string;
+  accountId: string;
+  debitCents: number;
+  creditCents: number;
+  description: string;
+  sortOrder: number;
+};
+
+export type LedgerEntry = {
+  id: string;
+  companyId: string;
+  date: string;
+  memo: string;
+  source: LedgerEntrySource;
+  sourceRefId: string | null;
+  createdById: string | null;
+  reviewStatus: LedgerReviewStatus;
+  reviewChangesJson: string | null;
+  reviewChanges: LedgerReviewChange[];
+  reviewNote: string | null;
+  reviewedByEmployeeId: string | null;
+  reviewedByEmployee: { id: string; name: string; slug: string } | null;
+  reviewedAt: string | null;
+  approvedById: string | null;
+  approvedAt: string | null;
+  createdAt: string;
+  lines: LedgerLine[];
+  totalCents: number;
+  /** Why Entry review can't change its categories, or null when it can (`shared/entryCategory.ts`). */
+  categoryLock: EntryCategoryLock | null;
+};
+
+export type LedgerLineDraft = {
+  accountId: string;
+  debitCents?: number;
+  creditCents?: number;
+  description?: string;
+};
+
+export type LedgerBulkAction = "approve" | "return" | "delete" | "recategorize";
+
+export type LedgerBulkResult = {
+  action: LedgerBulkAction;
+  succeeded: string[];
+  skipped: Array<{ id: string; reason: string }>;
+};
+
+export type TrialBalanceRow = {
+  account: Pick<Account, "id" | "code" | "name" | "type" | "isSystem">;
+  /** Every debit posted to the account through the date. */
+  debitCents: number;
+  /** Every credit posted to the account through the date. */
+  creditCents: number;
+  /** Signed by the account's normal side; below zero is an unusual balance. */
+  balanceCents: number;
+};
+
+export type TrialBalanceResponse = {
+  asOf: string;
+  rows: TrialBalanceRow[];
+};
+
+export const ACCOUNT_TYPE_LABEL: Record<AccountType, string> = {
+  asset: "Asset",
+  liability: "Liability",
+  equity: "Equity",
+  // The type is `revenue` in the books; people call it income.
+  revenue: "Income",
+  expense: "Expense",
+};
+
+/** The cent magnitude without its sign, for a layout that marks a negative
+ *  amount some other way — the balance sheet's parentheses. */
+export function formatBalanceMagnitude(cents: number, currency: string): string {
+  return formatMoney(Math.abs(cents), currency);
+}
+
+// ─────────────────────────── Reports (M19 Phase C) ──────────────────────
+
+export type ReportRow = {
+  account: Pick<Account, "id" | "code" | "name" | "type">;
+  amountCents: number;
+};
+
+export type IncomeStatementReport = {
+  from: string;
+  to: string;
+  revenue: ReportRow[];
+  totalRevenue: number;
+  expenses: ReportRow[];
+  totalExpenses: number;
+  netIncome: number;
+};
+
+export type BalanceSheetReport = {
+  asOf: string;
+  assets: ReportRow[];
+  totalAssets: number;
+  liabilities: ReportRow[];
+  totalLiabilities: number;
+  equity: ReportRow[];
+  currentEarnings: number;
+  totalEquity: number;
+};
+
+export type CashFlowSection = {
+  label: string;
+  lines: { description: string; cents: number; entryId: string }[];
+  total: number;
+};
+
+export type CashFlowReport = {
+  from: string;
+  to: string;
+  openingBalance: number;
+  operating: CashFlowSection;
+  investing: CashFlowSection;
+  financing: CashFlowSection;
+  netChange: number;
+  closingBalance: number;
+};
+
+export type AccountActivityRow = {
+  entryId: string;
+  date: string;
+  source: LedgerEntrySource;
+  sourceRefId: string | null;
+  memo: string;
+  description: string;
+  debitCents: number;
+  creditCents: number;
+  runningBalanceCents: number;
+  /** The entry's other accounts — the other side of the transaction. */
+  otherAccounts: Array<Pick<Account, "id" | "code" | "name">>;
+};
+
+export type AccountActivityReport = {
+  account: Pick<Account, "id" | "code" | "name" | "type" | "isSystem">;
+  from: string | null;
+  to: string | null;
+  openingBalance: number;
+  rows: AccountActivityRow[];
+  closingBalance: number;
+};
+
+export type ReportEnvelope<T> = { current: T; prior: T | null };
+
+export type FinancialTrendPoint = {
+  label: string;
+  from: string;
+  to: string;
+  revenue: number;
+  expenses: number;
+  netIncome: number;
+  assets: number;
+  liabilities: number;
+  equity: number;
+  operatingCash: number;
+  investingCash: number;
+  financingCash: number;
+  netCash: number;
+  closingCash: number;
+};
+
+export type FinancialTrendsReport = {
+  from: string;
+  to: string;
+  truncated: boolean;
+  points: FinancialTrendPoint[];
+};
+
+// ─────────────────────── Period preset helper ──────────────────────────
+
+export type PeriodPreset =
+  | "this_month"
+  | "this_quarter"
+  | "this_year"
+  | "last_month"
+  | "last_quarter"
+  | "last_year"
+  | "custom";
+
+export type PeriodRange = { from: Date; to: Date };
+
+/**
+ * Resolve a preset into a [from, to] date range based on `now`. All
+ * ranges are inclusive on both ends. UTC throughout — the server
+ * normalizes to start/end-of-day, so the timezone of `now` doesn't
+ * matter to the math.
+ */
+export function rangeFromPreset(preset: PeriodPreset, now: Date = new Date()): PeriodRange {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const today = new Date(Date.UTC(y, m, now.getUTCDate()));
+  switch (preset) {
+    case "this_month":
+      return {
+        from: new Date(Date.UTC(y, m, 1)),
+        to: today,
+      };
+    case "this_quarter": {
+      const qStart = Math.floor(m / 3) * 3;
+      return {
+        from: new Date(Date.UTC(y, qStart, 1)),
+        to: today,
+      };
+    }
+    case "this_year":
+      return {
+        from: new Date(Date.UTC(y, 0, 1)),
+        to: today,
+      };
+    case "last_month":
+      return {
+        from: new Date(Date.UTC(y, m - 1, 1)),
+        to: new Date(Date.UTC(y, m, 0)),
+      };
+    case "last_quarter": {
+      const qStart = Math.floor(m / 3) * 3 - 3;
+      return {
+        from: new Date(Date.UTC(y, qStart, 1)),
+        to: new Date(Date.UTC(y, qStart + 3, 0)),
+      };
+    }
+    case "last_year":
+      return {
+        from: new Date(Date.UTC(y - 1, 0, 1)),
+        to: new Date(Date.UTC(y - 1, 11, 31)),
+      };
+    case "custom":
+      // Caller picks; default to YTD.
+      return {
+        from: new Date(Date.UTC(y, 0, 1)),
+        to: today,
+      };
+  }
+}
+
+/** Compute the immediately-prior equal-length range. Used as the
+ *  default for the "compare to prior period" toggle. */
+export function priorRangeOf(range: PeriodRange): PeriodRange {
+  const span = range.to.getTime() - range.from.getTime();
+  return {
+    from: new Date(range.from.getTime() - span - 24 * 60 * 60 * 1000),
+    to: new Date(range.from.getTime() - 24 * 60 * 60 * 1000),
+  };
+}
+
+// ─────────────────────── Reconciliation (M19 Phase D) ──────────────────
+
+export type BankFeedKind =
+  | "stripe_payouts"
+  | "brex_cash"
+  | "mercury_account"
+  | "wise_balance"
+  | "csv";
+
+export type BankFeed = {
+  id: string;
+  companyId: string;
+  name: string;
+  kind: BankFeedKind;
+  connectionId: string | null;
+  externalAccountId: string | null;
+  accountId: string;
+  /** The last successful sync — the last import, for a CSV account. */
+  lastSyncAt: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BrexCashAccount = {
+  id: string;
+  name: string;
+  status: string | null;
+  primary: boolean;
+  accountNumberLast4: string;
+  currentBalance: { amount: number; currency: string | null };
+  availableBalance: { amount: number; currency: string | null };
+};
+
+/** One account a Mercury Connection can read, as the Add account picker lists it. */
+export type MercuryAccountChoice = {
+  /** Mercury's account id — what the feed stores as `externalAccountId`. */
+  id: string;
+  name: string;
+  /** "checking", "savings", … as Mercury says it. */
+  kind: string | null;
+  accountNumberLast4: string | null;
+  currentCents: number | null;
+  availableCents: number | null;
+  /** Why it can't be added to Banking, or null when it can. */
+  unavailableReason: string | null;
+};
+
+/** One balance a Wise Connection can read, as the Add account picker lists it. */
+export type WiseBalanceChoice = {
+  /** `<profileId>:<balanceId>` — what the feed stores as `externalAccountId`. */
+  id: string;
+  profileName: string;
+  profileType: string;
+  currency: string;
+  availableCents: number | null;
+  /** Why it can't be added to Banking, or null when it can. */
+  unavailableReason: string | null;
+};
+
+export type CardFeed = {
+  id: string;
+  companyId: string;
+  name: string;
+  kind: "brex_card" | "ramp_card";
+  connectionId: string;
+  liabilityAccountId: string;
+  defaultExpenseAccountId: string;
+  paymentAccountId: string;
+  lastSyncAt: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CardAccountingKind = "expense" | "refund" | "payment";
+
+export type CardTransaction = {
+  id: string;
+  companyId: string;
+  feedId: string;
+  externalId: string;
+  cardId: string | null;
+  postedAt: string;
+  amountCents: number;
+  currency: string;
+  description: string;
+  providerType: string;
+  accountingKind: CardAccountingKind;
+  expenseAccountId: string | null;
+  ledgerEntryId: string | null;
+  postingError: string;
+  raw: string;
+  reclassifiedAt: string | null;
+  /** Waiting in To review for someone to keep its category or pick another. */
+  needsReview: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** One line of the entry that fixes a card purchase's category. */
+export type CardCategoryLine = { accountId: string; debitCents: number; creditCents: number };
+
+/**
+ * A card purchase whose books no longer match the category Banking shows,
+ * from before Banking was the one place it changes
+ * (`server/services/cardCategoryDrift.ts`). Banking lists the ones only a
+ * person can fix: `split_in_books`, with the entry Fix would post, and
+ * `unrecognized`, with why it can't be fixed there.
+ */
+export type CardCategoryDrift = {
+  kind: "banking_out_of_date" | "split_in_books" | "unrecognized";
+  transaction: Pick<
+    CardTransaction,
+    | "id"
+    | "feedId"
+    | "description"
+    | "postedAt"
+    | "amountCents"
+    | "currency"
+    | "accountingKind"
+    | "expenseAccountId"
+    | "ledgerEntryId"
+  >;
+  feedName: string;
+  /** What the purchase's posting put on its category, in the home currency. */
+  bookedCents: number;
+  /** Where the books hold the purchase, by category: debits minus credits. */
+  filed: Array<{ accountId: string; cents: number }>;
+  reviewEntryIds: string[];
+  repair:
+    | { kind: "show_category"; accountId: string }
+    | { kind: "reclassify"; lines: CardCategoryLine[] }
+    | null;
+  problem: string | null;
+};
+
+export type CardSyncResult = {
+  inserted: number;
+  posted: number;
+  failed: number;
+};
+
+/** One invoice payment a bank transaction is linked to. */
+export type BankTransactionPayment = {
+  paymentId: string;
+  invoiceId: string;
+  invoiceNumber: string;
+  invoiceSlug: string;
+  customerName: string;
+  amountCents: number;
+  /** Banking recorded this payment from the deposit, so undoing removes it. */
+  recordedHere: boolean;
+};
+
+export type BankTransactionMatch =
+  | {
+      /**
+       * The invoice payments the transaction is: one, or several when one
+       * deposit paid several invoices. A transaction still in review with
+       * payments here paid them with part of its money, and the rest waits.
+       */
+      kind: "payments";
+      payments: BankTransactionPayment[];
+    }
+  | {
+      kind: "ledger_entry";
+      entryId: string;
+      memo: string;
+      source: string;
+      sourceRefId: string | null;
+      /** The category the transaction was filed under, when it was categorized. */
+      categoryAccountId: string | null;
+    };
+
+export type BankTransaction = {
+  id: string;
+  companyId: string;
+  feedId: string;
+  externalId: string | null;
+  date: string;
+  amountCents: number;
+  description: string;
+  reference: string;
+  raw: string;
+  matchedPaymentId: string | null;
+  matchedLedgerEntryId: string | null;
+  reconciledAt: string | null;
+  reconciledById: string | null;
+  createdAt: string;
+  match: BankTransactionMatch | null;
+};
+
+export type MatchCandidate =
+  | {
+      kind: "payment";
+      paymentId: string;
+      invoiceNumber: string;
+      invoiceSlug: string;
+      customerName: string;
+      amountCents: number;
+      paidAt: string;
+      method: string;
+      score: number;
+    }
+  | {
+      kind: "ledger_entry";
+      ledgerEntryId: string;
+      memo: string;
+      source: string;
+      sourceRefId: string | null;
+      date: string;
+      amountCents: number;
+      score: number;
+    };
+
+/** Whether a transaction still waits for someone, or is explained. */
+export type BankingStatus = "review" | "done";
+
+/**
+ * Why an account's last sync failed (`server/services/feedSyncErrors.ts`),
+ * which decides what its card offers: Reconnect for a credential, Choose a
+ * Connection for one that was removed, nothing but the next try otherwise.
+ */
+export type FeedSyncErrorKind =
+  | "auth"
+  | "permission"
+  | "connection_missing"
+  | "credentials"
+  | "account_missing"
+  | "rate_limited"
+  | "provider_unavailable"
+  | "provider_error"
+  | "bad_data"
+  | "unsupported"
+  | "internal";
+
+/** How an account's sync is doing (`feedSyncStatus` on the server). */
+export type FeedSyncStatus = {
+  /** `automatic`: synced on a schedule. `manual`: connected, but the background sync is off. `import`: a CSV account. */
+  mode: "automatic" | "manual" | "import";
+  intervalMinutes: number;
+  syncing: boolean;
+  startedAt: string | null;
+  lastAttemptAt: string | null;
+  /** The last successful sync — the last import, for a CSV account. */
+  lastSuccessAt: string | null;
+  failureCount: number;
+  /** Why the last attempt failed: one line for the card, and the provider's details. */
+  error: { kind: FeedSyncErrorKind; message: string; detail: string } | null;
+  /** When the background sync next tries on its own; null when it won't. */
+  nextAttemptAt: string | null;
+};
+
+export type BankingProvider = "brex" | "mercury" | "ramp" | "wise" | "stripe";
+
+/** The Connection an account syncs through. */
+export type BankingConnection = {
+  id: string;
+  label: string;
+  provider: string;
+  status: IntegrationConnection["status"];
+  statusMessage: string;
+};
+
+type BankingAccountExtras = {
+  toReview: number;
+  total: number;
+  /** Null for a CSV account. */
+  provider: BankingProvider | null;
+  sync: FeedSyncStatus;
+  /** Null for a CSV account, and for one whose Connection was removed. */
+  connection: BankingConnection | null;
+  /** What the provider reported at the last sync — a Brex cash account, a Mercury account or a Wise balance. */
+  balance: { cents: number; currency: string; at: string } | null;
+};
+
+/** A bank account or card on Banking, with how many of its transactions wait and how its sync is doing. */
+export type BankingAccount =
+  | ({ kind: "bank"; feed: BankFeed } & BankingAccountExtras)
+  | ({ kind: "card"; feed: CardFeed } & BankingAccountExtras);
+
+/** What Sync now answered with. */
+export type FeedSyncResponse =
+  | { inserted: number; matched: number }
+  | CardSyncResult
+  /** Still running after twenty seconds; the account shows Syncing… until it is done. */
+  | { syncing: true };
+
+/** What Banking's bulk bar does to a selection — `POST …/banking/bulk`. */
+export type BankingBulkAction = "categorize" | "mark_reviewed" | "send_to_review";
+
+export type BankingBulkResult = {
+  action: BankingBulkAction;
+  /** Now in the state the action asked for. */
+  succeeded: { bank: string[]; card: string[] };
+  skipped: Array<{ kind: "bank" | "card"; id: string; reason: string }>;
+};
+
+/** An open invoice a deposit could be the payment of. */
+export type OpenInvoiceCandidate = {
+  invoiceId: string;
+  slug: string;
+  number: string;
+  customerName: string;
+  currency: string;
+  totalCents: number;
+  balanceCents: number;
+  issueDate: string;
+  dueDate: string;
+  /** What is still due is exactly what is left of the deposit. */
+  exactAmount: boolean;
+  /** The bank's description names the customer or the invoice number. */
+  mentioned: boolean;
+  score: number;
+};
+
+/** Several of one customer's open invoices that add up to exactly what is left of a deposit. */
+export type OpenInvoiceSet = {
+  customerName: string;
+  /** Oldest due first. */
+  invoiceIds: string[];
+};
+
+/** What a deposit could pay — `GET …/bank-transactions/:id/open-invoices`. */
+export type DepositInvoiceOptions = {
+  /** What is left of the deposit to put on invoices: all of it, unless part already paid some. */
+  remainingCents: number;
+  /** The invoices it could pay, best guess first. */
+  invoices: OpenInvoiceCandidate[];
+  /** One customer's invoices that add up to exactly `remainingCents`, best guess first. */
+  sets: OpenInvoiceSet[];
+};
+
+// ─────────────────────── Finance proposals (M33 A3) ────────────────────
+
+export type FinanceProposalKind = "journal_entry";
+export type FinanceProposalStatus = "pending" | "applied" | "rejected" | "superseded";
+export type FinanceProposalActorType = "human" | "ai";
+
+/** Mirror of server/db/entities/FinanceProposal.ts — a staged, human-reviewed
+ *  finance mutation. Keep the two in step. */
+export type FinanceProposal = {
+  id: string;
+  companyId: string;
+  kind: FinanceProposalKind;
+  status: FinanceProposalStatus;
+  proposedByType: FinanceProposalActorType;
+  proposedById: string | null;
+  proposedByLabel: string | null;
+  title: string;
+  summary: string | null;
+  payloadJson: string;
+  resultJson: string | null;
+  appliedEntryId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  reviewNote: string | null;
+};
+
+/** Parsed shape of a `journal_entry` proposal's `payloadJson`. */
+export type JournalProposalPayload = {
+  date: string;
+  memo: string;
+  lines: { accountId: string; debitCents: number; creditCents: number; description?: string }[];
+};
+
+// ─────────────────────── Multi-currency (M19 Phase E) ──────────────────
+
+export type Currency = {
+  id: string;
+  companyId: string;
+  code: string;
+  name: string;
+  symbol: string;
+  decimalPlaces: number;
+  createdAt: string;
+};
+
+export type ExchangeRate = {
+  id: string;
+  companyId: string;
+  fromCurrency: string;
+  toCurrency: string;
+  date: string;
+  rate: number;
+  source: string;
+  /** Fetched from the ECB rather than set by a person. */
+  automatic: boolean;
+  createdAt: string;
+};
+
+/** `GET …/exchange-rates/overview`, from `services/exchangeRateFeed.ts`. */
+export type ExchangeRateOverview = {
+  homeCurrency: string;
+  automatic: {
+    enabled: boolean;
+    /** Whether the ECB quotes the home currency, so automatic rates can work at all. */
+    available: boolean;
+    /** The newest ECB reference day on file, `YYYY-MM-DD`. */
+    latestDate: string | null;
+  };
+  /** The rate each currency in use converts at today; null where none is on file. */
+  rates: Array<{
+    currency: string;
+    rate: number | null;
+    date: string | null;
+    source: string | null;
+    automatic: boolean;
+  }>;
+};
+
+export type CompanyFinanceSettings = {
+  id: string;
+  companyId: string;
+  homeCurrency: string;
+  /** Fill exchange rates from the ECB's daily reference rates. On by default. */
+  automaticExchangeRates: boolean;
+  /** Multi-line text rendered in the "From" column on every invoice
+   *  and estimate. Empty means fall back to the bare company name. */
+  defaultFromBlock: string;
+  /** Default printable footer for invoices and estimates that don't
+   *  have one of their own. Per-doc footers always win. */
+  defaultFooter: string;
+  /** Internal recipients copied on every invoice email. */
+  invoiceCcEmails: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+// ─────────────────────── Period close (M19 Phase F) ────────────────────
+
+export type AccountingPeriodStatus = "open" | "closed";
+
+export type AccountingPeriod = {
+  id: string;
+  companyId: string;
+  name: string;
+  startDate: string;
+  endDate: string;
+  status: AccountingPeriodStatus;
+  closedAt: string | null;
+  closedById: string | null;
+  closingEntryId: string | null;
+  createdAt: string;
+};
+
+// ─────────────────────── Vendors + Bills (M19 Phase G) ─────────────────
+
+export type Vendor = {
+  id: string;
+  companyId: string;
+  name: string;
+  slug: string;
+  email: string;
+  phone: string;
+  address: string;
+  taxNumber: string;
+  currency: string;
+  notes: string;
+  archivedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BillStatus = "draft" | "sent" | "paid" | "void";
+export type BillPaymentMethod = InvoicePaymentMethod;
+
+export type BillLineItem = {
+  id: string;
+  billId: string;
+  expenseAccountId: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId: string | null;
+  taxName: string;
+  taxPercent: number;
+  taxInclusive: boolean;
+  lineSubtotalCents: number;
+  lineTaxCents: number;
+  lineTotalCents: number;
+  sortOrder: number;
+};
+
+export type BillPayment = {
+  id: string;
+  billId: string;
+  amountCents: number;
+  currency: string;
+  paidAt: string;
+  /** The rate into the home currency on the day it was paid, locked when it posted. */
+  exchangeRate: number | null;
+  method: BillPaymentMethod;
+  reference: string;
+  notes: string;
+  createdById: string | null;
+  createdAt: string;
+};
+
+export type VendorStub = { id: string; name: string; slug: string };
+
+export type Bill = {
+  id: string;
+  companyId: string;
+  vendorId: string;
+  slug: string;
+  numberSeq: number;
+  number: string;
+  vendorRef: string;
+  status: BillStatus;
+  issueDate: string;
+  dueDate: string;
+  currency: string;
+  /** The rate into the home currency the bill was booked at, locked when it was issued. */
+  exchangeRate: number | null;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  paidCents: number;
+  balanceCents: number;
+  notes: string;
+  receivedAt: string | null;
+  paidAt: string | null;
+  voidedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  vendor: VendorStub | null;
+  lines: BillLineItem[];
+  payments: BillPayment[];
+};
+
+export type BillListItem = Omit<Bill, "lines" | "payments"> & {
+  linesCount: number;
+  paymentsCount: number;
+};
+
+export type BillLineDraft = {
+  expenseAccountId?: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId?: string | null;
+  sortOrder?: number;
+};
+
+export function displayBillStatus(
+  bill: Pick<Bill, "status" | "dueDate">,
+  now: Date = new Date(),
+): BillStatus | "overdue" {
+  if (bill.status === "sent" && new Date(bill.dueDate).getTime() < now.getTime()) {
+    return "overdue";
+  }
+  return bill.status;
+}
+
+// ───────────────────────── Company search (⌘K palette) ──────────────────
+
+export type SearchResultKind =
+  | "product"
+  | "employee"
+  | "skill"
+  | "routine"
+  | "channel"
+  | "project"
+  | "todo"
+  | "base"
+  | "notebook"
+  | "note"
+  | "resource"
+  | "chart"
+  | "dashboard"
+  | "repository"
+  | "pipeline"
+  | "customer"
+  /** A customer opened as its Revenue account, for a Member without finance access. */
+  | "account"
+  | "opening"
+  | "applicant"
+  /** A support ticket, by its subject, customer or number. */
+  | "ticket"
+  /** A Finance → Products & services row, opened filtered to its name. */
+  | "catalogProduct";
+
+export type CompanySearchResult = {
+  kind: SearchResultKind;
+  id: string;
+  label: string;
+  sublabel: string | null;
+  /** Route under `/c/<companySlug>` that opens this result. */
+  path: string;
+};

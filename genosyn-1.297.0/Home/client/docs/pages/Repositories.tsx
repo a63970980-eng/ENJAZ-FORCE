@@ -1,0 +1,610 @@
+import {
+  Callout,
+  Code,
+  DocLink,
+  H2,
+  H3,
+  KeyList,
+  LI,
+  OL,
+  P,
+  PageHeader,
+  Strong,
+  UL,
+} from "@/docs/Prose";
+
+export function Repositories() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Engineering"
+        title="Repositories"
+        lead={
+          <>
+            A <Strong>Repository</Strong> is a version-controlled workspace your company owns — a
+            service&apos;s source code, a quarter&apos;s strategy, a set of operating policies.
+            Browse and edit it in the browser, commit and branch, read the history, or hand a piece
+            of work to an AI Employee and merge what it produced after you have read the diff.
+          </>
+        }
+      />
+
+      <H2 id="what">What a Repository is</H2>
+      <P>
+        Every Repository is a plain git repository. Two fields decide how it behaves, and you set
+        both when you create it:
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "origin",
+            def: (
+              <>
+                <Strong>Remote</Strong> — a clone of any HTTPS or SSH git URL: GitHub, GitLab,
+                Bitbucket, a self-hosted Gitea, anything git speaks to. <Strong>Local</Strong> —
+                created empty inside Genosyn with <Code>git init</Code> and no clone URL at all, so
+                a versioned set of documents needs no git host. A local one can be connected to
+                GitHub later without that having been the plan.
+              </>
+            ),
+          },
+          {
+            term: "kind",
+            def: (
+              <>
+                <Strong>Code</Strong> or <Strong>Documents</Strong>. It changes the empty states,
+                the editor defaults, and how an AI Employee is briefed — &ldquo;run the tests before
+                you commit&rdquo; is useful advice in a service repo and noise in a folder of
+                strategy memos. It restricts nothing: any file may live in any Repository.
+              </>
+            ),
+          },
+        ]}
+      />
+      <P>
+        Find them under <Strong>Repositories</Strong> in the section menu. Nothing here is limited
+        to engineers, and nothing here requires a git host, an account on one, or coding tools
+        switched on.
+      </P>
+      <P>
+        Any Member can edit files, commit, branch, and hand work to an AI Employee: start a work
+        session, ask for changes, stop it, merge it, or throw it away. Pulling, pushing, connecting
+        a remote, and opening a pull request are <Strong>owner or admin</Strong> only, because they
+        reach outside the company. So are adding a repository and changing its settings or AI
+        access.
+      </P>
+
+      <H2 id="create">Create a repository</H2>
+      <OL>
+        <LI>
+          Open <Strong>Repositories</Strong> from the section menu, choose{" "}
+          <Strong>Add repository</Strong>, give it a name, and choose whether it is{" "}
+          <Strong>local</Strong> — created here and never pushed anywhere — or a clone of a
+          repository that already exists.
+        </LI>
+        <LI>
+          For a remote repository, paste the clone URL —{" "}
+          <Code>https://github.com/acme/web.git</Code> or <Code>git@github.com:acme/web.git</Code> —
+          and pick an <Strong>authentication</Strong> mode. Set the default branch and, optionally,
+          a committer identity; left blank, commits are committed as <Code>Genosyn</Code>.
+        </LI>
+        <LI>
+          Open the repository. For a remote one, <Strong>Test connection</Strong> confirms Genosyn
+          can reach it and detects the default branch, using the stored token or SSH key, else a
+          pinned or sole Connection for that server, else anonymous access.
+        </LI>
+      </OL>
+      <P>
+        A local repository is created with <Code>git init</Code> on the default branch you chose,
+        plus one empty commit, so there is a revision to branch from and diff against before you
+        write your first file. It has no remote and uses no authentication — until you connect one.
+      </P>
+
+      <H2 id="connect">Connect a local repository to a git host</H2>
+      <P>
+        A repository that started life inside Genosyn can be given a real remote later, and its
+        existing history is pushed into it rather than re-created. Nobody pastes a personal access
+        token for this: the company authenticated GitHub once under{" "}
+        <Strong>Settings → Integrations</Strong>, and connecting reuses that{" "}
+        <DocLink to="/docs/integrations">Connection</DocLink>.
+      </P>
+      <OL>
+        <LI>
+          Pick one of the company&apos;s connected GitHub or Forgejo / Gitea Connections — each
+          option names its server and the account it authenticates as — then give the repository a
+          name there, optionally an organisation to own it, and choose <Strong>private</Strong> (the
+          default) or public.
+        </LI>
+        <LI>
+          Genosyn creates it through that server&apos;s API — empty, so the first push is a clean
+          fast-forward — and pushes the history into it. Every branch goes across{" "}
+          <Strong>except</Strong> the AI work-session ones under <Code>genosyn/</Code>: unreviewed
+          AI work must not reach a remote through a button that says nothing about AI.
+        </LI>
+      </OL>
+      <P>
+        The other route is to paste the clone URL of an <Strong>empty</Strong> repository you made
+        yourself, anywhere, and let Genosyn push into that. An HTTPS URL on a server the company has
+        connected authenticates through that Connection; for any other host you can supply an HTTPS
+        token or an SSH key in the same step, stored encrypted exactly as on a cloned repository. A
+        remote that already has commits is refused with an explanation rather than force-pushed.
+        Afterwards push, pull, and refresh behave exactly as they do for a repository that was
+        cloned. Connecting is <Strong>owner or admin</Strong> only, for the same reason pushing is,
+        and it is written to the audit log.
+      </P>
+
+      <H2 id="overview">The Overview: what the AI has been doing</H2>
+      <P>
+        Opening a repository lands on its <Strong>Overview</Strong>, and the subject of that page is
+        the work rather than the settings. It opens with one sentence about the state of AI work
+        here — who is working right now, how many sessions are waiting for you to decide, or that
+        nothing has run yet — and the button that starts the next one.
+      </P>
+      <P>
+        Under it are four numbers: what is running, what is waiting for you, how many sessions you
+        have accepted out of everything ever asked for, and the lines those accepted sessions
+        actually put into the repository. Only accepted work counts toward the last two. A branch
+        nobody merged changed nothing here, and counting it would measure how much the employees
+        typed rather than how much of it was any good.
+      </P>
+      <P>Then the sessions themselves, in three bands that hide when they are empty.</P>
+      <UL>
+        <LI>
+          <Strong>Working now.</Strong> Each running session with the line its employee is on this
+          second — <em>Ran npm test → Exit 1</em> — its progress through its own step list, and how
+          many tool calls it has made. It updates live, without a reload.
+        </LI>
+        <LI>
+          <Strong>Needs you.</Strong> What has come back. Each row says what to do about it —{" "}
+          <em>Read the diff and decide</em>, <em>The last turn failed — ask again</em> — rather than
+          naming a status, and opens in <Strong>AI work</Strong>.
+        </LI>
+        <LI>
+          <Strong>Recently decided.</Strong> A short tail of the work you accepted or threw away, so
+          a repository where everything has been settled still says something.
+        </LI>
+      </UL>
+      <P>
+        <Strong>Who works here</Strong> closes the page: the AI Employees you granted access, each
+        with what it has actually done in this repository rather than only the fact that it may. A
+        repository nobody has been granted says so, and links to the page that fixes it.
+      </P>
+      <P>
+        The repository&apos;s own settings — default branch, sign-in, what an employee may run, and
+        the connection check for a remote — are still here, one disclosure down under{" "}
+        <Strong>Repository details</Strong>. A <Code>README</Code> at the root is rendered above
+        them.
+      </P>
+
+      <H2 id="files">Browse and edit files</H2>
+      <P>
+        The <Strong>Files</Strong> page shows the working tree of a checkout Genosyn keeps on the
+        server. The tree is read from disk rather than from git, so a file you just created appears
+        before you have committed it. Symlinks and the <Code>.git</Code> directory are never listed,
+        one directory shows at most 2,000 entries, and <Code>.gitignore</Code> is respected —
+        ignored entries are hidden, with a toggle that brings them back dimmed.
+      </P>
+      <P>
+        Open a file to edit it in place, with syntax highlighting. You can create, rename, move, and
+        delete files and folders; a new empty folder gets a <Code>.gitkeep</Code> so it survives a
+        reload, and a <Code>README</Code> at the root is rendered on the Overview page. Files above{" "}
+        <Strong>1 MB</Strong> are not rendered at all; files above <Strong>256 KB</Strong> open
+        read-only, as do binary files and any file opened at an older revision.{" "}
+        <Strong>Search</Strong> finds text anywhere in the checkout, including files nobody has
+        committed yet. The changed-files list comes from <Code>git status</Code>; discarding changes
+        is scoped to the paths you pick — there is no discard-everything button on a checkout the
+        whole company shares.
+      </P>
+
+      <H2 id="version-control">Commit, branch, and history</H2>
+      <P>
+        Commit everything that changed or only the paths you select, with a message — select{" "}
+        <Strong>Commit</Strong>, or press <Code>⌘/Ctrl+Enter</Code> in the message. The commit is
+        attributed to <Strong>you</Strong>: <Code>git log</Code> shows the Member&apos;s name and
+        email as the author, not the server. Commits are also recorded in the company audit log.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Branches.</Strong> Create a branch from any revision, switch between branches, and
+          see local branches alongside the <Code>origin/*</Code> ones.
+        </LI>
+        <LI>
+          <Strong>History.</Strong> The commit log for the repository or for a single file, each
+          commit with its own diff. Open a file at an older commit to read it as it was.
+        </LI>
+        <LI>
+          <Strong>Refresh</Strong> is the explicit &ldquo;go and talk to the remote&rdquo; that
+          fetches. <Strong>Pull</Strong> is fast-forward only; a diverged branch is reported rather
+          than merged. <Strong>Push</Strong> sends one branch using the stored credential or the
+          Connection the repository was connected with.
+        </LI>
+      </UL>
+
+      <H2 id="work-sessions">Hand work to an AI Employee</H2>
+      <P>
+        A <Strong>work session</Strong> is a conversation with an AI Employee about one piece of
+        work in a repository, and the reviewable result of it. Grant access first: open a
+        repository&apos;s <Strong>AI access</Strong> page and add the employees that should be able
+        to work on it. Any granted employee can be picked for a session, and it needs a connected{" "}
+        <DocLink to="/docs/models">AI Model</DocLink> to run.
+      </P>
+      <P>
+        The <Strong>AI work</Strong> page is a searchable session inbox, grouped by what needs
+        attention so running or ready-to-review work does not disappear into finished work. Each
+        session has its own URL, so you can send a colleague straight to the work you want them to
+        review. Rename a session from its header when the instruction it was opened with stops
+        describing it, and <Strong>archive</Strong> one you are finished with. On a narrow window
+        the inbox becomes a compact switcher above the open session. For the short version — what is
+        running, what is waiting for you, and what has been accepted — the{" "}
+        <DocLink to="#overview">Overview</DocLink> summarises the same sessions.
+      </P>
+      <P>
+        On <Strong>Home</Strong>, <Strong>Repository AI work</Strong> brings together sessions
+        needing attention across the company&apos;s repositories: <Strong>Ready to review</Strong>,{" "}
+        <Strong>Pull request open</Strong>, <Strong>No changes made</Strong>, and{" "}
+        <Strong>Failed</Strong>. Open a session from the card to read its Activity, review Changes,
+        or ask the employee for another pass. Choose <Strong>Throw away</Strong> on the row to
+        remove its local branch and working copy without opening the session; Genosyn asks you to
+        confirm first, keeps the session in Repository history, and leaves any remote branch or pull
+        request open. Use <Strong>Show more</Strong> to reach the rest of a longer queue. Archived
+        sessions stay out of the card, and it disappears when nothing needs attention.
+      </P>
+
+      <H3 id="quick-start">Start with a useful brief</H3>
+      <P>
+        The quick-start surface keeps the employee picker and brief together. Suggested briefs give
+        you a concrete starting point; choose one and its part in brackets, such as{" "}
+        <Code>[describe what is going wrong]</Code>, is already selected in the brief, so you just
+        type over it. Or write your own in plain language.
+        An unfinished text brief is saved for this repository until the session starts. Paste a
+        screenshot into the brief, drag files onto it, or choose{" "}
+        <Strong>Attach files or paste an image</Strong>. Review the image previews and remove
+        anything you do not want to send. Wait for uploads to finish, then start the session. The
+        same controls are available when asking for another pass, and sent attachments stay
+        alongside the brief in Activity. Unsent attachments must be selected again after a page
+        refresh. See <DocLink to="/docs/workspace-chat#images">image formats and limits</DocLink>.
+      </P>
+      <OL>
+        <LI>
+          Pick the <Strong>AI employee</Strong> by name, choose a suggested brief if it helps, and
+          describe the outcome. If the employee has multiple assigned models,{" "}
+          <Strong>AI Model</Strong> lists them all and selects its connected default, or another
+          connected model if needed. Disconnected models are shown but cannot be selected. With one
+          assigned model, there is no picker. Your choice applies to this session and its follow-ups
+          without changing the employee&apos;s{" "}
+          <DocLink to="/docs/models#multiple-models">active model</DocLink>.
+        </LI>
+        <LI>
+          Choose a <Strong>Thinking level</Strong> to control how hard the selected AI Model thinks
+          before each response. This control appears for models that offer levels, including when
+          the employee has only one model, and lists only that model&apos;s levels; levels above the
+          highest your company allows on the model are greyed out. Higher levels can take more time
+          and tokens. <Strong>Default</Strong> — shown with the level it means, such as{" "}
+          <em>Default (Medium)</em> — uses the model&apos;s default for chat and work sessions. The
+          level you choose stays with the session for every follow-up and appears in its header.
+          Changing the employee or AI Model resets the choice to Default. See{" "}
+          <DocLink to="/docs/models#thinking-level">Thinking levels</DocLink>.
+        </LI>
+        <LI>
+          Genosyn fetches from the remote and starts the session on the repository&apos;s{" "}
+          <Strong>default branch</Strong> as it stands there — see{" "}
+          <Strong>Where a session starts</Strong> below — in a git <Strong>worktree</Strong> of its
+          own, on a fresh branch under <Code>genosyn/</Code>. Each session has a separate working
+          copy.
+        </LI>
+        <LI>
+          Genosyn reads the root contributor guide into the employee&apos;s briefing and records
+          that it loaded it in Activity. It recognizes <Code>AGENTS.md</Code>, <Code>agent.md</Code>
+          , and other capitalization variants, with <Code>CLAUDE.md</Code> as a fallback. See{" "}
+          <DocLink to="#agents-md">Contributor guides</DocLink>.
+        </LI>
+        <LI>
+          The employee works through Genosyn&apos;s Repository tools. It can list the files and find
+          them by name pattern, search their contents, read a file with line numbers, change one by
+          exact replacement of text it copied from a read, create or delete a file, check its
+          working copy&apos;s status and diff, keep a visible step list of its plan, and commit.
+          When command execution is enabled, it can also <Strong>run commands</Strong> in its
+          working copy — your tests, your linter, your build — so it verifies its own work before
+          you read the diff. What it may run is yours to decide; see{" "}
+          <DocLink to="#commands">Commands</DocLink>.
+        </LI>
+        <LI>
+          It commits its work and writes a short report of what it changed, what it left alone, and
+          what it could not verify. Anything it left uncommitted when the turn ends — because it hit
+          its turn limit, was stopped, or failed — is committed for it as a checkpoint named as
+          such, so nothing it wrote is lost and everything is in the diff you review.
+        </LI>
+        <LI>
+          Follow the work in <Strong>Activity</Strong>. If it is not right yet, ask for changes in
+          the composer — the same employee picks up in the same working copy, on the same branch,
+          and commits the revision on top.
+        </LI>
+        <LI>
+          Open <Strong>Changes</Strong> for the file-by-file diff and the review actions. When it is
+          right, accept the work, send it on, or open a pull request for it.
+        </LI>
+      </OL>
+      <P>
+        <Strong>Activity</Strong> shows each brief, and under it a live feed of how the employee is
+        going about it: every tool call as one line — <em>Read src/router.ts</em>,{" "}
+        <em>Ran npm test → Exit 1</em> — with a spinner until its result lands, a red tint when it
+        failed, and a chevron that opens the detail: the exact edit as removed and added text, the
+        command and what it printed, the file that was read. The employee&apos;s narration appears
+        between the calls as it thinks, and its step list is pinned at the top with{" "}
+        <em>n of m done</em>. A finished turn folds the feed to one line —{" "}
+        <em>14 tool calls · 3 files edited · 2 commands run</em> — above the report, and you can
+        open it again whenever you want to check how a change came to be.
+      </P>
+      <P>
+        While a turn runs, a <Strong>Stop</Strong> button sits in the session header. Stopping ends
+        the turn where it is: whatever the employee had committed stays on the branch, anything it
+        had edited and not yet committed becomes a checkpoint commit, and the session accepts
+        another instruction — so a stop is a chance to redirect, not a discard. The stopped turn is
+        marked as such in Activity, with whatever report it managed to write. A turn that reaches
+        its limit of model turns before finishing is kept the same way, with a note saying so.
+      </P>
+      <P>
+        <Strong>Changes</Strong> is the review surface. It lists the changed files with their path,
+        change type, and line counts; clicking one opens its diff, while <Strong>Expand all</Strong>{" "}
+        opens every file, and a change small enough to read at a glance opens itself. The checkpoint
+        list shows how the work built up, while the file list always reviews everything the session
+        branch contains. Merge, push, and pull request actions live here rather than in the
+        transcript. <Strong>Throw away</Strong> is available here too, as well as directly on the
+        Home attention list, and only actions that apply to the current state are shown. If a
+        request fails, the affected surface keeps the rest of the session visible and offers{" "}
+        <Strong>Retry</Strong>.
+      </P>
+      <KeyList
+        rows={[
+          { term: "running", def: "One of the employee's turns is in flight." },
+          {
+            term: "ready",
+            def: "The last turn finished and left commits on the branch, waiting for you to review the diff and decide.",
+          },
+          {
+            term: "empty",
+            def: "The last turn finished without committing anything. Not a failure — “I read it and there is nothing to change” is a legitimate answer, and there is nothing to publish. Ask for changes if it should have done something.",
+          },
+          {
+            term: "proposed",
+            def: "The branch is pushed and a pull request is open on it. You can still ask for changes; pressing the button again pushes the new commits into the same pull request.",
+          },
+          {
+            term: "published",
+            def: "You merged the branch into the shared checkout, and for a remote repository it was pushed.",
+          },
+          {
+            term: "discarded",
+            def: "You rejected the work; the worktree and its branch are gone.",
+          },
+          {
+            term: "failed",
+            def: "The last turn errored, or its result could not be read afterwards. Ask again to retry on the same branch — earlier commits are kept.",
+          },
+        ]}
+      />
+      <P>
+        Those are the session&apos;s states. Each turn inside it has one of its own — running, ok,
+        failed, or <Strong>stopped</Strong> when a Member used the Stop button — and a stopped turn
+        lands the session on <Code>ready</Code> or <Code>empty</Code> depending on whether it had
+        committed anything, so the session stays open for another pass.
+      </P>
+      <P>
+        Publishing merges the session&apos;s branch into whatever branch the shared checkout is on.
+        The worktree shares the repository&apos;s object store, so the commits are already present.
+        For a remote repository you can push in the same step. Merging refuses to run while the
+        shared checkout has uncommitted changes of its own, and a merge that would conflict is
+        aborted rather than left half-applied. Only <Code>published</Code> and{" "}
+        <Code>discarded</Code> end a session; everything else still accepts another instruction.
+      </P>
+
+      <H3 id="archiving">Clearing the inbox</H3>
+      <P>
+        <Strong>Archive</Strong> a finished session to file it away: the inbox gets shorter and
+        nothing else changes. The branch, the commits, the transcript, and the session&apos;s status
+        are all left exactly as they were, and its URL keeps working — which is what makes archiving
+        different from throwing the work away.
+      </P>
+      <UL>
+        <LI>
+          Archive from a session&apos;s header, or from its row in the inbox. There is no
+          confirmation step, because there is nothing to undo; <Strong>Restore</Strong> puts it back
+          exactly where it was. The archive lives behind the <Strong>Archive</Strong> toggle at the
+          top of the inbox, and archived sessions leave the <Strong>needs attention</Strong> count.
+        </LI>
+        <LI>
+          Asking an archived session for another pass restores it automatically, and a session with
+          a turn in flight cannot be archived at all. Work running inside something filtered out of
+          view is the one state an inbox must never produce.
+        </LI>
+      </UL>
+
+      <H3 id="session-base">Where a session starts</H3>
+      <P>
+        Work starts from the repository&apos;s <Strong>default branch</Strong>, brought up to date
+        first. Genosyn fetches from the remote before every session and takes the trunk from{" "}
+        <Code>origin/</Code> rather than from the shared checkout, so an employee is never handed a
+        copy of the code from weeks ago. Where it can be done without costing you anything, the
+        local default branch is fast-forwarded to match. Three things are deliberately left alone:
+        <Strong>local commits you have not pushed</Strong>, which are the trunk this installation
+        actually has, so the session starts from them;{" "}
+        <Strong>a default branch that has diverged from the remote</Strong>, because reconciling
+        that is a decision, not a refresh — use <Strong>Pull</Strong> when you have decided; and{" "}
+        <Strong>your uncommitted edits, always</Strong> — if the trunk cannot fast-forward without
+        touching them, it is left behind instead, and the session still starts from the
+        remote&apos;s tip.
+      </P>
+      <P>
+        A session already under way keeps the base it started with. Asking for changes continues on
+        the same branch rather than moving the ground under a diff you are in the middle of reading.
+      </P>
+
+      <H3 id="agents-md">Contributor guides</H3>
+      <P>
+        Keep your conventions, setup steps, and verification commands in <Code>AGENTS.md</Code>
+        at the repository root. Genosyn automatically includes it in every work session&apos;s
+        briefing, including follow-ups, and in ordinary chats and Routines after it prepares the
+        employee&apos;s granted checkouts. Activity shows when a work session loads its root guide.
+      </P>
+      <P>
+        Names are matched without regard to capitalization: <Code>AGENTS.md</Code> takes precedence
+        over <Code>AGENT.md</Code>, then <Code>CLAUDE.md</Code>. Lowercase names such as{" "}
+        <Code>agents.md</Code> and <Code>agent.md</Code> work too. The first readable, nonempty
+        guide in that order is used per directory. Guides in subdirectories apply only to that
+        directory and its descendants. Work-session file reads and directory listings include the
+        applicable guides, from the root down; deeper guidance takes precedence within its scope. In
+        ordinary chats and Routines, employees are instructed to read nested guides before editing
+        those directories.
+      </P>
+      <P>
+        Large guides include continuation instructions so the employee can read the remaining text
+        before making changes. Guidance controls repository conventions and verification scope,
+        including instructions to run only targeted tests. It cannot change the Member&apos;s
+        request, company Policies, or the employee&apos;s access. A guide is read as instructions
+        for the employee; its Markdown is never executed as a script.
+      </P>
+      <P>
+        Name each required command, its directory, and when it should run. For example:
+        <Code>npm run lint</Code> in <Code>App/</Code> and <Code>Home/</Code> before committing. The
+        employee is instructed to run applicable commands, including checks for document
+        repositories, and report their directory and result. If a command cannot run, its report
+        should name the command and the reason. Expand its Activity entry to inspect the recorded
+        output and exit status; a commit alone does not prove verification passed.
+      </P>
+
+      <H3 id="commands">Commands</H3>
+      <P>
+        An employee that can only write files has to hand you work it hopes is right. One that can
+        run your tests hands you work it has checked. On the repository&apos;s{" "}
+        <Strong>Settings</Strong> page, under <Strong>Commands</Strong>, you choose which it is:
+      </P>
+      <UL>
+        <LI>
+          <Strong>No commands</Strong> — the employee reads, writes, and commits, and nothing else.
+        </LI>
+        <LI>
+          <Strong>Allowed commands only</Strong> — the default. Anything matching the
+          repository&apos;s list runs; anything else is refused, and the employee is told which part
+          of its command was refused and that an owner or admin can add it. Leave the list empty to
+          use Genosyn&apos;s built-in one, which covers the usual test, lint, and build tooling and
+          leaves out the verbs a work session has no business reaching for — no <Code>curl</Code>,
+          no <Code>ssh</Code>, no <Code>git push</Code>, no package-manager installs onto the host.
+        </LI>
+        <LI>
+          <Strong>Every command</Strong> — no list and no check, for a repository whose own tooling
+          needs more than a list can express.
+        </LI>
+      </UL>
+      <P>
+        A pattern is a command with an optional trailing <Code>*</Code> that matches the rest of it,
+        so <Code>npm run *</Code> allows every npm script while <Code>npm test</Code> allows only
+        itself. Every part of a chained command is checked separately —{" "}
+        <Code>npm test &amp;&amp; curl example.com</Code> is refused for the second half — and the
+        constructs that would hide what actually runs, such as <Code>$(…)</Code> and redirection,
+        are refused rather than guessed at. Lines beginning with <Code>#</Code> are comments.
+      </P>
+      <P>
+        Commands can run in a subdirectory of the session&apos;s working copy. The employee supplies
+        that directory separately from the command, so <Code>npm run lint</Code> in <Code>App</Code>
+        meets the same command policy as it does at the root. Every call starts in its own
+        directory; changing directories in one call does not affect the next. Activity includes the
+        directory alongside the command.
+      </P>
+      <Callout kind="info" title="Commands use the installation's execution mode.">
+        The default host mode starts commands in the session&apos;s worktree and runs them directly
+        on the host with the App process user&apos;s filesystem and network authority. The worktree
+        keeps changes separate and the command list expresses what the company permits; neither is
+        an OS sandbox. Disabled mode runs work sessions without commands. OpenCode uses the scoped
+        Repository tools in both modes, preserving work-session activity, command policy, and review
+        before delivery.
+      </Callout>
+      <P>
+        Genosyn runs on Node 22. When a repository asks for a newer Node — through{" "}
+        <Code>engines.node</Code> in its <Code>package.json</Code>, an <Code>.nvmrc</Code>, or a{" "}
+        <Code>.node-version</Code> — the session&apos;s briefing names the version and tells the
+        employee to run its Node commands through <Code>npx -y -p node@26 -- npm test</Code> (with
+        the major the repository asks for). The first use downloads that Node, so it needs the same
+        network access as installing dependencies. The employee is told never to lower the
+        repository&apos;s requirement to fit the environment.
+      </P>
+      <Callout kind="warn" title="A working copy holds only what git tracks.">
+        A session&apos;s worktree is created from the Repository&apos;s history, so it has no
+        <Code> node_modules</Code>, virtualenv, or vendor directory. Host execution can install
+        dependencies using the App container&apos;s network. If required dependencies cannot be
+        installed, the employee reports the checks it could not run.
+      </Callout>
+      <H2 id="tasks">Sessions and Tasks</H2>
+      <P>
+        A session can belong to a todo. An AI Employee working a todo links the session it starts to
+        that todo, and can wait on it, so the todo carries on when the session&apos;s turn ends and
+        hears about its pull request. From a todo, <Strong>Start work session</Strong> starts one
+        with the todo&apos;s text. From a session, the <Strong>Tasks</Strong> card shows what it&apos;s
+        linked to, and <Strong>Create task</Strong> files a new todo linked to it.{" "}
+        <DocLink to="/docs/tasks#code">Todos and code</DocLink> has the rest.
+      </P>
+
+      <H2 id="proactive-work">Work that starts from email or a Routine</H2>
+      <P>
+        An AI Employee can read a customer&apos;s bug report and related evidence before asking you
+        to act. If it needs a Repository investigation or fix, it brings a concrete work proposal to
+        the <DocLink to="/docs/decisions">Decision stack</DocLink>, explaining why human authority
+        is needed. It cannot start a Work session or change the Repository until an owner or admin
+        approves the proposal.
+      </P>
+      <P>
+        After approval, the employee needs a <Strong>write Grant</Strong> on the Repository to start
+        the Work session. The approved plan should name the expected scope and verification steps:
+        investigate the reported issue, make a focused fix, run relevant tests, and prepare the
+        result for review. Approval does not add Grants or allow merging the result.
+      </P>
+      <P>
+        The work runs separately. The employee can save its session id in a Workstream and check the
+        final report before drafting a customer update. Follow-up work keeps the original delivery
+        limits and needs any applicable work approval. Each session keeps its own branch and working
+        copy; its tools cannot send mail or reach other Connections. You can inspect its Activity
+        and Changes from the Repository at any time.
+      </P>
+      <P>
+        Authorize delivery in the Soul or Routine and give the employee a{" "}
+        <Strong>write Grant</Strong> on the Repository. It starts a Work session, checks the final
+        report, asks for another round on the same branch with{" "}
+        <Code>revise_repository_work_session</Code> when review feedback comes in, then can push
+        that session&apos;s completed branch with{" "}
+        <Code>push_repository_work_session</Code>. A stored SSH key or HTTPS token stays on the
+        server and can push without a forge Connection. The credential must have write access on the
+        remote. Repositories that use a Connection for Git also need that exact Connection selected
+        and granted to the employee.
+      </P>
+      <P>
+        <Code>open_repository_work_session_pull_request</Code> pushes the completed branch and opens
+        or updates its PR. For an HTTPS repository with a stored personal access token, the same
+        token handles both actions; the employee needs a Repository write Grant, with no separate
+        Connection Grant. The token must allow repository writes and pull requests. GitHub needs no
+        Connection. For Forgejo / Gitea, keep a matching server connected in
+        <Strong> Settings → Integrations</Strong>. Genosyn uses that Connection only to identify the
+        configured server address; the Repository&apos;s own token makes the API call. It never
+        guesses an endpoint from an unknown host.
+      </P>
+      <P>
+        For SSH or Connection-backed repositories, choose <Strong>Pull request Connection</Strong>
+        in the Repository&apos;s <Strong>Settings</Strong> and grant that same GitHub or Forgejo
+        Connection to the employee. SSH repositories keep their SSH key for Git; the Connection
+        supplies the separate API access needed to create a PR. An SSH key alone can push a branch
+        but cannot create a PR. Genosyn rechecks Grants before delivery and refuses unfinished,
+        stopped, or failed work. Merging and publishing the default branch remain Member actions.
+      </P>
+      <P>
+        Changes intended for delivery should start in a Work session. An employee&apos;s general
+        checkout has no credentials. If earlier work stopped at a local commit there, preserve that
+        branch and give a new Work session the relevant diff or changed contents to reproduce and
+        verify. A successful push is recorded separately from a PR URL, so a pushed branch is never
+        reported as an opened pull request.
+      </P>
+      <P>
+        Continue with <DocLink to="/docs/routines">Routines</DocLink> and{" "}
+        <DocLink to="/docs/soul">Soul</DocLink> to define when the employee acts and what it may
+        send.
+      </P>
+    </>
+  );
+}

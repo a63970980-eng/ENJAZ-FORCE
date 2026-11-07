@@ -1,0 +1,470 @@
+import type { AgentTool } from "../types.js";
+import { codingTools, type CodingToolContext } from "./coding.js";
+import { codingRuntimeAvailability } from "../codingAvailability.js";
+import { deadToolNames } from "./grantDead.js";
+import { loadGenosynTools } from "./genosyn.js";
+import { connectMcpServer, type BridgedServer } from "./mcpBridge.js";
+import { DISCOVERY_TOOL_NAMES, discoveryTools } from "./discovery.js";
+import { domainOf } from "./toolIndex.js";
+import { buildRegistry, unprefixedToolName, type ToolRegistry } from "./toolRegistry.js";
+import {
+  browserServerSpec,
+  loadBrowserConfig,
+  loadUserServerSpecs,
+  type BrowserConfig,
+} from "./mcpSources.js";
+import { config } from "../../../../config.js";
+import { getAgentSettings } from "../../runtimeSettings.js";
+import type { PrivilegedToolCallAuthorizer } from "../../memberTurnAuthority.js";
+import { resolveMcpToken } from "../../mcpTokens.js";
+import { canReportRunFailure } from "../../runFailureReport.js";
+import { selfReviewToolScope } from "../../proactive/reviewPolicy.js";
+import {
+  preparationMayReply,
+  proactiveReviewToolScope,
+} from "../../proactive/workReviewPolicy.js";
+import { collaborationToolScope } from "../../collaborationScope.js";
+
+/**
+ * Assemble the tools an employee's agent can reach this turn, and split them
+ * into what the model is shown and what it has to look up.
+ *
+ * Sources, in order:
+ *   1. the built-in coding toolset (bash + file editing), in-process;
+ *   2. the built-in `genosyn` tools, in-process over loopback with `genosynToken`;
+ *   3. the built-in `browser` tools (when enabled), bridged from a stdio child;
+ *   4. every company-configured MCP server, bridged over stdio/HTTP.
+ *
+ * Returns a {@link ToolRegistry} plus a `close()` that tears down the bridged
+ * connections — the caller MUST call it once the turn finishes, because the
+ * registry holds references to those closures.
+ */
+
+/**
+ * The working set: genosyn tools sent to the model on every request.
+ *
+ * This list is a judgement about *consequence*, not frequency. Three rules
+ * decided it, and each is preventing a specific failure:
+ *
+ * - **Every write tool stays.** `toolsBriefing()` exists because models like to
+ *   *say* they scheduled a routine without calling anything. Deferring
+ *   `create_routine` behind a lookup makes narrating strictly cheaper than
+ *   doing, which is the one behaviour that briefing is there to counter.
+ * - **`update_routine` stays because `create_routine` does.** Both briefings
+ *   spend their strongest sentence on "never create a duplicate to change one".
+ *   Making the create free and the update a lookup away engineers exactly that
+ *   duplicate.
+ * - **`send_chat_attachment` stays** for the same shape of reason: if sending
+ *   the file costs a round-trip and describing it does not, the model
+ *   describes it.
+ * - **`request_decision` stays** because it is the escape hatch, and an escape
+ *   hatch you have to go looking for is not one. A model that has hit a fork it
+ *   should not take alone is, by construction, not in a state where it thinks
+ *   to search the catalogue for permission to stop — it guesses instead. Its
+ *   read-back partners (`list_decisions`, `cancel_decision`) defer: by the time
+ *   you are collecting an answer you already know the tool exists. A company
+ *   that switches its Decision stack off gets no `request_decision` at all —
+ *   `loadGenosynTools` drops it before this list is consulted.
+ *
+ * Coding and browser tools are resident too, but for a different reason — see
+ * where they are added below.
+ */
+/**
+ * A turn confined to one surface's tools.
+ *
+ * A Repository work session is the case this exists for. The MCP seam already
+ * refuses every genosyn tool outside the `repository_*` set inside a session
+ * (`routes/mcpInternal.ts`), but the seam only governs genosyn tools: the
+ * employee-cwd `bash`, the browser, company MCP servers and delegation are
+ * in-process, so a session started by an admin used to receive all of them —
+ * a shell in a *different* checkout, in a turn whose briefing promises that
+ * nothing it does reaches outside its worktree. And the deferred catalogue
+ * plus `find_tools` sat in the prompt advertising a hundred tools that would
+ * all be refused.
+ *
+ * `genosynTools` is the exact genosyn set the turn gets; `surfaceOnly` drops
+ * every other source. What remains is small enough that discovery never
+ * engages and the model sees the whole set on every step.
+ */
+export type ToolScope = {
+  genosynTools: string[];
+  surfaceOnly: boolean;
+  /** Discovery stays confined to this scope's explicit allowlist. */
+  discovery?: boolean;
+};
+
+export const RESIDENT_GENOSYN_TOOLS = [
+  // writes — deferring these makes narrating cheaper than doing
+  "create_routine",
+  "update_routine",
+  "delete_routine",
+  "create_project",
+  "create_todo",
+  "update_todo",
+  "add_journal_entry",
+  // the escape hatch — see above
+  "request_decision",
+  // orientation — small, and the model needs them to know what it is
+  "get_self",
+  "list_employees",
+  "list_routines",
+  // always hot
+  "memory",
+  "send_chat_attachment",
+];
+
+export async function gatherEmployeeTools(params: {
+  employeeId: string;
+  genosynToken: string;
+  cwd: string;
+  /** Runtime-local tools (for example bounded parallel delegation). */
+  localTools?: AgentTool[];
+  /** Read/recovery tools discoverable without enlarging the resident working set. */
+  deferredLocalTools?: AgentTool[];
+  /** Explicit env for the coding runtime (for example Environment secrets). */
+  toolEnv: Record<string, string>;
+  bashTimeoutMs: number;
+  /** Model-facing names a Skill's declared toolset asked to keep resident. */
+  skillToolset?: string[];
+  routineId?: string;
+  conversationId?: string;
+  runId?: string;
+  signal?: AbortSignal;
+  /** OpenCode supplies the native host coding tools instead of legacy wrappers. */
+  nativeCoding?: boolean;
+  /** Expose tool sources that do not have a Member-level ACL. */
+  allowPrivilegedToolSources?: boolean;
+  /** Work that spans turns without a conversation, to come back to the same page. */
+  browserSessionKey?: string;
+  /**
+   * Live Member check for every call into an otherwise ambient-authority tool
+   * source. Employee-owned automation omits this; administrative chat supplies
+   * it so a role change or membership removal takes effect mid-turn.
+   */
+  authorizePrivilegedToolCall?: PrivilegedToolCallAuthorizer;
+  /** Called when a Soul, Skill or brief reached for a retired family name. */
+  onDeprecatedFamily?: (family: string, target: string) => void;
+  /**
+   * Narrow the turn to one surface's tools. See {@link ToolScope}.
+   */
+  toolScope?: ToolScope;
+}): Promise<{ registry: ToolRegistry; browser: BrowserConfig; close: () => Promise<void> }> {
+  const codingProcessCleanups = new Set<() => void>();
+  const codingCtx: CodingToolContext = {
+    cwd: params.cwd,
+    env: params.toolEnv,
+    bashTimeoutMs: params.bashTimeoutMs,
+    signal: params.signal,
+    registerProcessCleanup: (cleanup) => {
+      codingProcessCleanups.add(cleanup);
+      return () => codingProcessCleanups.delete(cleanup);
+    },
+  };
+
+  // 1 + 2: in-process tools (no teardown needed).
+  const tokenInfo = resolveMcpToken(params.genosynToken);
+  const reviewScope =
+    selfReviewToolScope(tokenInfo?.selfReviewOnly) ??
+    proactiveReviewToolScope(tokenInfo?.proactiveReview, {
+      mayReply: preparationMayReply(tokenInfo),
+      trustedSender: tokenInfo?.trustedSender,
+    }) ??
+    collaborationToolScope(tokenInfo?.collaboration);
+  const scope = reviewScope ?? params.toolScope ?? null;
+  const allowPrivileged = (params.allowPrivilegedToolSources ?? true) && !scope?.surfaceOnly;
+  const [genosynAll, browser, userServers] = await Promise.all([
+    loadGenosynTools(params.genosynToken, params.signal, params.onDeprecatedFamily),
+    // The token decides, whatever the caller passed: a trusted sender's preparation
+    // turn gets this one source, and every other stays closed.
+    allowPrivileged || tokenInfo?.trustedSender === true
+      ? loadBrowserConfig(params.employeeId, {
+          routineId: params.routineId,
+          conversationId: params.conversationId,
+          runId: params.runId,
+          todoId: params.browserSessionKey,
+          todoPickupId: tokenInfo?.todoPickupId,
+        })
+      : Promise.resolve<BrowserConfig>({
+          enabled: false,
+          allowedHosts: "",
+          approvalRequired: false,
+          sessionId: null,
+          sessionToken: null,
+          memberBrowserId: null,
+          memberBrowserName: null,
+        }),
+    allowPrivileged ? loadUserServerSpecs(params.employeeId) : Promise.resolve([]),
+  ]);
+  // A scoped turn keeps exactly the genosyn tools it names, and none of the
+  // retired family aliases — a Skill telling a session to call `mail` with an
+  // op would only reach a refusal at the seam either way.
+  const genosyn = scope
+    ? {
+        tools: genosynAll.tools.filter((t) => scope.genosynTools.includes(t.name)),
+        aliases: [] as AgentTool[],
+      }
+    : genosynAll;
+
+  const codingEnabled =
+    allowPrivileged && !params.nativeCoding && codingRuntimeAvailability().available;
+  const coding = codingEnabled ? filterCodingToolsForExecutionMode(codingTools(codingCtx)) : [];
+  const guardedCoding = guardPrivilegedTools(coding, params.authorizePrivilegedToolCall);
+
+  const tools: AgentTool[] = [
+    ...(reviewScope ? [] : (params.localTools ?? [])),
+    ...(scope?.surfaceOnly ? [] : (params.deferredLocalTools ?? [])),
+    ...guardedCoding,
+    ...genosyn.tools,
+  ];
+  const bridged: BridgedServer[] = [];
+
+  // 3: browser server (bridged stdio child) when enabled.
+  const browserNames = new Set<string>();
+  if (browser.enabled) {
+    const b = await connectMcpServer(
+      "browser",
+      browserServerSpec(browser, params.genosynToken),
+      "", // keep native browser_* names (referenced in prompts)
+      params.signal,
+    );
+    bridged.push(b);
+    const guardedBrowserTools = guardPrivilegedTools(b.tools, params.authorizePrivilegedToolCall);
+    for (const t of guardedBrowserTools) browserNames.add(t.name);
+    tools.push(...guardedBrowserTools);
+  }
+
+  // 4: company-configured MCP servers, each namespaced by server name.
+  // A server's guarded tools (McpServer.guardedToolsJson patterns) queue an
+  // Approval instead of executing — the guard closure was bound in
+  // loadUserServerSpecs.
+  const connections = await Promise.all(
+    userServers.map((s) => connectMcpServer(s.name, s.spec, s.name, params.signal, s.guard)),
+  );
+  for (const c of connections) {
+    bridged.push(c);
+    tools.push(...guardPrivilegedTools(c.tools, params.authorizePrivilegedToolCall));
+  }
+
+  // Provider APIs reject duplicate or over-length tool names with a 400 that
+  // fails the whole turn — dedup across every source (coding/genosyn/browser/
+  // user, plus integration labels) so that can never happen. The discovery
+  // names are reserved: a user MCP server exposing `find_tools` would otherwise
+  // push ours to `find_tools_2` and turn every briefing sentence into a lie.
+  dedupeToolNames(tools, DISCOVERY_TOOL_NAMES);
+
+  // Ordering only, and it still runs on the whole array: if `trimToProviderCap`
+  // ever has to cut, it should cut the tools that could only have returned 403.
+  const grantDead = await deadToolNames(params.employeeId);
+  sinkGrantDeadTools(tools, grantDead);
+
+  const close = async () => {
+    for (const cleanup of codingProcessCleanups) cleanup();
+    codingProcessCleanups.clear();
+    await Promise.all(bridged.map((b) => b.close()));
+  };
+
+  // The meta-tools resolve too, so `call_tool("find_tools", …)` works — a very
+  // common move once the model is told everything runs through `call_tool`. The
+  // array is filled in below, before any dispatch, so the forward reference is
+  // safe; capturing it here also makes call_tool's self-call guard reachable.
+  const meta: AgentTool[] = [];
+  const resolveExact = (name: string): AgentTool | undefined =>
+    tools.find((t) => t.name === name) ??
+    meta.find((t) => t.name === name) ??
+    genosyn.aliases.find((a) => a.name === name);
+  // A model running under OpenCode sees and repeats the `genosyn_` wire name.
+  const resolveAny = (name: string): AgentTool | undefined =>
+    resolveExact(name) ?? resolveExact(unprefixedToolName(name));
+
+  // The revert path is one branch rather than a flag threaded through the
+  // partition: everything goes resident and there are no meta-tools. The model
+  // then sees the whole catalogue, as it did before deferral. `trimToProviderCap`
+  // in runEmployee is the backstop if that exceeds a provider cap — grant-dead
+  // tools were already sorted to the tail for exactly this. The briefing reads
+  // the same flag so it doesn't promise a `find_tools` that isn't there.
+  const discovery = getAgentSettings().toolDiscovery;
+  if (
+    (scope?.surfaceOnly && !scope.discovery) ||
+    !discovery.enabled ||
+    tools.length < discovery.minCatalogueSize
+  ) {
+    return {
+      registry: buildRegistry({
+        resident: tools,
+        deferred: [],
+        aliases: genosyn.aliases,
+        domains: [],
+        fromSkills: [],
+      }),
+      browser,
+      close,
+    };
+  }
+
+  const wanted = new Set([
+    // A default resident tool this employee can only be refused stays one
+    // `find_tools` away rather than on every step: today that is the Routine
+    // writers for an employee held at read + run (Routines → AI access).
+    ...RESIDENT_GENOSYN_TOOLS.filter((name) => !grantDead.has(name)),
+    // Keep review submission visible; bounded preparation tools remain discoverable.
+    ...(tokenInfo?.proactiveReview
+      ? ["request_mail_review", "request_work_review", "get_proactive_work", "list_workstreams"]
+      : []),
+    // An owner let this session answer the email it came from, so it needn't go looking.
+    ...(preparationMayReply(tokenInfo) ? ["send_mail"] : []),
+    ...(tokenInfo?.mailDeliveryMode === "review"
+      ? ["request_mail_review", "revise_mail_review"]
+      : []),
+    // The Run's brief and deadline notes ask for a checkpoint after every
+    // batch, so it is hot for the top-level Routine Run. Deferred, a slow model
+    // racing the deadline spent its last turn in `find_tools` looking for it.
+    ...(canReportRunFailure(tokenInfo) ? ["save_run_checkpoint"] : []),
+    // Coding tools stay resident because of *argument shape*, not frequency:
+    // `write_file.content` and `edit_file.old_string` are large free-form
+    // strings, and re-escaping a 20k-char file body inside `call_tool`'s
+    // `args_json` is where models drop escapes.
+    ...guardedCoding.map((t) => t.name),
+    // Delegation is the parent's only way to fan work out, and a worker that
+    // never got delegated is indistinguishable from one that failed.
+    ...(params.localTools ?? []).map((t) => t.name),
+    // Browser stays whole when enabled: it is a snapshot-per-action loop where
+    // an extra dispatch hop would land on every click, its names are referenced
+    // literally in the UI and docs, and it does not grow with the product.
+    ...browserNames,
+  ]);
+
+  const requestedBySkills = (params.skillToolset ?? []).filter((n) => !wanted.has(n));
+  for (const n of requestedBySkills) wanted.add(n);
+
+  const resident: AgentTool[] = [];
+  const deferred: AgentTool[] = [];
+  for (const t of tools) {
+    if (wanted.has(t.name)) resident.push(t);
+    else deferred.push(t);
+  }
+
+  // Discovery is built last because it closes over the deferred set, and goes
+  // first in the resident list because it is the door to everything behind it.
+  meta.push(...discoveryTools({ searchable: deferred, resolve: resolveAny, grantDead }));
+  resident.unshift(...meta);
+
+  const domains = [...new Set(deferred.map((t) => domainOf(t.name) ?? "connected services"))];
+
+  return {
+    registry: buildRegistry({
+      resident,
+      deferred,
+      aliases: genosyn.aliases,
+      domains,
+      // Only report the ones that actually landed — a Skill naming a tool this
+      // employee doesn't have should not appear in the log as if it did.
+      fromSkills: requestedBySkills.filter((n) => resident.some((t) => t.name === n)),
+    }),
+    browser,
+    close,
+  };
+}
+
+/**
+ * Put a live Member authorization check immediately in front of each tool
+ * closure that otherwise retains ambient employee authority for the whole
+ * model turn. The wrapper returns a normal tool error so the model can continue
+ * with its still-governed Genosyn tools after an admin is demoted or removed.
+ * Authorization lookup failures also fail closed without exposing database
+ * details to the model.
+ */
+export function guardPrivilegedTools(
+  tools: AgentTool[],
+  authorize?: PrivilegedToolCallAuthorizer,
+): AgentTool[] {
+  if (!authorize) return tools;
+  return tools.map((tool) => ({
+    ...tool,
+    run: async (input) => {
+      let denial: string | null;
+      try {
+        denial = await authorize();
+      } catch {
+        denial =
+          "This privileged tool is temporarily unavailable because Member authority could not be verified. No action was taken.";
+      }
+      if (denial) return { content: denial, isError: true };
+      return tool.run(input);
+    },
+  }));
+}
+
+/**
+ * Classify surface-local tools explicitly. Read-only, Member-safe controls
+ * (currently the Help source readers) remain available to ordinary Members.
+ * Every unclassified local tool defaults to privileged: it is omitted when the
+ * turn lacks privileged sources and receives the same live revocation wrapper
+ * as coding/browser/configured-MCP tools otherwise.
+ */
+export function selectSurfaceTools(
+  tools: AgentTool[],
+  options: {
+    authority?: "member" | "privileged";
+    allowPrivileged: boolean;
+    authorizePrivilegedToolCall?: PrivilegedToolCallAuthorizer;
+  },
+): AgentTool[] {
+  if (options.authority === "member") return tools;
+  if (!options.allowPrivileged) return [];
+  return guardPrivilegedTools(tools, options.authorizePrivilegedToolCall);
+}
+
+export function filterCodingToolsForExecutionMode(
+  tools: AgentTool[],
+  executionMode = config.agent.codingTools.executionMode,
+): AgentTool[] {
+  if (executionMode !== "host") return [];
+  // Codex subscription turns retain these adapters; ordinary host turns use
+  // OpenCode's native coding tools. Host execution is deliberately unsandboxed.
+  return tools;
+}
+
+/**
+ * Move the tools this employee holds no grant for to the back of the list, in
+ * place, keeping everything else in its existing relative order.
+ *
+ * Ordering only — nothing is dropped. See `grantDead.ts` for why this must
+ * never become a filter.
+ */
+function sinkGrantDeadTools(tools: AgentTool[], dead: Set<string>): void {
+  if (dead.size === 0) return;
+  // Stable partition: Array#sort is stable in Node, but comparing booleans is
+  // easy to get subtly wrong, so split and rejoin instead.
+  const live = tools.filter((t) => !dead.has(t.name));
+  const sunk = tools.filter((t) => dead.has(t.name));
+  tools.length = 0;
+  tools.push(...live, ...sunk);
+}
+
+/**
+ * Make every tool's model-facing name unique and ≤64 chars. Renaming only the
+ * exposed `name` is safe: each tool dispatches inside its own `run` closure,
+ * which captured the real target when it was built.
+ *
+ * `reserved` names are pre-claimed so nothing can take them — they belong to
+ * tools this module adds *after* deduping.
+ */
+function dedupeToolNames(tools: AgentTool[], reserved: string[] = []): void {
+  const seen = new Set<string>(reserved);
+  for (const t of tools) {
+    let name = t.name.slice(0, 64) || "tool";
+    if (seen.has(name)) {
+      let n = 2;
+      let candidate = withSuffix(name, n);
+      while (seen.has(candidate)) candidate = withSuffix(name, ++n);
+      name = candidate;
+    }
+    t.name = name;
+    seen.add(name);
+  }
+}
+
+function withSuffix(name: string, n: number): string {
+  const suffix = `_${n}`;
+  return name.slice(0, 64 - suffix.length) + suffix;
+}

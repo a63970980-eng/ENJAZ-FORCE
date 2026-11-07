@@ -1,0 +1,20 @@
+# SQLite on the /app/data volume, with no bundled Postgres — the same shape as
+# the one-line Docker installer:
+#
+#   helm install genosyn oci://ghcr.io/genosyn/charts/genosyn \
+#     --namespace genosyn --create-namespace \
+#     -f values-selfhost.yaml
+#
+# Everything else follows values.yaml: single-tenant, one replica on the 20Gi
+# volume, and strong session/encryption secrets in a kept Kubernetes Secret.
+# The post-install public URL Job needs Postgres, so here the first master
+# admin's sign-in records the public URL instead.
+
+config:
+  db:
+    # SQLite lives on the /app/data volume. Flip to postgres +
+    # config.db.postgresUrlSecret (or postgres.enabled) when you outgrow it.
+    driver: sqlite
+
+postgres:
+  enabled: false

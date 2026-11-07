@@ -1,0 +1,2124 @@
+import { MAIL_ANALYSIS_CATEGORIES } from "../services/mail/analysis.js";
+import { Router, type Request, type Response } from "express";
+import multer from "multer";
+import { z } from "zod";
+import {
+  type CursorValue,
+  decodeCursor,
+  encodeCursor,
+  filterFingerprint,
+  type KeysetColumn,
+  keysetRows,
+  ListQueryError,
+} from "../services/listPaging.js";
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  EmployeeMailAccountGrant,
+  MAIL_ACCESS_LEVELS,
+  type MailAccessLevel,
+} from "../db/entities/EmployeeMailAccountGrant.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { MailAccount } from "../db/entities/MailAccount.js";
+import { MailHandover } from "../db/entities/MailHandover.js";
+import { MailLabel } from "../db/entities/MailLabel.js";
+import { MailMessage } from "../db/entities/MailMessage.js";
+import { MailRule } from "../db/entities/MailRule.js";
+import { MailSavedSearch } from "../db/entities/MailSavedSearch.js";
+import { MailThread } from "../db/entities/MailThread.js";
+import {
+  onRoutePaths,
+  requireAuth,
+  requireBrowserSession,
+  requireCompanyMember,
+  requireCompanyRole,
+  requireCompanyRoleForMutations,
+} from "../middleware/auth.js";
+import { effectiveFinanceAccess } from "../middleware/financeAccess.js";
+import { validateBody, validateParams, validateQuery } from "../middleware/validate.js";
+import { recordAudit } from "../services/audit.js";
+import { decryptConnectionConfig } from "../services/integrations.js";
+import { broadcastToCompany } from "../services/realtime.js";
+import {
+  createMailAccount,
+  serializeMailAccount,
+  updateMailAccountSenderName,
+} from "../services/mail/accounts.js";
+import { connectImapMailbox, describeMailboxConnect } from "../services/mail/connect.js";
+import { hasGoogleGmailMailboxScope } from "../integrations/providers/google/auth.js";
+import {
+  MAX_BULK_THREAD_IDS,
+  bulkThreadAction,
+  createMailDraft,
+  discardMailDraft,
+  performThreadAction,
+  replyAllRecipients,
+  sendMailDraft,
+  sendMailMessage,
+  updateMailDraft,
+  type ThreadAction,
+} from "../services/mail/actions.js";
+import {
+  MAX_BULK_DRAFT_IDS,
+  listDrafts,
+  previewDraftSend,
+  runBulkDraftDiscard,
+  type DraftSelection,
+} from "../services/mail/drafts.js";
+import {
+  DraftSendQueueBusyError,
+  MAX_QUEUED_DRAFT_IDS,
+  createDraftSendBatch,
+  getLatestDraftSendBatch,
+} from "../services/mail/draftSendQueue.js";
+import {
+  MailAnalysisAlreadyActed,
+  MailAnalysisModelUnavailable,
+  MailAnalysisWaiting,
+  analysesForThread,
+  analyzeInboundMessage,
+  resolveAnalysisReader,
+  serializeAnalysis,
+} from "../services/mail/analysis.js";
+import { mailReviewsForThreads, type MailReviewSummary } from "../services/mail/reviewStatus.js";
+import { mailReviewTimeline } from "../services/mail/reviewTimeline.js";
+import { executeAnalysisAction } from "../services/mail/analysisActions.js";
+import { undoAutomaticAnalysisAction } from "../services/mail/analysisAutomation.js";
+import {
+  MailAnalysisSettingsError,
+  readMailAnalysisSettings,
+  updateMailAnalysisSettings,
+} from "../services/mail/analysisSettings.js";
+import { MailInboundAnalysis } from "../db/entities/MailInboundAnalysis.js";
+import { listAccessibleProjectIds } from "../services/projects.js";
+import { presentIntakeOutcome } from "../services/todoIntake.js";
+import { decodeHtmlEntities } from "../services/mail/gmailClient.js";
+import {
+  MailAttachmentError,
+  fetchMailAttachmentBytes,
+  summarizeMailAttachments,
+} from "../services/mail/attachments.js";
+import { stageAttachment } from "../services/mail/outbox.js";
+import { loadAccount, loadThread } from "../services/mail/lookup.js";
+import {
+  RECIPIENT_SUGGESTIONS_DEFAULT,
+  RECIPIENT_SUGGESTIONS_MAX,
+  checkRecipients,
+  suggestRecipients,
+} from "../services/mail/recipients.js";
+import {
+  createMailHandover,
+  handoverGrantError,
+  retryMailHandover,
+} from "../services/mail/handovers.js";
+import { columnToLabelIds } from "../services/mail/store.js";
+import {
+  applyMailScope,
+  applyMailSearchFilters,
+  effectiveScope,
+  isEmptyQuery,
+  parseMailQuery,
+  resolveSearchLabelId,
+} from "../services/mail/searchQuery.js";
+import {
+  disconnectMailAccount,
+  MailSyncPausedError,
+  queueAccountSync,
+} from "../services/mail/sync.js";
+import {
+  parseActions as parseRuleActions,
+  parseConditions as parseRuleConditions,
+  validateMailRuleConfiguration,
+} from "../services/mail/rules.js";
+
+/**
+ * HTTP surface for the Email section (M25): mailbox accounts, the local
+ * thread/message mirror, write-through actions, drafts, rules, handovers,
+ * and per-employee grants. Mounted at /api/companies/:cid, so every path here
+ * starts `/mail`.
+ *
+ * Route handlers parse + shape only; the mechanics live in services/mail/.
+ */
+
+export const mailRouter = Router({ mergeParams: true });
+mailRouter.use(requireAuth);
+mailRouter.use(requireCompanyMember);
+
+/**
+ * Who may decide what AI Employees can do with a mailbox, as opposed to using
+ * it.
+ *
+ * Every Member reads and answers mail, so working the inbox stays open to them.
+ * Granting, changing and revoking AI access does not: a `send` Grant lets an
+ * employee speak for the company unattended, and it makes the employee eligible
+ * for automatic proactive email work. That is the same act as
+ * `/revenue/ai-access`, `/meetings/ai-access` or `/signatures/ai-access`, and it
+ * is gated the same way. Reading the Grant list stays open, so every Member can
+ * see what has been delegated.
+ *
+ * The mailbox's own lifecycle is gated on its routes below. Connecting stores
+ * or reuses a credential the whole company relies on. Disconnecting deletes
+ * every Grant and lifts the levels from the Google connector's `gmail_*` tools
+ * (see `services/connectionCapabilities.ts`). If a Member could disconnect, they
+ * could get around this gate. Those routes are gated one by one because
+ * `PATCH /mail/accounts/:aid` shares their path and stays open.
+ *
+ * Deliberately left open to Members, because none of it can widen what an AI
+ * Employee may do beyond the Grants an owner or admin set:
+ *
+ *   - pausing or resuming sync and the sender name (`PATCH /mail/accounts/:aid`).
+ *     Pausing stops sync and inbound automation without constraining any tool,
+ *     so resuming only restores what was configured. A Standdown is the stop
+ *     instrument;
+ *   - AI analysis settings, instructions included. The reader must already
+ *     hold a Grant on this mailbox and gets one submission tool. Its buttons
+ *     run with the pressing Member's authority; the instructions can only
+ *     star, mark read, archive, add a label they name, or send a verified
+ *     one-click unsubscribe, on new mail, under the reader's own Draft Grant;
+ *   - rules, handovers, drafts, sending and Sync now: ordinary use of the
+ *     inbox, each bounded by the employee's Grant where an employee is involved.
+ *
+ * `onRoutePaths` is load-bearing: this router is mounted at
+ * `/api/companies/:cid` beside its siblings, so an unscoped `.use()` guard would
+ * also intercept their requests. The matcher covers `/grants` and anything
+ * under it, but not `/grant-candidates`, which is a read.
+ */
+mailRouter.use(
+  onRoutePaths([/^\/mail\/accounts\/[^/]+\/grants(?:\/|$)/], requireCompanyRoleForMutations("admin")),
+);
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+function serializeThread(t: MailThread, aiReview?: MailReviewSummary) {
+  return {
+    id: t.id,
+    gmailThreadId: t.gmailThreadId,
+    aiReview,
+    accountId: t.accountId,
+    subject: t.subject,
+    snippet: decodeHtmlEntities(t.snippet),
+    participants: t.participants,
+    labelIds: columnToLabelIds(t.labelIds),
+    unread: t.unread,
+    messageCount: t.messageCount,
+    hasAttachments: t.hasAttachments,
+    lastMessageAt: t.lastMessageAt ? t.lastMessageAt.toISOString() : null,
+  };
+}
+
+function serializeMessage(m: MailMessage) {
+  return {
+    id: m.id,
+    threadId: m.threadId,
+    gmailMessageId: m.gmailMessageId,
+    isDraft: m.gmailDraftId !== "",
+    fromName: m.fromName,
+    fromEmail: m.fromEmail,
+    toEmails: m.toEmails,
+    ccEmails: m.ccEmails,
+    bccEmails: m.bccEmails,
+    subject: m.subject,
+    snippet: decodeHtmlEntities(m.snippet),
+    bodyText: m.bodyText,
+    bodyHtml: m.bodyHtml,
+    labelIds: columnToLabelIds(m.labelIds),
+    sentAt: m.sentAt ? m.sentAt.toISOString() : null,
+    createdAt: m.createdAt ? m.createdAt.toISOString() : null,
+    // Raw provenance ids. The Drafts queue resolves these to employee/routine
+    // names in one batched pass (see services/mail/drafts.ts); per-message
+    // lookups here would be an N+1 on every thread open.
+    createdByUserId: m.createdByUserId,
+    createdByEmployeeId: m.createdByEmployeeId,
+    createdByRoutineId: m.createdByRoutineId,
+    createdByRunId: m.createdByRunId,
+    attachments: summarizeMailAttachments(m.attachmentsJson),
+  };
+}
+
+function serializeHandover(
+  h: MailHandover,
+  employees: Map<string, AIEmployee>,
+  threads?: Map<string, MailThread>,
+) {
+  const emp = employees.get(h.employeeId);
+  const thread = threads?.get(h.threadId);
+  return {
+    id: h.id,
+    accountId: h.accountId,
+    threadId: h.threadId,
+    threadSubject: thread ? thread.subject || "(no subject)" : undefined,
+    employee: emp ? { id: emp.id, name: emp.name, slug: emp.slug, avatarKey: emp.avatarKey } : null,
+    mode: h.mode,
+    instruction: h.instruction,
+    status: h.status,
+    resultSummary: h.resultSummary,
+    errorMessage: h.errorMessage,
+    sourceKind: h.sourceKind,
+    createdAt: h.createdAt.toISOString(),
+    startedAt: h.startedAt ? h.startedAt.toISOString() : null,
+    finishedAt: h.finishedAt ? h.finishedAt.toISOString() : null,
+  };
+}
+
+async function employeesById(ids: string[], companyId?: string): Promise<Map<string, AIEmployee>> {
+  if (ids.length === 0) return new Map();
+  const rows = await AppDataSource.getRepository(AIEmployee).find({
+    where: { id: In(Array.from(new Set(ids))), ...(companyId ? { companyId } : {}) },
+  });
+  return new Map(rows.map((e) => [e.id, e]));
+}
+
+// ───────────────────────────── accounts ─────────────────────────────
+
+mailRouter.get("/mail/accounts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const accounts = await AppDataSource.getRepository(MailAccount).find({
+    where: { companyId: cid },
+    order: { createdAt: "ASC" },
+  });
+  res.json({ accounts: accounts.map(serializeMailAccount) });
+});
+
+/**
+ * Which of the company's connections can back a mailbox.
+ *
+ * A `google` connection qualifies when its granted OAuth scope includes
+ * Gmail; an `imap` connection always does, since holding the mailbox
+ * credential is the only thing it is for. Connections already linked to a
+ * mailbox are flagged rather than hidden so the UI can explain why they are
+ * not clickable.
+ */
+mailRouter.get("/mail/connect-candidates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const conns = await AppDataSource.getRepository(IntegrationConnection).find({
+    where: [
+      { companyId: cid, provider: "google" },
+      { companyId: cid, provider: "imap" },
+    ],
+    order: { createdAt: "ASC" },
+  });
+  const accounts = await AppDataSource.getRepository(MailAccount).find({
+    where: { companyId: cid },
+  });
+  const linkedByConn = new Map(accounts.map((a) => [a.connectionId, a.id]));
+  const candidates = conns.map((c) => {
+    let hasGmailScope = c.provider === "imap";
+    if (c.provider === "google") {
+      try {
+        const cfg = decryptConnectionConfig(c) as { scope?: string; scopes?: string[] };
+        hasGmailScope = hasGoogleGmailMailboxScope(cfg.scope ?? cfg.scopes ?? []);
+      } catch {
+        hasGmailScope = false;
+      }
+    }
+    return {
+      connectionId: c.id,
+      provider: c.provider,
+      label: c.label,
+      accountHint: c.accountHint,
+      status: c.status,
+      hasGmailScope,
+      linkedAccountId: linkedByConn.get(c.id) ?? null,
+    };
+  });
+  res.json({ candidates });
+});
+
+const discoverSchema = z.object({ email: z.string().min(3).max(320) });
+
+/**
+ * What will work for this address, on this install.
+ *
+ * A POST rather than a GET with a query string: the address is personal data,
+ * and query strings end up in access logs, proxy logs, and browser history.
+ * It reads nothing and writes nothing, which is why it is safe to call on
+ * every keystroke-free blur of the connect field.
+ */
+mailRouter.post("/mail/connect/discover", validateBody(discoverSchema), async (req, res) => {
+  const body = req.body as z.infer<typeof discoverSchema>;
+  try {
+    res.json({ plan: await describeMailboxConnect(body.email) });
+  } catch (err) {
+    res
+      .status(400)
+      .json({ error: err instanceof Error ? err.message : "Could not read that address" });
+  }
+});
+
+const port = z.number().int().min(1).max(65535);
+/**
+ * Only bounded here. The service trims, collapses and checks it — see
+ * `parseSenderName` — because it can say what is wrong with a name in a
+ * sentence, where a schema failure reaches the person as "ValidationError".
+ */
+const senderNameField = z.string().max(1000);
+const connectImapSchema = z.object({
+  address: z.string().min(3).max(320),
+  password: z.string().min(1).max(1024),
+  username: z.string().max(320).optional(),
+  imapHost: z.string().max(253).optional(),
+  imapPort: port.optional(),
+  smtpHost: z.string().max(253).optional(),
+  smtpPort: port.optional(),
+  senderName: senderNameField.optional(),
+});
+
+/**
+ * Connect an IMAP mailbox: credential, Connection and MailAccount in one
+ * call, with the first sync queued before the response returns.
+ */
+mailRouter.post(
+  "/mail/connect/imap",
+  // Creating a Connection is an admin act everywhere else in the product
+  // (`integrationsRouter` gates every mutation on it), and a shortcut that
+  // reaches the same object from a different router with a weaker gate is not
+  // a shortcut — it is the hole. `requireBrowserSession` comes with it because
+  // this one stores a credential.
+  requireBrowserSession,
+  requireCompanyRole("admin"),
+  validateBody(connectImapSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const body = req.body as z.infer<typeof connectImapSchema>;
+    let connected: Awaited<ReturnType<typeof connectImapMailbox>>;
+    try {
+      connected = await connectImapMailbox({
+        companyId: cid,
+        userId: req.userId ?? null,
+        input: body,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : "Connect failed" });
+    }
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "mail.account.connect",
+      targetType: "mail_account",
+      targetId: connected.account.id,
+      targetLabel: connected.account.address,
+      metadata: { provider: "imap" },
+    });
+    void queueAccountSync(connected.account.id).catch(() => {});
+    res.json({ account: serializeMailAccount(connected.account) });
+  },
+);
+
+const createAccountSchema = z.object({ connectionId: z.string().uuid() });
+
+// Admin-only for the reason `/mail/connect/imap` is: Google sign-in creates the
+// same MailAccount behind the admin-gated `/integrations/oauth/start`, so a
+// Member-level path to it is a hole, not a shortcut. Linking also opens the
+// whole mailbox to every Member and moves the `gmail_*` tools onto
+// mailbox Grants.
+mailRouter.post(
+  "/mail/accounts",
+  requireCompanyRole("admin"),
+  validateBody(createAccountSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const body = req.body as z.infer<typeof createAccountSchema>;
+    let account: MailAccount;
+    try {
+      account = await createMailAccount({
+        companyId: cid,
+        connectionId: body.connectionId,
+        createdByUserId: req.userId ?? null,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : "Connect failed" });
+    }
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "mail.account.connect",
+      targetType: "mail_account",
+      targetId: account.id,
+      targetLabel: account.address,
+    });
+    // First sync (the backfill) runs in the background; the UI follows along
+    // via `mail.updated` events and the account's lastSyncAt/backfilledAt.
+    void queueAccountSync(account.id).catch(() => {});
+    res.json({ account: serializeMailAccount(account) });
+  },
+);
+
+mailRouter.get("/mail/accounts/:aid", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  res.json({ account: serializeMailAccount(account) });
+});
+
+const patchAccountSchema = z
+  .object({
+    status: z.enum(["active", "paused"]).optional(),
+    senderName: senderNameField.optional(),
+  })
+  .refine((body) => body.status !== undefined || body.senderName !== undefined, {
+    message: "Nothing to change: send a status or a senderName.",
+  });
+
+// Open to every Member on purpose. Neither field can widen an AI Employee's
+// access; see the role note at the top of this file.
+mailRouter.patch("/mail/accounts/:aid", validateBody(patchAccountSchema), async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const body = req.body as z.infer<typeof patchAccountSchema>;
+  const accountRepo = AppDataSource.getRepository(MailAccount);
+  // The name goes first because it is the half that can be refused, and a
+  // refusal must not leave a status change applied behind it.
+  if (body.senderName !== undefined) {
+    let renamed: MailAccount;
+    try {
+      renamed = await updateMailAccountSenderName(account, body.senderName);
+    } catch (err) {
+      return res
+        .status(400)
+        .json({ error: err instanceof Error ? err.message : "Could not save the sender name" });
+    }
+    if (renamed.senderName !== account.senderName) {
+      await recordAudit({
+        companyId: account.companyId,
+        actorUserId: req.userId ?? null,
+        action: "mail.account.sender_name",
+        targetType: "mail_account",
+        targetId: account.id,
+        targetLabel: account.address,
+        metadata: { previous: account.senderName, senderName: renamed.senderName },
+      });
+    }
+  }
+  if (body.status !== undefined) {
+    const resumed = body.status === "active" && account.status !== "active";
+    // Target only the operator-controlled fields. A full entity save can race
+    // a sync transition and overwrite its queued/running attempt metadata.
+    await accountRepo.update(account.id, {
+      status: body.status,
+      statusMessage: "",
+      ...(body.status === "paused" ? { syncState: "failed", syncFinishedAt: new Date() } : {}),
+    });
+    await recordAudit({
+      companyId: account.companyId,
+      actorUserId: req.userId ?? null,
+      action: body.status === "paused" ? "mail.account.pause" : "mail.account.resume",
+      targetType: "mail_account",
+      targetId: account.id,
+      targetLabel: account.address,
+    });
+    // Un-pausing should catch up immediately, not on the next heartbeat.
+    if (resumed) void queueAccountSync(account.id).catch(() => {});
+  }
+  const updatedAccount = await accountRepo.findOneByOrFail({ id: account.id });
+  broadcastToCompany(account.companyId, {
+    type: "mail.updated",
+    accountId: account.id,
+    threadsChanged: false,
+  });
+  res.json({ account: serializeMailAccount(updatedAccount) });
+});
+
+// Admin-only: disconnecting deletes the mailbox's Grants and rules, and
+// without a MailAccount the `gmail_*` tools answer to the Connection Grant
+// alone. A Member who could disconnect could undo the Grant gate above.
+mailRouter.delete("/mail/accounts/:aid", requireCompanyRole("admin"), async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  await disconnectMailAccount(account);
+  broadcastToCompany(account.companyId, {
+    type: "mail.updated",
+    accountId: account.id,
+    threadsChanged: false,
+  });
+  await recordAudit({
+    companyId: account.companyId,
+    actorUserId: req.userId ?? null,
+    action: "mail.account.delete",
+    targetType: "mail_account",
+    targetId: account.id,
+    targetLabel: account.address,
+  });
+  res.json({ ok: true });
+});
+
+mailRouter.post("/mail/accounts/:aid/sync", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  try {
+    // The request is durable before this returns. The client follows the
+    // attempt id through account state (websocket first, polling fallback), so
+    // completion cannot be confused with an unrelated timestamp change.
+    const sync = await queueAccountSync(account.id);
+    res.status(202).json({ sync });
+  } catch (error) {
+    if (error instanceof MailSyncPausedError) {
+      return res.status(409).json({ error: error.message });
+    }
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Mailbox sync could not be queued",
+    });
+  }
+});
+
+// ───────────────────────────── labels + counts ─────────────────────────────
+
+mailRouter.get("/mail/accounts/:aid/labels", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const labels = await AppDataSource.getRepository(MailLabel).find({
+    where: { accountId: account.id },
+    order: { name: "ASC" },
+  });
+  // One grouped pass computes every sidebar count. The database folds the
+  // conversations into their distinct (labelIds, unread) combinations — a
+  // few hundred even across 200K conversations — so this endpoint, which
+  // re-runs every time the sidebar follows a sync update, no longer builds
+  // one JS object per conversation on the event loop.
+  const groups = await AppDataSource.getRepository(MailThread)
+    .createQueryBuilder("t")
+    .select("t.labelIds", "labelIds")
+    .addSelect("t.unread", "unread")
+    .addSelect("COUNT(*)", "threads")
+    .where("t.accountId = :accountId", { accountId: account.id })
+    .groupBy("t.labelIds")
+    .addGroupBy("t.unread")
+    .getRawMany<{ labelIds: string; unread: boolean | number; threads: number | string }>();
+  let inboxUnread = 0;
+  let drafts = 0;
+  let starred = 0;
+  const perLabel: Record<string, number> = {};
+  for (const g of groups) {
+    // Postgres returns COUNT(*) as a string; SQLite as a number.
+    const n = Number(g.threads);
+    const inTrash = g.labelIds.includes(" TRASH ");
+    if (!inTrash && g.unread && g.labelIds.includes(" INBOX ")) inboxUnread += n;
+    if (!inTrash && g.labelIds.includes(" DRAFT ")) drafts += n;
+    if (!inTrash && g.labelIds.includes(" STARRED ")) starred += n;
+    if (inTrash) continue;
+    for (const id of columnToLabelIds(g.labelIds)) {
+      perLabel[id] = (perLabel[id] ?? 0) + n;
+    }
+  }
+  res.json({
+    labels: labels.map((l) => ({
+      id: l.id,
+      gmailLabelId: l.gmailLabelId,
+      name: l.name,
+      labelType: l.labelType,
+      color: l.color,
+      threadCount: perLabel[l.gmailLabelId] ?? 0,
+    })),
+    counts: { inboxUnread, drafts, starred },
+  });
+});
+
+// ───────────────────────────── threads ─────────────────────────────
+
+const THREAD_VIEWS = ["inbox", "starred", "sent", "drafts", "all", "spam", "trash"] as const;
+type ThreadView = (typeof THREAD_VIEWS)[number];
+
+/** A mailbox's threads, newest first, ties by id: the list's keyset. */
+const THREAD_KEYS: KeysetColumn[] = [
+  { column: "t.lastMessageAt", direction: "DESC", type: "timestamp" },
+  { column: "t.id", direction: "DESC", type: "string" },
+];
+
+mailRouter.get("/mail/accounts/:aid/threads", async (req, res) => {
+  const companyId = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(companyId, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+
+  const view = (
+    THREAD_VIEWS.includes(req.query.view as ThreadView) ? req.query.view : "inbox"
+  ) as ThreadView;
+  const label = typeof req.query.label === "string" ? req.query.label : "";
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const before = typeof req.query.before === "string" ? req.query.before : "";
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : "";
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? "50"), 10) || 50, 1), 100);
+
+  // Load more follows a keyset cursor on (lastMessageAt, id): mail is dated to
+  // the second, so the `before` timestamp it replaces skipped every other
+  // thread sharing the oldest one's second. `before` still narrows to threads
+  // before an instant, for callers that page with it.
+  const fingerprint = filterFingerprint(companyId, {
+    account: account.id,
+    view,
+    label: label || undefined,
+    q: q || undefined,
+    before: before || undefined,
+  });
+  let after: CursorValue[] | null = null;
+  if (cursor) {
+    try {
+      after = decodeCursor("mail.threads", fingerprint, cursor);
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      throw err;
+    }
+  }
+
+  // A search covers the whole mailbox (minus spam/trash), like Gmail —
+  // finding an archived thread from the Inbox is the whole point. The query
+  // itself can narrow back down (`in:` / `label:` / `is:` operators, see
+  // services/mail/searchQuery.ts); folder browsing without a query keeps
+  // the view/label params.
+  const parsed = q ? parseMailQuery(q) : null;
+  const searching = parsed !== null && !isEmptyQuery(parsed);
+
+  let qb = AppDataSource.getRepository(MailThread)
+    .createQueryBuilder("t")
+    .where("t.accountId = :aid", { aid: account.id })
+    .andWhere("t.lastMessageAt IS NOT NULL");
+
+  if (searching) {
+    const labelId = parsed.label ? await resolveSearchLabelId(account.id, parsed.label) : undefined;
+    qb = applyMailScope(qb, effectiveScope(parsed, labelId));
+    qb = applyMailSearchFilters(qb, parsed, labelId);
+  } else if (label) {
+    qb = qb.andWhere("t.labelIds LIKE :lbl", { lbl: `% ${label} %` });
+    qb = qb.andWhere("t.labelIds NOT LIKE :trash", { trash: "% TRASH %" });
+  } else {
+    qb = applyMailScope(qb, view);
+  }
+
+  if (before) {
+    const cursor = new Date(before);
+    if (!Number.isNaN(cursor.getTime())) {
+      qb = qb.andWhere("t.lastMessageAt < :before", { before: cursor });
+    }
+  }
+
+  const fetched = await keysetRows(qb, { keys: THREAD_KEYS, after, limit, prefix: "thread" });
+  const kept = fetched.slice(0, limit);
+  const page = kept.map((entry) => entry.row);
+  const hasMore = fetched.length > limit && page.length > 0;
+  const nextBefore = hasMore ? (page[page.length - 1].lastMessageAt?.toISOString() ?? null) : null;
+  const nextCursor = hasMore
+    ? encodeCursor("mail.threads", fingerprint, kept[kept.length - 1].key)
+    : null;
+  const reviews = await mailReviewsForThreads(account, page);
+  res.json({
+    threads: page.map((thread) => serializeThread(thread, reviews.get(thread.id))),
+    nextBefore,
+    nextCursor,
+  });
+});
+
+mailRouter.get("/mail/threads/:tid", async (req, res) => {
+  const found = await loadThread(
+    (req.params as Record<string, string>).cid,
+    req.params.tid as string,
+  );
+  if (!found) return res.status(404).json({ error: "Thread not found" });
+  const { thread, account } = found;
+  const messages = await AppDataSource.getRepository(MailMessage).find({
+    where: { threadId: thread.id, accountId: account.id, companyId: account.companyId },
+    order: { sentAt: "ASC" },
+  });
+  const handovers = await AppDataSource.getRepository(MailHandover).find({
+    where: { threadId: thread.id, accountId: account.id, companyId: account.companyId },
+    order: { createdAt: "DESC" },
+  });
+  const employees = await employeesById(
+    handovers.map((h) => h.employeeId),
+    account.companyId,
+  );
+  const analyses = await analysesForThread(thread.companyId, thread.id, account.id);
+  const [reviews, reviewTimeline] = await Promise.all([
+    mailReviewsForThreads(account, [thread]),
+    mailReviewTimeline({
+      account,
+      thread,
+      messages,
+      handovers,
+      analyses,
+      canReadFinance: effectiveFinanceAccess(req) !== "none",
+      canReviewApprovals: req.companyRole === "owner" || req.companyRole === "admin",
+    }),
+  ]);
+  res.json({
+    thread: serializeThread(thread, reviews.get(thread.id)),
+    reviewTimeline,
+    account: { id: account.id, address: account.address },
+    messages: messages.map(serializeMessage),
+    handovers: handovers.map((h) => serializeHandover(h, employees)),
+    analyses: await analysesForMember(req, analyses),
+  });
+});
+
+/**
+ * An email's analyses as this Member may see them. What it was filed as is in a
+ * Project, and a Todo in one they can't open is one they aren't told about.
+ */
+async function analysesForMember(req: Request, rows: MailInboundAnalysis[]) {
+  const openable = rows.some((row) => row.intakeJson)
+    ? await listAccessibleProjectIds((req.params as Record<string, string>).cid, {
+        kind: "user",
+        id: req.userId!,
+        role: req.companyRole!,
+      })
+    : new Set<string>();
+  return rows.map((row) => ({
+    ...serializeAnalysis(row),
+    intake: presentIntakeOutcome(row.intakeJson, openable),
+  }));
+}
+
+const threadActionSchema = z.object({
+  action: z.enum([
+    "markRead",
+    "markUnread",
+    "star",
+    "unstar",
+    "archive",
+    "moveToInbox",
+    "trash",
+    "untrash",
+    "applyLabel",
+    "removeLabel",
+  ]),
+  labelId: z.string().optional(),
+  labelName: z.string().max(200).optional(),
+});
+
+mailRouter.post(
+  "/mail/threads/:tid/actions",
+  validateBody(threadActionSchema),
+  async (req, res) => {
+    const found = await loadThread(
+      (req.params as Record<string, string>).cid,
+      req.params.tid as string,
+    );
+    if (!found) return res.status(404).json({ error: "Thread not found" });
+    const body = req.body as z.infer<typeof threadActionSchema>;
+    try {
+      await performThreadAction(found.account, found.thread, body.action as ThreadAction, {
+        labelId: body.labelId,
+        labelName: body.labelName,
+      });
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : "Action failed" });
+    }
+    await recordAudit({
+      companyId: found.account.companyId,
+      actorUserId: req.userId ?? null,
+      action: "mail.thread.action",
+      targetType: "mail_thread",
+      targetId: found.thread.id,
+      targetLabel: found.thread.subject || "(no subject)",
+      metadata: { action: body.action, labelName: body.labelName ?? body.labelId },
+    });
+    const fresh = await AppDataSource.getRepository(MailThread).findOneBy({
+      id: found.thread.id,
+    });
+    res.json({ thread: fresh ? serializeThread(fresh) : null });
+  },
+);
+
+const threadBulkSchema = z
+  .object({
+    action: threadActionSchema.shape.action,
+    // Chunked by the client — see MAX_BULK_THREAD_IDS.
+    ids: z.array(z.string().uuid()).min(1).max(MAX_BULK_THREAD_IDS),
+    labelId: z.string().optional(),
+    labelName: z.string().max(200).optional(),
+  })
+  .strict();
+
+mailRouter.post(
+  "/mail/accounts/:aid/threads/bulk",
+  validateBody(threadBulkSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    const body = req.body as z.infer<typeof threadBulkSchema>;
+
+    // Scope the ids to this account rather than trusting them — a bulk call is
+    // the easiest place to smuggle in a thread from somewhere else.
+    const threads = await AppDataSource.getRepository(MailThread).find({
+      where: { id: In(body.ids), companyId: cid, accountId: account.id },
+    });
+
+    const result = await bulkThreadAction(account, threads, body.action as ThreadAction, {
+      labelId: body.labelId,
+      labelName: body.labelName,
+    });
+    const found = new Set(threads.map((thread) => thread.id));
+    for (const id of body.ids) {
+      if (!found.has(id)) result.skipped.push({ id, reason: "not-found" });
+    }
+
+    if (result.succeeded.length > 0) {
+      await recordAudit({
+        companyId: account.companyId,
+        actorUserId: req.userId ?? null,
+        action: "mail.thread.bulk_action",
+        targetType: "mail_account",
+        targetId: account.id,
+        targetLabel: account.address,
+        metadata: {
+          action: body.action,
+          requested: body.ids.length,
+          succeeded: result.succeeded.length,
+          skipped: result.skipped.length,
+        },
+      });
+    }
+    res.json(result);
+  },
+);
+
+/** Prefill helper for the reply-all composer. */
+mailRouter.get("/mail/threads/:tid/reply-recipients", async (req, res) => {
+  const found = await loadThread(
+    (req.params as Record<string, string>).cid,
+    req.params.tid as string,
+  );
+  if (!found) return res.status(404).json({ error: "Thread not found" });
+  const recipients = await replyAllRecipients(found.account, found.thread);
+  res.json(recipients);
+});
+
+// ───────────────────────────── recipients ─────────────────────────────
+
+const recipientSuggestionsQuerySchema = z.object({
+  q: z.string().max(320).optional().default(""),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(RECIPIENT_SUGGESTIONS_MAX)
+    .optional()
+    .default(RECIPIENT_SUGGESTIONS_DEFAULT),
+});
+
+/**
+ * The mailbox's address book for the To / Cc / Bcc fields: people it has
+ * exchanged mail with, most frequent first, matching what is being typed.
+ */
+mailRouter.get(
+  "/mail/accounts/:aid/recipient-suggestions",
+  validateQuery(recipientSuggestionsQuerySchema),
+  async (req, res, next) => {
+    try {
+      const cid = (req.params as Record<string, string>).cid;
+      const account = await loadAccount(cid, req.params.aid as string);
+      if (!account) return res.status(404).json({ error: "Mail account not found" });
+      const query = req.query as unknown as z.infer<typeof recipientSuggestionsQuerySchema>;
+      res.json({ suggestions: await suggestRecipients(account, query.q, query.limit) });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+const recipientCheckSchema = z
+  .object({
+    to: z.string().max(2000).optional(),
+    cc: z.string().max(2000).optional(),
+    bcc: z.string().max(2000).optional(),
+  })
+  .strict();
+
+/**
+ * Which of these recipients a send would refuse, and why — the do-not-email
+ * list, a Contact marked do not contact, or a Policy's blocked domain — so a
+ * composer can mark them before Send. Read-only: nothing is refused or
+ * audited here, and the send path checks again.
+ */
+mailRouter.post(
+  "/mail/accounts/:aid/recipient-check",
+  validateBody(recipientCheckSchema),
+  async (req, res, next) => {
+    try {
+      const cid = (req.params as Record<string, string>).cid;
+      const account = await loadAccount(cid, req.params.aid as string);
+      if (!account) return res.status(404).json({ error: "Mail account not found" });
+      const body = req.body as z.infer<typeof recipientCheckSchema>;
+      res.json({ blocked: await checkRecipients(account.companyId, body) });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ───────────────────────────── compose / drafts ─────────────────────────────
+
+const composeSchema = z.object({
+  to: z.string().max(2000).default(""),
+  cc: z.string().max(2000).default(""),
+  bcc: z.string().max(2000).default(""),
+  subject: z.string().max(1000).default(""),
+  bodyText: z.string().max(200_000),
+  threadId: z.string().uuid().optional(),
+  attachmentIds: z.array(z.string().max(64)).max(20).optional(),
+  /**
+   * Forwarding: the email being forwarded (a message in this same mailbox) and
+   * which of its attachments go along, by the download route's index. The
+   * files are read from the mail server when the message is composed.
+   */
+  forwardFrom: z
+    .object({
+      messageId: z.string().uuid(),
+      attachmentIndexes: z.array(z.number().int().min(0)).max(20),
+    })
+    .strict()
+    .optional(),
+});
+
+/** A compose failure as the person should see it: its own status when it carries one. */
+function composeFailureStatus(err: unknown): number {
+  return err instanceof MailAttachmentError ? err.status : 400;
+}
+
+// Outbound attachments are staged in memory, then referenced by token when
+// the message is sent or drafted. 25 MB per file (Gmail's own attachment cap).
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
+mailRouter.post(
+  "/mail/accounts/:aid/outbox-attachments",
+  attachmentUpload.single("file"),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    try {
+      const info = stageAttachment({
+        accountId: account.id,
+        filename: file.originalname,
+        mimeType: file.mimetype,
+        content: file.buffer,
+      });
+      res.json({ attachment: info });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Upload failed" });
+    }
+  },
+);
+
+async function resolveComposeThread(
+  cid: string,
+  accountId: string,
+  threadId: string | undefined,
+  res: Response,
+): Promise<{ thread: MailThread | null } | null> {
+  if (!threadId) return { thread: null };
+  const found = await loadThread(cid, threadId);
+  if (!found || found.account.id !== accountId) {
+    res.status(404).json({ error: "Thread not found" });
+    return null;
+  }
+  return { thread: found.thread };
+}
+
+mailRouter.post("/mail/accounts/:aid/send", validateBody(composeSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const body = req.body as z.infer<typeof composeSchema>;
+  const resolved = await resolveComposeThread(cid, account.id, body.threadId, res);
+  if (!resolved) return;
+  try {
+    const message = await sendMailMessage(account, body, resolved.thread);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "mail.send",
+      targetType: "mail_message",
+      targetId: message.id,
+      targetLabel: message.subject || "(no subject)",
+    });
+    res.json({ message: serializeMessage(message) });
+  } catch (err) {
+    res
+      .status(composeFailureStatus(err))
+      .json({ error: err instanceof Error ? err.message : "Send failed" });
+  }
+});
+
+mailRouter.post("/mail/accounts/:aid/drafts", validateBody(composeSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const body = req.body as z.infer<typeof composeSchema>;
+  const resolved = await resolveComposeThread(cid, account.id, body.threadId, res);
+  if (!resolved) return;
+  try {
+    const message = await createMailDraft(account, body, resolved.thread, {
+      userId: req.userId ?? null,
+    });
+    res.json({ message: serializeMessage(message) });
+  } catch (err) {
+    res
+      .status(composeFailureStatus(err))
+      .json({ error: err instanceof Error ? err.message : "Draft failed" });
+  }
+});
+
+// ───────────────────────── drafts review queue ─────────────────────────
+
+const draftListQuerySchema = z.object({
+  employeeId: z.string().uuid().optional(),
+  routineId: z.string().uuid().optional(),
+  q: z.string().max(200).optional(),
+  // Flags arrive as "1" rather than being coerced — z.coerce.boolean() treats
+  // the string "0" as true, which is exactly the wrong answer here.
+  missingRecipient: z.string().optional(),
+  unattributed: z.string().optional(),
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(200).default(100),
+});
+
+const draftFilterSchema = z
+  .object({
+    employeeId: z.string().uuid().optional(),
+    routineId: z.string().uuid().optional(),
+    q: z.string().max(200).optional(),
+    onlyMissingRecipient: z.boolean().optional(),
+    unattributed: z.boolean().optional(),
+    sendableOnly: z.boolean().optional(),
+  })
+  .strict();
+
+/** Either an explicit tick-box selection, or "everything matching" minus opt-outs. */
+const draftSelectionSchema = z.union([
+  z.object({ ids: z.array(z.string().uuid()).min(1).max(2000) }).strict(),
+  z
+    .object({
+      filter: draftFilterSchema,
+      exclude: z.array(z.string().uuid()).max(2000).default([]),
+    })
+    .strict(),
+]);
+
+const draftBulkSchema = z
+  .object({
+    // Sending is always durable and paced through `/send-queue`; this endpoint
+    // remains the small synchronous path for reversible draft disposal.
+    action: z.literal("discard"),
+    ids: z.array(z.string().uuid()).min(1).max(MAX_BULK_DRAFT_IDS),
+  })
+  .strict();
+
+const draftSendQueueSchema = z
+  .object({
+    ids: z.array(z.string().uuid()).min(1).max(MAX_QUEUED_DRAFT_IDS),
+  })
+  .strict();
+
+mailRouter.get("/mail/accounts/:aid/drafts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+
+  const parsed = draftListQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "ValidationError", issues: parsed.error.issues });
+  }
+  const query = parsed.data;
+  const result = await listDrafts(account, {
+    filter: {
+      employeeId: query.employeeId,
+      routineId: query.routineId,
+      q: query.q,
+      onlyMissingRecipient: query.missingRecipient === "1",
+      unattributed: query.unattributed === "1",
+    },
+    offset: query.offset,
+    limit: query.limit,
+  });
+  res.json(result);
+});
+
+mailRouter.post(
+  "/mail/accounts/:aid/drafts/send-preview",
+  validateBody(draftSelectionSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    res.json(await previewDraftSend(account, req.body as DraftSelection));
+  },
+);
+
+mailRouter.post(
+  "/mail/accounts/:aid/drafts/bulk",
+  validateBody(draftBulkSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    const body = req.body as z.infer<typeof draftBulkSchema>;
+    const result = await runBulkDraftDiscard(account, body.ids, req.userId ?? null);
+    res.json(result);
+  },
+);
+
+mailRouter.get("/mail/accounts/:aid/drafts/send-queue", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  res.json({ batch: await getLatestDraftSendBatch(account) });
+});
+
+mailRouter.post(
+  "/mail/accounts/:aid/drafts/send-queue",
+  validateBody(draftSendQueueSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    try {
+      const result = await createDraftSendBatch(
+        account,
+        (req.body as z.infer<typeof draftSendQueueSchema>).ids,
+        req.userId ?? null,
+      );
+      res.status(202).json(result);
+    } catch (error) {
+      res.status(error instanceof DraftSendQueueBusyError ? 409 : 400).json({
+        error: error instanceof Error ? error.message : "Could not queue drafts",
+      });
+    }
+  },
+);
+
+async function loadDraft(
+  cid: string,
+  messageId: string,
+): Promise<{ draft: MailMessage; account: MailAccount } | null> {
+  const draft = await AppDataSource.getRepository(MailMessage).findOneBy({
+    id: messageId,
+    companyId: cid,
+  });
+  if (!draft || !draft.gmailDraftId) return null;
+  const account = await loadAccount(cid, draft.accountId);
+  if (!account) return null;
+  return { draft, account };
+}
+
+const patchDraftSchema = composeSchema.omit({ threadId: true, forwardFrom: true }).extend({
+  /**
+   * Which of the draft's existing attachments to keep, by the same positional
+   * index the download route uses. Editing a draft rebuilds it from raw MIME,
+   * so files not listed here are dropped: `[]` clears them, and omitting the
+   * field keeps every one — a client that only edited the wording never loses
+   * the attachments it didn't mention.
+   */
+  keepAttachmentIndexes: z.array(z.number().int().min(0)).max(20).optional(),
+});
+
+mailRouter.patch("/mail/drafts/:mid", validateBody(patchDraftSchema), async (req, res) => {
+  const found = await loadDraft(
+    (req.params as Record<string, string>).cid,
+    req.params.mid as string,
+  );
+  if (!found) return res.status(404).json({ error: "Draft not found" });
+  const body = req.body as z.infer<typeof patchDraftSchema>;
+  const keepAttachmentIndexes =
+    body.keepAttachmentIndexes ??
+    summarizeMailAttachments(found.draft.attachmentsJson).map((a) => a.index);
+  try {
+    const message = await updateMailDraft(found.account, found.draft, body, {
+      keepAttachmentIndexes,
+    });
+    res.json({ message: serializeMessage(message) });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Update failed" });
+  }
+});
+
+mailRouter.post("/mail/drafts/:mid/send", async (req, res) => {
+  const found = await loadDraft(
+    (req.params as Record<string, string>).cid,
+    req.params.mid as string,
+  );
+  if (!found) return res.status(404).json({ error: "Draft not found" });
+  try {
+    const message = await sendMailDraft(found.account, found.draft);
+    await recordAudit({
+      companyId: found.account.companyId,
+      actorUserId: req.userId ?? null,
+      action: "mail.send",
+      targetType: "mail_message",
+      targetId: message.id,
+      targetLabel: message.subject || "(no subject)",
+      metadata: { fromDraft: true },
+    });
+    res.json({ message: serializeMessage(message) });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Send failed" });
+  }
+});
+
+mailRouter.delete("/mail/drafts/:mid", async (req, res) => {
+  const found = await loadDraft(
+    (req.params as Record<string, string>).cid,
+    req.params.mid as string,
+  );
+  if (!found) return res.status(404).json({ error: "Draft not found" });
+  try {
+    await discardMailDraft(found.account, found.draft);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Discard failed" });
+  }
+});
+
+// ───────────────────────────── saved searches ─────────────────────────────
+
+/** Enough for anyone; a bound stops a scripted client filling the table. */
+const MAX_SAVED_SEARCHES = 50;
+
+const savedSearchCreateSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80),
+    query: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
+const savedSearchPatchSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80).optional(),
+    query: z.string().trim().min(1).max(500).optional(),
+    sortOrder: z.number().finite().optional(),
+  })
+  .strict();
+
+function serializeSavedSearch(row: MailSavedSearch) {
+  return {
+    id: row.id,
+    accountId: row.accountId,
+    name: row.name,
+    query: row.query,
+    sortOrder: row.sortOrder,
+  };
+}
+
+/**
+ * Saved searches belong to one Member, so every query here is scoped by
+ * `userId` as well as company — a shared mailbox must not turn into a shared
+ * list of everybody's shortcuts.
+ */
+mailRouter.get("/mail/accounts/:aid/saved-searches", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ error: "Not signed in" });
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+
+  const rows = await AppDataSource.getRepository(MailSavedSearch).find({
+    where: { companyId: cid, userId, accountId: account.id },
+    order: { sortOrder: "ASC", createdAt: "ASC" },
+  });
+  res.json({ savedSearches: rows.map(serializeSavedSearch) });
+});
+
+mailRouter.post(
+  "/mail/accounts/:aid/saved-searches",
+  validateBody(savedSearchCreateSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: "Not signed in" });
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+
+    const repo = AppDataSource.getRepository(MailSavedSearch);
+    const scope = { companyId: cid, userId, accountId: account.id };
+    const existing = await repo.find({ where: scope, order: { sortOrder: "DESC" }, take: 1 });
+    const count = await repo.countBy(scope);
+    if (count >= MAX_SAVED_SEARCHES) {
+      return res
+        .status(400)
+        .json({ error: `You can keep up to ${MAX_SAVED_SEARCHES} saved searches.` });
+    }
+
+    const body = req.body as z.infer<typeof savedSearchCreateSchema>;
+    const saved = await repo.save(
+      repo.create({ ...scope, ...body, sortOrder: (existing[0]?.sortOrder ?? 0) + 1 }),
+    );
+    res.json({ savedSearch: serializeSavedSearch(saved) });
+  },
+);
+
+/** Load one, refusing anything that is not this member's own. */
+async function loadSavedSearch(
+  cid: string,
+  userId: string,
+  id: string,
+): Promise<MailSavedSearch | null> {
+  return AppDataSource.getRepository(MailSavedSearch).findOneBy({
+    id,
+    companyId: cid,
+    userId,
+  });
+}
+
+mailRouter.patch(
+  "/mail/saved-searches/:sid",
+  validateBody(savedSearchPatchSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: "Not signed in" });
+    const row = await loadSavedSearch(cid, userId, req.params.sid as string);
+    if (!row) return res.status(404).json({ error: "Saved search not found" });
+
+    const body = req.body as z.infer<typeof savedSearchPatchSchema>;
+    if (body.name !== undefined) row.name = body.name;
+    if (body.query !== undefined) row.query = body.query;
+    if (body.sortOrder !== undefined) row.sortOrder = body.sortOrder;
+    const saved = await AppDataSource.getRepository(MailSavedSearch).save(row);
+    res.json({ savedSearch: serializeSavedSearch(saved) });
+  },
+);
+
+mailRouter.delete("/mail/saved-searches/:sid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ error: "Not signed in" });
+  const row = await loadSavedSearch(cid, userId, req.params.sid as string);
+  if (!row) return res.status(404).json({ error: "Saved search not found" });
+  await AppDataSource.getRepository(MailSavedSearch).delete({ id: row.id });
+  res.json({ ok: true });
+});
+
+// ───────────────────────────── attachments ─────────────────────────────
+
+const attachmentParamsSchema = z.object({
+  cid: z.string().min(1),
+  mid: z.string().min(1),
+  index: z
+    .string()
+    .regex(/^\d+$/, "Attachment index must be a nonnegative integer")
+    .refine((value) => Number.isSafeInteger(Number(value)), "Attachment index is too large"),
+});
+
+/**
+ * Stream one attachment. The bytes live in Gmail, not here — see
+ * services/mail/attachments.ts for how a drifting Gmail attachment id is
+ * resolved back to the position the stored metadata recorded.
+ */
+mailRouter.get(
+  "/mail/messages/:mid/attachments/:index",
+  validateParams(attachmentParamsSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const row = await AppDataSource.getRepository(MailMessage).findOneBy({
+      id: req.params.mid as string,
+      companyId: cid,
+    });
+    if (!row) return res.status(404).json({ error: "Message not found" });
+    const account = await loadAccount(cid, row.accountId);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    const index = Number(req.params.index);
+    try {
+      const { meta, bytes } = await fetchMailAttachmentBytes(account, row, index);
+      // Express provides filename* encoding for non-Latin names that cannot
+      // be written directly into a Content-Disposition header.
+      res.attachment(meta.filename.replace(/["\r\n]/g, "") || "attachment");
+      res.setHeader("content-type", meta.mimeType || "application/octet-stream");
+      res.setHeader("x-content-type-options", "nosniff");
+      res.send(bytes);
+    } catch (err) {
+      if (err instanceof MailAttachmentError) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      res.status(400).json({ error: err instanceof Error ? err.message : "Download failed" });
+    }
+  },
+);
+
+// ───────────────────────────── rules ─────────────────────────────
+
+const ruleConditionsSchema = z
+  .object({
+    from: z.string().max(500).optional(),
+    fromExact: z.string().trim().email().max(254).optional(),
+    category: z.enum(MAIL_ANALYSIS_CATEGORIES).optional(),
+    to: z.string().max(500).optional(),
+    subjectContains: z.string().max(500).optional(),
+    bodyContains: z.string().max(500).optional(),
+    hasAttachment: z.boolean().optional(),
+    ai: z
+      .object({
+        employeeId: z.string().uuid(),
+        instruction: z.string().trim().min(1).max(4000),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+const ruleActionSchema = z.discriminatedUnion("type", [
+  z
+    .object({ type: z.literal("applyLabel"), labelName: z.string().trim().min(1).max(200) })
+    .strict(),
+  z.object({ type: z.literal("markRead") }).strict(),
+  z.object({ type: z.literal("star") }).strict(),
+  z.object({ type: z.literal("archive") }).strict(),
+  z.object({ type: z.literal("spam") }).strict(),
+  z.object({ type: z.literal("blockSender") }).strict(),
+  z.object({ type: z.literal("unsubscribe") }).strict(),
+  z
+    .object({
+      type: z.literal("handToEmployee"),
+      employeeId: z.string().uuid(),
+      instruction: z.string().trim().max(4000).default(""),
+      mode: z.enum(["draft", "reply", "triage", "work"]),
+    })
+    .strict(),
+]);
+
+const createRuleSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    enabled: z.boolean().default(true),
+    conditions: ruleConditionsSchema,
+    actions: z.array(ruleActionSchema).min(1).max(10),
+  })
+  .strict();
+
+function serializeRule(r: MailRule, employees: Map<string, AIEmployee>) {
+  let actions: unknown[] = [];
+  try {
+    actions = JSON.parse(r.actionsJson) as unknown[];
+  } catch {
+    actions = [];
+  }
+  const hydrated = actions.map((a) => {
+    const action = a as { type?: string; employeeId?: string };
+    if (action.type === "handToEmployee" && action.employeeId) {
+      const emp = employees.get(action.employeeId);
+      return { ...action, employeeName: emp?.name ?? "(deleted employee)" };
+    }
+    return action;
+  });
+  let conditions = parseRuleConditions(r.conditionsJson);
+  if (conditions.ai) {
+    const employee = employees.get(conditions.ai.employeeId);
+    conditions = {
+      ...conditions,
+      ai: {
+        ...conditions.ai,
+        employeeName: employee?.name ?? "(deleted AI Employee)",
+      },
+    };
+  }
+  return {
+    id: r.id,
+    accountId: r.accountId,
+    name: r.name,
+    enabled: r.enabled,
+    position: r.position,
+    conditions,
+    actions: hydrated,
+    matchCount: r.matchCount,
+    lastMatchedAt: r.lastMatchedAt ? r.lastMatchedAt.toISOString() : null,
+    createdAt: r.createdAt.toISOString(),
+  };
+}
+
+async function ruleEmployees(
+  companyId: string,
+  rules: MailRule[],
+): Promise<Map<string, AIEmployee>> {
+  const ids: string[] = [];
+  for (const r of rules) {
+    const condition = parseRuleConditions(r.conditionsJson).ai;
+    if (condition?.employeeId) ids.push(condition.employeeId);
+    try {
+      for (const a of JSON.parse(r.actionsJson) as Array<{ employeeId?: string }>) {
+        if (a.employeeId) ids.push(a.employeeId);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  if (ids.length === 0) return new Map();
+  const rows = await AppDataSource.getRepository(AIEmployee).find({
+    where: { id: In(Array.from(new Set(ids))), companyId },
+  });
+  return new Map(rows.map((employee) => [employee.id, employee]));
+}
+
+mailRouter.get("/mail/accounts/:aid/rules", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const rules = await AppDataSource.getRepository(MailRule).find({
+    where: { accountId: account.id },
+    order: { position: "ASC", createdAt: "ASC" },
+  });
+  const employees = await ruleEmployees(account.companyId, rules);
+  res.json({ rules: rules.map((r) => serializeRule(r, employees)) });
+});
+
+mailRouter.post("/mail/accounts/:aid/rules", validateBody(createRuleSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const body = req.body as z.infer<typeof createRuleSchema>;
+  const empError = await validateMailRuleConfiguration({
+    companyId: cid,
+    accountId: account.id,
+    conditions: body.conditions,
+    actions: body.actions,
+    requireReady: body.enabled,
+  });
+  if (empError) return res.status(400).json({ error: empError });
+  const repo = AppDataSource.getRepository(MailRule);
+  const maxPosition = await repo.count({ where: { accountId: account.id } });
+  const rule = await repo.save(
+    repo.create({
+      companyId: cid,
+      accountId: account.id,
+      name: body.name,
+      enabled: body.enabled,
+      position: maxPosition,
+      conditionsJson: JSON.stringify(body.conditions),
+      actionsJson: JSON.stringify(body.actions),
+      createdByUserId: req.userId ?? null,
+    }),
+  );
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "mail.rule.create",
+    targetType: "mail_rule",
+    targetId: rule.id,
+    targetLabel: rule.name,
+  });
+  const employees = await ruleEmployees(cid, [rule]);
+  res.json({ rule: serializeRule(rule, employees) });
+});
+
+const patchRuleSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    enabled: z.boolean().optional(),
+    position: z.number().int().min(0).optional(),
+    conditions: ruleConditionsSchema.optional(),
+    actions: z.array(ruleActionSchema).min(1).max(10).optional(),
+  })
+  .strict();
+
+async function loadRule(cid: string, ruleId: string): Promise<MailRule | null> {
+  return AppDataSource.getRepository(MailRule).findOneBy({
+    id: ruleId,
+    companyId: cid,
+  });
+}
+
+mailRouter.patch("/mail/rules/:rid", validateBody(patchRuleSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const rule = await loadRule(cid, req.params.rid as string);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+  const body = req.body as z.infer<typeof patchRuleSchema>;
+  const conditions = body.conditions ?? parseRuleConditions(rule.conditionsJson);
+  const actions = body.actions ?? parseRuleActions(rule.actionsJson);
+  if (body.conditions || body.actions || body.enabled === true) {
+    const empError = await validateMailRuleConfiguration({
+      companyId: cid,
+      accountId: rule.accountId,
+      conditions,
+      actions,
+      requireReady: body.enabled ?? rule.enabled,
+    });
+    if (empError) return res.status(400).json({ error: empError });
+  }
+  if (body.actions) {
+    rule.actionsJson = JSON.stringify(body.actions);
+  }
+  if (body.conditions) rule.conditionsJson = JSON.stringify(body.conditions);
+  if (body.name !== undefined) rule.name = body.name;
+  if (body.enabled !== undefined) rule.enabled = body.enabled;
+  if (body.position !== undefined) rule.position = body.position;
+  await AppDataSource.getRepository(MailRule).save(rule);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "mail.rule.update",
+    targetType: "mail_rule",
+    targetId: rule.id,
+    targetLabel: rule.name,
+  });
+  const employees = await ruleEmployees(cid, [rule]);
+  res.json({ rule: serializeRule(rule, employees) });
+});
+
+mailRouter.delete("/mail/rules/:rid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const rule = await loadRule(cid, req.params.rid as string);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+  await AppDataSource.getRepository(MailRule).delete({ id: rule.id });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "mail.rule.delete",
+    targetType: "mail_rule",
+    targetId: rule.id,
+    targetLabel: rule.name,
+  });
+  res.json({ ok: true });
+});
+
+// ───────────────────────────── handovers ─────────────────────────────
+
+mailRouter.get("/mail/accounts/:aid/handovers", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const where: Record<string, string> = { accountId: account.id };
+  if (typeof req.query.threadId === "string" && req.query.threadId) {
+    where.threadId = req.query.threadId;
+  }
+  const handovers = await AppDataSource.getRepository(MailHandover).find({
+    where,
+    order: { createdAt: "DESC" },
+    take: 200,
+  });
+  const employees = await employeesById(handovers.map((h) => h.employeeId));
+  const threadRows = await AppDataSource.getRepository(MailThread).find({
+    where: { id: In(Array.from(new Set(handovers.map((h) => h.threadId)))) },
+  });
+  const threads = new Map(threadRows.map((t) => [t.id, t]));
+  res.json({
+    handovers: handovers.map((h) => serializeHandover(h, employees, threads)),
+  });
+});
+
+const createHandoverSchema = z.object({
+  employeeId: z.string().uuid(),
+  instruction: z.string().max(4000).default(""),
+  mode: z.enum(["draft", "reply", "triage", "work"]),
+});
+
+mailRouter.post(
+  "/mail/threads/:tid/handovers",
+  requireBrowserSession,
+  validateBody(createHandoverSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const found = await loadThread(cid, req.params.tid as string);
+    if (!found) return res.status(404).json({ error: "Thread not found" });
+    const body = req.body as z.infer<typeof createHandoverSchema>;
+    const employee = await AppDataSource.getRepository(AIEmployee).findOneBy({
+      id: body.employeeId,
+      companyId: cid,
+    });
+    if (!employee) return res.status(404).json({ error: "Employee not found" });
+    const grantError = await handoverGrantError(employee.id, found.account.id, body.mode);
+    if (grantError) return res.status(400).json({ error: grantError });
+    const handover = await createMailHandover({
+      account: found.account,
+      thread: found.thread,
+      employeeId: employee.id,
+      mode: body.mode,
+      instruction: body.instruction,
+      sourceKind: "manual",
+      ruleId: null,
+      createdByUserId: req.userId!,
+      requesterUserId: req.userId!,
+      requesterSessionVersion: req.session!.sessionVersion!,
+    });
+    const employees = new Map([[employee.id, employee]]);
+    res.json({ handover: serializeHandover(handover, employees) });
+  },
+);
+
+mailRouter.post("/mail/handovers/:hid/retry", requireBrowserSession, async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const handover = await AppDataSource.getRepository(MailHandover).findOneBy({
+    id: req.params.hid as string,
+    companyId: cid,
+  });
+  if (!handover) return res.status(404).json({ error: "Handover not found" });
+  if (handover.status !== "failed") {
+    return res.status(409).json({ error: "Only failed handovers can be retried" });
+  }
+  await retryMailHandover(handover, {
+    userId: req.userId!,
+    sessionVersion: req.session!.sessionVersion!,
+  });
+  res.json({ ok: true });
+});
+
+// ───────────────────────────── grants ─────────────────────────────
+//
+// Which AI Employees may act on this mailbox, at read < draft < send. Human
+// Members reach mail through company membership; this governs the AI surface
+// only. Reads are open to every Member. Mutations are owner/admin, enforced by
+// the `onRoutePaths` guard at the top of this file.
+
+async function hydrateGrants(grants: EmployeeMailAccountGrant[]): Promise<unknown[]> {
+  const employees = await employeesById(grants.map((g) => g.employeeId));
+  return grants.map((g) => {
+    const emp = employees.get(g.employeeId);
+    return {
+      id: g.id,
+      employeeId: g.employeeId,
+      accessLevel: g.accessLevel,
+      createdAt: g.createdAt.toISOString(),
+      employee: emp
+        ? { id: emp.id, name: emp.name, slug: emp.slug, role: emp.role, avatarKey: emp.avatarKey }
+        : null,
+    };
+  });
+}
+
+mailRouter.get("/mail/accounts/:aid/grants", async (req, res) => {
+  const account = await loadAccount(
+    (req.params as Record<string, string>).cid,
+    req.params.aid as string,
+  );
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const grants = await AppDataSource.getRepository(EmployeeMailAccountGrant).find({
+    where: { accountId: account.id },
+    order: { createdAt: "ASC" },
+  });
+  res.json({ direct: await hydrateGrants(grants) });
+});
+
+const createGrantSchema = z.object({
+  employeeId: z.string().uuid(),
+  accessLevel: z.enum(["read", "draft", "send"]).default("draft"),
+});
+
+mailRouter.post("/mail/accounts/:aid/grants", validateBody(createGrantSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const body = req.body as z.infer<typeof createGrantSchema>;
+  const employee = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: body.employeeId,
+    companyId: cid,
+  });
+  if (!employee) return res.status(404).json({ error: "Employee not found" });
+  const repo = AppDataSource.getRepository(EmployeeMailAccountGrant);
+  let grant = await repo.findOneBy({
+    employeeId: employee.id,
+    accountId: account.id,
+  });
+  if (grant) {
+    grant.accessLevel = body.accessLevel;
+  } else {
+    grant = repo.create({
+      employeeId: employee.id,
+      accountId: account.id,
+      accessLevel: body.accessLevel,
+    });
+  }
+  await repo.save(grant);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "mail.grant.create",
+    targetType: "mail_account",
+    targetId: account.id,
+    targetLabel: account.address,
+    metadata: { employeeId: employee.id, accessLevel: body.accessLevel },
+  });
+  const [hydrated] = await hydrateGrants([grant]);
+  res.json({ grant: hydrated });
+});
+
+const patchGrantSchema = z.object({
+  accessLevel: z.enum(MAIL_ACCESS_LEVELS as [MailAccessLevel, ...MailAccessLevel[]]),
+});
+
+mailRouter.patch(
+  "/mail/accounts/:aid/grants/:gid",
+  validateBody(patchGrantSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    const repo = AppDataSource.getRepository(EmployeeMailAccountGrant);
+    const grant = await repo.findOneBy({
+      id: req.params.gid as string,
+      accountId: account.id,
+    });
+    if (!grant) return res.status(404).json({ error: "Grant not found" });
+    grant.accessLevel = (req.body as z.infer<typeof patchGrantSchema>).accessLevel;
+    await repo.save(grant);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "mail.grant.update",
+      targetType: "mail_account",
+      targetId: account.id,
+      targetLabel: account.address,
+      metadata: { employeeId: grant.employeeId, accessLevel: grant.accessLevel },
+    });
+    const [hydrated] = await hydrateGrants([grant]);
+    res.json({ grant: hydrated });
+  },
+);
+
+mailRouter.delete("/mail/accounts/:aid/grants/:gid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const repo = AppDataSource.getRepository(EmployeeMailAccountGrant);
+  const grant = await repo.findOneBy({
+    id: req.params.gid as string,
+    accountId: account.id,
+  });
+  if (!grant) return res.status(404).json({ error: "Grant not found" });
+  await repo.delete({ id: grant.id });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "mail.grant.delete",
+    targetType: "mail_account",
+    targetId: account.id,
+    targetLabel: account.address,
+    metadata: { employeeId: grant.employeeId },
+  });
+  res.json({ ok: true });
+});
+
+mailRouter.get("/mail/accounts/:aid/grant-candidates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  const employees = await AppDataSource.getRepository(AIEmployee).find({
+    where: { companyId: cid },
+    order: { name: "ASC" },
+  });
+  const grants = await AppDataSource.getRepository(EmployeeMailAccountGrant).find({
+    where: { accountId: account.id },
+  });
+  const granted = new Set(grants.map((g) => g.employeeId));
+  res.json({
+    candidates: employees.map((e) => ({
+      id: e.id,
+      name: e.name,
+      slug: e.slug,
+      role: e.role,
+      avatarKey: e.avatarKey,
+      alreadyGranted: granted.has(e.id),
+    })),
+  });
+});
+
+// ───────────────────────── AI analysis of inbound mail ─────────────────────────
+//
+// Analysis itself runs off the inbound automation queue — see
+// `services/mail/analysis.ts`, and `analysisAutomation.ts` for the steps the
+// mailbox's instructions take on their own. These routes are the human side
+// of it: the mailbox setting, a manual re-read, pressing one of the buttons,
+// and undoing an automatic step. A button or an undo always executes with the
+// Member's own authority through the ordinary services, never with the
+// analysing employee's.
+
+async function loadAnalysis(
+  cid: string,
+  analysisId: string,
+): Promise<{ analysis: MailInboundAnalysis; account: MailAccount } | null> {
+  const analysis = await AppDataSource.getRepository(MailInboundAnalysis).findOneBy({
+    id: analysisId,
+    companyId: cid,
+  });
+  if (!analysis) return null;
+  const account = await loadAccount(cid, analysis.accountId);
+  if (!account) return null;
+  return { analysis, account };
+}
+
+/**
+ * The mailbox's triage setting, its instructions, everything the pickers need
+ * and — the part a Member actually wants — who would read the next email that
+ * arrives. See `services/mail/analysisSettings.ts`.
+ */
+mailRouter.get("/mail/accounts/:aid/ai-analysis", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadAccount(cid, req.params.aid as string);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  res.json(await readMailAnalysisSettings(account));
+});
+
+const aiAnalysisSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    employeeId: z.string().uuid().nullable().optional(),
+    modelId: z.string().uuid().nullable().optional(),
+    // Null goes back to the default instructions. The precise limits — length,
+    // number of lines, printable text — are the service's, so they answer in
+    // a sentence; this bound only stops an absurd body at the door.
+    instructions: z.string().max(20_000).nullable().optional(),
+  })
+  .strict();
+
+// Open to every Member. It chooses among employees an owner or admin already
+// granted on this mailbox (checked by the service, and again at read time by
+// `resolveAnalysisReader`), and its instructions can only reach the short list
+// of steps the reader's own Grant allows, so it cannot widen anyone's access.
+mailRouter.patch(
+  "/mail/accounts/:aid/ai-analysis",
+  validateBody(aiAnalysisSettingsSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const account = await loadAccount(cid, req.params.aid as string);
+    if (!account) return res.status(404).json({ error: "Mail account not found" });
+    try {
+      res.json(
+        await updateMailAnalysisSettings(
+          account,
+          req.body as z.infer<typeof aiAnalysisSettingsSchema>,
+          req.userId ?? null,
+        ),
+      );
+    } catch (err) {
+      if (err instanceof MailAnalysisSettingsError) {
+        return res.status(400).json({ error: err.message });
+      }
+      throw err;
+    }
+  },
+);
+
+/**
+ * Read this message again on demand — after a model outage, after granting an
+ * employee access, or simply because the first verdict was wrong. Re-analysis
+ * replaces the row rather than adding a second set of buttons under the same
+ * email, which is why the entity keys on `messageId`.
+ */
+// Browser session only, like every other mail route that starts model work:
+// an API key scoped to the company should not be able to spend a mailbox's
+// model budget on demand by asking for re-reads.
+mailRouter.post("/mail/messages/:mid/analyze", requireBrowserSession, async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const message = await AppDataSource.getRepository(MailMessage).findOneBy({
+    id: req.params.mid as string,
+    companyId: cid,
+  });
+  if (!message) return res.status(404).json({ error: "Message not found" });
+  const account = await loadAccount(cid, message.accountId);
+  if (!account) return res.status(404).json({ error: "Mail account not found" });
+  if (!account.aiAnalysisEnabled) {
+    return res
+      .status(409)
+      .json({ error: "AI analysis is off for this mailbox. Turn it on in Email settings." });
+  }
+  const reader = await resolveAnalysisReader(account);
+  if (!reader) {
+    return res.status(409).json({
+      error:
+        "No AI Employee with a connected model has access to this mailbox. Grant one under AI access.",
+    });
+  }
+  try {
+    const analysis = await analyzeInboundMessage(account, message);
+    if (!analysis) {
+      return res.status(409).json({ error: "This message cannot be analysed." });
+    }
+    res.json({ analysis: (await analysesForMember(req, [analysis]))[0] });
+  } catch (err) {
+    if (err instanceof MailAnalysisAlreadyActed || err instanceof MailAnalysisWaiting) {
+      return res.status(409).json({ error: err.message });
+    }
+    if (err instanceof MailAnalysisModelUnavailable) {
+      return res.status(503).json({ error: err.message });
+    }
+    throw err;
+  }
+});
+
+mailRouter.post("/mail/analyses/:id/actions/:actionId", requireBrowserSession, async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const found = await loadAnalysis(cid, req.params.id as string);
+  if (!found) return res.status(404).json({ error: "Analysis not found" });
+  try {
+    const result = await executeAnalysisAction(
+      found.account,
+      found.analysis,
+      req.params.actionId as string,
+      {
+        userId: req.userId!,
+        sessionVersion: req.session!.sessionVersion!,
+        role: req.companyRole!,
+        financeAccess: effectiveFinanceAccess(req),
+      },
+    );
+    res.json({
+      analysis: (await analysesForMember(req, [result.analysis]))[0],
+      navigateTo: result.navigateTo,
+      message: result.message,
+    });
+  } catch (err) {
+    // Both a refused button (`MailAnalysisActionError`) and a downstream
+    // failure (a review/source check, the mailbox, or the finance ledger) are the Member's to see and retry,
+    // so both answer 400 with the real reason rather than a 500.
+    res.status(400).json({
+      error: err instanceof Error ? err.message : "The action could not be completed",
+    });
+  }
+});
+
+const undoAutomaticActionParamsSchema = z.object({
+  cid: z.string().min(1),
+  id: z.string().uuid(),
+  autoId: z.string().regex(/^auto-\d{1,2}$/, "Unknown automatic action"),
+});
+
+/**
+ * Take back one step the mailbox's instructions took on their own — unstar,
+ * mark unread, return to the inbox, remove the label — with the pressing
+ * Member's authority, the way they would have done it by hand. Browser session
+ * only, like the buttons beside it.
+ */
+mailRouter.post(
+  "/mail/analyses/:id/automatic/:autoId/undo",
+  requireBrowserSession,
+  validateParams(undoAutomaticActionParamsSchema),
+  validateBody(z.object({}).strict()),
+  async (req, res) => {
+    const { cid, id, autoId } = req.params as z.infer<typeof undoAutomaticActionParamsSchema>;
+    const found = await loadAnalysis(cid, id);
+    if (!found) return res.status(404).json({ error: "Analysis not found" });
+    try {
+      const result = await undoAutomaticAnalysisAction(found.account, found.analysis, autoId, {
+        userId: req.userId!,
+      });
+      res.json({
+        analysis: (await analysesForMember(req, [result.analysis]))[0],
+        message: result.message,
+      });
+    } catch (err) {
+      // A refusal and a mail server that would not take the change back are
+      // both the Member's to read and retry.
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "That step could not be undone",
+      });
+    }
+  },
+);

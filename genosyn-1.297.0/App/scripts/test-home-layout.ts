@@ -1,0 +1,3362 @@
+/**
+ * Run with `npm run test:home-layout`; local Chrome or GENOSYN_TEST_BROWSER.
+ * Tests the real Home greeting, cards and employee day with deterministic API
+ * fixtures. Geometry assertions catch reserved columns and overflow that static
+ * rendering cannot. Every unexpected request fails the suite.
+ * Set GENOSYN_HOME_TEST_FILTER to a check-name substring while iterating.
+ */
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createServer } from "vite";
+import { chromium, type Locator, type Page, type WebSocketRoute } from "playwright-core";
+import type {
+  Approval,
+  BoardLetterSummary,
+  Decision,
+  Employee,
+  EmployeeQueueItem,
+  EmployeeWorkQueue,
+  HomeApproval,
+  HomeChannel,
+  HomeData,
+  HomeFailedRun,
+  Notification,
+  Run,
+  RunStatus,
+  WorkEntry,
+  WorkTimeline,
+} from "../client/lib/api";
+import { runExplanationPrompt } from "../client/lib/runStatus";
+import { browserTestVite } from "./browserTestVite";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const output = path.resolve(root, "../output/playwright");
+const fixtureNow = new Date("2026-09-09T09:00:00.000Z");
+const browserErrors: string[] = [];
+const unexpectedRequests: string[] = [];
+const server = await createServer({
+  ...browserTestVite,
+  configFile: path.join(root, "vite.config.ts"),
+  server: { host: "127.0.0.1", port: 18481, strictPort: false, hmr: false },
+  cacheDir: path.join(root, "node_modules/.vite-home-layout"),
+  plugins: [
+    {
+      name: "home-layout-browser-fixture",
+      configureServer(dev) {
+        // Served at Home's own path so window.location agrees with the
+        // MemoryRouter, as it does under the app's BrowserRouter: Ask AI keeps
+        // the records an ask() brought only while window.location is unchanged.
+        dev.middlewares.use("/c/company", async (_request, response) => {
+          const html = await dev.transformIndexHtml(
+            "/c/company",
+            '<html><meta name="viewport" content="width=device-width, initial-scale=1"><div id="root"></div>' +
+              `<script type="module" src="/@fs${root}/scripts/homeLayoutHarness.tsx"></script></html>`,
+          );
+          response.setHeader("Content-Type", "text/html");
+          response.end(html);
+        });
+      },
+    },
+  ],
+});
+await server.listen().catch(async (error) => {
+  await server.close();
+  throw error;
+});
+const origin = server.resolvedUrls!.local[0].replace(/\/$/, "");
+const browser = await chromium
+  .launch({
+    channel: process.env.GENOSYN_TEST_BROWSER ?? "chrome",
+    headless: true,
+  })
+  .catch(async (error) => {
+    await server.close();
+    throw error;
+  });
+const context = await browser
+  .newContext({
+    viewport: { width: 1440, height: 1000 },
+    timezoneId: "Europe/London",
+  })
+  .catch(async (error) => {
+    await browser.close();
+    await server.close();
+    throw error;
+  });
+context.setDefaultTimeout(15000);
+const touchContext = await browser.newContext({
+  viewport: { width: 390, height: 1000 },
+  timezoneId: "Europe/London",
+  hasTouch: true,
+});
+touchContext.setDefaultTimeout(15000);
+
+function roster(count = 1): Employee[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `employee-${index + 1}`,
+    slug: `employee-${index + 1}`,
+    name: index === 0 ? "Jamie Mallers" : `Employee ${index + 1}`,
+    role: "Customer support",
+    avatarKey: null,
+  })) as Employee[];
+}
+function decision(changes: Partial<Decision> = {}): Decision {
+  return {
+    id: "decision",
+    companyId: "company",
+    title: "Which retention commitment needs attention?",
+    body: "Confirm the owner and next update.",
+    status: "pending",
+    urgency: "high",
+    options: [{ id: "confirm", label: "Confirm the owner", detail: null, tone: "primary" }],
+    createdAt: fixtureNow.toISOString(),
+    employee: null,
+    source: { kind: "unknown", routine: null, run: null, conversation: null, mailThread: null },
+    routineId: null,
+    runId: null,
+    conversationId: null,
+    mailThreadId: null,
+    chosenOptionId: null,
+    chosenOptionLabel: null,
+    note: null,
+    decidedAt: null,
+    decidedByUserId: null,
+    decidedBy: null,
+    decidedByEmployee: null,
+    routedToEmployee: null,
+    pickupStatus: "none",
+    pickupSummary: null,
+    pickupStartedAt: null,
+    pickupFinishedAt: null,
+    snoozedUntil: null,
+    expiresAt: null,
+    assignee: null,
+    ...changes,
+  };
+}
+function review(kind: "proactive_work" | "mail_send"): HomeApproval {
+  return {
+    id: kind === "proactive_work" ? "work-review" : "mail-review",
+    kind,
+    title:
+      kind === "proactive_work" ? "Prepare the retention follow-up" : "Review the customer reply",
+    summary: null,
+    requestedAt: "2026-09-09T08:00:00.000Z",
+    employee: { id: "employee-1", name: "Jamie Mallers", slug: "employee-1" },
+    routine: null,
+    review:
+      kind === "proactive_work"
+        ? {
+            kind: "work",
+            revision: "work-revision",
+            context: "The customer asked for an update on their retention review.",
+            plan: "Prepare the owner summary and next steps for the customer.",
+            source: {
+              routineId: null,
+              runId: null,
+              conversationId: null,
+              mailThreadId: null,
+              mailAccountId: null,
+              mailHandoverId: null,
+            },
+          }
+        : {
+            kind: "mail",
+            revision: "mail-revision",
+            context: "The customer asked who will own their next update.",
+            workSummary: "Checked the owner and prepared a reply.",
+            steps: [],
+            attachments: [],
+            source: {
+              accountId: "account",
+              threadId: "thread",
+              mailHandoverId: null,
+              routineId: null,
+              runId: null,
+              conversationId: null,
+            },
+            draft: {
+              to: "customer@example.test",
+              cc: "",
+              bcc: "",
+              subject: "Your next update",
+              bodyText: "Jamie will send your next update tomorrow.",
+            },
+          },
+  };
+}
+function channel(id: string, label: string, unreadCount: number): HomeChannel {
+  return { id, kind: "channel", label, unreadCount, lastReadAt: null };
+}
+function notification(id: string, title: string): Notification {
+  return {
+    id,
+    kind: "approval_stale",
+    title,
+    body: "A review has been waiting for 24 hours.",
+    link: `/c/company/decisions#review-${id}`,
+    actor: {
+      kind: "ai",
+      id: "employee-1",
+      name: "Jamie Mallers",
+      avatarKey: null,
+      slug: "employee-1",
+    },
+    entityKind: "approval",
+    entityId: id,
+    readAt: null,
+    createdAt: fixtureNow.toISOString(),
+  };
+}
+
+function failedRun(changes: Partial<HomeFailedRun> = {}): HomeFailedRun {
+  return {
+    followUpRun: null,
+    runId: "failed-run",
+    routineId: "customer-update",
+    routineName: "Daily customer update",
+    status: "failed",
+    errorKind: null,
+    failureReason: "The customer update could not be delivered.",
+    exitCode: 1,
+    startedAt: "2026-09-09T08:00:00.000Z",
+    employee: { id: "employee-1", name: "Jamie Mallers", slug: "employee-1", avatarKey: null },
+    ...changes,
+  };
+}
+
+const failureTranscript =
+  "[08:00:01] Looking up customer requests.\n[08:00:05] Mailbox rejected the request: Connection expired.";
+
+function homeData(
+  employeeCount: number,
+  options: {
+    quiet?: boolean;
+    unreadChannels?: HomeChannel[];
+    notifications?: Notification[];
+  } = {},
+): HomeData {
+  const quiet = options.quiet ?? false;
+  return {
+    repositoryWork: [],
+    repositoryWorkCount: 0,
+    decisions: quiet ? [] : [decision()],
+    pendingDecisionCount: quiet ? 0 : 1,
+    notifications: options.notifications ?? [],
+    unreadNotificationCount: options.notifications?.length ?? 0,
+    myTodos: quiet
+      ? []
+      : [
+          {
+            id: "todo",
+            number: 1,
+            title: "Review the customer update",
+            status: "todo",
+            priority: "medium",
+            dueAt: null,
+            parentTodoId: null,
+            project: { id: "project", key: "OPS", name: "Operations", slug: "operations" },
+          },
+        ],
+    myTodoCount: quiet ? 0 : 1,
+    reviewTodos: [],
+    reviewTodoCount: 0,
+    approvals: [],
+    pendingApprovalCount: 0,
+    unreadChannels: options.unreadChannels ?? (quiet ? [] : [channel("support", "Support", 2)]),
+    failedRuns: [],
+    failedRunCount: 0,
+    tldrs: [],
+    unreadTldrCount: 0,
+    boardLetter: null,
+    unreadBoardLetterCount: 0,
+    draftEmails: [],
+    draftEmailCount: 0,
+    draftEmailAccounts: [],
+    starredEmailCount: 0,
+    starredEmailAccounts: [],
+    systemHealth: { status: "ok", issueCount: 0, checks: [] },
+    counts: { employees: employeeCount, projects: 1 },
+  };
+}
+function timeline(employees: Employee[], query: URLSearchParams, working = false): WorkTimeline {
+  const since = query.get("since") ?? new Date(fixtureNow.getTime() - 86400000).toISOString();
+  const until = query.get("until") ?? fixtureNow.toISOString();
+  const employeeId = query.get("employeeId");
+  const latest = employees[0]
+    ? ({
+        id: "chat:work",
+        kind: "chat",
+        at: new Date(fixtureNow.getTime() - 19 * 60000).toISOString(),
+        endedAt: working ? null : fixtureNow.toISOString(),
+        active: working,
+        employee: employees[0],
+        title: "Customer update",
+        subject: "Customer update",
+        detail: "Reviewed customer requests",
+        source: null,
+        effects: [],
+        effectCount: 0,
+        run: null,
+      } as WorkEntry)
+    : null;
+  return {
+    since,
+    until,
+    employeeId,
+    entries: employeeId && latest && employeeId === latest.employee.id ? [latest] : [],
+    entryCount: latest ? 1 : 0,
+    employeeSummaries: latest
+      ? [
+          {
+            employeeId: latest.employee.id,
+            entryCount: 1,
+            latest,
+            current: working ? latest : null,
+            waiting: null,
+          },
+        ]
+      : [],
+  };
+}
+function boardLetter(changes: Partial<BoardLetterSummary> = {}): BoardLetterSummary {
+  return {
+    id: "letter-3",
+    number: 3,
+    month: "2026-08",
+    monthLabel: "August 2026",
+    status: "ready",
+    auditStatus: "exceptions",
+    summary: "August closed with revenue up a quarter and the Goal at 6,200 roofs.",
+    untracedCount: 1,
+    findingsCount: 2,
+    writer: {
+      id: "employee-1",
+      name: "Jamie Mallers",
+      role: "CEO",
+      slug: "jamie",
+      avatarKey: null,
+    },
+    auditor: { id: "auditor", name: "Otto", role: "Auditor", slug: "otto", avatarKey: null },
+    triggerKind: "schedule",
+    attempts: 1,
+    retryAt: null,
+    errorMessage: "",
+    createdAt: "2026-09-01T06:00:00.000Z",
+    writtenAt: "2026-09-01T06:01:00.000Z",
+    auditedAt: "2026-09-01T06:02:00.000Z",
+    deliveredAt: "2026-09-01T06:02:00.000Z",
+    ...changes,
+  };
+}
+function queueItem(changes: Partial<EmployeeQueueItem> = {}): EmployeeQueueItem {
+  return {
+    id: "queued-1",
+    runId: "queued-1",
+    routine: { id: "routine-1", name: "Review customer requests", slug: "review-customers" },
+    triggerKind: "schedule",
+    queuedAt: "2026-09-09T08:55:00.000Z",
+    availableAt: null,
+    position: null,
+    blockedReason: null,
+    ...changes,
+  };
+}
+type FixtureOptions = {
+  count?: number;
+  width?: number;
+  height?: number;
+  quiet?: boolean;
+  dark?: boolean;
+  longNames?: boolean;
+  rosterError?: boolean;
+  workError?: boolean;
+  holdWork?: boolean;
+  workQueue?: EmployeeWorkQueue;
+  queueError?: boolean;
+  holdQueue?: boolean;
+  holdMarkRead?: boolean;
+  markReadError?: boolean;
+  holdNotificationMarkAll?: boolean;
+  notificationMarkAllError?: boolean;
+  working?: boolean;
+  brokenAvatar?: boolean;
+  touch?: boolean;
+  channels?: HomeChannel[];
+  notifications?: Notification[];
+  unreadNotificationCount?: number;
+  statCounts?: Partial<Pick<HomeData, "myTodoCount" | "reviewTodoCount" | "pendingApprovalCount">>;
+  decisions?: Decision[];
+  decisionApprovals?: HomeApproval[];
+  pendingDecisionCount?: number;
+  pendingDecisionApprovalCount?: number;
+  role?: "member" | "admin" | "owner";
+  allowDecisionAnswer?: boolean;
+  allowDecisionSnooze?: boolean;
+  allowReview?: boolean;
+  decisionAnswerError?: boolean;
+  failedRuns?: HomeFailedRun[];
+  runRetry?: "same" | "new" | "network-error";
+  allowRunResume?: boolean;
+  runResumeError?: boolean;
+  longFailureTranscript?: boolean;
+  live?: boolean;
+  /** The Goals the company has written; the all-clear card shows the first active one. */
+  goals?: Array<Record<string, unknown>>;
+  /** What Home's payload carries; the server sends one only to owners and admins. */
+  boardLetter?: BoardLetterSummary;
+  unreadBoardLetterCount?: number;
+  letterReadError?: boolean;
+};
+function fixtureGoal(values: Record<string, unknown> = {}) {
+  return {
+    id: "goal",
+    slug: "reach-50-paying-customers",
+    title: "Reach 50 paying customers by March",
+    description: "",
+    parentGoalId: null,
+    ownerEmployeeId: null,
+    metricKind: "manual",
+    chartId: null,
+    startValue: null,
+    targetValue: 50,
+    currentValue: null,
+    currentValueUpdatedAt: null,
+    direction: "increase_to",
+    unit: "customers",
+    dueAt: null,
+    status: "active",
+    settledAt: null,
+    createdAt: "2026-09-01T00:00:00.000Z",
+    progress: null,
+    met: false,
+    ...values,
+  };
+}
+async function open(options: FixtureOptions = {}) {
+  const page = await (options.touch ? touchContext : context).newPage();
+  await page.setViewportSize({ width: options.width ?? 1440, height: options.height ?? 1000 });
+  await page.emulateMedia({
+    colorScheme: options.dark ? "dark" : "light",
+    reducedMotion: "reduce",
+  });
+  await page.clock.setFixedTime(fixtureNow);
+  await page.addInitScript(() => {
+    if (!sessionStorage.getItem("home-fixture-started")) {
+      for (const key of Object.keys(localStorage))
+        if (key.startsWith("genosyn.decisionFollowUps.v1:")) localStorage.removeItem(key);
+      localStorage.removeItem("genosyn.askAi.open");
+      sessionStorage.setItem("home-fixture-started", "1");
+    }
+    localStorage.setItem("genosyn.pushPromptDismissed", "1");
+  });
+  let employees = roster(options.count ?? 1);
+  if (options.longNames) employees[0].name = "Alexandria Rivera-Montgomery ".repeat(5).trim();
+  if (options.brokenAvatar) employees[0].avatarKey = "missing";
+  let rosterError = options.rosterError ?? false;
+  let workError = options.workError ?? false;
+  let workQueue = options.workQueue;
+  let queueError = options.queueError ?? false;
+  let decisionAnswerError = options.decisionAnswerError ?? false;
+  let failedRuns = options.failedRuns ?? [];
+  const runHistory = [...failedRuns];
+  let decisions = options.decisions ?? (options.quiet ? [] : [decision()]);
+  let decisionApprovals = options.decisionApprovals ?? [];
+  const decisionDetails = new Map(decisions.map((row) => [row.id, row]));
+  const reviewDetails = new Map(
+    decisionApprovals.map((row): [string, Approval] => [
+      row.id,
+      {
+        ...row,
+        companyId: "company",
+        routineId: row.routine?.id ?? "",
+        employeeId: row.employee?.id ?? "",
+        status: "pending",
+        errorMessage: null,
+        decidedAt: null,
+        decidedByUserId: null,
+      },
+    ]),
+  );
+  let pendingDecisionCount = options.pendingDecisionCount ?? decisions.length;
+  let pendingDecisionApprovalCount =
+    options.pendingDecisionApprovalCount ?? decisionApprovals.length;
+  const mutations: Array<{ path: string; body: unknown }> = [];
+  let homeError = false;
+  let markReadError = options.markReadError ?? false;
+  let unreadChannels = (
+    options.channels ?? (options.quiet ? [] : [channel("support", "Support", 2)])
+  ).map((row) => ({ ...row }));
+  let notifications = (options.notifications ?? []).map((row) => ({ ...row }));
+  let shownLetter = options.boardLetter ?? null;
+  let unreadBoardLetterCount = options.unreadBoardLetterCount ?? (shownLetter ? 1 : 0);
+  let releaseWork: () => void = () => {};
+  const workGate = new Promise<void>((resolve) => {
+    releaseWork = resolve;
+  });
+  let releaseQueue: () => void = () => {};
+  const queueGate = new Promise<void>((resolve) => {
+    releaseQueue = resolve;
+  });
+  let releaseMarkRead: () => void = () => {};
+  const markReadGate = new Promise<void>((resolve) => {
+    releaseMarkRead = resolve;
+  });
+  let releaseNotificationMarkAll: () => void = () => {};
+  const notificationMarkAllGate = new Promise<void>((resolve) => {
+    releaseNotificationMarkAll = resolve;
+  });
+  let holdNextHome = false;
+  let releaseHome: () => void = () => {};
+  const homeGate = new Promise<void>((resolve) => {
+    releaseHome = resolve;
+  });
+  const reads: string[] = [];
+  const writes: string[] = [];
+  const sockets: WebSocketRoute[] = [];
+  if (options.live) {
+    await page.routeWebSocket(`${origin.replace(/^http/, "ws")}/api/ws?token=*`, (socket) => {
+      sockets.push(socket);
+    });
+  }
+  page.on("pageerror", (error) => browserErrors.push(error.message));
+  // React only logs duplicate sibling keys, but it may then duplicate or drop
+  // one of Home's cards on the next reconciliation.
+  page.on("console", (message) => {
+    if (
+      message.type() === "error" &&
+      message.text().includes("Encountered two children with the same key")
+    )
+      browserErrors.push(message.text());
+  });
+  await page.route("**/*", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.origin !== origin) {
+      unexpectedRequests.push(`${request.method()} ${url.href}`);
+      return route.abort();
+    }
+    if (!url.pathname.startsWith("/api/")) return route.continue();
+    // An email review's recipient chips ask who can be emailed and who the
+    // mailbox knows. Both are reads with no effect, answered empty here.
+    if (
+      request.method() === "POST" &&
+      /^\/api\/companies\/company\/mail\/accounts\/[^/]+\/recipient-check$/.test(url.pathname)
+    )
+      return route.fulfill({ json: { blocked: [] } });
+    if (
+      request.method() === "GET" &&
+      /^\/api\/companies\/company\/mail\/accounts\/[^/]+\/recipient-suggestions$/.test(url.pathname)
+    )
+      return route.fulfill({ json: { suggestions: [] } });
+    if (request.method() === "POST") {
+      if (options.live && url.pathname === "/api/companies/company/workspace/ws-token")
+        return route.fulfill({ json: { token: "fixture-token" } });
+      const retrying = failedRuns.find(
+        (item) => url.pathname === `/api/companies/company/routines/${item.routineId}/run`,
+      );
+      if (options.runRetry && retrying) {
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: null });
+        if (options.runRetry === "network-error") return route.abort("failed");
+        return route.fulfill({
+          json: { id: options.runRetry === "same" ? retrying.runId : "new-run" },
+        });
+      }
+      const dismissing = failedRuns.find(
+        (item) => url.pathname === `/api/companies/company/runs/${item.runId}/dismiss`,
+      );
+      if (options.runRetry && dismissing) {
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: null });
+        failedRuns = failedRuns.filter((item) => item.runId !== dismissing.runId);
+        return route.fulfill({ json: { ok: true } });
+      }
+      const resuming = failedRuns.find(
+        (item) => url.pathname === `/api/companies/company/runs/${item.runId}/resume`,
+      );
+      if (options.allowRunResume && resuming) {
+        assert.ok(options.role === "admin" || options.role === "owner");
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: request.postDataJSON() });
+        assert.deepEqual(request.postDataJSON(), { acknowledgeNewAllowance: true });
+        if (options.runResumeError)
+          return route.fulfill({
+            status: 409,
+            json: { error: "A newer Run already continued this work." },
+          });
+        const resumed: Run = {
+          id: "resumed-run",
+          routineId: resuming.routineId,
+          startedAt: fixtureNow.toISOString(),
+          finishedAt: null,
+          createdAt: fixtureNow.toISOString(),
+          status: "running",
+          exitCode: null,
+          hasUnfinishedWork: false,
+          triggerKind: "continuation",
+          continuationCount: 0,
+          tokensIn: 0,
+          tokensOut: 0,
+        };
+        runHistory.push({
+          ...resuming,
+          ...resumed,
+          runId: resumed.id,
+          failureReason: null,
+          retryAt: null,
+          continuationPending: false,
+        });
+        failedRuns = failedRuns.filter((item) => item.runId !== resuming.runId);
+        return route.fulfill({ json: resumed });
+      }
+      const answering = decisions.find(
+        (item) => url.pathname === `/api/companies/company/decisions/${item.id}/decide`,
+      );
+      if (options.allowDecisionAnswer && answering) {
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: request.postDataJSON() });
+        if (decisionAnswerError)
+          return route.fulfill({ status: 503, json: { error: "The answer could not be saved." } });
+        decisions = decisions.filter((item) => item.id !== answering.id);
+        pendingDecisionCount--;
+        const body = request.postDataJSON() as { optionId: string; note?: string };
+        const answered: Decision = {
+          ...answering,
+          status: "decided",
+          chosenOptionId: body.optionId,
+          chosenOptionLabel:
+            answering.options.find((option) => option.id === body.optionId)?.label ?? null,
+          note: body.note ?? null,
+          decidedAt: fixtureNow.toISOString(),
+          decidedByUserId: "member",
+          decidedBy: { id: "member", name: "Nawaz Dhandala" },
+        };
+        decisionDetails.set(answered.id, answered);
+        return route.fulfill({ json: answered });
+      }
+      const snoozing = decisions.find(
+        (item) => url.pathname === `/api/companies/company/decisions/${item.id}/snooze`,
+      );
+      if (options.allowDecisionSnooze && snoozing) {
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: request.postDataJSON() });
+        decisions = decisions.filter((item) => item.id !== snoozing.id);
+        pendingDecisionCount--;
+        return route.fulfill({ json: { ...snoozing, snoozedUntil: "2026-09-10T09:00:00.000Z" } });
+      }
+      const approving = decisionApprovals.find(
+        (item) => url.pathname === `/api/companies/company/approvals/${item.id}/approve`,
+      );
+      if (options.allowReview && approving) {
+        assert.ok(options.role === "admin" || options.role === "owner");
+        writes.push(`${request.method()} ${url.pathname}`);
+        mutations.push({ path: url.pathname, body: request.postDataJSON() });
+        decisionApprovals = decisionApprovals.filter((item) => item.id !== approving.id);
+        pendingDecisionApprovalCount--;
+        const approved: Approval = {
+          ...reviewDetails.get(approving.id)!,
+          status: approving.kind === "proactive_work" ? "executing" : "approved",
+          decidedAt: fixtureNow.toISOString(),
+          decidedByUserId: "member",
+          ...(approving.kind === "mail_send"
+            ? {
+                mailDeliveryStatus: "sent" as const,
+                mailOutcome: {
+                  sentMessageId: "sent-message",
+                  providerMessageRef: "provider-ref",
+                  sentAt: fixtureNow.toISOString(),
+                },
+              }
+            : {}),
+        };
+        reviewDetails.set(approved.id, approved);
+        return route.fulfill({ json: approved });
+      }
+    }
+    const markRead = url.pathname.match(
+      /^\/api\/companies\/company\/workspace\/channels\/([^/]+)\/read$/,
+    );
+    if (request.method() === "POST" && markRead) {
+      writes.push(`${request.method()} ${url.pathname}`);
+      if (options.holdMarkRead) await markReadGate;
+      if (markReadError) {
+        return route.fulfill({ status: 503, json: { error: "Workspace is unavailable." } });
+      }
+      unreadChannels = unreadChannels.filter((row) => row.id !== decodeURIComponent(markRead[1]));
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (
+      request.method() === "POST" &&
+      shownLetter &&
+      url.pathname === `/api/companies/company/board-letters/${shownLetter.number}/read`
+    ) {
+      writes.push(`${request.method()} ${url.pathname}`);
+      mutations.push({ path: url.pathname, body: request.postDataJSON() });
+      if (options.letterReadError) {
+        return route.fulfill({ status: 503, json: { error: "Letters are unavailable." } });
+      }
+      shownLetter = null;
+      unreadBoardLetterCount = Math.max(0, unreadBoardLetterCount - 1);
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (
+      request.method() === "POST" &&
+      url.pathname === "/api/companies/company/notifications/mark-all-read"
+    ) {
+      writes.push(`${request.method()} ${url.pathname}`);
+      if (options.holdNotificationMarkAll) await notificationMarkAllGate;
+      if (options.notificationMarkAllError) {
+        return route.fulfill({ status: 503, json: { error: "Notifications are unavailable." } });
+      }
+      notifications = [];
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (request.method() !== "GET") {
+      unexpectedRequests.push(`${request.method()} ${url.href}`);
+      return route.abort();
+    }
+    reads.push(url.pathname + url.search);
+    const detailMatch = url.pathname.match(
+      /^\/api\/companies\/company\/(decisions|approvals)\/([^/]+)$/,
+    );
+    if (detailMatch) {
+      const row =
+        detailMatch[1] === "decisions"
+          ? decisionDetails.get(detailMatch[2])
+          : reviewDetails.get(detailMatch[2]);
+      return row
+        ? route.fulfill({ json: row })
+        : route.fulfill({ status: 404, json: { error: "Not found" } });
+    }
+    if (url.pathname === "/api/companies/company/home") {
+      if (holdNextHome) {
+        holdNextHome = false;
+        await homeGate;
+      }
+      if (homeError) {
+        return route.fulfill({ status: 503, json: { error: "Home is unavailable." } });
+      }
+      return route.fulfill({
+        json: {
+          ...homeData(employees.length, {
+            quiet: options.quiet,
+            unreadChannels,
+            notifications,
+          }),
+          ...options.statCounts,
+          unreadNotificationCount: notifications.length
+            ? (options.unreadNotificationCount ?? notifications.length)
+            : 0,
+          decisions,
+          pendingDecisionCount,
+          decisionApprovals,
+          pendingDecisionApprovalCount,
+          failedRuns,
+          failedRunCount: failedRuns.length,
+          boardLetter: shownLetter,
+          unreadBoardLetterCount,
+        },
+      });
+    }
+    const failure = runHistory.find((item) =>
+      url.pathname.startsWith(`/api/companies/company/runs/${item.runId}/`),
+    );
+    if (failure && url.pathname.endsWith("/log"))
+      return route.fulfill({
+        json: {
+          content:
+            failure.runId === "resumed-run"
+              ? "Continuing from saved progress. Verifying earlier Effects before the next batch."
+              : options.longFailureTranscript
+                ? `${"[07:59:00] Reviewing earlier customer updates.\n".repeat(200)}${failureTranscript}`
+                : failureTranscript,
+          live: false,
+          status: failure.status,
+          errorKind: failure.errorKind,
+          failureReason: failure.failureReason,
+          hasUnfinishedWork: failure.hasUnfinishedWork,
+          retryAt: failure.retryAt,
+          continuationPending: failure.continuationPending,
+          followUpRun: failure.followUpRun,
+          exitCode: failure.exitCode,
+          startedAt: failure.startedAt,
+          finishedAt: failure.status === "running" ? null : "2026-09-09T08:00:06.000Z",
+          browserRecordings: [],
+        },
+      });
+    const evidenceRun = runHistory.find((item) =>
+      url.pathname.startsWith(`/api/companies/company/routines/runs/${item.runId}/`),
+    );
+    if (evidenceRun && url.pathname.endsWith("/checks"))
+      return route.fulfill({ json: { results: [] } });
+    if (evidenceRun && url.pathname.endsWith("/effects"))
+      return route.fulfill({ json: { effects: [], total: 0 } });
+    if (url.pathname === "/api/companies/company/employees")
+      return route.fulfill(
+        rosterError
+          ? { status: 503, json: { error: "Could not load your AI employees." } }
+          : { json: employees },
+      );
+    if (url.pathname === "/api/companies/company/members") return route.fulfill({ json: [] });
+    if (url.pathname === "/api/companies/company/goals")
+      return route.fulfill({ json: options.goals ?? [] });
+    if (url.pathname === "/api/companies/company/onboarding-status")
+      return route.fulfill({
+        json: {
+          complete: true,
+          employee: null,
+          modelConnected: true,
+          routineCount: 0,
+          scheduledRoutineCount: 0,
+          nextRunAt: null,
+          skillCount: 0,
+          mailGranted: false,
+          mailAccessLevel: null,
+          nextStep: "done",
+        },
+      });
+    if (url.pathname === "/api/companies/company/work-timeline") {
+      if (options.holdWork && !url.searchParams.has("employeeId")) await workGate;
+      if (workError && !url.searchParams.has("employeeId"))
+        return route.fulfill({
+          status: 503,
+          json: { error: "Recent work is temporarily unavailable." },
+        });
+      return route.fulfill({ json: timeline(employees, url.searchParams, options.working) });
+    }
+    const queueMatch = /^\/api\/companies\/company\/employees\/([^/]+)\/work-queue$/.exec(
+      url.pathname,
+    );
+    if (queueMatch) {
+      if (options.holdQueue) await queueGate;
+      if (queueError)
+        return route.fulfill({
+          status: 503,
+          json: { error: "Routine Runs are temporarily unavailable." },
+        });
+      return route.fulfill({
+        json:
+          workQueue?.employeeId === queueMatch[1]
+            ? workQueue
+            : {
+                employeeId: queueMatch[1],
+                current: null,
+                running: [],
+                runningCount: 0,
+                pending: [],
+                pendingCount: 0,
+              },
+      });
+    }
+    if (
+      options.brokenAvatar &&
+      url.pathname === "/api/companies/company/employees/employee-1/avatar"
+    )
+      return route.fulfill({ status: 404, body: "" });
+    unexpectedRequests.push(`${request.method()} ${url.pathname}`);
+    return route.fulfill({ status: 500, json: { error: "Unexpected fixture request" } });
+  });
+  const query = new URLSearchParams();
+  if (options.longNames) query.set("longNames", "1");
+  if (options.role) query.set("role", options.role);
+  if (options.live) query.set("live", "1");
+  await page.goto(`${origin}/c/company?${query}`, {
+    waitUntil: "commit",
+    timeout: 60000,
+  });
+  await page.locator('header[aria-label="Home greeting"]').waitFor({ timeout: 300000 });
+  await page
+    .getByRole("heading", {
+      name:
+        decisions.length ||
+        ((options.role === "admin" || options.role === "owner") && decisionApprovals.length)
+          ? "Active decisions"
+          : failedRuns.length > 0
+            ? "Routines needing attention"
+            : options.quiet && unreadChannels.length === 0 && notifications.length === 0
+              ? "Nothing needs you right now"
+              : notifications.length > 0
+                ? "Needs your attention"
+                : options.quiet
+                  ? "Unread messages"
+                  : "Active decisions",
+      exact: true,
+    })
+    .waitFor();
+  if (employees.length && !rosterError) {
+    await page.getByRole("group", { name: "Open an AI employee's day", exact: true }).waitFor();
+    if (!options.holdWork)
+      await page.waitForFunction(
+        () => !document.querySelector('button[aria-label*="Loading work"]'),
+      );
+  }
+  if (rosterError) await page.getByRole("alert").waitFor();
+  if (options.live)
+    await page.locator('[data-socket-status="open"]').waitFor({ state: "attached" });
+  return {
+    page,
+    reads,
+    writes,
+    mutations,
+    releaseWork,
+    releaseQueue,
+    releaseMarkRead,
+    releaseNotificationMarkAll,
+    releaseHome,
+    recover: () => {
+      rosterError = false;
+      workError = false;
+      queueError = false;
+      homeError = false;
+      markReadError = false;
+      decisionAnswerError = false;
+    },
+    failHome: () => {
+      homeError = true;
+    },
+    holdNextHome: () => {
+      holdNextHome = true;
+    },
+    removeChannel: (channelId: string) => {
+      unreadChannels = unreadChannels.filter((row) => row.id !== channelId);
+    },
+    removeEmployees: () => {
+      employees = [];
+    },
+    setDecisions: (items: Decision[]) => {
+      decisions = items;
+      pendingDecisionCount = items.length;
+      for (const row of items) decisionDetails.set(row.id, row);
+    },
+    setReviews: (items: HomeApproval[]) => {
+      decisionApprovals = items;
+      pendingDecisionApprovalCount = items.length;
+    },
+    updateReview: (id: string, changes: Partial<Approval>) => {
+      const row = reviewDetails.get(id);
+      assert.ok(row);
+      reviewDetails.set(id, { ...row, ...changes });
+    },
+    setQueue: (value: EmployeeWorkQueue) => {
+      workQueue = value;
+    },
+    emitResourceEvent: (
+      kind: "decision" | "approval" | "run" | "routine" | "employee" | "standdown",
+    ) => {
+      for (const socket of sockets)
+        socket.send(JSON.stringify({ type: "resource.changed", kind, scopeIds: [] }));
+    },
+  };
+}
+const greeting = (page: Page) => page.locator('header[aria-label="Home greeting"]');
+const work = (page: Page) =>
+  page.getByRole("complementary", { name: "AI employee work", exact: true });
+const bubbles = (page: Page) => work(page).getByRole("button");
+const card = (page: Page, title: string) =>
+  page.locator("section").filter({ has: page.getByRole("heading", { name: title, exact: true }) });
+const activeDecisions = (page: Page) =>
+  page.getByRole("region", { name: "Active decisions", exact: true });
+const statTiles = (page: Page) =>
+  page.getByRole("link").filter({
+    has: page.getByText(
+      /^(Unread notifications|Todos assigned to you|Reviews waiting on you|Pending approvals)$/,
+    ),
+  });
+// Every row in Home's Active decisions, in reading order (email and work
+// reviews sit inside their group's list).
+const decisionRows = (page: Page) => activeDecisions(page).locator("[data-stack-row]");
+/** The one line a settled row collapses to. */
+const statusLine = (page: Page, id: string) => page.locator(`[id="${id}"] [data-status-line]`);
+async function editMailReply(page: Page, id: string, body: string) {
+  const row = page.locator(`#review-${id}`);
+  await row.getByRole("button", { name: "Edit email", exact: true }).click();
+  const textarea = row.getByRole("textbox", { name: "Email", exact: true });
+  await textarea.fill(body);
+  await textarea.press("ArrowLeft");
+  const element = await textarea.elementHandle();
+  assert.ok(element);
+  return { row, textarea, element, body };
+}
+async function retainsMailEditor(
+  editor: Awaited<ReturnType<typeof editMailReply>>,
+  focused = false,
+) {
+  assert.equal(await editor.element.evaluate((element) => element.isConnected), true);
+  assert.equal(await editor.textarea.inputValue(), editor.body);
+  assert.equal(
+    await editor.textarea.evaluate((element) => (element as HTMLTextAreaElement).selectionStart),
+    editor.body.length - 1,
+    "the editor must retain the insertion point",
+  );
+  if (focused)
+    assert.equal(
+      await editor.element.evaluate((element) => element === document.activeElement),
+      true,
+      "refresh must leave keyboard focus in the same textarea",
+    );
+}
+const markReadButton = (page: Page, label: string) =>
+  page.getByRole("button", {
+    name: `Mark ${label} as read`,
+    exact: true,
+    includeHidden: true,
+  });
+async function markReadPresentation(button: Locator) {
+  return button.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { opacity: style.opacity, pointerEvents: style.pointerEvents };
+  });
+}
+async function unreadCardCount(page: Page, expected: number) {
+  const header = card(page, "Unread messages").locator(":scope > div").first();
+  await header.getByText(String(expected), { exact: true }).waitFor();
+}
+async function box(locator: Locator) {
+  const value = await locator.boundingBox();
+  assert.ok(value, "element must be visible");
+  return value;
+}
+async function fits(page: Page) {
+  assert.equal(
+    await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    true,
+    "page must not scroll horizontally",
+  );
+  assert.equal(
+    await page
+      .locator("#main-content")
+      .evaluate((element) => element.scrollWidth <= element.clientWidth),
+    true,
+    "Home itself must not have hidden horizontal overflow",
+  );
+}
+async function fillsContent(page: Page, title?: string) {
+  const header = await box(greeting(page));
+  const content = await box(title ? card(page, title) : card(page, "Your todos").locator(".."));
+  assert.ok(Math.abs(content.x - header.x) < 1, "card must align with the greeting's left edge");
+  assert.ok(
+    Math.abs(content.width - header.width) < 1,
+    "card must use the greeting's entire width without a reserved employee column",
+  );
+  assert.ok(
+    content.y >= header.y + header.height,
+    "cards must start below the greeting and employee bubbles",
+  );
+}
+async function statRowsFillContent(page: Page, count: number) {
+  assert.equal(await statTiles(page).count(), count, "only nonzero counters occupy space");
+  const header = await box(greeting(page));
+  const tiles = await Promise.all((await statTiles(page).all()).map(box));
+  const rows = new Map<number, typeof tiles>();
+  for (const tile of tiles) rows.set(tile.y, [...(rows.get(tile.y) ?? []), tile]);
+  assert.equal(rows.size, page.viewportSize()!.width >= 1024 ? 1 : Math.ceil(count / 2));
+  for (const row of rows.values()) {
+    const first = row[0];
+    const last = row[row.length - 1];
+    assert.ok(Math.abs(first.x - header.x) < 1, "counter row starts at the content's left edge");
+    assert.ok(
+      Math.abs(last.x + last.width - header.x - header.width) < 1,
+      "counter row fills the content's right edge without empty slots",
+    );
+    for (const tile of row)
+      assert.ok(Math.abs(tile.width - first.width) < 1, "counter tiles share their row equally");
+  }
+}
+async function openDay(page: Page, index = 0, key?: string) {
+  const bubble = bubbles(page).nth(index);
+  if (key) {
+    await bubble.focus();
+    await page.keyboard.press(key);
+  } else await bubble.click();
+  const dialog = page.getByRole("dialog");
+  await dialog.waitFor();
+  return dialog;
+}
+const askAiProbe = (page: Page) => page.locator('output[aria-label="Ask AI request"]');
+async function askAiState(page: Page) {
+  return JSON.parse((await askAiProbe(page).textContent()) ?? "null") as {
+    open: boolean;
+    refs: Array<{ kind: string; id: string }>;
+    prompt: string | null;
+    employeeIds: string[] | null;
+    requestRefs: Array<{ kind: string; id: string }> | null;
+    newConversation: boolean | null;
+  };
+}
+/**
+ * Ask AI is open about exactly this Run, in a new conversation, with the
+ * question its status implies.
+ */
+async function asksAiAbout(page: Page, runId: string, status: RunStatus) {
+  const run = [{ kind: "run", id: runId }];
+  const expected = {
+    open: true,
+    refs: run,
+    prompt: runExplanationPrompt(status),
+    employeeIds: null,
+    requestRefs: run,
+    newConversation: true,
+  };
+  await page
+    .waitForFunction(
+      (text) => document.querySelector('output[aria-label="Ask AI request"]')?.textContent === text,
+      JSON.stringify(expected),
+      { timeout: 5000 },
+    )
+    .catch(() => undefined);
+  assert.deepEqual(await askAiState(page), expected);
+}
+let checks = 0;
+const filters = process.argv.slice(2).map((value) => value.toLowerCase());
+async function check(name: string, run: () => Promise<void>) {
+  if (filters.length && !filters.some((filter) => name.toLowerCase().includes(filter))) return;
+  if (process.env.GENOSYN_HOME_TEST_FILTER && !name.includes(process.env.GENOSYN_HOME_TEST_FILTER))
+    return;
+  console.log(`RUN ${name}`);
+  try {
+    await run();
+  } catch (error) {
+    const page = context.pages().at(-1);
+    if (page)
+      await page.screenshot({ path: path.join(output, "home-layout-failure.png"), fullPage: true });
+    if (browserErrors.length) console.error("Browser errors:", browserErrors);
+    if (unexpectedRequests.length) console.error("Unexpected requests:", unexpectedRequests);
+    throw error;
+  }
+  checks++;
+  console.log(`PASS ${name}`);
+}
+try {
+  await fs.mkdir(output, { recursive: true });
+  for (const response of ["same", "new", "network-error"] as const) {
+    await check(
+      `Home Retry acceptance handles ${response} without hiding unfinished cleanup`,
+      async () => {
+        const { page, mutations } = await open({
+          quiet: true,
+          role: "admin",
+          runRetry: response,
+          failedRuns: [failedRun({ status: "error", errorKind: "interrupted" })],
+        });
+        const panel = card(page, "Routines needing attention");
+        await panel
+          .getByRole("button", { name: "Retry Daily customer update", exact: true })
+          .click();
+        const confirmation = page.getByRole("dialog", {
+          name: "Run Daily customer update again?",
+          exact: true,
+        });
+        await confirmation.getByText(/Review its recorded reason, log, and Effects/).waitFor();
+        assert.equal(await confirmation.getByText(/server stopped/).count(), 0);
+        assert.equal(mutations.length, 0, "confirmation alone performs no work");
+        await confirmation.getByRole("button", { name: "Retry", exact: true }).click();
+        if (response === "same") {
+          const modal = page.getByRole("dialog", {
+            name: "Run: Daily customer update",
+            exact: true,
+          });
+          await modal.locator("pre").filter({ hasText: failureTranscript }).waitFor();
+          await page.keyboard.press("Escape");
+          await modal.waitFor({ state: "detached" });
+          await panel
+            .getByRole("button", { name: "Retry Daily customer update", exact: true })
+            .waitFor();
+          assert.deepEqual(
+            mutations.map((entry) => entry.path),
+            ["/api/companies/company/routines/customer-update/run"],
+          );
+        } else if (response === "new") {
+          await panel.waitFor({ state: "detached" });
+          assert.deepEqual(
+            mutations.map((entry) => entry.path),
+            [
+              "/api/companies/company/routines/customer-update/run",
+              "/api/companies/company/runs/failed-run/dismiss",
+            ],
+          );
+        } else {
+          const error = page.getByRole("dialog", {
+            name: "Couldn’t run Daily customer update again",
+            exact: true,
+          });
+          await error.waitFor();
+          await page.keyboard.press("Escape");
+          await error.waitFor({ state: "detached" });
+          await panel
+            .getByRole("button", { name: "Retry Daily customer update", exact: true })
+            .waitFor();
+          assert.deepEqual(
+            mutations.map((entry) => entry.path),
+            ["/api/companies/company/routines/customer-update/run"],
+          );
+        }
+        await page.close();
+      },
+    );
+  }
+  for (const width of [1440, 390]) {
+    await check(
+      `Resume unfinished work confirms a fresh time window without a token limit and follows the Run at ${width}px`,
+      async () => {
+        const { page, mutations } = await open({
+          width,
+          quiet: true,
+          role: "admin",
+          allowRunResume: true,
+          failedRuns: [failedRun({ hasUnfinishedWork: true })],
+        });
+        await card(page, "Routines needing attention")
+          .getByRole("link", { name: /Daily customer update/ })
+          .click();
+        const modal = page.getByRole("dialog", { name: "Run: Daily customer update", exact: true });
+        await modal.locator("pre").filter({ hasText: failureTranscript }).waitFor();
+        const resume = modal.getByRole("button", { name: "Resume unfinished work", exact: true });
+        await resume.click();
+        const confirmation = page.getByRole("dialog", {
+          name: "Resume Daily customer update?",
+          exact: true,
+        });
+        await confirmation
+          .getByText(/configured time limit starts again, with no total model token limit/)
+          .waitFor();
+        await confirmation.getByText(/verify earlier Effects/).waitFor();
+        assert.equal(mutations.length, 0, "opening the confirmation cannot start a Run");
+        await page.screenshot({
+          path: path.join(output, `home-run-resume-confirm-${width}.png`),
+          fullPage: true,
+        });
+        await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+        assert.equal(mutations.length, 0, "cancelling preserves the original Run without a write");
+        await resume.click();
+        await confirmation
+          .getByRole("button", { name: "Resume unfinished work", exact: true })
+          .click();
+        await modal.locator("pre").filter({ hasText: "Continuing from saved progress." }).waitFor();
+        assert.deepEqual(mutations, [
+          {
+            path: "/api/companies/company/runs/failed-run/resume",
+            body: { acknowledgeNewAllowance: true },
+          },
+        ]);
+        assert.equal(
+          await modal.getByRole("button", { name: "Resume unfinished work", exact: true }).count(),
+          0,
+        );
+        assert.equal(await modal.getByRole("button", { name: "Retry", exact: true }).count(), 0);
+        await fits(page);
+        assert.equal(
+          await modal.evaluate((element) => element.scrollWidth <= element.clientWidth),
+          true,
+        );
+        await page.screenshot({
+          path: path.join(output, `home-run-resumed-${width}.png`),
+          fullPage: true,
+        });
+        await page.close();
+      },
+    );
+  }
+  await check(
+    "Resume unfinished work is unavailable to Members, Errors, missing progress, or pending recovery",
+    async () => {
+      for (const scenario of [
+        { role: "member" as const, run: failedRun({ hasUnfinishedWork: true }) },
+        { role: "admin" as const, run: failedRun({ hasUnfinishedWork: false }) },
+        {
+          role: "admin" as const,
+          run: failedRun({ status: "error", errorKind: "timeout", hasUnfinishedWork: true }),
+        },
+        {
+          role: "admin" as const,
+          run: failedRun({ errorKind: "runtime", hasUnfinishedWork: true }),
+        },
+        {
+          role: "admin" as const,
+          run: failedRun({
+            hasUnfinishedWork: true,
+            retryAt: "2026-09-09T10:00:00.000Z",
+            continuationPending: true,
+          }),
+        },
+      ]) {
+        const { page, mutations } = await open({
+          quiet: true,
+          role: scenario.role,
+          failedRuns: [scenario.run],
+        });
+        assert.equal(
+          await page.getByRole("button", { name: "Resume unfinished work", exact: true }).count(),
+          0,
+        );
+        await card(page, "Routines needing attention")
+          .getByRole("link", { name: /Daily customer update/ })
+          .click();
+        const modal = page.getByRole("dialog", { name: "Run: Daily customer update", exact: true });
+        await modal.locator("pre").filter({ hasText: failureTranscript }).waitFor();
+        assert.equal(
+          await modal.getByRole("button", { name: "Resume unfinished work", exact: true }).count(),
+          0,
+        );
+        assert.equal(mutations.length, 0);
+        await page.close();
+      }
+    },
+  );
+  await check(
+    "Resume unfinished work on Home keeps progress visible when the server refuses",
+    async () => {
+      const { page, mutations } = await open({
+        quiet: true,
+        role: "owner",
+        allowRunResume: true,
+        runResumeError: true,
+        failedRuns: [failedRun({ hasUnfinishedWork: true })],
+      });
+      const panel = card(page, "Routines needing attention");
+      await panel.getByRole("button", { name: "Resume unfinished work", exact: true }).click();
+      const confirmation = page.getByRole("dialog", {
+        name: "Resume Daily customer update?",
+        exact: true,
+      });
+      await confirmation
+        .getByRole("button", { name: "Resume unfinished work", exact: true })
+        .click();
+      await page
+        .getByRole("dialog", { name: "Couldn’t resume unfinished work", exact: true })
+        .getByText("A newer Run already continued this work.", { exact: true })
+        .waitFor();
+      assert.equal(mutations.length, 1);
+      assert.equal(await panel.getByRole("link", { name: /Daily customer update/ }).count(), 1);
+      await page.close();
+    },
+  );
+  for (const width of [1440, 390]) {
+    await check(
+      `Why did it fail? asks Ask AI about that Run without opening a modal at ${width}px`,
+      async () => {
+        const { page, mutations, writes } = await open({
+          width,
+          quiet: true,
+          count: 2,
+          failedRuns: [
+            failedRun({
+              employee: {
+                id: "employee-2",
+                name: "Employee 2",
+                slug: "employee-2",
+                avatarKey: null,
+              },
+            }),
+          ],
+        });
+        assert.deepEqual(
+          await askAiState(page),
+          {
+            open: false,
+            refs: [],
+            prompt: null,
+            employeeIds: null,
+            requestRefs: null,
+            newConversation: null,
+          },
+          "Ask AI stays closed until the Member asks",
+        );
+        const panel = card(page, "Routines needing attention");
+        await panel
+          .getByRole("button", { name: "Why did it fail? Daily customer update", exact: true })
+          .click();
+        await asksAiAbout(page, "failed-run", "failed");
+        assert.equal(await page.getByRole("dialog").count(), 0, "asking never opens the Run modal");
+        assert.equal(await page.getByLabel("Opened route").count(), 0, "asking stays on Home");
+        assert.deepEqual(mutations, [], "asking neither retries nor dismisses the Run");
+        assert.deepEqual(writes, []);
+        assert.equal(
+          await panel.getByRole("link", { name: /Daily customer update/ }).count(),
+          1,
+          "the failure stays on Home while Ask AI explains it",
+        );
+        await fits(page);
+        await page.screenshot({
+          path: path.join(output, `home-run-ask-ai-${width}.png`),
+          fullPage: true,
+        });
+        await page.close();
+      },
+    );
+  }
+  for (const width of [1440, 390]) {
+    await check(
+      `Run modal shows its log directly and hands Why did it fail? to Ask AI at ${width}px`,
+      async () => {
+        const { page, mutations, writes } = await open({
+          width,
+          quiet: true,
+          failedRuns: [failedRun()],
+          longFailureTranscript: width === 1440,
+        });
+        const panel = card(page, "Routines needing attention");
+        await panel.getByRole("link", { name: /Daily customer update/ }).click();
+        const modal = page.getByRole("dialog", { name: "Run: Daily customer update", exact: true });
+        await modal.locator("pre").filter({ hasText: failureTranscript }).waitFor();
+        assert.equal(
+          await modal.getByRole("tablist").count(),
+          0,
+          "the log is the modal's only view",
+        );
+        assert.equal(await modal.getByRole("tab").count(), 0);
+        if (width === 1440) {
+          await page.waitForFunction(() => {
+            const log = document.querySelector('[role="dialog"] pre');
+            return (
+              log &&
+              log.scrollHeight > log.clientHeight &&
+              log.scrollHeight - log.clientHeight - log.scrollTop < 24
+            );
+          });
+        }
+        assert.deepEqual(
+          await askAiState(page),
+          {
+            open: false,
+            refs: [{ kind: "run", id: "failed-run" }],
+            prompt: null,
+            employeeIds: null,
+            requestRefs: null,
+            newConversation: null,
+          },
+          "the open Run is what Ask AI would be asked about",
+        );
+        const bounds = await box(modal);
+        assert.ok(
+          bounds.x >= 0 && bounds.x + bounds.width <= width,
+          "the Run modal stays inside the viewport",
+        );
+        assert.equal(
+          await modal.evaluate((element) => element.scrollWidth <= element.clientWidth),
+          true,
+        );
+        await fits(page);
+        await page.screenshot({
+          path: path.join(output, `home-run-log-${width}.png`),
+          fullPage: true,
+        });
+        await modal.getByRole("button", { name: "Why did it fail?", exact: true }).click();
+        await modal.waitFor({ state: "detached" });
+        await asksAiAbout(page, "failed-run", "failed");
+        assert.equal(await page.getByRole("dialog").count(), 0, "the modal makes way for Ask AI");
+        assert.deepEqual(mutations, []);
+        assert.deepEqual(writes, []);
+        assert.equal(await panel.getByRole("link", { name: /Daily customer update/ }).count(), 1);
+        await page.close();
+      },
+    );
+  }
+  await check(
+    "Why did it error? asks Ask AI with Error wording for legacy operational failures",
+    async () => {
+      const { page, mutations, writes } = await open({
+        quiet: true,
+        failedRuns: [
+          failedRun({ runId: "timeout-run", status: "timeout", routineName: "Nightly export" }),
+          failedRun({ runId: "interrupted-run", status: "interrupted" }),
+        ],
+      });
+      const panel = card(page, "Routines needing attention");
+      assert.equal(await panel.getByRole("button", { name: /^Why did it error\?/ }).count(), 2);
+      assert.equal(await panel.getByRole("button", { name: /^Why did it fail\?/ }).count(), 0);
+      assert.equal((await askAiState(page)).open, false, "explaining remains an explicit action");
+      await panel
+        .getByRole("button", { name: "Why did it error? Daily customer update", exact: true })
+        .click();
+      await asksAiAbout(page, "interrupted-run", "interrupted");
+      assert.notEqual(runExplanationPrompt("interrupted"), runExplanationPrompt("failed"));
+      await panel.getByRole("link", { name: /Nightly export/ }).click();
+      const modal = page.getByRole("dialog", { name: "Run: Nightly export", exact: true });
+      await modal.locator("pre").filter({ hasText: failureTranscript }).waitFor();
+      assert.equal(
+        await modal.getByRole("button", { name: "Why did it fail?", exact: true }).count(),
+        0,
+      );
+      await modal.getByRole("button", { name: "Why did it error?", exact: true }).click();
+      await modal.waitFor({ state: "detached" });
+      await asksAiAbout(page, "timeout-run", "timeout");
+      assert.deepEqual(mutations, [], "asking about an Error performs no work");
+      assert.deepEqual(writes, []);
+      await page.close();
+    },
+  );
+  for (const count of [1, 2, 3, 4]) {
+    await check(`${count} Home counters fill every responsive row`, async () => {
+      const { page } = await open({
+        quiet: count === 1,
+        notifications: [notification("review-one", "The customer reply is waiting for review")],
+        unreadNotificationCount: 69,
+        statCounts: {
+          reviewTodoCount: count >= 3 ? 2 : 0,
+          pendingApprovalCount: count >= 4 ? 1 : 0,
+        },
+      });
+      await statTiles(page).filter({ hasText: "Unread notifications" }).getByText("69").waitFor();
+      for (const width of [320, 390, 768, 1440, 2560]) {
+        await page.setViewportSize({ width, height: 1000 });
+        await statRowsFillContent(page, count);
+        await fits(page);
+        if (count === 1 && width === 2560) {
+          const body = card(page, "Needs your attention").locator(":scope > div").last();
+          const bodyBox = await box(body);
+          const rowsBox = await box(body.locator(":scope > ul"));
+          assert.ok(
+            Math.abs(bodyBox.height - rowsBox.height) < 1,
+            "a single short queue has no forced empty body space",
+          );
+        }
+        if (count === 1 && (width === 390 || width === 1440 || width === 2560)) {
+          await page.screenshot({
+            path: path.join(output, `home-single-notification-counter-${width}.png`),
+            fullPage: true,
+          });
+        }
+      }
+      if (count === 2) {
+        await page.getByRole("button", { name: "Mark all as read", exact: true }).click();
+        await page
+          .getByText("Unread notifications", { exact: true })
+          .waitFor({ state: "detached" });
+        await statRowsFillContent(page, 1);
+        await fits(page);
+      }
+      await page.close();
+    });
+  }
+  for (const width of [1440, 768, 390, 320]) {
+    await check(
+      `greeting contains compact employee bubble on the right at ${width}px`,
+      async () => {
+        const { page, reads } = await open({ width });
+        const heading = await box(
+          page.getByRole("heading", { name: "Good morning, Nawaz", exact: true }),
+        );
+        const employee = await box(bubbles(page).first());
+        assert.equal(await greeting(page).getByRole("complementary").count(), 1);
+        assert.ok(
+          employee.x >= heading.x + heading.width,
+          "bubble belongs to the right of the greeting text",
+        );
+        assert.ok(
+          employee.height >= 44 && employee.height <= 52,
+          "compact bubble retains a 44px touch target",
+        );
+        const avatar = await box(
+          bubbles(page).first().locator("[aria-hidden=true] > span[aria-label]").first(),
+        );
+        assert.equal(avatar.width, 24);
+        assert.equal(avatar.height, 24);
+        assert.equal(
+          await page.getByRole("heading", { name: "Active decisions", exact: true }).count(),
+          1,
+        );
+        assert.equal(
+          await page
+            .getByText("Which retention commitment needs attention?", { exact: true })
+            .count(),
+          1,
+        );
+        await fillsContent(page, "Active decisions");
+        await fits(page);
+        const todo = await box(card(page, "Your todos"));
+        const messages = await box(card(page, "Unread messages"));
+        const header = await box(greeting(page));
+        if (width >= 1024) {
+          assert.equal(todo.y, messages.y);
+          assert.ok(
+            Math.abs(messages.x + messages.width - header.x - header.width) < 1,
+            "card grid reaches the full right edge",
+          );
+        } else {
+          assert.equal(todo.width, header.width);
+          assert.equal(messages.width, header.width);
+        }
+        assert.equal(
+          reads.some((url) => url.includes("employeeId=")),
+          false,
+          "day detail stays lazy",
+        );
+        assert.equal(await page.getByRole("dialog").count(), 0);
+        await page.screenshot({
+          path: path.join(output, `home-compact-${width}.png`),
+          fullPage: true,
+        });
+        await page.close();
+      },
+    );
+  }
+  await check(
+    "a Member can answer an active Decision from Home and recover an inline failure",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        decisions: [decision()],
+        allowDecisionAnswer: true,
+        decisionAnswerError: true,
+      });
+      const { page, mutations } = fixture;
+      assert.equal(
+        await page.getByRole("heading", { name: "Nothing needs you right now" }).count(),
+        0,
+      );
+      await fillsContent(page, "Active decisions");
+      await activeDecisions(page).getByText("Confirm the owner", { exact: true }).click();
+      assert.equal(
+        await activeDecisions(page)
+          .getByRole("radio", { name: /^Confirm the owner/ })
+          .isChecked(),
+        true,
+      );
+      assert.deepEqual(mutations, [], "choosing an answer must not submit it");
+      await activeDecisions(page)
+        .getByRole("button", { name: "Add guidance", exact: true })
+        .click();
+      await activeDecisions(page).getByRole("textbox").fill("Jamie owns the next update.");
+      await activeDecisions(page)
+        .getByRole("button", { name: "Confirm: Confirm the owner", exact: true })
+        .click();
+      await activeDecisions(page)
+        .getByText("The answer could not be saved.", { exact: true })
+        .waitFor();
+      assert.equal(await decisionRows(page).count(), 1, "failed answers stay available on Home");
+      fixture.recover();
+      await activeDecisions(page)
+        .getByRole("button", { name: "Confirm: Confirm the owner", exact: true })
+        .click();
+      await statusLine(page, "decision-decision")
+        .getByText("You chose “Confirm the owner”", { exact: true })
+        .waitFor();
+      assert.equal(
+        await decisionRows(page).count(),
+        1,
+        "the final answer keeps its Home stack mounted",
+      );
+      assert.equal(
+        await page
+          .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+          .count(),
+        0,
+      );
+      await activeDecisions(page)
+        .getByRole("button", { name: "Close decision", exact: true })
+        .click();
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(
+        await activeDecisions(page).count(),
+        0,
+        "Close clears the followed Decision from Home",
+      );
+      await page
+        .getByRole("status")
+        .getByText(`Decision “${decision().title}” answered.`, { exact: true })
+        .waitFor();
+      assert.deepEqual(mutations, [
+        {
+          path: "/api/companies/company/decisions/decision/decide",
+          body: { optionId: "confirm", note: "Jamie owns the next update." },
+        },
+        {
+          path: "/api/companies/company/decisions/decision/decide",
+          body: { optionId: "confirm", note: "Jamie owns the next update." },
+        },
+      ]);
+      await page.close();
+    },
+  );
+  await check(
+    "a failed Home refresh preserves the saved answer and cannot reopen it after Close",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        decisions: [decision()],
+        allowDecisionAnswer: true,
+      });
+      const { page } = fixture;
+      fixture.failHome();
+      await activeDecisions(page).getByText("Confirm the owner", { exact: true }).click();
+      await activeDecisions(page)
+        .getByRole("button", { name: "Confirm: Confirm the owner", exact: true })
+        .click();
+      await statusLine(page, "decision-decision")
+        .getByText("You chose “Confirm the owner”", { exact: true })
+        .waitFor();
+      await page.getByText("Home is unavailable.", { exact: true }).waitFor();
+      await activeDecisions(page)
+        .getByRole("button", { name: "Close decision", exact: true })
+        .click();
+      await page.locator("#decision-decision").waitFor({ state: "detached" });
+      assert.equal(
+        await page.getByRole("button", { name: "Confirm: Confirm the owner", exact: true }).count(),
+        0,
+      );
+      fixture.recover();
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(await page.locator("#decision-decision").count(), 0);
+      assert.deepEqual(fixture.mutations, [
+        { path: "/api/companies/company/decisions/decision/decide", body: { optionId: "confirm" } },
+      ]);
+      await page.close();
+    },
+  );
+  await check(
+    "snoozing a Decision from Home removes it and announces the selected duration",
+    async () => {
+      const { page, mutations } = await open({
+        quiet: true,
+        decisions: [decision()],
+        allowDecisionSnooze: true,
+        width: 390,
+      });
+      await activeDecisions(page).getByRole("button", { name: "Snooze", exact: true }).click();
+      await page.getByRole("menuitem", { name: "1 day", exact: true }).click();
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).count(), 0);
+      await page
+        .getByRole("status")
+        .getByText(`Decision “${decision().title}” snoozed for 1 day.`, { exact: true })
+        .waitFor();
+      assert.deepEqual(mutations, [
+        { path: "/api/companies/company/decisions/decision/snooze", body: { duration: "one_day" } },
+      ]);
+      await page.close();
+    },
+  );
+  for (const width of [1440, 390]) {
+    await check(
+      `active Decisions preview prioritizes urgency and age with the complete count at ${width}px`,
+      async () => {
+        const { page } = await open({
+          quiet: true,
+          width,
+          role: "admin",
+          decisions: [
+            decision({ id: "new-urgent", title: "A new urgent customer question" }),
+            decision({
+              id: "low",
+              title: "A lower priority question",
+              urgency: "low",
+              createdAt: "2026-09-08T06:00:00.000Z",
+            }),
+            decision({
+              id: "old-urgent",
+              title: "The oldest urgent customer question",
+              createdAt: "2026-09-09T07:00:00.000Z",
+            }),
+            decision({
+              id: "normal",
+              title: "A routine customer question",
+              urgency: "normal",
+              createdAt: "2026-09-09T08:30:00.000Z",
+            }),
+          ],
+          decisionApprovals: [review("proactive_work"), review("mail_send")],
+          pendingDecisionCount: 12,
+          pendingDecisionApprovalCount: 4,
+        });
+        assert.deepEqual(
+          await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+          [
+            "The oldest urgent customer question",
+            "A new urgent customer question",
+            "Prepare the retention follow-up",
+          ],
+        );
+        assert.equal(
+          await activeDecisions(page).getByText("16 waiting", { exact: true }).count(),
+          1,
+        );
+        assert.equal(
+          await activeDecisions(page)
+            .getByText("A lower priority question", { exact: true })
+            .count(),
+          0,
+        );
+        const all = activeDecisions(page).getByRole("link", { name: "All decisions", exact: true });
+        const more = activeDecisions(page).getByRole("link", {
+          name: "View all decisions · 13 more waiting",
+          exact: true,
+        });
+        assert.equal(await all.getAttribute("href"), "/c/company/decisions");
+        assert.equal(await more.getAttribute("href"), "/c/company/decisions");
+        await fillsContent(page, "Active decisions");
+        await fits(page);
+        await page.screenshot({
+          path: path.join(output, `home-active-decisions-${width}.png`),
+          fullPage: true,
+        });
+        await (width === 1440 ? all : more).click();
+        await page.getByRole("status").filter({ hasText: "/c/company/decisions" }).waitFor();
+        await page.close();
+      },
+    );
+  }
+  await check(
+    "Members see only Decisions even when an unexpected response includes privileged reviews",
+    async () => {
+      const { page, mutations } = await open({
+        quiet: true,
+        role: "member",
+        decisions: [decision()],
+        decisionApprovals: [review("proactive_work"), review("mail_send")],
+        pendingDecisionApprovalCount: 20,
+        allowDecisionAnswer: true,
+      });
+      assert.equal(await decisionRows(page).count(), 1);
+      assert.equal(await activeDecisions(page).getByText("1 waiting", { exact: true }).count(), 1);
+      assert.equal(
+        await page.getByText("Prepare the retention follow-up", { exact: true }).count(),
+        0,
+      );
+      assert.equal(await page.getByText("Review the customer reply", { exact: true }).count(), 0);
+      assert.equal(
+        await activeDecisions(page)
+          .getByRole("link", { name: /more waiting/ })
+          .count(),
+        0,
+      );
+      await activeDecisions(page).getByText("Confirm the owner", { exact: true }).click();
+      await activeDecisions(page)
+        .getByRole("button", { name: "Confirm: Confirm the owner", exact: true })
+        .click();
+      await activeDecisions(page)
+        .getByRole("button", { name: "Close decision", exact: true })
+        .click();
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).count(), 0);
+      assert.deepEqual(mutations, [
+        { path: "/api/companies/company/decisions/decision/decide", body: { optionId: "confirm" } },
+      ]);
+      await page.close();
+    },
+  );
+  for (const role of ["owner", "admin"] as const) {
+    await check(`${role} can review proposed work and email directly on Home`, async () => {
+      const { page, mutations } = await open({
+        quiet: true,
+        role,
+        decisionApprovals: [review("proactive_work"), review("mail_send")],
+        allowReview: true,
+        width: role === "owner" ? 1440 : 390,
+        dark: role === "admin",
+      });
+      assert.equal(await decisionRows(page).count(), 2);
+      assert.equal(await activeDecisions(page).getByText("2 waiting", { exact: true }).count(), 1);
+      assert.equal(
+        await page.getByRole("heading", { name: "Nothing needs you right now" }).count(),
+        0,
+      );
+      await activeDecisions(page)
+        .getByText("Jamie will send your next update tomorrow.", { exact: true })
+        .waitFor();
+      await fits(page);
+      await page.screenshot({
+        path: path.join(output, `home-active-reviews-${role}.png`),
+        fullPage: true,
+      });
+      await activeDecisions(page)
+        .getByRole("button", { name: "Approve & start", exact: true })
+        .click();
+      await activeDecisions(page)
+        .locator("[data-status-line]")
+        .getByText("Approved", { exact: true })
+        .waitFor();
+      assert.equal(await decisionRows(page).count(), 2);
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        ["Prepare the retention follow-up", "Review the customer reply"],
+      );
+      await page
+        .getByRole("status")
+        .getByText("Work review “Prepare the retention follow-up” approved.", { exact: true })
+        .waitFor();
+      await activeDecisions(page).getByRole("button", { name: "Send now", exact: true }).click();
+      await activeDecisions(page).getByText("Sent", { exact: true }).waitFor();
+      assert.equal(
+        await decisionRows(page).count(),
+        2,
+        "both outcomes stay in their original slots",
+      );
+      await fits(page);
+      await page
+        .getByRole("status")
+        .getByText("Email review “Review the customer reply” sent.", { exact: true })
+        .waitFor();
+      await page
+        .locator("#review-work-review")
+        .getByRole("button", { name: "Close review", exact: true })
+        .click();
+      assert.equal(await decisionRows(page).count(), 1);
+      await page
+        .locator("#review-mail-review")
+        .getByRole("button", { name: "Close review", exact: true })
+        .click();
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).count(), 0);
+      assert.deepEqual(mutations, [
+        {
+          path: "/api/companies/company/approvals/work-review/approve",
+          body: { reviewRevision: "work-revision" },
+        },
+        {
+          path: "/api/companies/company/approvals/mail-review/approve",
+          body: { reviewRevision: "mail-revision" },
+        },
+      ]);
+      await page.close();
+    });
+  }
+  await check(
+    "a followed work review receives a live failed outcome and survives mobile reload",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        live: true,
+        role: "admin",
+        width: 320,
+        decisionApprovals: [review("proactive_work")],
+        allowReview: true,
+      });
+      const { page } = fixture;
+      await activeDecisions(page)
+        .getByRole("button", { name: "Approve & start", exact: true })
+        .click();
+      await activeDecisions(page)
+        .locator("[data-status-line]")
+        .getByText("Approved", { exact: true })
+        .waitFor();
+      fixture.updateReview("work-review", {
+        status: "execution_failed",
+        errorMessage: "The checkout service was unavailable; no fix was published.",
+        outcomeSummary: "Investigation stopped when the service became unavailable.",
+      });
+      fixture.emitResourceEvent("approval");
+      const failedLine = statusLine(page, "review-work-review");
+      await failedLine.getByText("Couldn’t finish", { exact: true }).waitFor();
+      assert.equal(
+        await failedLine.innerText(),
+        "Couldn’t finish · The checkout service was unavailable; no fix was published.",
+      );
+      await page.reload({ waitUntil: "commit" });
+      await statusLine(page, "review-work-review")
+        .getByText("Couldn’t finish", { exact: true })
+        .waitFor();
+      await fits(page);
+      await page.screenshot({
+        path: path.join(output, "home-followed-work-failed-mobile.png"),
+        fullPage: true,
+      });
+      assert.equal(
+        await activeDecisions(page)
+          .getByRole("button", { name: "Approve & start", exact: true })
+          .count(),
+        0,
+      );
+      await activeDecisions(page)
+        .getByRole("button", { name: "Close review", exact: true })
+        .click();
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.deepEqual(fixture.mutations, [
+        {
+          path: "/api/companies/company/approvals/work-review/approve",
+          body: { reviewRevision: "work-revision" },
+        },
+      ]);
+      await page.close();
+    },
+  );
+  await check(
+    "Decision and Approval events refresh active work without reloading Home",
+    async () => {
+      const fixture = await open({ quiet: true, live: true, role: "admin" });
+      const { page } = fixture;
+      assert.equal(await activeDecisions(page).count(), 0, "an empty section stays hidden");
+      fixture.setDecisions([decision()]);
+      fixture.emitResourceEvent("decision");
+      await activeDecisions(page)
+        .getByRole("heading", { name: decision().title, exact: true })
+        .waitFor();
+      fixture.setReviews([review("proactive_work")]);
+      fixture.emitResourceEvent("approval");
+      await activeDecisions(page)
+        .getByRole("heading", { name: "Prepare the retention follow-up", exact: true })
+        .waitFor();
+      assert.equal(await decisionRows(page).count(), 2);
+      fixture.setDecisions([]);
+      fixture.emitResourceEvent("decision");
+      await activeDecisions(page)
+        .getByRole("heading", { name: decision().title, exact: true })
+        .waitFor({ state: "detached" });
+      assert.equal(await decisionRows(page).count(), 1);
+      fixture.setReviews([]);
+      fixture.emitResourceEvent("approval");
+      await page
+        .getByRole("heading", { name: "Nothing needs you right now", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).count(), 0);
+      await page.close();
+    },
+  );
+  await check(
+    "an open email editor survives urgent Decisions changing the Home preview",
+    async () => {
+      const existing = [
+        decision({
+          id: "first",
+          title: "First customer question",
+          urgency: "normal",
+          createdAt: "2026-09-09T06:00:00.000Z",
+        }),
+        decision({
+          id: "second",
+          title: "Second customer question",
+          urgency: "normal",
+          createdAt: "2026-09-09T07:00:00.000Z",
+        }),
+      ];
+      const urgent = decision({ id: "urgent", title: "A new urgent question" });
+      const fixture = await open({
+        quiet: true,
+        live: true,
+        role: "admin",
+        decisions: existing,
+        decisionApprovals: [review("mail_send")],
+      });
+      const { page } = fixture;
+      const originalOrder = [
+        "First customer question",
+        "Second customer question",
+        "Review the customer reply",
+      ];
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        originalOrder,
+      );
+      const editor = await editMailReply(
+        page,
+        "mail-review",
+        "My unsaved reply must survive the urgent arrival.",
+      );
+
+      fixture.setDecisions([urgent, ...existing]);
+      fixture.emitResourceEvent("decision");
+      await activeDecisions(page)
+        .getByRole("link", { name: "View all decisions · 1 more waiting", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).getByText("4 waiting", { exact: true }).count(), 1);
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        originalOrder,
+      );
+      assert.equal(await decisionRows(page).count(), 3);
+      await retainsMailEditor(editor, true);
+      await page.screenshot({
+        path: path.join(output, "home-active-email-editor.png"),
+        fullPage: true,
+      });
+
+      await editor.row.getByRole("button", { name: "Cancel", exact: true }).click();
+      await activeDecisions(page)
+        .getByRole("heading", { name: urgent.title, exact: true })
+        .waitFor();
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        [urgent.title, ...existing.map((item) => item.title)],
+      );
+      assert.equal(
+        await editor.row.count(),
+        0,
+        "closing the editor restores the normal three-item cutoff",
+      );
+      assert.deepEqual(
+        fixture.mutations,
+        [],
+        "unsaved edits and cancellation must not write the email",
+      );
+      await page.close();
+    },
+  );
+  await check(
+    "multiple open email editors keep the Home preview stable until the last closes",
+    async () => {
+      const existing = decision({
+        id: "existing",
+        title: "Existing customer question",
+        urgency: "normal",
+        createdAt: "2026-09-09T06:00:00.000Z",
+      });
+      const firstMail = {
+        ...review("mail_send"),
+        id: "first-mail",
+        title: "Review the first email",
+        requestedAt: "2026-09-09T07:00:00.000Z",
+      };
+      const secondMail = {
+        ...review("mail_send"),
+        id: "second-mail",
+        title: "Review the second email",
+      };
+      const urgent = [
+        decision({
+          id: "urgent-one",
+          title: "First urgent arrival",
+          createdAt: "2026-09-09T08:50:00.000Z",
+        }),
+        decision({
+          id: "urgent-two",
+          title: "Second urgent arrival",
+          createdAt: "2026-09-09T08:55:00.000Z",
+        }),
+      ];
+      const fixture = await open({
+        quiet: true,
+        live: true,
+        role: "admin",
+        decisions: [existing],
+        decisionApprovals: [firstMail, secondMail],
+      });
+      const { page } = fixture;
+      const firstEditor = await editMailReply(page, firstMail.id, "Unsaved first reply.");
+      const secondEditor = await editMailReply(page, secondMail.id, "Unsaved second reply.");
+      const originalOrder = [existing.title, firstMail.title, secondMail.title];
+
+      fixture.setDecisions([...urgent, existing]);
+      fixture.emitResourceEvent("decision");
+      await activeDecisions(page)
+        .getByRole("link", { name: "View all decisions · 2 more waiting", exact: true })
+        .waitFor();
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        originalOrder,
+      );
+      assert.equal(
+        await activeDecisions(page).getByRole("form", { name: "Edit email", exact: true }).count(),
+        2,
+      );
+      await retainsMailEditor(firstEditor);
+      await retainsMailEditor(secondEditor, true);
+
+      await firstEditor.row.getByRole("button", { name: "Cancel", exact: true }).click();
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        originalOrder,
+      );
+      await retainsMailEditor(secondEditor);
+      // Cancel restores focus on the next frame. Let that finish before
+      // moving to the other editor so its callback cannot race this check.
+      await page.waitForFunction(
+        (button) => button === document.activeElement,
+        await firstEditor.row
+          .getByRole("button", { name: "Edit email", exact: true })
+          .elementHandle(),
+      );
+      await secondEditor.textarea.focus();
+      const oldestUrgent = decision({
+        id: "oldest-urgent",
+        title: "An older urgent question",
+        createdAt: "2026-09-09T08:40:00.000Z",
+      });
+      fixture.setDecisions([oldestUrgent, ...urgent, existing]);
+      fixture.emitResourceEvent("decision");
+      await activeDecisions(page)
+        .getByRole("link", { name: "View all decisions · 3 more waiting", exact: true })
+        .waitFor();
+      assert.equal(await activeDecisions(page).getByText("6 waiting", { exact: true }).count(), 1);
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        originalOrder,
+      );
+      assert.equal(await decisionRows(page).count(), 3);
+      await retainsMailEditor(secondEditor, true);
+
+      await secondEditor.row.getByRole("button", { name: "Cancel", exact: true }).click();
+      await activeDecisions(page)
+        .getByRole("heading", { name: oldestUrgent.title, exact: true })
+        .waitFor();
+      assert.deepEqual(
+        await decisionRows(page).getByRole("heading", { level: 3 }).allTextContents(),
+        [oldestUrgent.title, ...urgent.map((item) => item.title)],
+      );
+      assert.equal(
+        await activeDecisions(page).getByRole("form", { name: "Edit email", exact: true }).count(),
+        0,
+      );
+      assert.deepEqual(fixture.mutations, []);
+      await page.close();
+    },
+  );
+  await check("an unpaired final card fills its row without leaving a middle gap", async () => {
+    const { page } = await open({
+      width: 1440,
+      notifications: [notification("review-one", "The customer reply is waiting for review")],
+    });
+    const header = await box(greeting(page));
+    const attention = await box(card(page, "Needs your attention"));
+    const todo = await box(card(page, "Your todos"));
+    const messages = await box(card(page, "Unread messages"));
+
+    assert.equal(attention.y, todo.y, "the first pair must stay together on the first row");
+    assert.ok(todo.x > attention.x, "the first pair must retain two columns");
+    assert.ok(messages.y >= attention.y + attention.height, "the final card must use the next row");
+    assert.ok(
+      Math.abs(messages.x - header.x) < 1,
+      "the unpaired card must align with the content's left edge",
+    );
+    assert.ok(
+      Math.abs(messages.width - header.width) < 1,
+      "the unpaired card must span the full content width",
+    );
+    await fits(page);
+    await page.screenshot({
+      path: path.join(output, "home-unpaired-card-full-width.png"),
+      fullPage: true,
+    });
+    await page.close();
+  });
+  await check(
+    "marking every notification read clears the attention card without navigating",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        width: 320,
+        notifications: [
+          notification("review-one", "The customer reply is waiting for review"),
+          notification("review-two", "The renewal plan has waited 24 hours"),
+        ],
+      });
+      const attention = card(fixture.page, "Needs your attention");
+      const header = attention.locator(":scope > div").first();
+      await header.getByText("2", { exact: true }).waitFor();
+      const action = header.getByRole("button", { name: "Mark all as read", exact: true });
+      await action.waitFor();
+      await header.getByRole("link", { name: "All notifications", exact: false }).waitFor();
+      await fits(fixture.page);
+      await fixture.page.screenshot({
+        path: path.join(output, "home-notifications-mark-all-mobile.png"),
+        fullPage: true,
+      });
+      await fixture.page.setViewportSize({ width: 1440, height: 1000 });
+      const headingBounds = await box(
+        header.getByRole("heading", { name: "Needs your attention", exact: true }),
+      );
+      const actionBounds = await box(action);
+      assert.ok(
+        Math.abs(
+          headingBounds.y + headingBounds.height / 2 - actionBounds.y - actionBounds.height / 2,
+        ) < 2,
+        "the bulk action shares the card header row on a wide screen",
+      );
+      await fits(fixture.page);
+      await fixture.page.screenshot({
+        path: path.join(output, "home-notifications-mark-all-desktop.png"),
+        fullPage: true,
+      });
+
+      await action.focus();
+      const response = fixture.page.waitForResponse(
+        (row) =>
+          row.request().method() === "POST" &&
+          new URL(row.url()).pathname === "/api/companies/company/notifications/mark-all-read" &&
+          row.status() === 200,
+      );
+      await fixture.page.keyboard.press("Space");
+      await response;
+
+      const allClear = fixture.page.getByRole("heading", {
+        name: "Nothing needs you right now",
+        exact: true,
+      });
+      await allClear.waitFor();
+      await fixture.page.waitForFunction(
+        () => document.activeElement?.hasAttribute("data-home-all-clear") === true,
+      );
+      await fixture.page
+        .getByRole("status")
+        .getByText("All notifications marked as read.")
+        .waitFor();
+      assert.equal(await attention.count(), 0);
+      assert.equal(await statTiles(fixture.page).count(), 0, "zero counters leave no empty tiles");
+      assert.deepEqual(fixture.writes, ["POST /api/companies/company/notifications/mark-all-read"]);
+      assert.equal(await fixture.page.getByRole("dialog").count(), 0);
+      assert.equal(await fixture.page.getByLabel("Opened route").count(), 0);
+      await fits(fixture.page);
+      await fixture.page.close();
+    },
+  );
+  await check("a failed notification bulk read restores the attention card", async () => {
+    const fixture = await open({
+      quiet: true,
+      holdNotificationMarkAll: true,
+      notificationMarkAllError: true,
+      notifications: [
+        notification("review-one", "The customer reply is waiting for review"),
+        notification("review-two", "The renewal plan has waited 24 hours"),
+      ],
+    });
+    try {
+      const attention = card(fixture.page, "Needs your attention");
+      const request = fixture.page.waitForRequest(
+        (row) =>
+          row.method() === "POST" &&
+          new URL(row.url()).pathname === "/api/companies/company/notifications/mark-all-read",
+      );
+      await attention.getByRole("button", { name: "Mark all as read", exact: true }).click();
+      await request;
+      await attention.waitFor({ state: "detached" });
+      fixture.releaseNotificationMarkAll();
+
+      const dialog = fixture.page.getByRole("dialog", {
+        name: "Couldn’t mark all notifications as read",
+        exact: true,
+      });
+      await dialog.waitFor();
+      await dialog
+        .getByText("Notifications are unavailable. They have been restored.", { exact: true })
+        .waitFor();
+      await card(fixture.page, "Needs your attention").getByText("2", { exact: true }).waitFor();
+      assert.equal(
+        await fixture.page
+          .getByText("The customer reply is waiting for review", { exact: true })
+          .count(),
+        1,
+      );
+      assert.equal(
+        await fixture.page
+          .getByText("The renewal plan has waited 24 hours", { exact: true })
+          .count(),
+        1,
+      );
+      assert.deepEqual(fixture.writes, ["POST /api/companies/company/notifications/mark-all-read"]);
+      await dialog.getByRole("button", { name: "Close", exact: true }).last().click();
+    } finally {
+      fixture.releaseNotificationMarkAll();
+      await fixture.page.close();
+    }
+  });
+  await check(
+    "hover reveals only the selected channel action and preserves unread totals",
+    async () => {
+      const { page } = await open({
+        quiet: true,
+        channels: [
+          channel("marketing", "#marketing", 1),
+          channel("sales", "#sales", 89),
+          channel("youtube", "#youtube", 26),
+        ],
+      });
+      await unreadCardCount(page, 116);
+      const action = markReadButton(page, "#sales");
+      const otherAction = markReadButton(page, "#marketing");
+      assert.deepEqual(await markReadPresentation(action), {
+        opacity: "0",
+        pointerEvents: "none",
+      });
+      assert.equal(await card(page, "Unread messages").getByText("89", { exact: true }).count(), 1);
+
+      await action.locator("..").hover();
+      await page.waitForTimeout(200);
+      assert.deepEqual(await markReadPresentation(action), {
+        opacity: "1",
+        pointerEvents: "auto",
+      });
+      assert.deepEqual(await markReadPresentation(otherAction), {
+        opacity: "0",
+        pointerEvents: "none",
+      });
+      const count = card(page, "Unread messages").getByText("89", { exact: true });
+      assert.equal(await count.evaluate((element) => getComputedStyle(element).opacity), "1");
+      const actionBox = await box(action);
+      const countBox = await box(count);
+      assert.ok(
+        countBox.x + countBox.width < actionBox.x,
+        "the unread count stays beside the revealed action",
+      );
+      assert.ok(actionBox.width <= 28 && actionBox.height <= 28, "the row action stays compact");
+      assert.equal(await action.getAttribute("title"), "Mark as read");
+      await page.screenshot({ path: path.join(output, "home-channel-mark-read-hover.png") });
+      await page.close();
+    },
+  );
+  await check(
+    "marking one channel read sends one exact write without opening or navigating",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        channels: [
+          channel("marketing", "#marketing", 1),
+          channel("sales", "#sales", 89),
+          channel("youtube", "#youtube", 8),
+        ],
+      });
+      const action = markReadButton(fixture.page, "#sales");
+      await action.locator("..").hover();
+      const request = fixture.page.waitForRequest(
+        (row) =>
+          row.method() === "POST" &&
+          new URL(row.url()).pathname === "/api/companies/company/workspace/channels/sales/read",
+      );
+      await action.click();
+      await request;
+
+      await fixture.page.getByText("#sales", { exact: true }).waitFor({ state: "detached" });
+      await unreadCardCount(fixture.page, 9);
+      assert.equal(await fixture.page.getByText("#marketing", { exact: true }).count(), 1);
+      assert.equal(await fixture.page.getByText("#youtube", { exact: true }).count(), 1);
+      assert.deepEqual(fixture.writes, [
+        "POST /api/companies/company/workspace/channels/sales/read",
+      ]);
+      assert.equal(await fixture.page.getByRole("dialog").count(), 0);
+      assert.equal(await fixture.page.getByLabel("Opened route").count(), 0);
+      await fixture.page.close();
+    },
+  );
+  await check("keyboard focus reveals and activates the channel action", async () => {
+    const fixture = await open({
+      quiet: true,
+      channels: [channel("support", "#support", 2), channel("sales", "#sales", 3)],
+    });
+    const messages = card(fixture.page, "Unread messages");
+    const supportLink = messages.getByRole("link").filter({ hasText: "#support" });
+    const action = markReadButton(fixture.page, "#support");
+    const nextAction = markReadButton(fixture.page, "#sales");
+
+    await supportLink.focus();
+    await fixture.page.waitForTimeout(200);
+    assert.deepEqual(await markReadPresentation(action), {
+      opacity: "1",
+      pointerEvents: "auto",
+    });
+    await fixture.page.keyboard.press("Tab");
+    assert.equal(
+      await action.evaluate((element) => element === document.activeElement),
+      true,
+      "the action follows its channel link in keyboard order",
+    );
+    const request = fixture.page.waitForRequest((row) =>
+      new URL(row.url()).pathname.endsWith("/workspace/channels/support/read"),
+    );
+    await fixture.page.keyboard.press("Space");
+    await request;
+    await fixture.page.getByText("#support", { exact: true }).waitFor({ state: "detached" });
+    await unreadCardCount(fixture.page, 3);
+    await fixture.page.waitForFunction(
+      (channelId) =>
+        document.activeElement instanceof HTMLButtonElement &&
+        document.activeElement.dataset.homeMarkReadChannel === channelId,
+      "sales",
+    );
+    assert.equal(
+      await nextAction.evaluate((element) => element === document.activeElement),
+      true,
+      "focus moves to the next channel action after its predecessor disappears",
+    );
+    await fixture.page.getByRole("status").getByText("#support marked as read.").waitFor();
+    assert.equal(fixture.writes.length, 1);
+    await fixture.page.close();
+  });
+  await check(
+    "marking the last unread channel removes the queue and reveals all-clear",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        channels: [channel("support", "#support", 2)],
+      });
+      const action = markReadButton(fixture.page, "#support");
+      await action.focus();
+      await fixture.page.keyboard.press("Space");
+      const allClear = fixture.page.getByRole("heading", {
+        name: "Nothing needs you right now",
+        exact: true,
+      });
+      await allClear.waitFor();
+      await fixture.page.waitForFunction(
+        () => document.activeElement?.hasAttribute("data-home-all-clear") === true,
+      );
+      assert.equal(
+        await allClear.evaluate((element) => element === document.activeElement),
+        true,
+        "focus moves to the all-clear state after the final channel disappears",
+      );
+      assert.equal(await card(fixture.page, "Unread messages").count(), 0);
+      assert.deepEqual(fixture.writes, [
+        "POST /api/companies/company/workspace/channels/support/read",
+      ]);
+      await fixture.page.close();
+    },
+  );
+  await check(
+    "last-channel focus fallback scrolls into view when other Home queues remain",
+    async () => {
+      const fixture = await open({
+        width: 390,
+        height: 320,
+        channels: [channel("support", "#support", 2)],
+      });
+      const action = markReadButton(fixture.page, "#support");
+      await action.scrollIntoViewIfNeeded();
+      await action.focus();
+      const before = await fixture.page.evaluate(() => scrollY);
+      assert.ok(before > 0, "the compact viewport starts below the greeting");
+
+      await fixture.page.keyboard.press("Space");
+      await fixture.page.getByText("#support", { exact: true }).waitFor({ state: "detached" });
+      await fixture.page.waitForFunction(
+        () => document.activeElement?.hasAttribute("data-home-mark-read-fallback") === true,
+      );
+
+      const greeting = fixture.page.locator("[data-home-mark-read-fallback]");
+      assert.equal(await greeting.evaluate((element) => element === document.activeElement), true);
+      assert.ok(
+        (await fixture.page.evaluate(() => scrollY)) < before,
+        "moving focus to the fallback also brings it back into view",
+      );
+      assert.equal(await fixture.page.locator("[data-home-all-clear]").count(), 0);
+      await fixture.page.getByRole("heading", { name: "Active decisions", exact: true }).waitFor();
+      await fixture.page.close();
+    },
+  );
+  await check("a rapid physical double-click cannot clear or open the next channel", async () => {
+    const fixture = await open({
+      quiet: true,
+      channels: [
+        channel("marketing", "#marketing", 1),
+        channel("sales", "#sales", 89),
+        channel("youtube", "#youtube", 8),
+      ],
+    });
+    const action = markReadButton(fixture.page, "#sales");
+    await action.locator("..").hover();
+    const actionBox = await box(action);
+    const point = {
+      x: actionBox.x + actionBox.width / 2,
+      y: actionBox.y + actionBox.height / 2,
+    };
+
+    await fixture.page.mouse.click(point.x, point.y);
+    await fixture.page.getByText("#sales", { exact: true }).waitFor({ state: "detached" });
+    await fixture.page.mouse.click(point.x, point.y);
+    await fixture.page.waitForTimeout(550);
+
+    assert.deepEqual(fixture.writes, ["POST /api/companies/company/workspace/channels/sales/read"]);
+    await unreadCardCount(fixture.page, 9);
+    assert.equal(await fixture.page.getByText("#marketing", { exact: true }).count(), 1);
+    assert.equal(await fixture.page.getByText("#youtube", { exact: true }).count(), 1);
+    assert.equal(await fixture.page.getByRole("dialog").count(), 0);
+    assert.equal(await fixture.page.getByLabel("Opened route").count(), 0);
+    await fixture.page.close();
+  });
+  await check(
+    "a failed channel write restores the exact row and total without duplicating it",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        holdMarkRead: true,
+        markReadError: true,
+        channels: [
+          channel("marketing", "#marketing", 1),
+          channel("sales", "#sales", 89),
+          channel("youtube", "#youtube", 8),
+        ],
+      });
+      try {
+        const action = markReadButton(fixture.page, "#sales");
+        await action.locator("..").hover();
+        const request = fixture.page.waitForRequest((row) =>
+          new URL(row.url()).pathname.endsWith("/workspace/channels/sales/read"),
+        );
+        await action.click();
+        await request;
+        await fixture.page.getByText("#sales", { exact: true }).waitFor({ state: "detached" });
+        await unreadCardCount(fixture.page, 9);
+
+        // A focus refresh may put the authoritative unread row back while the
+        // write is still pending. The later rejection must not insert a
+        // duplicate from its optimistic snapshot.
+        await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+        await fixture.page.getByText("#sales", { exact: true }).waitFor();
+        fixture.releaseMarkRead();
+        const dialog = fixture.page.getByRole("dialog", {
+          name: "Couldn’t mark #sales as read",
+          exact: true,
+        });
+        await dialog.waitFor();
+        await dialog
+          .getByText("Workspace is unavailable. The latest Home data has been kept.", {
+            exact: true,
+          })
+          .waitFor();
+        await unreadCardCount(fixture.page, 98);
+        assert.deepEqual(
+          (await card(fixture.page, "Unread messages").getByRole("link").allTextContents())
+            .map((text) => text.trim())
+            .filter((text) => text.startsWith("#")),
+          ["#marketing1", "#sales89", "#youtube8"],
+        );
+        assert.equal(await fixture.page.getByText("#sales", { exact: true }).count(), 1);
+        assert.equal(fixture.writes.length, 1);
+        await dialog.getByRole("button", { name: "Close", exact: true }).last().click();
+      } finally {
+        fixture.releaseMarkRead();
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "a failed refresh cannot suppress rollback after a failed channel write",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        holdMarkRead: true,
+        markReadError: true,
+        channels: [
+          channel("marketing", "#marketing", 1),
+          channel("sales", "#sales", 89),
+          channel("youtube", "#youtube", 8),
+        ],
+      });
+      try {
+        const action = markReadButton(fixture.page, "#sales");
+        await action.locator("..").hover();
+        await action.click();
+        await fixture.page.getByText("#sales", { exact: true }).waitFor({ state: "detached" });
+        await unreadCardCount(fixture.page, 9);
+
+        fixture.failHome();
+        const failedRefresh = fixture.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/api/companies/company/home" &&
+            response.status() === 503,
+        );
+        await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+        await failedRefresh;
+        fixture.releaseMarkRead();
+
+        const dialog = fixture.page.getByRole("dialog", {
+          name: "Couldn’t mark #sales as read",
+          exact: true,
+        });
+        await dialog.waitFor();
+        await dialog
+          .getByText("Workspace is unavailable. It has been restored.", { exact: true })
+          .waitFor();
+        await unreadCardCount(fixture.page, 98);
+        assert.deepEqual(
+          (await card(fixture.page, "Unread messages").getByRole("link").allTextContents())
+            .map((text) => text.trim())
+            .filter((text) => text.startsWith("#")),
+          ["#marketing1", "#sales89", "#youtube8"],
+        );
+        assert.equal(await fixture.page.getByText("#sales", { exact: true }).count(), 1);
+        assert.equal(fixture.writes.length, 1);
+        await dialog.getByRole("button", { name: "Close", exact: true }).last().click();
+      } finally {
+        fixture.releaseMarkRead();
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "a successful Home refresh landing after the click remains authoritative",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        holdMarkRead: true,
+        markReadError: true,
+        channels: [
+          channel("marketing", "#marketing", 1),
+          channel("sales", "#sales", 89),
+          channel("youtube", "#youtube", 8),
+        ],
+      });
+      try {
+        fixture.holdNextHome();
+        const refreshStarted = fixture.page.waitForRequest(
+          (request) => new URL(request.url()).pathname === "/api/companies/company/home",
+        );
+        await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+        await refreshStarted;
+
+        const action = markReadButton(fixture.page, "#sales");
+        await action.locator("..").hover();
+        await action.click();
+        await fixture.page.getByText("#sales", { exact: true }).waitFor({ state: "detached" });
+        fixture.removeChannel("sales");
+        const refreshed = fixture.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/api/companies/company/home" &&
+            response.status() === 200,
+        );
+        fixture.releaseHome();
+        await refreshed;
+        fixture.releaseMarkRead();
+
+        const dialog = fixture.page.getByRole("dialog", {
+          name: "Couldn’t mark #sales as read",
+          exact: true,
+        });
+        await dialog.waitFor();
+        await dialog
+          .getByText("Workspace is unavailable. The latest Home data has been kept.", {
+            exact: true,
+          })
+          .waitFor();
+        await unreadCardCount(fixture.page, 9);
+        assert.equal(await fixture.page.getByText("#sales", { exact: true }).count(), 0);
+        assert.equal(fixture.writes.length, 1);
+        await dialog.getByRole("button", { name: "Close", exact: true }).last().click();
+      } finally {
+        fixture.releaseHome();
+        fixture.releaseMarkRead();
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "touch Home keeps the unread count visible without a permanent quick action",
+    async () => {
+      const fixture = await open({
+        quiet: true,
+        touch: true,
+        width: 320,
+        channels: [
+          channel(
+            "customer-success",
+            "#customer-success-with-a-name-that-must-truncate-on-mobile",
+            101,
+          ),
+        ],
+      });
+      const action = markReadButton(
+        fixture.page,
+        "#customer-success-with-a-name-that-must-truncate-on-mobile",
+      );
+      assert.equal(await action.isVisible(), false);
+      const count = card(fixture.page, "Unread messages").getByText("99+", { exact: true });
+      assert.equal(await count.evaluate((element) => getComputedStyle(element).opacity), "1");
+      const countBox = await box(count);
+      const rowBox = await box(
+        card(fixture.page, "Unread messages")
+          .getByRole("link")
+          .filter({ hasText: "#customer-success-with-a-name-that-must-truncate-on-mobile" }),
+      );
+      assert.ok(countBox.x + countBox.width <= rowBox.x + rowBox.width);
+      await fits(fixture.page);
+      await fixture.page.screenshot({
+        path: path.join(output, "home-channel-mark-read-touch.png"),
+        fullPage: true,
+      });
+      assert.deepEqual(fixture.writes, []);
+      await fixture.page.close();
+    },
+  );
+  for (const width of [1440, 390, 320]) {
+    await check(
+      `large roster stays one scrollable row and last employee is keyboard reachable at ${width}px`,
+      async () => {
+        const { page } = await open({ count: 25, width });
+        const row = page.getByRole("group", { name: "Open an AI employee's day", exact: true });
+        assert.equal(await bubbles(page).count(), 25);
+        const first = await box(bubbles(page).first());
+        const last = await box(bubbles(page).last());
+        assert.equal(first.y, last.y, "employees remain on one horizontal row");
+        assert.equal(
+          await row.evaluate((element) => element.scrollWidth > element.clientWidth),
+          true,
+        );
+        await bubbles(page).first().focus();
+        for (let index = 1; index < 25; index++) await page.keyboard.press("Tab");
+        assert.equal(
+          await bubbles(page)
+            .last()
+            .evaluate((element) => element === document.activeElement),
+          true,
+        );
+        const rowBox = await box(row);
+        const focused = await box(bubbles(page).last());
+        assert.ok(
+          focused.x >= rowBox.x - 1 && focused.x + focused.width <= rowBox.x + rowBox.width + 1,
+          "keyboard focus scrolls the last employee fully into view",
+        );
+        assert.ok(await row.evaluate((element) => element.scrollLeft > 0));
+        await page.keyboard.press("Enter");
+        await page.getByRole("dialog", { name: "Employee 25's day", exact: true }).waitFor();
+        await page.getByText("No work recorded on this day", { exact: true }).waitFor();
+        await page.keyboard.press("Escape");
+        assert.equal(await page.getByRole("dialog").count(), 0);
+        assert.equal(
+          await bubbles(page)
+            .last()
+            .evaluate((element) => element === document.activeElement),
+          true,
+        );
+        await fillsContent(page);
+        await fits(page);
+        await page.close();
+      },
+    );
+  }
+  await check(
+    "click, Enter and Space open only the selected employee and restore focus",
+    async () => {
+      const { page, reads } = await open({ count: 2 });
+      for (const key of [undefined, "Enter", "Space"]) {
+        const day = await openDay(page, 0, key);
+        await day.getByRole("heading", { name: "Jamie Mallers's day", exact: true }).waitFor();
+        assert.equal(await page.getByRole("dialog").count(), 1);
+        await page.keyboard.press("Escape");
+        assert.equal(
+          await bubbles(page)
+            .first()
+            .evaluate((element) => element === document.activeElement),
+          true,
+        );
+      }
+      const dayReads = reads.filter((url) => url.includes("employeeId="));
+      assert.ok(dayReads.length > 0);
+      assert.ok(
+        dayReads.every(
+          (url) => new URL(url, origin).searchParams.get("employeeId") === "employee-1",
+        ),
+      );
+      await page.close();
+    },
+  );
+  await check("pending work reads say Loading work while the cards remain usable", async () => {
+    const fixture = await open({ holdWork: true });
+    try {
+      await bubbles(fixture.page).first().getByText("Loading work", { exact: true }).waitFor();
+      assert.doesNotMatch(await work(fixture.page).innerText(), /Quiet today|Status unavailable/);
+      await fillsContent(fixture.page);
+      fixture.releaseWork();
+      await bubbles(fixture.page).first().getByText("Active 19m ago", { exact: true }).waitFor();
+    } finally {
+      fixture.releaseWork();
+      await fixture.page.close();
+    }
+  });
+  await check(
+    "work read failure remains inline, allows opening a day and recovers on focus",
+    async () => {
+      const fixture = await open({ workError: true, width: 320 });
+      await work(fixture.page)
+        .getByRole("alert")
+        .getByText("Recent work is temporarily unavailable.", { exact: true })
+        .waitFor();
+      assert.match(
+        (await bubbles(fixture.page).first().getAttribute("aria-label")) ?? "",
+        /Status unavailable/,
+      );
+      await fits(fixture.page);
+      await fillsContent(fixture.page);
+      const day = await openDay(fixture.page);
+      await day.getByRole("heading", { name: "Jamie Mallers's day", exact: true }).waitFor();
+      await fixture.page.keyboard.press("Escape");
+      fixture.recover();
+      await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+      await bubbles(fixture.page).first().getByText("Active 19m ago", { exact: true }).waitFor();
+      assert.equal(await work(fixture.page).getByRole("alert").count(), 0);
+      await fits(fixture.page);
+      await fillsContent(fixture.page);
+      await fixture.page.close();
+    },
+  );
+  await check("roster failure sits in the greeting and recovery restores bubbles", async () => {
+    const fixture = await open({ rosterError: true, width: 320 });
+    await greeting(fixture.page).getByRole("alert").waitFor();
+    assert.equal(await bubbles(fixture.page).count(), 0);
+    await fillsContent(fixture.page);
+    await fits(fixture.page);
+    fixture.recover();
+    await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+    await bubbles(fixture.page).first().getByText("Active 19m ago", { exact: true }).waitFor();
+    assert.equal(await greeting(fixture.page).getByRole("alert").count(), 0);
+    await fixture.page.close();
+  });
+  for (const width of [1440, 390, 320]) {
+    await check(
+      `employee Routine Runs stay above the calendar and show concurrent work at ${width}px`,
+      async () => {
+        const fixture = await open({
+          width,
+          dark: width === 320,
+          workQueue: {
+            employeeId: "employee-1",
+            current: null,
+            running: [
+              queueItem({
+                id: "active",
+                runId: "active",
+                routine: {
+                  id: "active-routine",
+                  name: "Morning customer briefing",
+                  slug: "morning-briefing",
+                },
+              }),
+              queueItem({
+                id: "active-2",
+                runId: "active-2",
+                routine: {
+                  id: "active-routine-2",
+                  name: "Review product feedback",
+                  slug: "product-feedback",
+                },
+              }),
+            ],
+            runningCount: 2,
+            pending: [
+              queueItem(),
+              queueItem({
+                id: "queued-2",
+                triggerKind: "retry",
+                routine: { id: "routine-2", name: "Refresh customer notes", slug: "refresh-notes" },
+                availableAt: "2026-09-09T10:30:00.000Z",
+              }),
+              queueItem({
+                id: "queued-3",
+                triggerKind: "continuation",
+                routine: { id: "routine-3", name: "Finish weekly report", slug: "weekly-report" },
+                blockedReason: "Waiting for the employee Standdown to be lifted.",
+              }),
+            ],
+            pendingCount: 3,
+          },
+        });
+        try {
+          const day = await openDay(fixture.page);
+          const queue = day.getByRole("region", { name: "Routine Runs", exact: true });
+          await queue.getByText("2 running · 3 pending", { exact: true }).waitFor();
+          await queue.getByText("Working now", { exact: true }).waitFor();
+          assert.equal(
+            await queue
+              .getByRole("link", { name: "Morning customer briefing", exact: true })
+              .getAttribute("href"),
+            "/c/company/routines/employee-1/morning-briefing?run=active",
+          );
+          const pending = queue.getByRole("list", { name: "Pending Routines", exact: true });
+          assert.deepEqual(await pending.getByRole("link").allTextContents(), [
+            "Review customer requests",
+            "Refresh customer notes",
+            "Finish weekly report",
+          ]);
+          assert.equal(await pending.locator("[aria-label^='Queue position']").count(), 0);
+          const running = queue.getByRole("list", { name: "Running Routines", exact: true });
+          assert.deepEqual(await running.getByRole("link").allTextContents(), [
+            "Morning customer briefing",
+            "Review product feedback",
+          ]);
+          assert.equal(
+            await running
+              .getByRole("link", { name: "Review product feedback", exact: true })
+              .getAttribute("href"),
+            "/c/company/routines/employee-1/product-feedback?run=active-2",
+          );
+          await pending.getByText(/Waiting until/).waitFor();
+          await pending
+            .getByText("Waiting for the employee Standdown to be lifted.", { exact: true })
+            .waitFor();
+          await day.getByLabel("Jamie Mallers's hourly work timeline", { exact: true }).waitFor();
+          const queueHeading = await box(
+            queue.getByRole("heading", { name: "Routine Runs", exact: true }),
+          );
+          const bounds = await box(day);
+          assert.ok(
+            queueHeading.y > bounds.y && queueHeading.y < bounds.y + bounds.height / 2,
+            "opening the calendar never scrolls the queue away",
+          );
+          assert.equal(
+            await day.evaluate((element) => element.scrollWidth > element.clientWidth),
+            false,
+            "modal has no horizontal overflow",
+          );
+          await fixture.page.screenshot({
+            path: path.join(output, `employee-routine-runs-${width}.png`),
+            fullPage: true,
+          });
+          const before = fixture.reads.filter((url) => url.includes("/work-queue")).length;
+          await day.getByRole("button", { name: "Previous day", exact: true }).click();
+          await day.getByRole("heading", { name: /Tuesday/ }).waitFor();
+          assert.equal(
+            fixture.reads.filter((url) => url.includes("/work-queue")).length,
+            before,
+            "changing calendar date does not reload or replace the queue",
+          );
+          await queue.getByText("2 running · 3 pending", { exact: true }).waitFor();
+          assert.deepEqual(fixture.writes, []);
+        } finally {
+          await fixture.page.close();
+        }
+      },
+    );
+  }
+  await check(
+    "employee Routine Runs refresh after a Run finishes while an earlier day stays selected",
+    async () => {
+      const first = queueItem();
+      const second = queueItem({
+        id: "queued-2",
+        runId: "queued-2",
+        routine: { id: "routine-2", name: "Refresh customer notes", slug: "refresh-notes" },
+      });
+      const fixture = await open({
+        live: true,
+        workQueue: {
+          employeeId: "employee-1",
+          current: first,
+          running: [first, second],
+          runningCount: 2,
+          pending: [],
+          pendingCount: 0,
+        },
+      });
+      try {
+        const day = await openDay(fixture.page);
+        const queue = day.getByRole("region", { name: "Routine Runs", exact: true });
+        await queue.getByText("2 running · 0 pending", { exact: true }).waitFor();
+        await day.getByRole("button", { name: "Previous day", exact: true }).click();
+        fixture.setQueue({
+          employeeId: "employee-1",
+          current: second,
+          running: [second],
+          runningCount: 1,
+          pending: [],
+          pendingCount: 0,
+        });
+        fixture.emitResourceEvent("run");
+        await queue.getByText("1 running · 0 pending", { exact: true }).waitFor();
+        await queue.getByText("No Routines waiting.", { exact: true }).waitFor();
+        assert.equal(
+          await queue.getByRole("link", { name: "Review customer requests", exact: true }).count(),
+          0,
+        );
+        assert.equal(
+          await queue
+            .getByRole("link", { name: "Refresh customer notes", exact: true })
+            .getAttribute("href"),
+          "/c/company/routines/employee-1/refresh-notes?run=queued-2",
+        );
+        assert.equal(await day.getByLabel("Work day", { exact: true }).inputValue(), "2026-09-08");
+      } finally {
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "employee Routine Runs loading and empty states leave recorded work usable",
+    async () => {
+      const fixture = await open({ holdQueue: true });
+      try {
+        const day = await openDay(fixture.page);
+        const queue = day.getByRole("region", { name: "Routine Runs", exact: true });
+        await queue
+          .getByRole("status")
+          .getByText("Loading Routine Runs…", { exact: true })
+          .waitFor();
+        await day.getByLabel("Jamie Mallers's hourly work timeline", { exact: true }).waitFor();
+        fixture.releaseQueue();
+        await queue.getByText("No active or pending Routines.", { exact: true }).waitFor();
+        assert.equal(await queue.getByText("Working now", { exact: true }).count(), 0);
+      } finally {
+        fixture.releaseQueue();
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "employee Routine Runs expands a long preview without hiding its full pending count",
+    async () => {
+      const fixture = await open({
+        width: 390,
+        workQueue: {
+          employeeId: "employee-1",
+          current: null,
+          running: [],
+          runningCount: 0,
+          pending: Array.from({ length: 7 }, (_, index) =>
+            queueItem({ id: `queued-${index + 1}` }),
+          ),
+          pendingCount: 120,
+        },
+      });
+      try {
+        const day = await openDay(fixture.page);
+        const queue = day.getByRole("region", { name: "Routine Runs", exact: true });
+        await queue.getByText("0 running · 120 pending", { exact: true }).waitFor();
+        assert.equal(await queue.getByRole("listitem").count(), 5);
+        await queue
+          .getByText("Showing the first 5 of 120 pending Routines.", { exact: true })
+          .waitFor();
+        await queue.getByRole("button", { name: "Show 2 more", exact: true }).click();
+        assert.equal(await queue.getByRole("listitem").count(), 7);
+        await queue
+          .getByText("Showing the first 7 of 120 pending Routines.", { exact: true })
+          .waitFor();
+        await queue.getByRole("button", { name: "Show fewer", exact: true }).click();
+        assert.equal(await queue.getByRole("listitem").count(), 5);
+        await day.getByRole("button", { name: "Go to first work", exact: true }).click();
+        const firstWork = await box(day.getByText(/Jamie Mallers replied in/));
+        const bounds = await box(day);
+        assert.ok(
+          firstWork.y > bounds.y && firstWork.y < bounds.y + bounds.height,
+          "recorded work is reachable beside a long queue",
+        );
+      } finally {
+        await fixture.page.close();
+      }
+    },
+  );
+  await check(
+    "employee Routine Runs failure is inline and retries independently of the calendar",
+    async () => {
+      const fixture = await open({ queueError: true, width: 320 });
+      try {
+        const day = await openDay(fixture.page);
+        const queue = day.getByRole("region", { name: "Routine Runs", exact: true });
+        await queue
+          .getByRole("alert")
+          .getByText("Routine Runs are temporarily unavailable.", { exact: true })
+          .waitFor();
+        await day.getByLabel("Jamie Mallers's hourly work timeline", { exact: true }).waitFor();
+        fixture.recover();
+        await queue.getByRole("button", { name: "Try again", exact: true }).click();
+        await queue.getByText("No active or pending Routines.", { exact: true }).waitFor();
+        assert.equal(await queue.getByRole("alert").count(), 0);
+      } finally {
+        await fixture.page.close();
+      }
+    },
+  );
+  await check("empty roster leaves the greeting and full-width all-clear card", async () => {
+    const { page } = await open({ count: 0, quiet: true });
+    assert.equal(await work(page).count(), 0);
+    await fillsContent(page, "Nothing needs you right now");
+    await fits(page);
+    await page.close();
+  });
+  await check("all-clear Home shows the company's Goal and where it stands", async () => {
+    const goal = fixtureGoal({ currentValue: 12, progress: 0.24 });
+    const { page } = await open({
+      quiet: true,
+      goals: [fixtureGoal({ id: "sub", parentGoalId: "goal" }), goal],
+    });
+    await fillsContent(page, "Nothing needs you right now");
+    await page.getByText("Your Goal", { exact: true }).waitFor();
+    await page.getByText("Reach 50 paying customers by March", { exact: true }).waitFor();
+    await page.getByText("12 of 50 customers", { exact: true }).waitFor();
+    const bar = page.getByRole("progressbar", { name: "Progress toward your Goal" });
+    assert.equal(await bar.getAttribute("aria-valuenow"), "24");
+    assert.equal(
+      await page.getByRole("link", { name: "See Goals", exact: true }).getAttribute("href"),
+      "/c/company/goals",
+    );
+    // A quiet day no longer sends anyone off to create a project.
+    assert.equal(await page.getByText(/Create a project/).count(), 0);
+    assert.equal(await page.getByText(/See what your AI employees are doing/).count(), 0);
+    await fits(page);
+    await page.close();
+  });
+  await check("all-clear Home names the target before anything is reported", async () => {
+    const { page } = await open({ quiet: true, goals: [fixtureGoal()] });
+    await page.getByText("Target 50 customers", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("progressbar").count(), 0);
+    await page.close();
+  });
+  await check("all-clear Home points an owner or admin at writing the Goal", async () => {
+    for (const role of ["owner", "admin"] as const) {
+      const { page } = await open({ quiet: true, role });
+      await fillsContent(page, "Nothing needs you right now");
+      const link = page.getByRole("link", { name: "Set your Goal", exact: true });
+      await link.waitFor();
+      assert.equal(await link.getAttribute("href"), "/c/company/goals");
+      assert.equal(await page.getByText(/Create a project/).count(), 0);
+      await page.close();
+    }
+  });
+  await check("all-clear Home sends a Member without a Goal to the Goals page", async () => {
+    const { page } = await open({ quiet: true });
+    const link = page.getByRole("link", { name: "See Goals", exact: true });
+    await link.waitFor();
+    assert.equal(await link.getAttribute("href"), "/c/company/goals");
+    assert.equal(await page.getByRole("link", { name: "Set your Goal" }).count(), 0);
+    await page.close();
+  });
+  await check(
+    "all-clear Home keeps employees available with honest working and quiet status",
+    async () => {
+      const { page } = await open({ count: 2, quiet: true, working: true });
+      await bubbles(page).first().getByText("Working now", { exact: true }).waitFor();
+      await bubbles(page).nth(1).getByText("Quiet today", { exact: true }).waitFor();
+      await fillsContent(page, "Nothing needs you right now");
+      await page.close();
+    },
+  );
+  await check(
+    "removing the selected employee dismisses their day and clears the header roster",
+    async () => {
+      const fixture = await open();
+      await openDay(fixture.page);
+      fixture.removeEmployees();
+      await fixture.page.evaluate(() => dispatchEvent(new Event("focus")));
+      await fixture.page.getByRole("dialog").waitFor({ state: "detached" });
+      assert.equal(await work(fixture.page).count(), 0);
+      await fillsContent(fixture.page);
+      await fixture.page.close();
+    },
+  );
+  await check(
+    "long names and failed photos fit a narrow dark-mode greeting with full accessible labels",
+    async () => {
+      const { page } = await open({ width: 320, longNames: true, brokenAvatar: true, dark: true });
+      const name = "Alexandria Rivera-Montgomery ".repeat(5).trim();
+      const bubble = bubbles(page).first();
+      assert.ok(
+        (await bubble.getAttribute("aria-label"))?.startsWith(`${name}, Customer support,`),
+      );
+      assert.ok((await bubble.getAttribute("title"))?.includes(name));
+      await bubble.locator("img").waitFor({ state: "detached" });
+      await bubble.getByText("AR", { exact: true }).waitFor();
+      assert.equal(
+        await page.locator("html").evaluate((element) => element.classList.contains("dark")),
+        true,
+      );
+      await fits(page);
+      await fillsContent(page);
+      const day = await openDay(page);
+      const bounds = await box(day);
+      assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 320);
+      await page.keyboard.press("Escape");
+      await page.screenshot({
+        path: path.join(output, "home-compact-long-dark.png"),
+        fullPage: true,
+      });
+      await page.close();
+    },
+  );
+  for (const [role, width, dark] of [
+    ["owner", 390, false],
+    ["admin", 1440, true],
+  ] as const) {
+    await check(`${role} finds the newest unread letter to the board on Home`, async () => {
+      const fixture = await open({
+        role,
+        width,
+        dark,
+        boardLetter: boardLetter(),
+        unreadBoardLetterCount: 2,
+      });
+      const letter = card(fixture.page, "Letter to the board");
+      await letter.waitFor();
+      for (const text of [
+        "No.",
+        "3",
+        "August 2026",
+        "Audited · 2 exceptions",
+        "1 number untraced",
+        "August closed with revenue up a quarter and the Goal at 6,200 roofs.",
+        "Jamie Mallers · audited by Otto",
+        "1 more unread letter",
+      ])
+        await letter.getByText(text, { exact: true }).first().waitFor();
+      assert.equal(
+        await letter
+          .getByRole("link", { name: "Read the letter", exact: true })
+          .getAttribute("href"),
+        "/c/company/tldrs/letters/3",
+      );
+      assert.equal(
+        await letter.getByRole("link", { name: "All letters", exact: true }).getAttribute("href"),
+        "/c/company/tldrs/letters",
+      );
+      await fits(fixture.page);
+      const bounds = await box(letter);
+      assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= width, "the card fits the viewport");
+      assert.deepEqual(fixture.writes, [], "showing a letter reads nothing");
+      await fixture.page.screenshot({
+        path: path.join(output, `home-board-letter-${role}.png`),
+        fullPage: true,
+      });
+      await fixture.page.close();
+    });
+  }
+
+  await check("Dismiss reads the letter once and Home refetches without it", async () => {
+    const fixture = await open({ role: "owner", boardLetter: boardLetter() });
+    const letter = card(fixture.page, "Letter to the board");
+    const refetched = fixture.page.waitForResponse(
+      (response) => new URL(response.url()).pathname === "/api/companies/company/home",
+    );
+    await letter.getByRole("button", { name: "Dismiss Letter No. 3", exact: true }).click();
+    await letter.waitFor({ state: "detached" });
+    await refetched;
+    assert.deepEqual(fixture.writes, ["POST /api/companies/company/board-letters/3/read"]);
+    assert.deepEqual(fixture.mutations, [
+      { path: "/api/companies/company/board-letters/3/read", body: {} },
+    ]);
+    assert.equal(await card(fixture.page, "Letter to the board").count(), 0);
+    await fixture.page.close();
+  });
+
+  await check("a failed Dismiss puts the letter back and says why in a dialog", async () => {
+    const fixture = await open({
+      role: "admin",
+      boardLetter: boardLetter(),
+      letterReadError: true,
+    });
+    const letter = card(fixture.page, "Letter to the board");
+    await letter.getByRole("button", { name: "Dismiss Letter No. 3", exact: true }).click();
+    const dialog = fixture.page.getByRole("dialog", {
+      name: "Couldn’t dismiss the letter",
+      exact: true,
+    });
+    await dialog.waitFor();
+    await dialog
+      .getByText("Letters are unavailable. It has been restored.", { exact: true })
+      .waitFor();
+    await card(fixture.page, "Letter to the board")
+      .getByText("August 2026", { exact: true })
+      .waitFor();
+    assert.deepEqual(fixture.writes, ["POST /api/companies/company/board-letters/3/read"]);
+    await dialog.getByRole("button", { name: "Close", exact: true }).last().click();
+    await dialog.waitFor({ state: "detached" });
+    await fixture.page.close();
+  });
+
+  await check("a Member is never shown a letter to the board", async () => {
+    const fixture = await open({ boardLetter: boardLetter() });
+    assert.equal(await card(fixture.page, "Letter to the board").count(), 0);
+    assert.equal(
+      await fixture.page.getByText("August closed with revenue", { exact: false }).count(),
+      0,
+    );
+    assert.deepEqual(fixture.writes, []);
+    await fixture.page.close();
+  });
+
+  assert.deepEqual(browserErrors, [], "browser must have no uncaught errors or duplicate keys");
+  assert.deepEqual(unexpectedRequests, [], "browser must only make expected fixture requests");
+  console.log(`PASS ${checks} Home layout browser regressions`);
+} finally {
+  await touchContext.close();
+  await context.close();
+  await browser.close();
+  await server.close();
+}

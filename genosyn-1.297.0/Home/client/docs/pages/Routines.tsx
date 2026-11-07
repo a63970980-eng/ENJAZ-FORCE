@@ -1,0 +1,1508 @@
+import {
+  Callout,
+  Code,
+  DocLink,
+  H2,
+  H3,
+  KeyList,
+  LI,
+  P,
+  PageHeader,
+  Pre,
+  Strong,
+  UL,
+} from "@/docs/Prose";
+
+export function Routines() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Core concepts"
+        title="Routines & Runs"
+        lead={
+          <>
+            A <Strong>Routine</Strong> is a scheduled, recurring piece of AI work. A schedule, a
+            markdown brief, an on/off switch. Every execution becomes a <Strong>Run</Strong> with a
+            captured log — and, when it uses a browser, a visual recording you can review beside
+            that log.
+          </>
+        }
+      />
+
+      <Callout kind="info" title='"Routine" is the word.'>
+        Genosyn never calls these &quot;tasks,&quot; &quot;jobs,&quot; or &quot;workflows.&quot;{" "}
+        <Strong>Task</Strong> is reserved for the human-style project/todo manager — different
+        feature, different surface.
+      </Callout>
+
+      <H2 id="where-they-live">Where they live</H2>
+      <P>
+        Routines have their own section in the nav, under <Strong>AI → Routines</Strong>, with two
+        pages at the top of its sidebar: <Strong>Running</Strong>, for the{" "}
+        <DocLink to="/docs/routines#recent-runs">Runs under way, waiting, and finished today</DocLink>
+        , and <Strong>All routines</Strong>, the list. That list is company-wide: every routine,
+        every employee, one page. Narrow it with the{" "}
+        <DocLink to="/docs/routines#search">search box</DocLink> at the top, or filter by the{" "}
+        <DocLink to="/docs/employees">AI Employee</DocLink> a routine is assigned to, or by health —{" "}
+        <Strong>Active</Strong>, <Strong>Paused</Strong>, <Strong>Needs attention</Strong>. Two more
+        axes group routines across employees: <DocLink to="/docs/routines#folders">folders</DocLink>{" "}
+        in the sidebar, and company <DocLink to="/docs/tags">Tags</DocLink> as chips above the list.
+      </P>
+      <P>
+        Clicking a routine opens its detail page: <Strong>Overview</Strong>, <Strong>Brief</Strong>,{" "}
+        <Strong>Runs</Strong>, and <Strong>Settings</Strong>; press{" "}
+        <DocLink to="/docs/routines#assistant">Ask AI</DocLink> in the top bar to ask about it. Each
+        AI Employee
+        links to their own slice of that list from <Strong>Settings → Routines</Strong> — same page,
+        filtered to them — and <Strong>New routine</Strong> from that slice starts with them
+        chosen. On the <Strong>Brief</Strong> tab, <Code>⌘S</Code> saves the brief. The status in a
+        row&apos;s <Strong>Last run</Strong> column opens that Run directly.
+      </P>
+      <P>
+        A routine made without a brief starts <Strong>Paused</Strong>, so one left unfinished never
+        runs its starter outline on schedule. That is what an API call or an AI Employee&apos;s{" "}
+        <Code>create_routine</Code> gets when it sends no brief; the New routine page always has
+        one. Its <Strong>Brief</Strong> tab says <Strong>Paused until its brief is saved</Strong>,
+        and the button reads <Strong>Save brief &amp; switch on</Strong>: that first save of a real
+        brief switches the routine on and schedules its next Run. Renaming or rescheduling it first
+        does not count, and saving a blank brief or the untouched outline leaves it paused. Later
+        saves never change the switch.
+      </P>
+      <P>
+        <Strong>Overview</Strong> keeps what you check most up front: who the routine is assigned
+        to and the model it runs on, its schedule in words, the next run, and the last run.{" "}
+        <Strong>More details</Strong> holds the rest — where it is filed, its timeout, approval,
+        outcome check, priority, browser, catch-up, retries, and webhook — and its summary line
+        names anything that is not at its default. <Strong>Settings</Strong> shows the basics:{" "}
+        <Strong>Name</Strong>, <Strong>Schedule</Strong>, <Strong>Goal</Strong>, and{" "}
+        <Strong>What counts as done</Strong>, saved with one <Strong>Save changes</Strong>.
+        Everything else is under <Strong>Advanced</Strong>, closed until you open it: the folder,
+        timeout and approval; <Strong>Checks</Strong>; the{" "}
+        <DocLink to="/docs/routines#priority">priority</DocLink>, model and browser; downtime and
+        retries; <Strong>Triggers</Strong>; and the <Strong>Webhook</Strong>. Its summary line
+        names what is set there, such as{" "}
+        <Code>Approval required · 2 Checks · 1 Trigger · Webhook on</Code>, or reads{" "}
+        <Strong>All defaults</Strong>. Checks, Triggers, and the webhook save as you change them;
+        the other Advanced settings are saved by <Strong>Save changes</Strong>. Standing a routine
+        down and deleting it stay in view at the bottom.
+      </P>
+      <P>
+        Owners and admins pause or resume a routine from the switch beside{" "}
+        <Strong>Run now</Strong> at the top of its page — one click, no Save. It is the only pause
+        control: Settings does not repeat it, and saving Settings never changes it. While a{" "}
+        <DocLink to="/docs/standdowns">Standdown</DocLink> covers the routine,{" "}
+        <Strong>Run now</Strong> is disabled and its tooltip names the Standdown. An AI Employee
+        can start a Run the same way with <Code>run_routine_now</Code> — to try a fix or do the
+        work early — at either Routines access level; a Standdown refuses it too.
+      </P>
+      <P>
+        If the list, employee roster, or folders cannot refresh, Genosyn keeps the last loaded
+        Routines and any edits in the open brief. An error offers <Strong>Try again</Strong>; it
+        does not mean the Routine was deleted. If the brief itself cannot load, use{" "}
+        <Strong>Retry brief</Strong>. A failed save keeps your edits available to retry, and the
+        brief is marked saved only after storage confirms the submitted text. Switching to another
+        Routine or company opens that destination&apos;s own brief.
+      </P>
+
+      <H2 id="creating">Creating a Routine</H2>
+      <P>
+        Owners and admins start from <Strong>New routine</Strong>, which opens on the form. Fill in
+        the details yourself, or describe what you want and an AI Employee drafts it for you.
+      </P>
+      <H3 id="set-it-up-yourself">Set it up yourself</H3>
+      <P>
+        The form asks for a <Strong>Name</Strong>, who the routine is <Strong>Assigned to</Strong>,
+        its <Strong>Schedule</Strong>, and <Strong>What should happen on each run?</Strong> — the
+        brief, which this form requires. <Strong>Create routine</Strong> opens the new routine,
+        already on its schedule. <Strong>Advanced</Strong> holds the <Strong>Folder</Strong> and{" "}
+        <Strong>Tags</Strong> — the same Advanced a routine&apos;s Settings tab has — and stays
+        closed until you open it; closed, it reads <em>No folder or tags</em>, or names the folder
+        carried over from the list you came from and how many tags you picked.
+      </P>
+      <P>
+        Every <Strong>New routine</Strong> opens this form: on the Routines list and its sidebar, in
+        a folder, on one AI Employee&apos;s routines, on <Strong>Running</Strong> and{" "}
+        <Strong>Proactive</Strong>, and in the <Code>⌘K</Code> palette. From a folder or one
+        employee&apos;s routines it starts filed in that folder and assigned to that employee.
+      </P>
+      <P>
+        Through the authenticated company API, the same fields go to{" "}
+        <Code>POST /api/companies/:companyId/employees/:employeeId/routines</Code>:{" "}
+        <Code>name</Code>, <Code>cronExpr</Code>, an optional <Code>brief</Code> of up to 20,000
+        characters, and optional <Code>folderId</Code> and <Code>tagIds</Code>. With a{" "}
+        <Code>brief</Code> the routine starts switched on. Without one — or with a blank brief, or
+        the starter outline unchanged — it is created paused with nothing scheduled, so nothing runs
+        before a real brief exists.
+      </P>
+      <H3 id="describe-it">Describe it instead</H3>
+      <P>
+        <Strong>Describe it instead</Strong>, under the form, swaps the fields for one box,{" "}
+        <Strong>What should happen, and how often?</Strong> Write it the way you would tell a
+        colleague, or press one of the <Strong>Examples</Strong> to start from. Choose the{" "}
+        <Strong>AI Employee</Strong> to ask — only employees with a connected{" "}
+        <DocLink to="/docs/models">AI Model</DocLink> are offered, and when only one can answer they
+        are already chosen — then press <Strong>Continue to Chat</Strong>.
+      </P>
+      <P>
+        That opens a new Chat with your request as an unsent draft. Read it, change it, and send it
+        when you are ready; nothing is sent from the New routine page. The employee checks your
+        existing Routines and <DocLink to="/docs/reactivity#initiatives">Initiatives</DocLink>, then
+        proposes the Routine as an Initiative. It waits in the{" "}
+        <DocLink to="/docs/decisions">Decision stack</DocLink> until an owner or admin accepts it,
+        and accepting it is what creates the Routine, switched on.
+      </P>
+      <P>
+        <Strong>Back to the form</Strong>, under the box, returns to the fields, and what you typed
+        in either place is kept. While the box is open the page&apos;s address includes{" "}
+        <Code>describe=1</Code>, so a reload keeps the box open and a link that includes it opens
+        straight on the box. Until an AI Employee has a connected AI Model, a note under the form
+        says so in place of <Strong>Describe it instead</Strong>, with a link to connect one.
+      </P>
+
+      <H2 id="recent-runs">Running, queued, and today</H2>
+      <P>
+        <Strong>Running</Strong>, at the top of the Routines sidebar, is the work rather than the
+        list: every Routine&apos;s Runs as they happen, in three sections. It covers every Routine
+        — the sidebar&apos;s folders and AI Employees filter <Strong>All routines</Strong>, not
+        this page.
+      </P>
+      <P>
+        <Strong>Running now</Strong> shows each active Run with its Routine, assigned AI Employee,
+        and start time. Open a card to follow that Run in the Routine&apos;s detail page.
+      </P>
+      <P>
+        <Strong>Queued</Strong> shows each Run waiting to start, in the order the queue will start
+        them, and how long it has waited. The first reads <Strong>Next up</Strong> and the rest
+        their place — <Strong>#2</Strong>, <Strong>#3</Strong> — and a{" "}
+        <DocLink to="/docs/routines#priority">High priority</DocLink> Routine&apos;s Runs carry a{" "}
+        <Strong>High</Strong> mark. A Run waits while its AI Model already serves as many Runs as it
+        allows (see <DocLink to="/docs/routines#concurrent-runs">Concurrent Routine Runs</DocLink>),
+        while a <DocLink to="/docs/standdowns">Standdown</DocLink> covers it — its row then says{" "}
+        <Strong>Stood down</Strong> and takes no place in line — while its AI Model is{" "}
+        <DocLink to="/docs/models#unavailable">unavailable</DocLink>, or while Genosyn restarts for
+        an upgrade. A Run paused for a restart, or while its AI Model was unavailable, reads{" "}
+        <Strong>Resuming</Strong>, is first in line, and continues where it stopped. Open a row for
+        its Run log: a Run waiting for its AI Model or for an upgrade says so there. A long queue
+        lists its first 100 Runs and says how many wait in all.
+      </P>
+      <P>
+        <Strong>Ran today</Strong> shows each Routine&apos;s latest finished Run and how many times
+        it ran today, newest first. Status, outcome, and Check badges keep their separate meanings.
+        Open a row for that Run&apos;s log; the Routine&apos;s <Strong>Runs</Strong> tab holds
+        earlier Runs. Use <Strong>Show all</Strong> to expand a busy day.
+      </P>
+      <P>
+        Today follows your browser&apos;s local calendar day, including Runs that started yesterday
+        and finished today. Skipped Runs are excluded. Every section says when it is empty and
+        updates automatically.
+      </P>
+      <P>
+        A slow refresh can leave the last loaded results on screen until new data arrives. If recent
+        Runs cannot be loaded, use <Strong>Try again</Strong>. This loading error does not change a
+        Run&apos;s status.
+      </P>
+
+      <H2 id="search">Searching the list</H2>
+      <P>
+        Folders ask <Strong>where does this live</Strong> and tags ask{" "}
+        <Strong>what is this about</Strong> — both want you to know the answer before you can
+        narrow. The search box above the list is the third question:{" "}
+        <Strong>what was that thing called?</Strong> Type into it and the list narrows as you go,
+        matching everything the row already shows.
+      </P>
+      <UL>
+        <LI>
+          The routine&apos;s <Strong>name</Strong>, and its slug — so a link somebody pasted still
+          finds the routine after it was renamed.
+        </LI>
+        <LI>
+          The <Strong>AI Employee</Strong> it is assigned to.
+        </LI>
+        <LI>
+          The <Strong>folder</Strong> it is filed in, by full path — searching <Code>Finance</Code>{" "}
+          finds everything under <Code>Finance/Month-end</Code> too.
+        </LI>
+        <LI>
+          Its <DocLink to="/docs/tags">tags</DocLink>.
+        </LI>
+        <LI>
+          Its <Strong>schedule</Strong>, in any dialect: <Code>0 9 * * 1-5</Code>,{" "}
+          <Code>weekday</Code> — the words the row itself shows, “Every weekday at 9:00 AM” — and{" "}
+          <Code>Monday</Code> all find the routine that runs on weekday mornings. The cron
+          expression and both plain-English renderings are searched together, so it does not matter
+          whether you remember a schedule by its cadence or by the days it names.
+        </LI>
+      </UL>
+      <P>
+        Several words are all required, and they may land in different fields —{" "}
+        <Code>finance digest</Code> finds the digest filed under Finance. Case and accents are
+        ignored. Press <Code>/</Code> anywhere on the page to jump into the box and <Code>Esc</Code>{" "}
+        to empty it.
+      </P>
+      <Callout kind="info" title="Search stacks with the other filters.">
+        It narrows within whatever folder or employee you are already looking at, and the{" "}
+        <Strong>Active</Strong> / <Strong>Paused</Strong> / <Strong>Needs attention</Strong> counts
+        re-count themselves against your search, so each number is what clicking that chip would
+        actually show.
+      </Callout>
+
+      <H2 id="folders">Folders</H2>
+      <P>
+        Once a company runs dozens of routines, neither &quot;all of them&quot; nor &quot;one
+        employee&apos;s&quot; is a useful view. <Strong>Folders</Strong> are the filing tree in the
+        Routines sidebar: company-wide, nestable up to five levels, and exclusive — a routine is
+        filed in at most one folder, or in none at all.
+      </P>
+      <P>
+        Create one with the folder button at the top of the sidebar, or from{" "}
+        <Strong>New folder…</Strong> in any move menu. Selecting a folder narrows the list to that
+        folder <Strong>and everything nested inside it</Strong>, so a parent never reads as empty
+        just because its routines live one level down. The tag chips narrow with that same folder
+        scope, so every tag shown can match a routine currently in the list.{" "}
+        <Strong>Unfiled</Strong> at the bottom of the tree collects everything you haven&apos;t
+        filed yet. Each folder&apos;s <Code>⋯</Code> menu holds <Strong>New subfolder</Strong>,{" "}
+        <Strong>Rename</Strong>, <Strong>Move to top level</Strong>, and{" "}
+        <Strong>Delete folder</Strong>.
+      </P>
+      <Callout kind="info" title="Deleting a folder never deletes routines.">
+        Its routines and subfolders move up to the folder&apos;s own parent — which for a top-level
+        folder means they become Unfiled. The confirmation says exactly where they will land before
+        you press the button. An empty folder has nothing to move, so it is deleted without a
+        confirmation.
+      </Callout>
+      <H3 id="filing-routines">Filing routines</H3>
+      <P>
+        To file an existing library, press <Strong>Organize</Strong> above the list. Checkboxes
+        appear on every row: tick the ones you want (or <Strong>Select all</Strong>), then pick a
+        destination from <Strong>Move to folder</Strong>. It is one request for the whole batch, so
+        a failure never leaves half the selection moved. A single routine can also be re-filed from
+        the <Strong>Folder</Strong> field under <Strong>Settings → Advanced</Strong>, and a routine
+        you <DocLink to="/docs/routines#set-it-up-yourself">set up yourself</DocLink> while inside
+        a folder lands there by default.
+      </P>
+      <Callout kind="info" title="Folders and tags answer different questions.">
+        A folder is <Strong>where a routine lives</Strong> — one folder, navigable, exclusive. A{" "}
+        <DocLink to="/docs/tags">tag</DocLink> is <Strong>what it is about</Strong> — many per
+        routine, cutting across the tree. &quot;Finance/Month-end&quot; is a folder;
+        &quot;urgent&quot; and &quot;quarterly&quot; are tags. Use both.
+      </Callout>
+      <P>
+        AI Employees can file their own work too: <Code>create_routine</Code> and{" "}
+        <Code>update_routine</Code> both take a <Code>folder</Code> — a name like{" "}
+        <Code>Finance</Code> or a path like <Code>Finance/Month-end</Code>. Any segment that
+        doesn&apos;t exist yet is created, the same way tag names are. Passing an empty string to{" "}
+        <Code>update_routine</Code> unfiles the routine.
+      </P>
+
+      <H2 id="anatomy">Anatomy</H2>
+      <KeyList
+        rows={[
+          { term: "name", def: "What humans call this routine." },
+          {
+            term: "folder",
+            def: (
+              <>
+                Which <DocLink to="/docs/routines#folders">folder</DocLink> the routine is filed
+                under. Optional — a routine with no folder shows up under <Strong>Unfiled</Strong>.
+              </>
+            ),
+          },
+          {
+            term: "cron",
+            def: (
+              <>
+                When it runs. You build this from the <Strong>Schedule</Strong> control — a cadence,
+                the days, a time — and Genosyn compiles it to a standard 5-field cron expression.
+                See <DocLink to="/docs/routines#scheduling">Scheduling</DocLink>.
+              </>
+            ),
+          },
+          {
+            term: "body",
+            def: (
+              <>
+                Markdown brief — what the employee should do when this fires. Stored on{" "}
+                <Code>Routine.body</Code>.
+              </>
+            ),
+          },
+          {
+            term: "enabled",
+            def: (
+              <>
+                Boolean. Disabling stops the schedule without losing the row — the ordinary
+                housekeeping switch. To stop work during an incident, place a{" "}
+                <DocLink to="/docs/standdowns">Standdown</DocLink> instead; it records who and why,
+                and reaches surfaces this switch does not.
+              </>
+            ),
+          },
+          {
+            term: "approvalRequired",
+            def: (
+              <>
+                Optional. If true, the runner records the intended action and blocks it on a human ✓
+                via the <Code>Approval</Code> entity.
+              </>
+            ),
+          },
+          {
+            term: "model",
+            def: (
+              <>
+                Optional. Which of the employee&apos;s{" "}
+                <DocLink to="/docs/models">AI Models</DocLink> this routine runs on. Defaults to{" "}
+                <Strong>Inherit</Strong> — whichever model is active for the employee. See{" "}
+                <DocLink to="/docs/routines#model">Picking a model</DocLink>.
+              </>
+            ),
+          },
+          {
+            term: "priority",
+            def: (
+              <>
+                <Strong>Normal</Strong> (every Routine&apos;s default) or <Strong>High</Strong>.
+                While its AI Model is busy, a High Routine&apos;s Runs start before Normal ones.
+                Set under <Strong>Settings → Advanced → Execution</Strong>. See{" "}
+                <DocLink to="/docs/routines#priority">Putting a Routine first</DocLink>.
+              </>
+            ),
+          },
+          {
+            term: "timeoutSec",
+            def: (
+              <>
+                Hard timeout in seconds. The runner aborts the active runtime after this long and
+                marks the Run <Strong>Error</Strong>, with a timeout reason. Defaults to{" "}
+                <Strong>6 hours</Strong>, the longest allowed, and is editable per routine (10s –
+                6h) under <Strong>Settings → Advanced</Strong> — lower it to fail fast. A Run and
+                its automatic continuations share this one window. Time spent waiting in the queue
+                does not count. Near the end, tool results
+                tell the employee how many minutes remain so it can save progress and report before
+                it is stopped.
+              </>
+            ),
+          },
+          {
+            term: "catchUpPolicy",
+            def: (
+              <>
+                What to do about slots missed while the server was down. <Strong>Run once</Strong>{" "}
+                (the default) fires a single catch-up run; <Strong>Skip</Strong> declines it when
+                the slot is already more than a minute late. See{" "}
+                <DocLink to="/docs/routines#recovery">Downtime and recovery</DocLink>.
+              </>
+            ),
+          },
+          {
+            term: "maxAttempts",
+            def: (
+              <>
+                Total attempts per scheduled occurrence, counting the first. <Strong>1</Strong> by
+                default — ordinary failure and runtime or timeout retries are off. Saved unfinished
+                work can still continue automatically within the original time limit. A newly
+                interrupted initial scheduled Run on an enabled routine without an approval gate
+                still receives one recovery attempt an hour after Genosyn marks it. Higher limits
+                also bound interrupted retries later in the same chain. Paired with{" "}
+                <Code>retryBackoffSec</Code> and <Code>retryOnTimeout</Code>.
+              </>
+            ),
+          },
+          {
+            term: "browserEnabledOverride",
+            def: (
+              <>
+                Optional per-routine override of the employee&apos;s{" "}
+                <DocLink to="/docs/browser">browser</DocLink> toggle — force it on for a research
+                routine, or off for one that must never touch the web. Unset means &quot;inherit
+                from the employee&quot;.
+              </>
+            ),
+          },
+          {
+            term: "acceptanceCriteria",
+            def: (
+              <>
+                Optional plain-language definition of done, edited at{" "}
+                <Strong>Settings → What counts as done</Strong>. When set, the criteria ride along
+                in every Run&apos;s brief and each completed Run is graded against them. See{" "}
+                <DocLink to="/docs/routines#outcome-check">The outcome check</DocLink>.
+              </>
+            ),
+          },
+        ]}
+      />
+
+      <H2 id="scheduling">Scheduling</H2>
+      <P>
+        The <Strong>Schedule</Strong> control asks when the work should happen, not how to spell it.
+        Pick a cadence and the control offers only what that cadence needs:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Every few minutes</Strong> — 1, 2, 5, 10, 15, 20 or 30.
+        </LI>
+        <LI>
+          <Strong>Hourly</Strong> — every 1 to 12 hours, at a chosen number of minutes past.
+        </LI>
+        <LI>
+          <Strong>Daily</Strong> — a time of day.
+        </LI>
+        <LI>
+          <Strong>Weekly</Strong> — any set of weekdays, plus a time. Mon–Fri reads back as
+          &ldquo;Every weekday&rdquo;.
+        </LI>
+        <LI>
+          <Strong>Monthly</Strong> — a day of the month and a time.
+        </LI>
+        <LI>
+          <Strong>Yearly</Strong> — a month, a day, and a time.
+        </LI>
+      </UL>
+      <P>
+        Underneath, the control writes a plain English sentence, the cron expression it compiled,
+        and the next few times the routine will actually fire — so you can check the schedule before
+        you save rather than after the first Run lands. Those times are in your company&apos;s{" "}
+        <DocLink to="/docs/routines#time-zone">time zone</DocLink>, and the preview names it. The
+        same control appears on <DocLink to="/docs/signals">Revenue Signals</DocLink> and on a{" "}
+        <DocLink to="/docs/pipelines">Pipeline</DocLink> schedule trigger, where it still reads
+        server time.
+      </P>
+
+      <H3 id="time-zone">Time zone</H3>
+      <P>
+        A routine&apos;s schedule is read in the company&apos;s time zone, so &ldquo;every morning
+        at 8&rdquo; fires at 8:00 AM there and stays at 8:00 AM when daylight saving changes. Owners
+        and admins choose the zone in <Strong>Settings → Company → Time zone</Strong>. A company you
+        create starts in the time zone of your browser, and the schedule preview names the zone it
+        is using, such as <Code>Europe/Berlin</Code>.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Server time</Strong> keeps the old behavior: schedules follow the clock of the
+          machine running Genosyn, which is often UTC in Docker. Companies that existed before time
+          zones are on it until someone picks a zone, so nothing moves on its own.
+        </LI>
+        <LI>
+          Changing the zone re-times every enabled routine in the company at once; each one&apos;s
+          next run is worked out again on the new clock.
+        </LI>
+        <LI>
+          Of the schedules, it applies to Routines only.{" "}
+          <DocLink to="/docs/pipelines">Pipeline</DocLink> schedules, recurring invoices, and{" "}
+          <DocLink to="/docs/signals">Revenue Signals</DocLink> keep reading server time. Finance
+          counts days on it for the{" "}
+          <DocLink to="/docs/finance#invoices-figures">invoice</DocLink> and{" "}
+          <DocLink to="/docs/finance#estimates-figures">estimate</DocLink> figures and the
+          overdue and expired statuses beside them.
+        </LI>
+      </UL>
+
+      <H3 id="custom-cron">Writing cron by hand</H3>
+      <P>
+        Genosyn stores the schedule as a standard 5-field <Code>node-cron</Code> expression, and the
+        control&apos;s <Strong>Custom (cron)</Strong> option lets you write one directly. Cron can
+        say things the cadences above cannot — two fixed times a day, second-level granularity, the
+        13th and every Friday — and a routine already on such an expression opens in the custom
+        field with it intact rather than being rounded to the nearest cadence.
+      </P>
+      <Pre lang="text">{`┌───── minute (0 - 59)
+│ ┌─── hour (0 - 23)
+│ │ ┌─ day of month (1 - 31)
+│ │ │ ┌─ month (1 - 12)
+│ │ │ │ ┌─ day of week (0 - 6, Sunday = 0)
+│ │ │ │ │
+0 9 * * 1-5   →  weekdays at 09:00
+*/15 * * * *  →  every 15 minutes
+0 9,17 * * *  →  09:00 and 17:00, every day`}</Pre>
+      <P>
+        AI Employees writing a routine through <Code>create_routine</Code> or{" "}
+        <Code>update_routine</Code> pass the cron expression the same way they always did, and it is
+        read in the company&apos;s time zone like any other — the control is how humans are asked,
+        not a change to what is stored.
+      </P>
+      <P>
+        Cron is not the only way a routine fires. A <Strong>Trigger</Strong> subscribes a routine to
+        a resource family — deals, mail, Runs, <DocLink to="/docs/goals">Goals</DocLink> — and fires
+        it whenever that family changes anywhere in the company, with a per-trigger minimum interval
+        so a busy family can&apos;t hot-loop it. Gated routines still meet their{" "}
+        <DocLink to="/docs/routines#approvals">Approval</DocLink>. An AI Employee with write access
+        to Routines can add one too — say, to run its Banking routine whenever new transactions
+        arrive — limited to business records such as invoices, bills, bank and card transactions,
+        deals, and todos, company-wide, and at most once every five minutes. See{" "}
+        <DocLink to="/docs/reactivity#triggers">Reactivity</DocLink>.
+      </P>
+
+      <H2 id="the-brief">The brief</H2>
+      <P>
+        The <Code>body</Code> is markdown the model reads at run time. Keep it short and verb-first.
+        Reference a <DocLink to="/docs/skills">Skill</DocLink> by name if the playbook already
+        exists; otherwise describe the desired outcome.
+      </P>
+      <Pre lang="markdown">{`# Morning brief
+
+Every weekday at 09:00, post a 5-bullet summary of:
+1. Stripe revenue for the last 24h (call \`reconcile-stripe-payouts\`)
+2. New customer signups (Postgres connection "prod-read")
+3. Open PRs assigned to humans (GitHub connection "main")
+4. Anything new in #alerts since yesterday
+5. One sentence of your own opinion about the day
+
+Post it to the #morning channel.`}</Pre>
+      <P>
+        Edit it on the routine&apos;s <Strong>Brief</Strong> tab. Through the authenticated company
+        API, send the markdown as <Code>content</Code> to{" "}
+        <Code>PUT /api/companies/:companyId/routines/:routineId/readme</Code>. The routine&apos;s
+        settings endpoint, <Code>PATCH /api/companies/:companyId/routines/:routineId</Code>, does
+        not take <Code>body</Code>: it refuses any field it does not handle with a 400 that names
+        it, and saves nothing from that request.
+      </P>
+      <P>
+        A <Code>GET</Code> on the same path returns <Code>awaitingBrief: true</Code> while a paused
+        routine still has a blank brief or the starter outline. The <Code>PUT</Code> answers with
+        the routine&apos;s <Code>enabled</Code> state after the save, which is <Code>true</Code>{" "}
+        when that save wrote its first brief and switched it on.
+      </P>
+
+      <H2 id="assistant">Ask AI about a routine</H2>
+      <P>
+        Open a routine and press <Strong>Ask AI</Strong> in the top bar (or <Code>⌘J</Code> /{" "}
+        <Code>Ctrl J</Code>). The routine is already in the chat, and the employee that owns it
+        answers by default, because the question is usually about their work. They are handed the
+        routine itself before they read your message: the schedule and every setting, the brief, how
+        the last ten <Strong>Runs</Strong> went, and the tail of the newest Run&apos;s log. So
+        &ldquo;why did last night&apos;s run fail?&rdquo; is answered from the transcript rather
+        than guessed at — and you never have to paste a log in. Type <Code>@</Code> to hand the
+        question to somebody else, or tag several employees to compare their views. The{" "}
+        <DocLink to="/docs/ask-ai">Ask AI</DocLink> page covers the panel itself.
+      </P>
+      <P>
+        Asking is not editing. Any Member who can open a routine can ask about it, while changing
+        one still needs an admin — and the employee is told to describe a change rather than make
+        it. If you do ask for the change and you have the rights to make it, it runs with{" "}
+        <em>your</em> authority, and whatever it did shows up as a small action pill under the
+        reply. A successful answer from another employee about this routine also lets that employee
+        suggest an <DocLink to="/docs/improvement">improvement to its brief</DocLink> for your
+        review.
+      </P>
+
+      <H2 id="concurrent-runs">Concurrent Routine Runs</H2>
+      <P>
+        Each AI Employee can run <Strong>multiple Routines at the same time</Strong>. Scheduled,
+        manually started, and triggered Runs start independently, including when that employee is
+        already working. Runs waiting to start survive a server restart. Retries and continuations
+        wait until their due time, and a Standdown defers affected work until it is lifted.
+      </P>
+      <P>
+        The exception is an AI Model with a <Strong>Concurrent Routine Runs</Strong> limit. A model
+        server on this machine or a private network serves one Routine at a time by default, and
+        you can set a limit on any model. Runs beyond it wait in the queue — Routines →{" "}
+        <Strong>Running</Strong> lists them under <Strong>Queued</Strong>, and the Run log says
+        which model they are waiting for — and start when a Run on that model finishes, in queue
+        order, with their whole time limit. Paused Runs resume first, continuations
+        of unfinished work start ahead of new work, and their wait does not count against the time
+        their earlier Run left; among the rest, <DocLink to="/docs/routines#priority">High
+        priority</DocLink> Routines go first and otherwise the oldest Run does. See{" "}
+        <DocLink to="/docs/open-source-models#busy-model">When the model is busy</DocLink>.
+      </P>
+      <P>
+        On <Strong>Home</Strong>, choose an AI Employee&apos;s bubble to see the{" "}
+        <Strong>Routine Runs</Strong> above their daily calendar: concurrent Routines and any
+        pending work, including delayed retries, continuations, and Standdown reasons. Both update
+        automatically. Changing the calendar date does not change the current work. Pending Runs
+        are listed in the order they will start, each with its place in the company&apos;s queue —{" "}
+        <Strong>Next up</Strong>, <Strong>#2</Strong>, … — counted across every AI Employee, since
+        employees on one model server share it. They wait only for their AI Model&apos;s
+        concurrent-Run limit, never for the employee&apos;s other Routines.
+      </P>
+      <P>
+        Starting a Routine does not make its AI Employee unavailable for Chat. Conversations are
+        independent too: one AI Employee answers several conversations at once, and only a second
+        message in the <em>same</em> thread waits for the reply ahead of it. Your deployment
+        operator and AI Model provider still determine real capacity, cost, and rate limits.
+      </P>
+      <Callout kind="warn" title="Parallel work shares the employee workspace.">
+        Reads are safe. For writes, use distinct output files and avoid simultaneous git operations
+        or edits to the same file. Browser sessions also share the employee&apos;s persisted browser
+        state.
+      </Callout>
+
+      <H2 id="priority">Putting a Routine first</H2>
+      <P>
+        When Routines wait for a busy AI Model, mark the ones that matter most{" "}
+        <Strong>High priority</Strong>: open the Routine, then <Strong>Settings → Advanced</Strong>,
+        and under <Strong>Execution</Strong> choose <Strong>Priority: High</Strong> and{" "}
+        <Strong>Save changes</Strong>. Every Routine starts <Strong>Normal</Strong>. A High
+        Routine carries a <Strong>High</Strong> mark in the Routines list, in its header, on{" "}
+        <Strong>Running</Strong>, and in an AI Employee&apos;s day, and the closed{" "}
+        <Strong>Advanced</Strong> line says <Strong>High priority</Strong>.
+      </P>
+      <P>Waiting Runs start in this order, the same order Running and an employee&apos;s day show:</P>
+      <UL>
+        <LI>
+          <Strong>Paused Runs</Strong> — paused for a restart, or while their AI Model was
+          unavailable — which were already working and resume first.
+        </LI>
+        <LI>
+          <Strong>Continuations</Strong> of unfinished work, which finish what a Run began.
+        </LI>
+        <LI>
+          <Strong>Everything else</Strong>: High priority before Normal, and within each the Run
+          queued first.
+        </LI>
+      </UL>
+      <P>
+        The queue reads each Routine&apos;s priority when it decides the order, so marking a
+        Routine High moves the Runs it already has waiting straight away, and setting it back to
+        Normal moves them back. Nothing waits forever: a Normal Run that has waited a day counts as
+        High from then on, behind the High work that was already waiting, so High Routines that
+        keep the model busy all day can hold Normal work back by a day at most.
+      </P>
+      <P>
+        Priority only orders Runs that are waiting. It never stops a Run that is already working,
+        lets a Run past a <DocLink to="/docs/standdowns">Standdown</DocLink>, an approval, an
+        upgrade or the one-Run-at-a-time rule for each Routine, or makes a model serve more Runs at
+        once. A High Run held back by one of those does not hold up the queue: the Runs behind it
+        start meanwhile. On a model with no limit every Run starts at once, so priority changes
+        nothing there.
+      </P>
+      <P>
+        Owners and admins set priority, like every other Routine setting; Members see it. AI
+        Employees can read it with <Code>get_routine</Code> and <Code>list_routines</Code> but no
+        tool changes it: the queue is shared by every Routine on the model, and who goes first is
+        the owners&apos; call. Through the API it is <Code>priority</Code> (<Code>normal</Code> or{" "}
+        <Code>high</Code>) on <Code>PATCH /api/companies/{"{cid}"}/routines/{"{rid}"}</Code> and
+        when creating a Routine; from a terminal,{" "}
+        <Code>genosyn-api routines update &lt;routine-id&gt; --priority high</Code>.
+      </P>
+      <Callout kind="info" title="A queue that keeps growing">
+        A self-hosted model serves one Run at a time by default, shared by every AI Employee that
+        uses it. When the Runs scheduled each day need more of the model&apos;s time than the day
+        has — a dozen Routines of an hour or more each, say — the queue grows and Runs wait for
+        hours. That is the limit working, not a fault. Mark the Routines that matter most High,
+        schedule the rest less often or make them shorter, or raise{" "}
+        <DocLink to="/docs/models#concurrent-runs">Concurrent Routine Runs</DocLink> if the server
+        batches well.
+      </Callout>
+
+      <H2 id="parallel-delegation">Parallel delegation</H2>
+      <P>
+        API-key and custom-endpoint Chat turns and Routine runs include{" "}
+        <Code>delegate_parallel_work</Code>. An AI Employee can split an objective into independent
+        briefs, run up to four temporary copies of itself at once, and receive their ordered results
+        before it writes the final answer or takes follow-up action. Each worker uses the same Soul,
+        Skills, AI Model, Grants, secrets, and timeout as its parent.
+      </P>
+      <P>
+        An AI Model with a <Strong>Concurrent Routine Runs</Strong> limit, which a local model
+        server has by default, does not include it: each worker would be one more long conversation
+        on the same GPU. See{" "}
+        <DocLink to="/docs/open-source-models#busy-model">When the model is busy</DocLink>.
+      </P>
+      <Callout kind="info" title="Subscription turns run one at a time per AI Model">
+        OpenAI subscription turns do not include parallel delegation. Managed ChatGPT credentials
+        may rotate during a Run, so Genosyn serializes subscription work on that AI Model to keep
+        refreshes consistent.
+      </Callout>
+      <Pre lang="markdown">{`Research our weekly launch brief in parallel:
+
+1. Summarize customer feedback from the support mailbox.
+2. Compare this week's Stripe metrics with last week.
+3. Review merged GitHub pull requests for customer-visible changes.
+
+Verify the three results, resolve any disagreement, then post one concise brief to #launch.`}</Pre>
+      <H3 id="github-issue-subagents">Copy/paste: one worker per GitHub issue</H3>
+      <P>
+        Before using this example, connect GitHub, allowlist the repository, and give the AI
+        employee a Grant to that Connection. See{" "}
+        <DocLink to="/docs/integrations#github-engineering">
+          GitHub &amp; engineering grants
+        </DocLink>
+        .
+      </P>
+      <Pre lang="markdown">{`Triage up to 12 open GitHub issues in acme/widgets.
+
+Please use subagents for this task. Use one subagent for each GitHub issue.
+
+First list the open issues and ignore pull requests. Give each temporary worker one issue number,
+its title and body, and ask it to identify the likely cause, affected area, severity, missing
+information, and a recommended next step. Verify the returned findings, then produce one table
+ordered by severity with links to the issues.
+
+This is read-only triage. Do not edit files, create branches, commit, push, or comment on issues.`}</Pre>
+      <P>
+        Replace <Code>acme/widgets</Code> with the allowlisted repository. The sentence about
+        subagents is ordinary Routine instructions, not special syntax: the AI Model plans the work
+        and calls <Code>delegate_parallel_work</Code> when that tool is available and the issue
+        briefs are independent. Confirm the call in the Run log. If delegation is unavailable or
+        unsafe, the employee should explain the constraint and continue serially.
+      </P>
+      <Callout kind="warn" title="Keep one-worker-per-issue work read-only.">
+        Temporary workers share one checkout. Issue research and triage can run safely in parallel;
+        concurrent code edits, branches, commits, pushes, or other git operations in that checkout
+        can conflict. Use separate Runs or a deliberately partitioned workflow for implementation.
+      </Callout>
+      <UL>
+        <LI>
+          A delegation call accepts up to eight briefs, runs at most four at a time, and a top-level
+          turn can delegate twelve briefs in total. Temporary workers cannot delegate again. For
+          more than twelve issues, narrow the filter or split the review across separate Runs.
+        </LI>
+        <LI>
+          Workers receive only their self-contained brief, not the parent chat history. Include the
+          relevant dates, data sources, constraints, and expected output in each brief.
+        </LI>
+        <LI>
+          Longer briefs return a pending status and result IDs after a short wait. The parent can
+          continue independent work and recover the results without starting duplicate workers; it
+          can also wait briefly for a particular result instead of checking repeatedly. Pending work
+          does not mean the company&apos;s tools are unavailable. Ending the parent turn stops its
+          unfinished workers. Completed evidence remains available to authorized retries and
+          continuations.
+        </LI>
+        <LI>
+          Workers share the employee&apos;s working directory. Parallel reads are safe; for writes,
+          assign distinct files and avoid concurrent git operations or overlapping edits.
+        </LI>
+        <LI>
+          Delegation multiplies AI Model usage. The parent Run timeout still applies to every worker
+          and aborts the whole group when it expires.
+        </LI>
+      </UL>
+      <Callout kind="info" title="Parallel delegation is not a Handoff.">
+        Temporary workers are copies of the same AI Employee and return during the current turn. A
+        Handoff delegates durable work to a different AI Employee, with its own inbox and status
+        trail.
+      </Callout>
+
+      <H2 id="self-serve">Employees manage their own routines</H2>
+      <P>
+        You don&apos;t have to click through the editor yourself — every AI Employee holds built-in
+        tools for the full routine lifecycle: <Code>list_routines</Code>,{" "}
+        <Code>create_routine</Code>, <Code>update_routine</Code>, and <Code>delete_routine</Code>.
+        Ask an employee in chat to set up a weekly report, move it to Fridays, rewrite its brief, or
+        pause it, and they edit the existing routine in place —<Code>update_routine</Code> covers
+        rename, re-schedule, brief rewrites, and the enable/disable switch, so nothing forces a
+        duplicate. That is the default; <DocLink to="/docs/routines#ai-access">AI access</DocLink>,
+        below, can hold an employee to reading and running Routines instead.
+      </P>
+      <P>
+        The same brief rule applies here. <Code>create_routine</Code> without a brief creates the
+        routine paused, and its reply says so. The first brief <Code>update_routine</Code> writes
+        switches it on, unless that call also sets <Code>enabled</Code>. A routine created with a
+        brief is switched on at once.
+      </P>
+      <P>
+        Every change made this way is written to the{" "}
+        <DocLink to="/docs/employees">audit log</DocLink>, and creating or deleting a routine also
+        lands in the owning employee&apos;s journal, so the humans can always see who rescheduled
+        what.
+      </P>
+
+      <H2 id="ai-access">AI access: read + write or read + run</H2>
+      <P>
+        Open <Strong>Routines → AI access</Strong> — pinned at the bottom of the Routines sidebar —
+        to see every AI Employee in the company and what it may do with Routines. Each one is at one
+        of two levels, and the level covers every Routine: its own and its teammates&apos;.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Read + write",
+            def: "The default, and what every AI Employee could already do. It reads every Routine and its Runs, its Routines keep running, and it may create, edit, re-schedule, pause, re-file, tag, and delete Routines — its own, and those of teammates who also hold Read + write.",
+          },
+          {
+            term: "Read + run",
+            def: (
+              <>
+                It still reads every Routine, its brief, and its Runs (<Code>list_routines</Code>,{" "}
+                <Code>get_routine</Code>, <Code>list_runs</Code>, <Code>get_run_report</Code>), and
+                its Routines keep running. <Code>create_routine</Code>,{" "}
+                <Code>update_routine</Code>, and <Code>delete_routine</Code> are refused for every
+                Routine, and so is a <DocLink to="/docs/pipelines#ai">Pipeline</DocLink> schedule
+                trigger, which would be recurring work by another name.
+              </>
+            ),
+          },
+        ]}
+      />
+      <P>
+        Read + run never stops a Run. Its Routines start exactly as before — on their schedule, from
+        a <DocLink to="/docs/reactivity">Trigger</DocLink> or webhook, from{" "}
+        <Strong>Run now</Strong>, or as a retry — and inside a Run it still saves checkpoints and
+        reports failure. What it takes away is change, in both directions: the employee cannot
+        change any Routine, and no other AI Employee can change <Strong>its</Strong> Routines, so a
+        change cannot be handed to a teammate that may write. Members still edit every Routine in
+        the Routines section, and the employee can still suggest a better brief or acceptance
+        criteria as a{" "}
+        <DocLink to="/docs/improvement">Revision proposal</DocLink>, or propose new standing work
+        as an Initiative — nothing changes until a human applies or accepts it.
+      </P>
+      <P>
+        Every Member can open the page and see who is read + run; only owners and admins can change
+        a level, and each change is recorded in the{" "}
+        <DocLink to="/docs/security#audit-log">audit log</DocLink> as{" "}
+        <Code>routine.ai_access.update</Code> with the level before and after. A read + run
+        employee is told so in its briefing — in chat and in every Run — and the three writers
+        leave the set of tools it sees on every step, so it says it can&apos;t make a change instead
+        of attempting one. A Member chatting with it cannot lend it write access. The setting
+        governs only what AI Employees do through their tools.
+      </P>
+      <Callout kind="info" title="Same page, same rules as Resources → AI access.">
+        Routines and <DocLink to="/docs/resources#ai-access">Resources</DocLink> each have an AI
+        access page with one row per employee and the default at the top level, so an upgrade
+        changes nothing until you narrow someone.
+      </Callout>
+
+      <H2 id="model">Picking a model</H2>
+      <P>
+        An employee can hold several <DocLink to="/docs/models">AI Models</DocLink> and keeps one
+        active. By default a routine runs on that active model — the <Strong>Model</Strong> field
+        under <Strong>Settings → Advanced</Strong> reads <Strong>Inherit</Strong>, and the routine
+        follows the employee whenever you switch their brain.
+      </P>
+      <P>
+        Pick a specific model instead to <Strong>pin</Strong> it. The routine then always runs on
+        that model regardless of which one is active. This is how you put a noisy hourly digest on a
+        cheap local endpoint while choosing a frontier model in employee Chat — or the reverse,
+        pinning the weekly board report to your strongest model.
+      </P>
+      <UL>
+        <LI>
+          You can only pin a model that <Strong>belongs to that employee</Strong>. Register it at
+          the employee&apos;s <Strong>Settings → Model</Strong> first (
+          <Strong>Add an AI Model</Strong> if they already have one).
+        </LI>
+        <LI>
+          A pin only affects this routine&apos;s <Strong>Runs</Strong>. Dedicated employee Chat has
+          its own per-message picker when multiple models are connected; it defaults to whatever
+          model that conversation last answered on, and to the active model for a new thread.
+        </LI>
+        <LI>
+          Remove a pinned model and its routines quietly revert to <Strong>Inherit</Strong> rather
+          than breaking. The run log names the model it used and whether it was pinned or inherited.
+        </LI>
+      </UL>
+
+      <H2 id="runs">Runs</H2>
+      <P>
+        Every accepted scheduled occurrence creates a <Code>Run</Code> row, unless the Routine
+        already has a scheduled Run waiting to start: that Run then covers the new occurrence too
+        (see <a href="#missed-slots">missed slots</a>). <Strong>Run now</Strong>{" "}
+        opens the Routine&apos;s existing queued or running Run when there is one, including while a
+        stopped Run is still finishing cleanup. This also prevents a repeated click after a lost
+        response from starting duplicate work. Once that work has fully ended, a fresh click creates
+        a new Run. Home&apos;s <Strong>Retry</Strong> keeps the failure alert and opens the original
+        Run while its cleanup is still in progress. The runner runs OpenCode (or the official Codex
+        app-server for subscription models) with the employee&apos;s context and stores the agent
+        transcript — the model&apos;s messages and tool trace, not captured CLI stdout — on{" "}
+        <Code>Run.logContent</Code>. It records what each tool <Strong>returned</Strong>, not only
+        what was called, and an oversized transcript is elided in the middle rather than cut off at
+        the cap: the ending is where a Run says what it did, and it is the last thing worth losing.
+        While the Run is active, Genosyn checkpoints that transcript to the database about once a
+        second, so it survives a server or container crash.
+      </P>
+      <P>
+        The transcript is still the model&apos;s account of its own work. What the server recorded
+        the Run actually changing is the separate <Strong>Effects</Strong> list beside it — see{" "}
+        <DocLink to="/docs/verification">what proves a Run worked</DocLink>. Home&apos;s{" "}
+        <DocLink to="/docs/employees#work-timeline">AI Employee bubbles</DocLink> open each
+        employee&apos;s day, where Runs show a concise outcome summary with their status and
+        verification badges. Choose <Strong>Open the run log</Strong> there to read the full report
+        and inspect its evidence.
+      </P>
+      <P>
+        A routine&apos;s full run history lives on its <Strong>Runs</Strong> tab — every Run,
+        scheduled or manual, with the log viewer. If a Run actually opens a browser, Genosyn also
+        captures a silent visual recording automatically, from that browser session&apos;s first
+        activity until it finishes. Enabling Browser access alone creates no video, and browser
+        recordings contain no audio.
+      </P>
+      <P>
+        Open the Run log to watch the browser as it records. The <Strong>Browser recording</Strong>{" "}
+        panel beside the log shows <Strong>Live</Strong> and follows the current browser view. When
+        the recording is ready, it switches automatically to a player where you can replay, seek, or
+        download the finished MP4. A Run may have more than one recording when it delegates
+        independent browser work; use the numbered Browser buttons above the player to switch
+        between them.
+      </P>
+      <Callout kind="warn" title="Recordings follow the Browser access boundary">
+        A recording made in Genosyn&apos;s browser is available to company owners and admins. A
+        recording made in a <DocLink to="/docs/member-browsers">Member browser</DocLink> is
+        available only to that browser&apos;s exact owner, regardless of company role. Recordings
+        are kept whole: the video shows whatever the page rendered, sign-in screens included.
+      </Callout>
+      <UL>
+        <LI>
+          <Strong>Status</Strong> starts at <Strong>Running</Strong> and ends at{" "}
+          <Strong>Completed</Strong>, <Strong>Reviewed</Strong> (proactive review and preparation),{" "}
+          <Strong>Continued</Strong> (a{" "}
+          <DocLink to="/docs/routines#continuations">continuation</DocLink> took over the unfinished
+          work), <Strong>Failed</Strong>, <Strong>Error</Strong>, or <Strong>Skipped</Strong> (no AI
+          Model was connected). Completed means the work finished without a known failure; the
+          separate <DocLink to="/docs/routines#checks">Checks</DocLink> and{" "}
+          <DocLink to="/docs/routines#outcome-check">outcome verdict</DocLink> show what was
+          verified.
+        </LI>
+        <LI>
+          <Strong>Error</Strong> means a model request or runtime problem stopped the Run: a request
+          timeout, an unavailable AI Model, a response cut off at the model&apos;s output limit, or
+          an interrupted server. The Run log retains the cause. Older timeout and interrupted Runs
+          also display Error.
+        </LI>
+        <LI>
+          <Strong>Failed</Strong> means the intended work was not completed. An AI Employee can call{" "}
+          <Code>mark_run_failed</Code> with a <Code>reason</Code> during its own active Run; that
+          reason appears under <Strong>Why this Run failed</Strong> in the log. It cannot mark
+          another Run, change a Check, or mark itself successful. Exhausting required Check
+          remediation or an <Code>off goal</Code> outcome also fails the Run. A later runtime error
+          takes precedence and retains the reported failure reason.
+        </LI>
+        <LI>
+          Each Run also records the <Strong>tokens</Strong> it consumed — the provider&apos;s own
+          per-turn counts, summed. They show on the Run log modal and roll up per employee and per
+          routine at <Strong>Settings → Usage</Strong>.
+        </LI>
+        <LI>
+          The Run detail view tails the transcript while it&apos;s running, then renders the full
+          transcript when it&apos;s done.
+        </LI>
+        <LI>
+          Manual Runs from the &quot;Run now&quot; button live in the same table as scheduled Runs.
+        </LI>
+        <LI>
+          <Strong>Retry</Strong> a Run marked <Strong>Failed</Strong> or <Strong>Error</Strong>{" "}
+          straight from its run history. It opens any already accepted Run for that Routine;
+          otherwise it starts a fresh Run outside the schedule and opens its live log.
+        </LI>
+      </UL>
+      <P>
+        Recordings are kept for 7 days after they finish, then deleted; the Run and its log stay.
+        Change how long under <Strong>Keep browser recordings</Strong> at{" "}
+        <Code>Admin → Runtime → Browser</Code>, where <Code>0</Code> keeps them forever. Deleting
+        the Routine deletes its Run logs and browser recordings sooner, and deleting the company
+        removes them too. They live in the App-private data directory and are included in
+        whole-instance backups.
+      </P>
+      <P>
+        A Run that ends <Strong>Failed</Strong> or <Strong>Error</Strong> with no retry still
+        scheduled sends a bell (and web push) notification to the company&apos;s owners and admins,
+        deep-linked to the Run log. The Home page
+        additionally shows a <Strong>Routines needing attention</Strong> panel for anything that
+        broke in the last 24 hours — clicking a row there opens that Run&apos;s log over Home rather
+        than sending you to the routine — and every <Strong>Journal</Strong> entry for a Run links
+        straight to that routine&apos;s run history, where the Retry button is one click away. Once
+        you&apos;ve looked at a failure, hit the <Strong>✕</Strong> on its row to{" "}
+        <Strong>dismiss</Strong> it — the run stays in the routine&apos;s history, but it drops off
+        the panel (and out of the System Health failed-runs count) so it stops nagging the whole
+        team. A dismissed failure still appears in the employee&apos;s{" "}
+        <DocLink to="/docs/employees#work-timeline">work timeline</DocLink>, opened from their
+        bubble on Home, alongside every Run that went fine. Acknowledging a failure keeps it in the
+        account of what happened that day.
+      </P>
+      <P>
+        Click <Strong>Why did it fail?</Strong> or <Strong>Why did it error?</Strong> beside a Run
+        on Home, or inside its Run modal. <DocLink to="/docs/ask-ai">Ask AI</DocLink> opens a new
+        conversation with that Run in context and the question already typed, so the answer never
+        runs on from whatever you asked before: the AI Employee who ran the Routine reads the
+        Run&apos;s status, failure reason, outcome and Check verdicts, and the end of its log, then
+        explains the cause, the evidence, and what to try next. It is told that an Error (an
+        operational failure) is not a Failed Run (the work was not done), and not to retry, resume
+        or change anything unless you ask. Any Member can ask; follow-up questions stay in that
+        conversation, and your earlier ones are still in Ask AI&apos;s list.
+      </P>
+      <P>
+        Every row on that panel carries a <Strong>Retry</Strong> button too, so the commonest answer
+        to a broken Run doesn&apos;t cost a trip into the routine. It reuses any already accepted
+        Run or starts one outside the schedule. The source failure is dismissed only when another
+        Run was accepted. If the source still owns cleanup, its alert remains and its existing log
+        opens. Retry confirms first, because a Run that stopped part-way through may already have
+        changed records or sent a message; read the log if you&apos;re not sure repeating the work
+        is safe.
+      </P>
+      <P>
+        A failure the routine has already recovered from clears itself. If the routine has completed
+        a Run since — the next scheduled tick, an automatic retry, or a Retry you clicked — the
+        older failure drops off the panel and out of the System Health failed-runs count without
+        anyone dismissing it. It stays in the routine&apos;s run history, where the Run log and the{" "}
+        <Strong>Journal</Strong> still have it. The point is that a red panel on Home always means
+        something is broken <Strong>now</Strong>: a panel that is usually stale is a panel people
+        learn to scroll past.
+      </P>
+
+      <H2 id="outcome-check">The outcome check</H2>
+      <P>
+        A <Strong>Completed</Strong> Run has no known failure, but that alone is not verification.
+        The outcome check adds an independent assessment: give a routine{" "}
+        <Strong>acceptance criteria</Strong> (<Strong>Settings → What counts as done</Strong>) —
+        a plain-language definition of done, like &quot;the digest was posted to #general and
+        covers every failed run since the last digest&quot; — and two things happen.
+      </P>
+      <UL>
+        <LI>
+          The criteria ride along in every Run&apos;s brief, so the employee aims at the same bar it
+          will be graded against.
+        </LI>
+        <LI>
+          After a completed Run, a restricted checker — a zero-tool model turn on the same brain,
+          reading the transcript as untrusted evidence beside the server-written{" "}
+          <DocLink to="/docs/verification#effects">Effects</DocLink> list — grades the work and
+          stamps a verdict on the Run: <Code>achieved</Code>, <Code>unclear</Code> (it looked and
+          could not tell), <Code>off goal</Code>, or <Code>unverified</Code> (no judgement was ever
+          produced — the checker errored or never submitted). The verdict shows as a chip beside the
+          status everywhere Runs render, with the checker&apos;s one-line reason on hover and in the
+          log view.
+        </LI>
+      </UL>
+      <P>
+        An <Code>off goal</Code> verdict marks the Run <Strong>Failed</Strong> and notifies owners
+        and admins the same way a failure does — convincing-but-wrong is
+        exactly the failure mode a green checkmark hides. The verdict also lands in the
+        employee&apos;s Journal entry for the Run, so the employee itself learns from past outcomes
+        instead of only seeing that runs &quot;finished&quot;. <Code>unclear</Code> and{" "}
+        <Code>unverified</Code> keep their own meanings; neither is evidence that the work
+        succeeded. A routine with no criteria has no outcome verdict, extra model turn, or grading
+        cost.
+      </P>
+      <P>
+        A routine can also declare which company <DocLink to="/docs/goals">Goal</DocLink> its work
+        serves — the <Strong>Goal</Strong> picker on the <Strong>Settings</Strong> tab. The linked
+        goal rides into every Run&apos;s brief beside the criteria, and the checker receives it as
+        judging context: work that met the letter of the criteria while working against the
+        objective is <Code>off goal</Code>.
+      </P>
+      <P>
+        Verdicts also feed forward: a Run that fails, times out, or grades <Code>off goal</Code>{" "}
+        writes a <Strong>Lesson</Strong> into the routine&apos;s future briefs — see{" "}
+        <DocLink to="/docs/improvement">the improvement loop</DocLink>.
+      </P>
+      <Callout kind="info" title="What it costs">
+        One short extra model turn per completed Run, on the routine&apos;s own model. Its tokens
+        are counted into the Run&apos;s totals like everything else. Routines added from the{" "}
+        <DocLink to="/docs/getting-started#launch-plan">setup guide</DocLink> and the built-in
+        Proactive starters come with criteria already written, so their Runs are graded from the
+        first one.
+      </Callout>
+
+      <H2 id="checks">Checks</H2>
+      <P>
+        The outcome check is still a model reading a transcript another model wrote. A{" "}
+        <Strong>Check</Strong> is the third axis and the only one with no model in it: a
+        machine-verifiable assertion the Run must pass before it finalizes green, written by an
+        operator on the routine&apos;s <Strong>Settings → Advanced → Checks</Strong> panel.
+      </P>
+      <P>
+        A company admin configures Checks in that panel, or through the authenticated company API at{" "}
+        <Code>/api/companies/:companyId/routines/:routineId/checks</Code>. AI Employees can read the
+        requirements but cannot change them. Run reports explicitly show when no Check evidence
+        exists, and show the current configuration separately from the evidence a past Run recorded.
+      </P>
+      <P>
+        A proactive Run with status <Strong>Reviewed</Strong> has examined evidence and may have
+        completed permitted preparation; delivery remains unverified and its delivery Checks have
+        not run. Approving a major work proposal in the{" "}
+        <DocLink to="/docs/decisions">Decision stack</DocLink> starts a separate Run with the
+        original Checks and outcome grading. A Check cannot authorize work beyond the approved plan.
+      </P>
+      <UL>
+        <LI>
+          An <Strong>effect</Strong> Check counts what the server recorded this Run changing — at
+          least one <Code>mail.send</Code>, at most three. No shell, no model, no extra cost.
+        </LI>
+        <LI>
+          A <Strong>command</Strong> Check runs a shell command in the configured execution mode and
+          passes on exit <Code>0</Code> — a test suite, a <Code>git diff --exit-code</Code>, a
+          script that checks the thing was deployed.
+        </LI>
+      </UL>
+      <P>
+        Every Check&apos;s result lands on the Run with its detail and how long it took, and the Run
+        carries a <Strong>checks verdict</Strong> chip beside its status. A failing required Check
+        earns the employee up to two more briefed attempts inside the routine&apos;s existing
+        timeout — never more time, never a third round — and then finalizes as a failure that
+        revokes waivers and writes a Lesson like any other. Checks ride into the Run brief, so the
+        employee aims at the bar; no MCP tool can create, edit, or delete one. See{" "}
+        <DocLink to="/docs/verification">what proves a Run worked</DocLink>.
+      </P>
+      <P>
+        Choose assertions that prove the intended result. For a coverage report, a command Check
+        should compare source counts and completed cursors with the saved report and reject gaps or
+        duplicate IDs. For an artifact, verify that it exists, parses and contains the required
+        fields. For a read-only Routine, an effect Check with <Code>mail.send</Code> and a maximum
+        of zero verifies that the Run sent no email. Add separate bounds for each prohibited effect;
+        a single action count does not prove that every safety requirement held. A command that
+        merely exits successfully without checking evidence adds no assurance.
+      </P>
+
+      <H2 id="recovery">Downtime and recovery</H2>
+      <P>
+        Failed and Error Run reports include saved failure details independently of the transcript:
+        the phase, observed tool step, exception message and timeout reason where available.
+        Authorization, tool, timeout, model and application problems stay distinct. Recent tool
+        errors remain evidence even if a later step recovered; they do not by themselves turn a
+        completed Run into a failure. Sensitive values are redacted. Older Runs without detailed
+        evidence say so instead of inventing a cause.
+      </P>
+      <P>
+        Servers restart, containers get rescheduled, laptops go to sleep. Genosyn handles a planned
+        restart, a crash, and downtime across scheduled slots differently.
+      </P>
+
+      <H3 id="paused-for-restart">Paused for a restart, then resumed</H3>
+      <P>
+        An upgrade, <Code>genosyn stop</Code>, <Code>docker stop</Code>, or a Kubernetes rollout
+        pauses the Runs that are working instead of cutting them off. Each one stops its model
+        turn and goes back to the queue as the same Run, keeping its transcript, tokens, saved
+        progress, and Effects. Its status reads <Strong>Resuming</Strong> — the Routine itself
+        stays Active — and its log says it is waiting for Genosyn to come back. Nothing needs
+        doing: once Genosyn is running again, the same Run continues where it stopped, ahead of
+        new work, with the time it had left on its limit — the restart and the wait spend none of
+        it.
+      </P>
+      <P>
+        An upgrade gives each Run up to 90 seconds to save its progress first, so the employee
+        records exactly where to pick up; a stop pauses at once. Because the model&apos;s
+        conversation does not survive a restart, the resumed turn opens with the record of what
+        the Run had done: its saved progress, the changes the server recorded for it, and the end
+        of its transcript. It checks the current state before repeating anything a step in flight
+        may already have done. The Run log shows one transcript, with a <Code>[paused]</Code> and
+        a <Code>[resumed]</Code> line where the restart happened.
+      </P>
+      <P>
+        A pause is not a failure: it is not counted against the Routine or the AI Employee, sends
+        no alert, and owes no retry. It is not a{" "}
+        <DocLink to="/docs/standdowns">Standdown</DocLink> either — a Standdown placed while a Run
+        is paused still holds it in the queue until it is lifted. A Routine disabled or removed
+        while one of its Runs was paused ends that Run with an interruption reason, keeping its
+        transcript. A Run Genosyn has to pause for a restart more than five times ends instead of
+        resuming again.
+      </P>
+
+      <H3 id="paused-for-unavailable-model">Paused while its AI Model was unavailable</H3>
+      <P>
+        When a Run&apos;s <DocLink to="/docs/models#unavailable">AI Model is unavailable</DocLink> —
+        its service can&apos;t be reached, is failing or overloaded, or every key is rate-limited —
+        the Run does not end in an Error. A Run that was working pauses the way it does for a
+        restart: it goes back to the queue as the same Run with its transcript, tokens, saved
+        progress and Effects, and the time it had left. Its status reads <Strong>Resuming</Strong>,
+        and a <Code>[paused]</Code> line in its log says what the model answered. A Run that had not
+        started simply waits in the queue, its log saying which model it waits for; its time limit
+        starts when it does.
+      </P>
+      <P>
+        Once a check or any other work finds the model answering again, the paused Runs continue
+        where they stopped — first in line, a few seconds apart — with a <Code>[resumed]</Code>{" "}
+        line, and the queued ones follow. A scheduled slot that comes due meanwhile is covered by the
+        Routine&apos;s scheduled Run that is already waiting rather than queueing another, and
+        Triggers and Wakeups that fire meanwhile wait too, so nothing is dropped and no backlog
+        builds up.
+      </P>
+      <P>
+        Like a restart pause, it is not a failure: no failure count, alert, Journal entry, retry,
+        outcome verdict or change to the employee&apos;s Waivers. A Standdown placed meanwhile still
+        holds the Run until it is lifted. A Run whose model becomes unavailable more than ten times
+        ends as an <Strong>Error</Strong> instead of pausing again; these pauses never count toward
+        the five restarts.
+      </P>
+
+      <H3 id="crash-mid-run">The server stopped mid-run</H3>
+      <P>
+        A Run that was executing when the process died without pausing it — a crash, a power cut,
+        a kill — can&apos;t report its own outcome: nobody was left to write the row. If Genosyn
+        was stopping and the Run simply could not pause in time — stuck in a long call, or a
+        runtime that would not wait — the stopping process marked it first, so it is paused and
+        resumed as above from its last durable line, charged only the time it had worked. The same
+        goes for a Run an upgrade cut off while it was holding the queue, even on an image too old
+        to mark it. Otherwise the scheduler notices on its next heartbeat and marks it{" "}
+        <Strong>Error</Strong> with an interruption reason, appending a line after the last durable
+        checkpoint. The Run log still shows the model text and tool activity captured before the
+        stop, so the final line identifies where the visible work ended. Nothing is known about work
+        the employee did after that line. The interruption describes a runtime problem; it does not
+        judge the work itself.
+      </P>
+      <P>
+        Recovery distinguishes a confirmed restart from an overdue Run whose outcome was never
+        saved. An overdue record alone does not prove the server restarted. If this process still
+        owns the Run and its deadline has passed, recovery requests cancellation and records a
+        timeout. Another Run of the same Routine waits until the earlier Run finishes cleanup; this
+        also applies to manual retries. Independent Routines can continue working.
+      </P>
+      <P>
+        When Genosyn marks an initial scheduled Run on an enabled routine interrupted, it also
+        records a durable recovery retry. At the default <Strong>1 attempt</Strong>, exactly one
+        recovery attempt becomes due an hour later. Raising Attempts lets later interruptions in
+        that retry chain continue with the routine&apos;s configured jittered backoff, up to the
+        five-attempt cap. Manual &quot;Run now,&quot; webhook, and approval Runs are excluded.
+        Pausing the routine or adding an approval gate before dispatch cancels the automatic
+        attempt.
+      </P>
+      <Callout kind="info" title="Recovery starts with newly interrupted Runs.">
+        Upgrading does not sweep old interrupted history and replay it. Only a scheduled or retry
+        Run that Genosyn marks interrupted after this recovery behavior is active receives the
+        automatic attempt.
+      </Callout>
+      <H3 id="missed-slots">The server was off across scheduled slots</H3>
+      <P>
+        A routine fires <Strong>once</Strong> when the server comes back, never once per missed
+        slot. An hourly digest that was down overnight produces one run, not twelve. The catch-up
+        run records how many occurrences it stands in for — you&apos;ll see <Code>+11 missed</Code>{" "}
+        on the run row — and its brief tells the employee to cover the whole period rather than just
+        the last interval.
+      </P>
+      <P>
+        The same happens when an occurrence comes due while the Routine&apos;s previous scheduled
+        Run is still waiting to start, for example behind a busy local model. The waiting Run takes
+        the new occurrence and shows <Code>+1 missed</Code>, so the queue never holds two Runs of
+        the same scheduled work. A Run that has already started is never extended this way, and a
+        Run someone started with <Strong>Run now</Strong> keeps its own occurrence: the scheduled
+        one still gets a Run of its own.
+      </P>
+      <P>
+        Set <Strong>After downtime</Strong> to <Strong>Skip</Strong> under the routine&apos;s{" "}
+        <Strong>Settings → Advanced</Strong> when a late run is worse than no run — a 09:00
+        standup digest arriving at 16:00 is noise. The skipped occurrences are recorded in the
+        employee&apos;s Journal so the gap is still visible.
+      </P>
+      <Callout kind="info" title="Missed slots are never replayed one-for-one.">
+        There is no setting that re-runs every occurrence you missed. A week of downtime on a
+        15-minute routine would be 672 runs and a very large model bill, so the ceiling is
+        deliberately one catch-up run per routine.
+      </Callout>
+
+      <H3 id="continuations">Unfinished work continues automatically</H3>
+      <P>
+        When an AI Employee saves completed work, the remaining items, and an actionable next step,
+        Genosyn starts a fresh <Strong>Run</Strong> to continue from that progress. This works for
+        existing and new Routines without changing <Strong>Attempts</Strong> or configuring a
+        Workstream. Open the Run log to see <Strong>Continuation scheduled</Strong>; use
+        <Strong> Cancel continuation</Strong> to stop the follow-up without disabling the Routine.
+        The Run that handed off ends <Strong>Continued</Strong>, not Failed: its work goes on in the
+        continuation, and the last Run in the chain carries the outcome. Continued Runs never count
+        as failures in alerts, Usage, earned autonomy or the letter to the board. A Run whose
+        employee reported a failure with <Code>mark_run_failed</Code> stays Failed while its work
+        continues. If the continuation is cancelled, stops before it starts, or is skipped, the Run
+        returns to <Strong>Failed</Strong> and shows the reason. Later Runs show their continuation
+        number. Once a later Run exists, the original Run links to it with its current status.
+        Choose
+        <Strong> Open continuation</Strong> to follow its progress. A completed or reviewed later
+        Run keeps its own Checks and outcome; it does not rewrite the original Run&apos;s result.
+      </P>
+      <P>
+        Each occurrence permits up to three continuation Runs after the initial Run. They share the
+        original Routine time limit; time a continuation spends waiting for a busy AI Model moves
+        that deadline by the same amount, so the wait never uses up its working time. Runs have no
+        fixed limit on model steps or tool calls, and no
+        total model token limit. Individual AI Model context and response limits still apply. Token
+        usage includes repeated and cached input across model calls; it is not just the text the
+        employee writes. Automatic continuation stops when the saved checkpoint does not advance,
+        the employee reports a blocker, too little of the time limit remains for another Run to do
+        useful work (five minutes, or a quarter of a shorter limit), or all three continuations
+        have run; the Run shows the reason. Current Grants, delivery limits, and Standdowns still apply, and
+        approval-gated work is never replayed automatically. The final continuation can keep working
+        within the remaining shared time: saving a checkpoint does not require ending that Run. It
+        should finish when its work is complete, a real blocker prevents further useful work, or it
+        must close before the deadline, preserving any unfinished progress. The Routine&apos;s
+        priorities govern the order of work; inherited backlog stays recorded without displacing
+        explicitly required current work or changing the captured scope.
+      </P>
+      <P>
+        Employees are briefed to save progress after small batches, retain stable source IDs and the
+        original review window, and verify earlier changes before repeating a write or send. The
+        five-record batch size applies to substantive review or processing. Compact inventory
+        listings can use bounded pages supported by their tools, reducing the page size when a
+        response is truncated; captured IDs alone do not count as completed reviews. After a Run
+        uses about two million tokens, Genosyn ends the batch at its next actionable saved
+        checkpoint and continues in a fresh Run when time and continuations remain. During a
+        continuation, that checkpoint must advance both its stable source position and its
+        completed-work or next-step description beyond the previous Run. Saving the same position
+        while still working keeps the current Run active; reaching the batch threshold alone does
+        not stop it. If the employee ends with an unchanged checkpoint, Genosyn stops automatic
+        continuation and explains that the saved checkpoint did not advance. Recorded Effects remain
+        visible, but do not replace a usable checkpoint. A saved checkpoint reports progress; it
+        does not prove completion or guarantee that an external action happens only once. Coverage
+        must be complete before advancing a verified checkpoint, and existing{" "}
+        <DocLink to="/docs/verification">Checks and outcome grading</DocLink> retain their own
+        meaning. A fully reviewed source with no matching Contacts can still be completed work.
+      </P>
+      <P>
+        If a Failed Run has unfinished saved work and no follow-up already created or queued, an
+        owner or admin can choose <Strong>Resume unfinished work</Strong> from its Run log, the
+        Routine&apos;s Runs tab, or Home. Confirming starts a new Run from that checkpoint. The
+        Routine&apos;s configured time limit starts again, with no total model token limit. Existing
+        progress and Effects remain available, and the employee verifies current records before
+        repeating actions. Current Grants, approval requirements and Standdowns still apply. Cancel
+        a pending retry or continuation before resuming manually. <Strong>Retry</Strong> and{" "}
+        <Strong>Run now</Strong> start the Routine afresh. A historical Run with a later follow-up
+        offers the link to that work instead of another resumption. Open the latest Run to see
+        whether it still needs attention.
+      </P>
+      <P>
+        For a backlog that spans scheduled Runs, define a bounded daily scope: review a fixed batch
+        of changed or due records, save the next source position, and leave the remaining queue in a
+        linked <DocLink to="/docs/reactivity#workstreams">Workstream</DocLink>. This lets later
+        scheduled Runs pick up the backlog without reading every unchanged record again.
+      </P>
+      <P>
+        Fixing a Connection or upgrading Genosyn does not complete an earlier failed Run. Read its
+        failure details and saved progress first: missing source access may now be recoverable,
+        while protected files, expired event history, or work outside the available time still need
+        attention. Resume saved work when its next step is actionable. A completed batch is only a
+        successful Run when it meets the Routine&apos;s required scope.
+      </P>
+
+      <H3 id="retries">Retries</H3>
+      <P>
+        Repeated Failed or Error Runs do not automatically stand a Routine down. An enabled Routine
+        remains eligible for later scheduled Runs, and its Run history, failure alerts, and Check
+        results stay available. An owner or admin can place a{" "}
+        <DocLink to="/docs/standdowns">Standdown</DocLink> when work needs to stop.
+      </P>
+      <P>
+        OpenCode manages temporary model-request retries for API-key and custom AI Models; the Codex
+        app-server manages subscription retries. These attempts remain inside the current Run. If
+        the runtime cannot complete the request, the same Run ends
+        <Strong> Error</Strong> — unless its AI Model is unavailable, when it{" "}
+        <a href="#paused-for-unavailable-model">pauses</a> instead and owes no retry. Stopping the
+        Run or reaching its deadline stops the runtime. See{" "}
+        <DocLink to="/docs/models#model-errors">model errors</DocLink> for the other model failures
+        and subscription behavior.
+      </P>
+      <P>
+        Retrying the <Strong>whole Routine</Strong> creates a new Run. These retries after{" "}
+        <Strong>Failed</Strong> Runs without a saved continuation and runtime{" "}
+        <Strong>Errors</Strong> are <Strong>off by default.</Strong> Raise <Strong>Attempts</Strong>{" "}
+        above 1 under the routine&apos;s <Strong>Settings → Advanced</Strong> to retry them
+        automatically, up to 5 attempts, waiting a randomized, doubling interval between each
+        (from <Strong>Retry backoff</Strong>, capped at six hours). Retrying after the Run&apos;s own deadline is opted in separately,
+        because retrying one re-burns the routine&apos;s whole time budget. An interrupted initial
+        scheduled Run on an enabled routine without an approval gate is the safety exception: even
+        at 1 attempt, it receives one recovery attempt after an hour. Above 1, interrupted retries
+        use the configured bounded backoff until the chain reaches its cap.
+      </P>
+      <Callout kind="warn" title="Retries are at-least-once.">
+        An interrupted Run may already have sent the email, posted the update, or moved the money
+        before the process died — Genosyn can&apos;t know. The recovery attempt may do it again.
+        Make routine actions safe to repeat, or use <Strong>Cancel retry</Strong> on the Run before
+        its retry becomes due.
+      </Callout>
+      <P>
+        The retry itself is no longer blind about it. Attempt 2 opens with the{" "}
+        <DocLink to="/docs/verification#effects">Effects</DocLink> the server recorded during every
+        earlier attempt in the chain — the emails that went out, the rows that moved — and is told
+        to verify each one before doing it again. It repeats the scheduled work with that
+        attempt&apos;s tools and limits: a retry is not new proactive work, so it is not narrowed to
+        preparation, and a Routine with an email delivery ceiling keeps it. Deliberately &quot;verify before redoing&quot;
+        rather than &quot;skip&quot;: the ledger proves an action was recorded, not that whatever it
+        touched downstream actually landed.
+      </P>
+      <UL>
+        <LI>
+          Only <Strong>scheduled</Strong> Runs and Runs created by an automatic retry are eligible.
+          A manual &quot;Run now,&quot; a webhook, or an approved Run had someone present who saw
+          the outcome, so nothing respawns behind their back.
+        </LI>
+        <LI>
+          A run with a retry pending stays out of the Home{" "}
+          <Strong>Routines needing attention</Strong> panel until its last attempt is spent — it
+          isn&apos;t something to act on yet. It shows under <Strong>Runs waiting to retry</Strong>{" "}
+          in System Health instead.
+        </LI>
+        <LI>
+          <Strong>Cancel retry</Strong> from the run&apos;s log view stops the chain without pausing
+          the whole routine — the escape hatch when you&apos;ve decided to fix the failure by hand.
+        </LI>
+        <LI>
+          These are operator settings. AI Employees managing their own routines through{" "}
+          <Code>update_routine</Code> cannot change them.
+        </LI>
+      </UL>
+
+      <H2 id="system-health">System Health</H2>
+      <P>
+        <Strong>Settings → Advanced → System Health</Strong> (also a card on the Home page) rolls up everything
+        that might be quietly broken for the company, over a 24-hour window:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Runs needing attention</Strong> — Failed Runs and Errors, including timeouts and
+          restarts, excluding anything already scheduled for a retry.
+        </LI>
+        <LI>
+          <Strong>Runs waiting to retry</Strong> — an in-progress retry chain, so it&apos;s visible
+          rather than silent. Nothing to do.
+        </LI>
+        <LI>
+          <Strong>AI Models unavailable</Strong> — models whose service can&apos;t be reached, is
+          failing or overloaded, or keeps every key rate-limited, with since when and what waits
+          for them. Nothing to do: the work carries on by itself once a check finds the model back
+          (see <DocLink to="/docs/models#unavailable">AI Models</DocLink>).
+        </LI>
+        <LI>
+          <Strong>Stuck</Strong> runs — still <Code>running</Code> after 8 hours. Crash recovery
+          clears orphans within a heartbeat now, so anything here means the scheduler itself
+          isn&apos;t running.
+        </LI>
+        <LI>
+          <Strong>Skipped runs</Strong> and <Strong>employees missing an AI model</Strong> —
+          routines that never actually ran because no model was connected.
+        </LI>
+        <LI>
+          <Strong>Approvals waiting too long</Strong>, <Strong>email delivery failures</Strong>, and{" "}
+          <Strong>integration connections</Strong> in an error/expired state.
+        </LI>
+      </UL>
+      <P>
+        Every row deep-links to where you fix it — the routine&apos;s run history, the
+        employee&apos;s model settings, the approvals inbox, or the relevant settings page. It is
+        read-only and computed live from existing data, so there is nothing to configure.
+      </P>
+
+      <H2 id="approvals">Approvals</H2>
+      <P>
+        Some routines should not auto-fire. Flip <Code>approvalRequired</Code> on and the runner
+        stops the moment the routine would take a sensitive action — raising an ad budget, sending
+        an email, hitting a third-party API. The action is recorded as an <Code>Approval</Code> row.
+        A company owner or admin must approve or reject it from a logged-in browser session; API
+        keys and ordinary Members cannot open the inbox or decide approvals. Approval claims are
+        one-shot, so double-clicks and concurrent reviewers cannot replay the action. If the
+        approved action fails, the row moves to <Code>execution_failed</Code> for investigation
+        instead of becoming eligible to run again. Replay payloads, provider results, and raw
+        provider failures are never returned by the inbox API.
+      </P>
+      <P>
+        A pending Approval never expires, so a gated tick nobody answers is lost, not queued.
+        Genosyn no longer lets that happen in silence: an Approval still pending after{" "}
+        <Strong>24 hours</Strong> re-pages the owners and admins with a stall reminder — once per
+        row, so the bell nags exactly one extra time. Pending <Strong>Decisions</Strong> and overdue{" "}
+        <Strong>Handoffs</Strong> get the same treatment; see{" "}
+        <DocLink to="/docs/decisions">the Decision Stack</DocLink> and{" "}
+        <DocLink to="/docs/employees">AI Employees</DocLink>.
+      </P>
+
+      <H3 id="approval-kinds">Built-in approval kinds</H3>
+      <UL>
+        <LI>
+          <Code>routine</Code> — the whole Run is gated.
+        </LI>
+        <LI>
+          <Code>browser_action</Code> — a form submit from an employee whose{" "}
+          <DocLink to="/docs/browser">Browser</DocLink> requires approval for submits.
+        </LI>
+        <LI>
+          <Code>mcp_tool</Code> — a guarded tool on a company-configured{" "}
+          <DocLink to="/docs/integrations">MCP server</DocLink>. The call is snapshotted and
+          replayed on approve.
+        </LI>
+        <LI>
+          <Code>ad_spend</Code> — a spend-increasing ad-platform change above the Connection&apos;s
+          threshold. See <DocLink to="/docs/marketing">Paid Marketing</DocLink>.
+        </LI>
+        <LI>
+          <Code>lightning_payment</Code> — a retired kind. Nothing issues one any more; it stays
+          readable so Approvals decided before the Lightning connector was removed keep their
+          meaning.
+        </LI>
+      </UL>
+    </>
+  );
+}

@@ -1,0 +1,840 @@
+import { FROM_TODO_PARAM, linkSavedToTodo } from "@/components/todos/linkFromTodo";
+import React from "react";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useOutletContext,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
+import { ArrowLeft, Mail, Plus, Trash2 } from "lucide-react";
+import {
+  api,
+  canEditInvoice,
+  financeSubsidiaries,
+  Subsidiary,
+  InvoiceIssuer,
+  Customer,
+  formatMoney,
+  Invoice,
+  invoiceSettledCents,
+  InvoiceLineDraft,
+  parseMoneyToCents,
+  Product,
+  TaxRate,
+} from "../lib/api";
+import { customerOptionLabel } from "../lib/customerLabel";
+import { withSavedCustomer } from "../lib/customerBillTo";
+import {
+  type DiscountDraft,
+  discountDraftFrom,
+  discountDraftProblem,
+  discountFromDraft,
+  NO_DISCOUNT_DRAFT,
+  previewTotals,
+} from "../lib/discountForm";
+import { initialCustomerPick, requestedCustomerPick } from "../lib/customerPick";
+import { errorMessage } from "../lib/errors";
+import {
+  DEFAULT_PAYMENT_TERMS_DAYS,
+  addDays,
+  draftCustomerRequest,
+  draftFromOneTimeInvoice,
+  invoiceDraftState,
+  newInvoiceStep,
+  oneTimeInvoiceFromDraft,
+  readInvoiceDraft,
+  switchInvoiceKindPath,
+  type InvoiceDraftLine,
+} from "../lib/invoiceKind";
+import { canWriteFinance } from "../lib/subpages";
+import { Breadcrumbs } from "../components/AppShell";
+import { Button } from "../components/ui/Button";
+import { FormError } from "../components/ui/FormError";
+import { Spinner } from "../components/ui/Spinner";
+import { Input, fieldClassName } from "../components/ui/Input";
+import { Textarea } from "../components/ui/Textarea";
+import { Select } from "../components/ui/Select";
+import { InvoiceIssuerFixed, InvoiceIssuerSelect } from "@/components/finance/InvoiceIssuer";
+import { CustomerBillTo } from "@/components/finance/CustomerBillTo";
+import { FinanceReadOnlyPage } from "@/components/finance/FinanceReadOnly";
+import { DiscountField } from "@/components/finance/DiscountField";
+import { InvoiceKindChoice, InvoiceKindSwitch } from "@/components/finance/InvoiceKind";
+import { FinanceOutletCtx } from "./FinanceLayout";
+
+type LineRow = {
+  key: string;
+  productId: string | null;
+  description: string;
+  quantityText: string;
+  priceText: string;
+  taxRateId: string;
+};
+
+/** A line's columns from `sm` up: product, quantity, unit price, tax, total, remove. */
+const LINE_GRID = "sm:grid-cols-[minmax(0,1fr)_5rem_8rem_10rem_8rem_2.5rem]";
+
+/** A field's name above it on a phone, where the column heads are hidden. */
+function LineFieldLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      aria-hidden="true"
+      className="mb-1 block text-xs font-medium text-slate-500 sm:hidden dark:text-slate-400"
+    >
+      {children}
+    </span>
+  );
+}
+
+function lineKey(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function emptyLine(): LineRow {
+  return {
+    key: lineKey(),
+    productId: null,
+    description: "",
+    quantityText: "1",
+    priceText: "0.00",
+    taxRateId: "",
+  };
+}
+
+/** A line the recurring form handed over when someone switched. */
+function lineRowFromDraft(line: InvoiceDraftLine): LineRow {
+  return { key: lineKey(), ...line };
+}
+
+/** Today, as the date fields write it. */
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function lineRowFromExisting(l: {
+  productId: string | null;
+  description: string;
+  quantity: number;
+  unitPriceCents: number;
+  taxRateId: string | null;
+}): LineRow {
+  return {
+    key: lineKey(),
+    productId: l.productId,
+    description: l.description,
+    quantityText: String(l.quantity),
+    priceText: (l.unitPriceCents / 100).toFixed(2),
+    taxRateId: l.taxRateId ?? "",
+  };
+}
+
+/**
+ * `invoices/new` and `invoices/:invoiceSlug/edit`. Saving either needs Full
+ * finance access, so a read-only Member who lands here gets a note instead
+ * of a form that could only be refused.
+ *
+ * `invoices/new` first asks whether the invoice is one-time or recurring
+ * (`lib/invoiceKind.ts`): Recurring goes to the New recurring invoice form,
+ * and One-time comes back here as `?kind=one-time`, to the form.
+ */
+export default function FinanceInvoiceNew() {
+  const { company } = useOutletContext<FinanceOutletCtx>();
+  const { invoiceSlug } = useParams();
+  const [searchParams] = useSearchParams();
+  if (!canWriteFinance(company)) {
+    return (
+      <FinanceReadOnlyPage
+        company={company}
+        list={{ label: "Invoices", path: "invoices" }}
+        title={invoiceSlug ? "Edit invoice" : "New invoice"}
+        backTo={invoiceSlug ? `invoices/${invoiceSlug}` : "invoices"}
+      />
+    );
+  }
+  if (!invoiceSlug && newInvoiceStep(searchParams) === "choose") {
+    return <InvoiceKindChoice company={company} customerId={requestedCustomerPick(searchParams)} />;
+  }
+  return <InvoiceForm />;
+}
+
+/**
+ * Invoice form — handles both create (no `:invoiceSlug` route param)
+ * and edit (param present). The form composes line items inline (no
+ * separate per-line modal); selecting a product pre-fills description /
+ * unit price / default tax rate, and the choice is snapshotted onto each
+ * line at save time.
+ *
+ * A sent or paid invoice edits in place under the same number, with its
+ * customer and issuer fixed. Saving never emails the customer; Save &
+ * resend saves, then opens the detail page's resend dialog.
+ *
+ * Lifecycle actions (Issue / Send / Mark paid / Void) live on the
+ * detail page so users can preview the rendered HTML before sending.
+ *
+ * A new invoice keeps a One-time / Recurring switch at the top. Switching to
+ * Recurring hands what was typed to the New recurring invoice form, and
+ * coming back from it fills this form with what was typed there.
+ */
+function InvoiceForm() {
+  const { company } = useOutletContext<FinanceOutletCtx>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { invoiceSlug } = useParams();
+  const isEdit = Boolean(invoiceSlug);
+  const financeBase = `/c/${company.slug}/finance`;
+  // From a customer's page the link names them (`?customerId=`), so the form
+  // starts with them rather than the first customer in the list.
+  const [searchParams] = useSearchParams();
+  const requestedCustomerId = isEdit ? null : requestedCustomerPick(searchParams);
+  const [requestedCustomerUnavailable, setRequestedCustomerUnavailable] = React.useState(false);
+  // What the recurring form handed over, read once: the state is cleared
+  // below, so a reload or a later Back starts the form fresh.
+  const [received] = React.useState(() => (isEdit ? null : readInvoiceDraft(location.state)));
+  React.useEffect(() => {
+    if (!readInvoiceDraft(location.state)) return;
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location, navigate]);
+
+  const [customers, setCustomers] = React.useState<Customer[] | null>(null);
+  const [products, setProducts] = React.useState<Product[]>([]);
+  const [taxRates, setTaxRates] = React.useState<TaxRate[]>([]);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [ready, setReady] = React.useState(false);
+
+  const [subsidiaries, setSubsidiaries] = React.useState<Subsidiary[]>([]);
+  const [subsidiaryId, setSubsidiaryId] = React.useState("");
+  const [savedIssuer, setSavedIssuer] = React.useState<InvoiceIssuer | null>(null);
+  const [savedSubsidiaryId, setSavedSubsidiaryId] = React.useState<string | null>(null);
+  const [customerId, setCustomerId] = React.useState("");
+  const [issueDate, setIssueDate] = React.useState(today);
+  const [dueDate, setDueDate] = React.useState(() => addDays(today(), DEFAULT_PAYMENT_TERMS_DAYS));
+  const [currency, setCurrency] = React.useState("USD");
+  const [notes, setNotes] = React.useState("");
+  const [footer, setFooter] = React.useState("");
+  const [lines, setLines] = React.useState<LineRow[]>([emptyLine()]);
+  const [discount, setDiscount] = React.useState<DiscountDraft>(NO_DISCOUNT_DRAFT);
+  // The invoice being edited, as loaded — what an issued one may still change.
+  const [existing, setExisting] = React.useState<Invoice | null>(null);
+  const [busy, setBusy] = React.useState<null | "save" | "resend">(null);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const [c, p, t, subsidiaries] = await Promise.all([
+          api.get<Customer[]>(`/api/companies/${company.id}/customers`),
+          api.get<Product[]>(`/api/companies/${company.id}/products`),
+          api.get<TaxRate[]>(`/api/companies/${company.id}/tax-rates`),
+          financeSubsidiaries.list(company.id),
+        ]);
+        setCustomers(c);
+        setProducts(p);
+        setTaxRates(t);
+        setSubsidiaries(subsidiaries);
+        if (isEdit && invoiceSlug) {
+          const existing = await api.get<Invoice>(
+            `/api/companies/${company.id}/invoices/${invoiceSlug}`,
+          );
+          if (!canEditInvoice(existing)) {
+            setLoadError(
+              "This invoice is void, so it can't be edited. Duplicate it to bill the same items again.",
+            );
+            setReady(true);
+            return;
+          }
+          setExisting(existing);
+          setCustomerId(existing.customerId);
+          setSubsidiaryId(existing.subsidiaryId ?? "");
+          setSavedIssuer(existing.issuerSnapshot);
+          setSavedSubsidiaryId(existing.subsidiaryId);
+
+          setIssueDate(new Date(existing.issueDate).toISOString().slice(0, 10));
+          setDueDate(new Date(existing.dueDate).toISOString().slice(0, 10));
+          setCurrency(existing.currency);
+          setNotes(existing.notes);
+          setFooter(existing.footer);
+          setDiscount(discountDraftFrom(existing));
+          setLines(
+            existing.lines.length === 0 ? [emptyLine()] : existing.lines.map(lineRowFromExisting),
+          );
+        } else {
+          const initial = initialCustomerPick(
+            c,
+            draftCustomerRequest(received, requestedCustomerId),
+          );
+          setRequestedCustomerUnavailable(initial.requestedUnavailable);
+          if (initial.customer) {
+            setCustomerId(initial.customer.id);
+            setCurrency(initial.customer.currency || "USD");
+          }
+          if (received) {
+            const start = oneTimeInvoiceFromDraft(received, today());
+            setSubsidiaryId(start.subsidiaryId);
+            setCurrency(start.currency);
+            setNotes(start.notes);
+            setFooter(start.footer);
+            setLines(start.lines.length === 0 ? [emptyLine()] : start.lines.map(lineRowFromDraft));
+            setDiscount(start.discount);
+            setIssueDate(start.issueDate);
+            setDueDate(start.dueDate);
+          }
+        }
+        setReady(true);
+      } catch (err) {
+        setLoadError((err as Error).message);
+        setReady(true);
+      }
+    })();
+  }, [company.id, invoiceSlug, isEdit, requestedCustomerId, received]);
+
+  // When the customer changes, also adopt their default currency (the user
+  // can override before saving).
+  function changeCustomer(id: string) {
+    setCustomerId(id);
+    const c = customers?.find((x) => x.id === id);
+    if (c?.currency) setCurrency(c.currency);
+  }
+
+  function patchLine(idx: number, patch: Partial<LineRow>) {
+    setLines((ls) => ls.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+  }
+
+  // The line Add line just made, so its description takes the cursor. Lines
+  // already there — and every line on an edit page — never take focus.
+  const [newLineKey, setNewLineKey] = React.useState<string | null>(null);
+  function addLine() {
+    const line = emptyLine();
+    setLines((ls) => [...ls, line]);
+    setNewLineKey(line.key);
+  }
+  function removeLine(idx: number) {
+    setLines((ls) => (ls.length === 1 ? ls : ls.filter((_, i) => i !== idx)));
+  }
+  function pickProduct(idx: number, productId: string) {
+    if (!productId) {
+      patchLine(idx, { productId: null });
+      return;
+    }
+    const p = products.find((pp) => pp.id === productId);
+    if (!p) return;
+    patchLine(idx, {
+      productId: p.id,
+      description: p.name + (p.description ? ` — ${p.description}` : ""),
+      priceText: (p.unitPriceCents / 100).toFixed(2),
+      taxRateId: p.defaultTaxRateId ?? "",
+    });
+  }
+
+  // Live preview of totals using the same math the server runs (modulo
+  // rounding edge-cases on inclusive tax). Keeps the user honest about
+  // what they're about to save.
+  const preview = React.useMemo(
+    () => previewTotals(lines, taxRates, discount),
+    [lines, taxRates, discount],
+  );
+
+  const selectedCustomer = customers?.find((c) => c.id === customerId) ?? null;
+  const canSave =
+    !!customerId &&
+    lines.some((l) => l.description.trim().length > 0) &&
+    !discountDraftProblem(discount);
+  // Issued: the customer already holds a copy under this number.
+  const issued = existing !== null && existing.status !== "draft";
+  const settledCents = existing ? invoiceSettledCents(existing) : 0;
+
+  // Switching to Recurring hands that form everything typed here, as it stands.
+  const switchToRecurring = isEdit
+    ? null
+    : {
+        to: switchInvoiceKindPath(
+          "recurring",
+          financeBase,
+          customerId,
+          draftCustomerRequest(received, requestedCustomerId),
+        ),
+        state: invoiceDraftState(
+          draftFromOneTimeInvoice(
+            {
+              customerId,
+              subsidiaryId,
+              currency,
+              notes,
+              footer,
+              lines,
+              discount,
+              issueDate,
+              dueDate,
+            },
+            received,
+          ),
+        ),
+      };
+
+  async function save(then: "view" | "resend") {
+    if (!canSave || busy) return;
+    setBusy(then === "resend" ? "resend" : "save");
+    setSaveError(null);
+    try {
+      const lineDrafts: InvoiceLineDraft[] = lines
+        .filter((l) => l.description.trim())
+        .map((l, i) => ({
+          productId: l.productId,
+          description: l.description.trim(),
+          quantity: Number(l.quantityText) || 0,
+          unitPriceCents: parseMoneyToCents(l.priceText),
+          taxRateId: l.taxRateId || null,
+          sortOrder: i,
+        }));
+      const body = {
+        customerId,
+        subsidiaryId: subsidiaryId || null,
+        issueDate: new Date(issueDate).toISOString(),
+        dueDate: new Date(dueDate).toISOString(),
+        currency,
+        notes,
+        footer,
+        lines: lineDrafts,
+        ...discountFromDraft(discount),
+      };
+      const inv =
+        isEdit && invoiceSlug
+          ? await api.patch<Invoice>(`/api/companies/${company.id}/invoices/${invoiceSlug}`, body)
+          : await api.post<Invoice>(`/api/companies/${company.id}/invoices`, body);
+      if (!isEdit) {
+        await linkSavedToTodo(company.id, searchParams.get(FROM_TODO_PARAM), "invoice", inv.id);
+      }
+      // The detail page opens its resend dialog, where the recipients and a
+      // note are confirmed before anything is emailed.
+      navigate(
+        `/c/${company.slug}/finance/invoices/${inv.slug}`,
+        then === "resend" ? { state: { resendRevised: true } } : undefined,
+      );
+    } catch (err) {
+      setSaveError(errorMessage(err));
+      setBusy(null);
+    }
+  }
+
+  if (!ready || (customers === null && !loadError)) {
+    return (
+      <div className="flex justify-center p-16">
+        <Spinner size={20} />
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="mx-auto max-w-3xl p-8">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Invoices", to: `/c/${company.slug}/finance/invoices` },
+            { label: isEdit ? "Edit" : "New" },
+          ]}
+        />
+        <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+          {loadError}
+        </div>
+        <div className="mt-4">
+          <Link
+            to={
+              invoiceSlug
+                ? `/c/${company.slug}/finance/invoices/${invoiceSlug}`
+                : `/c/${company.slug}/finance/invoices`
+            }
+          >
+            <Button variant="secondary">Back</Button>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isEdit && customers?.length === 0) {
+    return (
+      <div className="mx-auto max-w-3xl p-8">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Invoices", to: `/c/${company.slug}/finance/invoices` },
+            { label: "New" },
+          ]}
+        />
+        <div className="mt-6 rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center dark:border-slate-700 dark:bg-slate-900">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            Add a customer first
+          </h3>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Invoices need a customer to bill.
+          </p>
+          <div className="mt-4">
+            <Link to={`/c/${company.slug}/customers`}>
+              <Button>Add customer</Button>
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save("view");
+      }}
+      className="page-shell p-4 sm:p-8"
+    >
+      <div className="mb-6">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Invoices", to: `/c/${company.slug}/finance/invoices` },
+            { label: isEdit ? "Edit" : "New" },
+          ]}
+        />
+      </div>
+
+      <div
+        className={
+          "flex flex-wrap items-center justify-between gap-3 " +
+          (switchToRecurring ? "mb-4" : "mb-6")
+        }
+      >
+        <div className="flex items-center gap-3">
+          <Link
+            to={
+              isEdit && invoiceSlug
+                ? `/c/${company.slug}/finance/invoices/${invoiceSlug}`
+                : `/c/${company.slug}/finance/invoices`
+            }
+            aria-label={isEdit ? "Back to the invoice" : "Back to invoices"}
+            className="touch-target relative rounded-md p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            <ArrowLeft size={18} />
+          </Link>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">
+            {isEdit ? `Edit ${existing?.number || "invoice"}` : "New one-time invoice"}
+          </h1>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Link
+            to={
+              isEdit && invoiceSlug
+                ? `/c/${company.slug}/finance/invoices/${invoiceSlug}`
+                : `/c/${company.slug}/finance/invoices`
+            }
+          >
+            <Button type="button" variant="secondary" disabled={busy !== null}>
+              Cancel
+            </Button>
+          </Link>
+          <Button
+            type="submit"
+            variant={issued ? "secondary" : "primary"}
+            loading={busy === "save"}
+            disabled={!canSave || busy !== null}
+          >
+            {isEdit ? "Save changes" : "Save draft"}
+          </Button>
+          {issued && (
+            <Button
+              type="button"
+              onClick={() => void save("resend")}
+              loading={busy === "resend"}
+              disabled={!canSave || busy !== null}
+            >
+              <Mail size={14} /> Save &amp; resend
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {switchToRecurring && (
+        <InvoiceKindSwitch
+          current="one-time"
+          to={switchToRecurring.to}
+          state={switchToRecurring.state}
+          disabled={busy !== null}
+        />
+      )}
+
+      {issued && existing && (
+        <div className="mb-4 rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-200">
+          <p>
+            <span className="font-medium">{existing.number} has already been sent.</span> Saving
+            keeps its number and updates the books to match. The customer keeps the copy they have
+            until you resend it — <span className="font-medium">Save &amp; resend</span> emails them
+            the updated invoice.
+          </p>
+          {settledCents > 0 && (
+            <p className="mt-2">
+              {formatMoney(settledCents, existing.currency)} is already paid, credited or written
+              off, so the total can&apos;t go below that and the currency stays {existing.currency}.
+            </p>
+          )}
+        </div>
+      )}
+
+      <FormError message={saveError} className="mb-4" />
+
+      <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+        <div className="mb-6 max-w-xl">
+          {issued ? (
+            <InvoiceIssuerFixed
+              issuer={savedIssuer}
+              companyName={company.name}
+              hint="Fixed once the invoice is issued. Void it and duplicate it to bill from another entity."
+            />
+          ) : (
+            <InvoiceIssuerSelect
+              company={company}
+              subsidiaries={subsidiaries}
+              value={subsidiaryId}
+              onChange={setSubsidiaryId}
+              savedIssuer={savedIssuer}
+              savedSubsidiaryId={savedSubsidiaryId}
+            />
+          )}
+        </div>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
+          <div className="sm:col-span-2">
+            <Select
+              label="Customer"
+              value={customerId}
+              onChange={(e) => changeCustomer(e.target.value)}
+              disabled={issued}
+              required
+            >
+              {customers?.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {customerOptionLabel(c)}
+                </option>
+              ))}
+            </Select>
+            <CustomerBillTo
+              companyId={company.id}
+              customer={selectedCustomer}
+              kind="invoice"
+              onCustomerSaved={(saved) => setCustomers((list) => withSavedCustomer(list, saved))}
+            />
+            {issued && (
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                The invoice number belongs to this customer. Void it and duplicate it to bill
+                someone else.
+              </p>
+            )}
+            {requestedCustomerUnavailable && !customerId && (
+              <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                The customer you came from is archived or no longer exists. Choose who to bill.
+              </p>
+            )}
+          </div>
+          <Input
+            label="Issue date"
+            type="date"
+            value={issueDate}
+            onChange={(e) => setIssueDate(e.target.value)}
+            required
+          />
+          <Input
+            label="Due date"
+            type="date"
+            value={dueDate}
+            onChange={(e) => setDueDate(e.target.value)}
+            required
+          />
+          <Input
+            label="Currency"
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+            maxLength={3}
+            disabled={issued && settledCents > 0}
+            className="disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500 dark:disabled:bg-slate-800/60 dark:disabled:text-slate-400"
+            required
+          />
+        </div>
+
+        <div className="mt-6">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-200">Line items</h2>
+          </div>
+          {/* One row per line from `sm` up, under a row of column heads. On a
+              phone each line stacks — product, quantity and price, tax, total —
+              with its own small labels, instead of a table wider than the
+              screen. The fields keep their "Line N …" names either way. */}
+          <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800">
+            <div
+              aria-hidden="true"
+              className={`hidden gap-2 border-b border-slate-200 bg-slate-50/80 px-3 py-2 text-xs font-medium text-slate-500 sm:grid dark:border-slate-800 dark:bg-slate-800/40 dark:text-slate-400 ${LINE_GRID}`}
+            >
+              <div>Product</div>
+              <div className="text-right">Qty</div>
+              <div className="text-right">Unit price</div>
+              <div>Tax</div>
+              <div className="text-right">Total</div>
+              <div />
+            </div>
+            {lines.map((l, i) => {
+              const qty = Number(l.quantityText) || 0;
+              const unit = parseMoneyToCents(l.priceText);
+              const gross = Math.round(qty * unit);
+              const rate = taxRates.find((r) => r.id === l.taxRateId);
+              let lineTotal = gross;
+              if (rate && !rate.inclusive) {
+                lineTotal = gross + Math.round((gross * rate.ratePercent) / 100);
+              }
+              return (
+                <div
+                  key={l.key}
+                  className={`grid grid-cols-2 gap-2 p-3 sm:items-start ${LINE_GRID} ${
+                    i > 0 ? "border-t border-slate-100 dark:border-slate-800" : ""
+                  }`}
+                >
+                  <div className="col-span-2 min-w-0 sm:col-span-1">
+                    <LineFieldLabel>Product</LineFieldLabel>
+                    <Select
+                      value={l.productId ?? ""}
+                      onChange={(e) => pickProduct(i, e.target.value)}
+                      aria-label={`Line ${i + 1} product`}
+                      className="h-9 px-2"
+                    >
+                      <option value="">—</option>
+                      {products.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="min-w-0">
+                    <LineFieldLabel>Qty</LineFieldLabel>
+                    <input
+                      value={l.quantityText}
+                      onChange={(e) => patchLine(i, { quantityText: e.target.value })}
+                      inputMode="decimal"
+                      aria-label={`Line ${i + 1} quantity`}
+                      className={`h-9 w-full px-2 text-right tabular-nums ${fieldClassName()}`}
+                    />
+                  </div>
+                  <div className="min-w-0">
+                    <LineFieldLabel>Unit price</LineFieldLabel>
+                    <input
+                      value={l.priceText}
+                      onChange={(e) => patchLine(i, { priceText: e.target.value })}
+                      inputMode="decimal"
+                      aria-label={`Line ${i + 1} unit price`}
+                      className={`h-9 w-full px-2 text-right tabular-nums ${fieldClassName()}`}
+                    />
+                  </div>
+                  <div className="col-span-2 min-w-0 sm:col-span-1">
+                    <LineFieldLabel>Tax</LineFieldLabel>
+                    <Select
+                      value={l.taxRateId}
+                      onChange={(e) => patchLine(i, { taxRateId: e.target.value })}
+                      aria-label={`Line ${i + 1} tax`}
+                      className="h-9 px-2"
+                    >
+                      <option value="">No tax</option>
+                      {taxRates.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name} ({t.ratePercent}%{t.inclusive ? " incl" : ""})
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="flex items-center gap-2 text-sm tabular-nums text-slate-700 sm:block sm:pt-2 sm:text-right dark:text-slate-200">
+                    <span aria-hidden="true" className="text-xs font-medium text-slate-500 sm:hidden dark:text-slate-400">
+                      Total
+                    </span>
+                    {formatMoney(lineTotal, currency)}
+                  </div>
+                  <div className="flex items-center justify-end sm:justify-center sm:pt-0.5">
+                    <button
+                      type="button"
+                      onClick={() => removeLine(i)}
+                      disabled={lines.length === 1}
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-red-50 hover:text-red-600 disabled:opacity-30 dark:text-slate-400 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                      aria-label="Remove line"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  <div className="col-span-2 sm:col-span-6">
+                    <textarea
+                      value={l.description}
+                      onChange={(e) => patchLine(i, { description: e.target.value })}
+                      autoFocus={l.key === newLineKey}
+                      aria-label={`Line ${i + 1} description`}
+                      placeholder="Item description"
+                      rows={2}
+                      className={`block w-full resize-y px-2 py-1.5 ${fieldClassName()}`}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2">
+            <button
+              type="button"
+              onClick={addLine}
+              className="touch-target relative inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+            >
+              <Plus size={12} /> Add line
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-6 grid grid-cols-1 gap-6 sm:grid-cols-2">
+          <div>
+            <Textarea
+              label="Notes (visible to customer)"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={3}
+            />
+          </div>
+          <div>
+            <Textarea
+              label="Footer (payment terms, bank details)"
+              value={footer}
+              onChange={(e) => setFooter(e.target.value)}
+              rows={3}
+            />
+            {subsidiaryId && (
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                Leave blank to use this subsidiary&apos;s footer.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-6 ml-auto w-full space-y-1 text-sm sm:w-72">
+          <div className="flex justify-between text-slate-500 dark:text-slate-400">
+            <span>Subtotal</span>
+            <span className="tabular-nums">
+              {formatMoney(preview.subtotalCents + preview.discountCents, currency)}
+            </span>
+          </div>
+          <DiscountField
+            draft={discount}
+            onChange={setDiscount}
+            currency={currency}
+            discountCents={preview.discountCents}
+          />
+          <div className="flex justify-between text-slate-500 dark:text-slate-400">
+            <span>Tax</span>
+            <span className="tabular-nums">{formatMoney(preview.taxCents, currency)}</span>
+          </div>
+          <div className="flex justify-between border-t border-slate-200 pt-2 text-base font-semibold text-slate-900 dark:border-slate-700 dark:text-slate-100">
+            <span>Total</span>
+            <span className="tabular-nums">{formatMoney(preview.totalCents, currency)}</span>
+          </div>
+        </div>
+      </div>
+    </form>
+  );
+}

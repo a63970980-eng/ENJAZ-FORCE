@@ -1,0 +1,465 @@
+import React from "react";
+import {
+  AlertCircle,
+  CalendarClock,
+  Check,
+  CheckCircle2,
+  ChevronRight,
+  Sparkles,
+} from "lucide-react";
+import { Link, useLocation, useOutletContext, useSearchParams } from "react-router-dom";
+
+import { useLiveRefetch } from "@/components/CompanySocket";
+import { TldrBriefing } from "@/components/tldrs/TldrBriefing";
+import { Avatar, employeeAvatarUrl } from "@/components/ui/Avatar";
+import { Button } from "@/components/ui/Button";
+import { useBackgroundAction } from "@/components/ui/Dialog";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Spinner } from "@/components/ui/Spinner";
+import { api, type TldrItem, type TldrListResponse, type TldrSettings } from "@/lib/api";
+import { errorMessage } from "@/lib/errors";
+import { formatRelative } from "@/components/decisions/relative";
+import type { TldrsOutletContext } from "@/pages/TldrsLayout";
+
+type Filter = "unread" | "all";
+type PageData = { list: TldrListResponse; settings: TldrSettings };
+
+export default function TldrsIndex() {
+  const { company } = useOutletContext<TldrsOutletContext>();
+  const background = useBackgroundAction();
+  const [data, setData] = React.useState<PageData | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const location = useLocation();
+  // Home's Discuss link names the briefing to open, so arriving from there ends
+  // in a composer rather than merely scrolled next to one.
+  const [searchParams] = useSearchParams();
+  const discussId = searchParams.get("discuss");
+  const briefingId = location.hash.startsWith("#tldr-") ? location.hash.slice(6) : "";
+  const [filter, setFilter] = React.useState<Filter>(() =>
+    briefingId || discussId ? "all" : "unread",
+  );
+  const [loadingMore, setLoadingMore] = React.useState(false);
+  const scrolledTarget = React.useRef<string | null>(null);
+
+  React.useEffect(() => {
+    if (briefingId || discussId) setFilter("all");
+  }, [briefingId, discussId]);
+
+  const reload = React.useCallback(async () => {
+    setError(null);
+    try {
+      const [list, settings] = await Promise.all([
+        api.get<TldrListResponse>(`/api/companies/${company.id}/tldrs`),
+        api.get<TldrSettings>(`/api/companies/${company.id}/tldrs/settings`),
+      ]);
+      setData({ list, settings });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load TLDRs.");
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    setData(null);
+    setLoadingMore(false);
+    void reload();
+  }, [reload]);
+
+  // `tldr_question` too: the Discuss badge counts cards, and asking or removing
+  // one never touches the briefing row that the "tldr" kind announces.
+  useLiveRefetch(["tldr", "tldr_question"], reload);
+
+  // Home links to a specific briefing. The card arrives after the fetch, so
+  // scroll once the target has actually mounted rather than relying on the
+  // browser's first, too-early hash pass.
+  React.useEffect(() => {
+    if (!data || (!briefingId && !discussId)) return;
+    const navigationTarget = `${location.key}:${discussId || briefingId}`;
+    if (scrolledTarget.current === navigationTarget) return;
+    const target = document.getElementById(`tldr-${discussId || briefingId}`);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    scrolledTarget.current = navigationTarget;
+  }, [data, briefingId, discussId, location.key, filter]);
+
+  function dismiss(item: TldrItem) {
+    if (item.dismissed) return;
+    setData((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        list: {
+          ...current.list,
+          unreadCount: Math.max(0, current.list.unreadCount - 1),
+          items: current.list.items.map((row) =>
+            row.id === item.id ? { ...row, dismissed: true } : row,
+          ),
+        },
+      };
+    });
+
+    background(() => api.post(`/api/companies/${company.id}/tldrs/${item.id}/dismiss`), {
+      title: "Couldn’t dismiss the TLDR",
+      error: (err) => `${errorMessage(err)} It has been restored.`,
+      onError: () => {
+        setData((current) => {
+          if (!current) return current;
+          const existing = current.list.items.find((row) => row.id === item.id);
+          if (!existing?.dismissed) return current;
+          return {
+            ...current,
+            list: {
+              ...current.list,
+              unreadCount: current.list.unreadCount + 1,
+              items: current.list.items.map((row) =>
+                row.id === item.id ? { ...row, dismissed: false } : row,
+              ),
+            },
+          };
+        });
+      },
+    });
+  }
+
+  async function loadMore() {
+    const cursor = data?.list.nextCursor;
+    if (!data || !cursor || loadingMore) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      // After the last briefing shown, by (createdAt, id): a briefing run
+      // writes many in one second, and none of them is skipped or repeated.
+      const next = await api.get<TldrListResponse>(
+        `/api/companies/${company.id}/tldrs?limit=30&cursor=${encodeURIComponent(cursor)}`,
+      );
+      setData((current) => {
+        if (!current) return current;
+        const known = new Set(current.list.items.map((item) => item.id));
+        return {
+          ...current,
+          list: {
+            total: next.total,
+            unreadCount: next.unreadCount,
+            nextCursor: next.nextCursor ?? null,
+            items: [...current.list.items, ...next.items.filter((item) => !known.has(item.id))],
+          },
+        };
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load older TLDRs.");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  const canManage = company.role !== "member";
+  const shown = data?.list.items.filter((item) => filter === "all" || !item.dismissed) ?? [];
+  const groups = groupByDay(shown);
+  const base = `/c/${company.slug}/tldrs`;
+  const hasMore = Boolean(data?.list.nextCursor);
+  const unloadedUnread = Math.max(0, (data?.list.unreadCount ?? 0) - shown.length);
+  const isDefaultDraft = data?.settings.id === null;
+  const needsWriter = Boolean(data?.settings.id && !data.settings.employeeId);
+
+  return (
+    <div className="page-shell px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
+            <Sparkles size={22} className="text-violet-500" /> Briefings
+          </h1>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            What changed. What needs your attention.
+          </p>
+        </div>
+        {data && (
+          <Link
+            to={`${base}/settings`}
+            className="inline-flex items-center gap-1 self-start rounded-lg px-2 py-1 text-xs text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+          >
+            {isDefaultDraft || needsWriter
+              ? canManage
+                ? "Choose a briefing writer"
+                : "Briefing writer needed"
+              : !data.settings.enabled
+                ? "Briefings paused"
+                : data.settings.nextRunAt
+                  ? `Next briefing ${formatRelative(data.settings.nextRunAt)}`
+                  : "Briefing settings"}
+            <ChevronRight size={13} />
+          </Link>
+        )}
+      </header>
+
+      {error && (
+        <div className="mt-5 flex flex-col gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 sm:flex-row sm:items-center dark:border-rose-500/25 dark:bg-rose-500/10">
+          <AlertCircle size={18} className="shrink-0 text-rose-600 dark:text-rose-300" />
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium text-rose-800 dark:text-rose-200">
+              Could not load TLDRs
+            </div>
+            <div className="mt-0.5 text-xs text-rose-700 dark:text-rose-300">{error}</div>
+          </div>
+          <Button size="sm" variant="secondary" onClick={() => void reload()}>
+            Try again
+          </Button>
+        </div>
+      )}
+
+      {!data && !error ? (
+        <div className="flex min-h-[45vh] items-center justify-center">
+          <Spinner size={22} />
+        </div>
+      ) : data ? (
+        <>
+          <div className="mt-6 flex flex-wrap items-center gap-2">
+            <FilterButton
+              active={filter === "unread"}
+              onClick={() => setFilter("unread")}
+              label="Unread"
+              count={data.list.unreadCount}
+            />
+            <FilterButton
+              active={filter === "all"}
+              onClick={() => setFilter("all")}
+              label="All briefings"
+              count={data.list.total}
+            />
+          </div>
+
+          {shown.length === 0 ? (
+            <div className="mt-4">
+              {data.list.total === 0 ? (
+                <EmptyState
+                  title={
+                    isDefaultDraft || needsWriter
+                      ? canManage
+                        ? "Choose a briefing AI Employee"
+                        : "A briefing AI Employee is needed"
+                      : data.settings.enabled
+                        ? "Automatic briefings are on"
+                        : "No TLDRs yet"
+                  }
+                  description={
+                    isDefaultDraft
+                      ? canManage
+                        ? "Daily briefings are on by default. Choose or hire an AI Employee to start the schedule, then connect their AI Model before the first briefing is due."
+                        : "Daily briefings are on by default. An owner or admin can choose the writer; the writer needs a connected AI Model before a briefing can run."
+                      : needsWriter
+                        ? canManage
+                          ? "Choose a connected AI Employee to resume automatic briefings."
+                          : "An owner or admin needs to choose a connected AI Employee before automatic briefings can resume."
+                        : data.settings.enabled
+                          ? data.settings.nextRunAt
+                            ? `The next scheduled check is ${formatRelative(data.settings.nextRunAt)}. A TLDR appears here and on Home when the writer has a connected AI Model and the period contains useful activity.`
+                            : "A TLDR will appear here and on Home once the writer has a connected AI Model and an interval contains useful activity."
+                          : canManage
+                            ? "Resume automatic briefings in Settings when you want new company activity summarized."
+                            : "An owner or admin can resume automatic briefings."
+                  }
+                  action={
+                    canManage ? (
+                      <Link
+                        to={`${base}/settings`}
+                        className="inline-flex h-10 items-center justify-center rounded-lg bg-indigo-600 px-4 text-sm font-medium text-white transition hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-1 dark:bg-indigo-500 dark:hover:bg-indigo-600"
+                      >
+                        Configure TLDRs
+                      </Link>
+                    ) : undefined
+                  }
+                />
+              ) : filter === "unread" && data.list.unreadCount > 0 && hasMore ? (
+                <EmptyState
+                  title="Older unread TLDRs are waiting"
+                  description={`${data.list.unreadCount} unread ${data.list.unreadCount === 1 ? "briefing is" : "briefings are"} outside the newest page. Load older history to bring ${data.list.unreadCount === 1 ? "it" : "them"} into view.`}
+                  action={
+                    <Button
+                      variant="secondary"
+                      onClick={() => void loadMore()}
+                      loading={loadingMore}
+                    >
+                      {loadingMore ? "Loading…" : "Find older unread TLDRs"}
+                    </Button>
+                  }
+                />
+              ) : (
+                <EmptyState
+                  title="You're all caught up"
+                  description="Every TLDR has been dismissed from your Home queue. The full history is still here whenever you need it."
+                  action={
+                    <Button variant="secondary" onClick={() => setFilter("all")}>
+                      View history
+                    </Button>
+                  }
+                />
+              )}
+            </div>
+          ) : (
+            <div className="mt-5 space-y-8">
+              {groups.map(([day, items]) => (
+                <section key={day}>
+                  <div className="text-xs font-medium mb-2 flex items-center gap-2 text-slate-500 dark:text-slate-400">
+                    <CalendarClock size={12} /> {formatDayHeading(day)}
+                  </div>
+                  <div className="space-y-3">
+                    {items.map((item) => (
+                      <TldrCard
+                        key={item.id}
+                        company={company}
+                        item={item}
+                        onDismiss={dismiss}
+                        openBriefing={item.id === briefingId}
+                        openDiscussion={item.id === discussId}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ))}
+              {hasMore && (
+                <div className="flex justify-center pt-1">
+                  <Button variant="secondary" onClick={() => void loadMore()} loading={loadingMore}>
+                    {loadingMore
+                      ? "Loading older TLDRs…"
+                      : filter === "unread" && unloadedUnread > 0
+                        ? `Load older briefings · ${unloadedUnread} unread remaining`
+                        : `Load older briefings · ${data.list.items.length} of ${data.list.total}`}
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function FilterButton({
+  active,
+  onClick,
+  label,
+  count,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  count: number;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        "flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition " +
+        (active
+          ? "border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-300"
+          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800")
+      }
+    >
+      {label}
+      <span className="tabular-nums text-slate-400 dark:text-slate-500">{count}</span>
+    </button>
+  );
+}
+
+function TldrCard({
+  company,
+  item,
+  onDismiss,
+  openBriefing = false,
+  openDiscussion = false,
+}: {
+  company: TldrsOutletContext["company"];
+  item: TldrItem;
+  onDismiss: (item: TldrItem) => void;
+  openBriefing?: boolean;
+  /** Arrived here from a Discuss link naming this briefing. */
+  openDiscussion?: boolean;
+}) {
+  const employee = item.employee;
+  const avatar = employee.id
+    ? employeeAvatarUrl(company.id, employee.id, employee.avatarKey)
+    : null;
+
+  return (
+    <article
+      id={`tldr-${item.id}`}
+      className="scroll-mt-5 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition-colors dark:border-slate-800 dark:bg-slate-900"
+    >
+      <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-center dark:border-slate-800">
+        <div className="flex min-w-0 items-center gap-3">
+          <Avatar name={employee.name || "AI Employee"} src={avatar} kind="ai" size="md" />
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+                {item.title || "Company TLDR"}
+              </h2>
+              {!item.dismissed && (
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-violet-500" title="Unread" />
+              )}
+            </div>
+            <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+              <span>{employee.name || "AI Employee"}</span>
+              <span aria-hidden="true">·</span>
+              <span
+                title={`${new Date(item.periodStart).toLocaleString()} – ${new Date(item.periodEnd).toLocaleString()}`}
+              >
+                {formatPeriod(item.periodStart, item.periodEnd)}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 sm:ml-auto sm:justify-end">
+          {item.dismissed ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
+              <CheckCircle2 size={11} /> Read
+            </span>
+          ) : (
+            <Button size="sm" variant="ghost" onClick={() => onDismiss(item)}>
+              <Check size={14} /> Dismiss
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="px-4 py-4 sm:px-5">
+        <TldrBriefing
+          company={company}
+          item={item}
+          openBriefing={openBriefing}
+          openDiscussion={openDiscussion}
+        />
+      </div>
+    </article>
+  );
+}
+
+function groupByDay(items: TldrItem[]): Array<[string, TldrItem[]]> {
+  const groups = new Map<string, TldrItem[]>();
+  for (const item of items) {
+    const date = new Date(item.createdAt);
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  return [...groups.entries()];
+}
+
+function formatDayHeading(day: string): string {
+  const date = new Date(`${day}T12:00:00`);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return "Today";
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+}
+
+function formatPeriod(startIso: string, endIso: string): string {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  const time = (date: Date) => date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (start.toDateString() === end.toDateString()) {
+    return `${start.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${time(start)}–${time(end)}`;
+  }
+  return `${start.toLocaleDateString(undefined, { month: "short", day: "numeric" })} – ${end.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
+}

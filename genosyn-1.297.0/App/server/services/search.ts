@@ -1,0 +1,699 @@
+import { SelectQueryBuilder } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Base } from "../db/entities/Base.js";
+import { Channel } from "../db/entities/Channel.js";
+import { ChannelMember } from "../db/entities/ChannelMember.js";
+import { Chart } from "../db/entities/Chart.js";
+import { Repository } from "../db/entities/Repository.js";
+import { Customer } from "../db/entities/Customer.js";
+import { Dashboard } from "../db/entities/Dashboard.js";
+import { FinanceAccess, Role } from "../db/entities/Membership.js";
+import { Note } from "../db/entities/Note.js";
+import { Notebook } from "../db/entities/Notebook.js";
+import { Pipeline } from "../db/entities/Pipeline.js";
+import { Product } from "../db/entities/Product.js";
+import { RecruitingApplication } from "../db/entities/RecruitingApplication.js";
+import { RecruitingOpening } from "../db/entities/RecruitingOpening.js";
+import { SupportTicket } from "../db/entities/SupportTicket.js";
+import { Project } from "../db/entities/Project.js";
+import { Resource } from "../db/entities/Resource.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Skill } from "../db/entities/Skill.js";
+import { Todo } from "../db/entities/Todo.js";
+import { financeAccessFor } from "../middleware/financeAccess.js";
+import {
+  andWhereTokens,
+  escapeLike,
+  scoreLabel,
+  tokenizeQuery,
+} from "./likeSearch.js";
+import type { Token } from "./likeSearch.js";
+import { canOpenProductReference, searchChatProductReferences } from "./chatReferences.js";
+import { listAccessibleProjectIds } from "./projects.js";
+import { financeProductPath } from "../../shared/financeProducts.js";
+import { KIND_MATCH_SCORE, matchKindToken } from "../../shared/searchKinds.js";
+
+/**
+ * Company-wide quick search — the data source behind the ⌘K palette's
+ * entity results (the palette matches the static section catalog on the
+ * client; this covers everything that lives in the database).
+ *
+ * Deliberately a *name* search: it matches the fields a person would type to
+ * jump somewhere (titles, names, a customer's email or an account's domain),
+ * not document bodies.
+ * Body search would drown the palette in weak hits; the per-section search
+ * surfaces (e.g. `/notes/search`) stay the right tool for content queries.
+ *
+ * Same crude-LIKE stance as notes search: SQLite + a few thousand rows per
+ * table is fine, and every query is capped. If this ever feels slow we can
+ * wire FTS in.
+ */
+
+export type SearchResultKind =
+  | "product"
+  | "employee"
+  | "skill"
+  | "routine"
+  | "channel"
+  | "project"
+  | "todo"
+  | "base"
+  | "notebook"
+  | "note"
+  | "resource"
+  | "chart"
+  | "dashboard"
+  | "repository"
+  | "pipeline"
+  | "customer"
+  /** A customer row opened as its Revenue account — see {@link ACCOUNT_SPEC}. */
+  | "account"
+  | "opening"
+  | "applicant"
+  /** A support ticket, by its subject, customer or number. */
+  | "ticket"
+  /** A row from Finance → Products & services, opened filtered to its name. */
+  | "catalogProduct";
+
+export type CompanySearchResult = {
+  kind: SearchResultKind;
+  id: string;
+  label: string;
+  sublabel: string | null;
+  /**
+   * Client route under `/c/<companySlug>` that opens this result. Computed
+   * here so the client keeps a single kind→icon mapping instead of fifteen
+   * kind→URL builders; if a client route moves, update the matching
+   * `path:` below in the same PR.
+   */
+  path: string;
+};
+
+/** How many rows each entity query fetches for JS-side ranking. */
+const FETCH_WINDOW = 20;
+/** How many results one kind may contribute. */
+const PER_KIND_CAP = 5;
+/** How many results the whole response may carry. */
+const TOTAL_CAP = 30;
+/**
+ * `getRawMany` bypasses TypeORM's hydration, and on sqlite datetime columns
+ * come back as UTC strings without a timezone marker ("2026-07-17 10:00:00")
+ * that `new Date()` would misread as *local* time. Re-attach the T/Z the
+ * same way the driver's own hydration does. Postgres hands us Date objects
+ * either way.
+ */
+function rawDate(v: unknown): Date | null {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "string" && !v.includes("T")) {
+    return new Date(v.replace(" ", "T") + "Z");
+  }
+  return new Date(v as string);
+}
+
+/**
+ * Fetch-window ordering: prefix matches on the primary column first, then
+ * rows whose primary column contains the query anywhere, so a table with more
+ * than `FETCH_WINDOW` candidates can't starve the rows the ranker would put
+ * on top anyway. The middle tier matters most for a kind-only query ("data"
+ * lists Bases): no word is left to filter on, every row of the kind
+ * qualifies, and "Marketing data" must not lose its place to twenty names
+ * that sort ahead of it. Recency (or name) breaks ties.
+ */
+function orderByPrefixFirst<T extends object>(
+  qb: SelectQueryBuilder<T>,
+  col: string,
+  q: string,
+  recencyCol: string | null,
+): SelectQueryBuilder<T> {
+  const literal = escapeLike(q);
+  qb = qb
+    .setParameter("prefix", `${literal}%`)
+    .setParameter("contains", `%${literal}%`)
+    .orderBy(
+      `CASE WHEN LOWER(${col}) LIKE :prefix ESCAPE '\\' THEN 0 ` +
+        `WHEN LOWER(${col}) LIKE :contains ESCAPE '\\' THEN 1 ELSE 2 END`,
+      "ASC",
+    );
+  // NULLS LAST: postgres sorts NULL as largest (first under DESC), sqlite
+  // as smallest — without this, never-touched rows would hog the window on
+  // postgres only. Matters for the one nullable recency column
+  // (Channel.lastMessageAt); harmless on the NOT NULL updatedAt columns.
+  if (recencyCol) qb = qb.addOrderBy(recencyCol, "DESC", "NULLS LAST");
+  return qb.addOrderBy(col, "ASC").limit(FETCH_WINDOW);
+}
+
+// ─────────────────────────── ranking ───────────────────────────
+
+type Scored = CompanySearchResult & {
+  score: number;
+  updatedAt: Date | null;
+};
+
+// ─────────────────────────── per-kind queries ───────────────────────────
+
+type Ctx = { companyId: string; q: string; tokens: Token[] };
+
+/**
+ * The bulk of the catalog: entities with a direct `companyId` column whose
+ * result is `name/title` + `slug`. The joined kinds (skills, routines,
+ * notes, todos, channels) get bespoke queries below.
+ */
+type SimpleSpec = {
+  kind: SearchResultKind;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  entity: new () => any;
+  nameCol: "name" | "title";
+  /** Extra columns the tokens may match (never displayed as the label). */
+  secondaryCols?: string[];
+  /** Rows are excluded when `archivedAt` is set. */
+  softDeletes?: boolean;
+  hasUpdatedAt?: boolean;
+  path: (r: Record<string, string>) => string;
+  sublabel: (r: Record<string, string>) => string | null;
+};
+
+const SIMPLE_SPECS: SimpleSpec[] = [
+  {
+    kind: "employee",
+    entity: AIEmployee,
+    nameCol: "name",
+    secondaryCols: ["t.role"],
+    path: (r) => `/employees/${r.slug}`,
+    sublabel: (r) => r.role || null,
+  },
+  {
+    kind: "base",
+    entity: Base,
+    nameCol: "name",
+    secondaryCols: ["t.description"],
+    path: (r) => `/bases/${r.slug}`,
+    sublabel: (r) => r.description || null,
+  },
+  {
+    kind: "notebook",
+    entity: Notebook,
+    nameCol: "title",
+    hasUpdatedAt: true,
+    path: (r) => `/notes/${r.slug}`,
+    sublabel: () => null,
+  },
+  {
+    kind: "resource",
+    entity: Resource,
+    nameCol: "title",
+    hasUpdatedAt: true,
+    path: (r) => `/resources/${r.slug}`,
+    sublabel: (r) => r.sourceKind || null,
+  },
+  {
+    kind: "chart",
+    entity: Chart,
+    nameCol: "title",
+    secondaryCols: ["t.description"],
+    hasUpdatedAt: true,
+    path: (r) => `/explore/charts/${r.slug}`,
+    sublabel: (r) => r.description || null,
+  },
+  {
+    kind: "dashboard",
+    entity: Dashboard,
+    nameCol: "title",
+    secondaryCols: ["t.description"],
+    hasUpdatedAt: true,
+    path: (r) => `/explore/dashboards/${r.slug}`,
+    sublabel: (r) => r.description || null,
+  },
+  {
+    kind: "repository",
+    entity: Repository,
+    nameCol: "name",
+    secondaryCols: ["t.description"],
+    hasUpdatedAt: true,
+    path: (r) => `/repositories/${r.slug}`,
+    sublabel: (r) => r.gitUrl || null,
+  },
+  {
+    kind: "pipeline",
+    entity: Pipeline,
+    nameCol: "name",
+    secondaryCols: ["t.description"],
+    hasUpdatedAt: true,
+    path: (r) => `/pipelines/${r.slug}`,
+    sublabel: (r) => r.description || null,
+  },
+  {
+    kind: "opening",
+    entity: RecruitingOpening,
+    nameCol: "title",
+    secondaryCols: ["t.department", "t.location"],
+    hasUpdatedAt: true,
+    path: (r) => `/recruiting/openings/${r.id}`,
+    sublabel: (r) => [r.department, r.location].filter(Boolean).join(" · ") || r.status || null,
+  },
+];
+
+/**
+ * People who applied, by name or email. Bespoke rather than a simple spec so
+ * the query never loads a resume: it selects the few columns a result needs,
+ * inside the same fetch window every kind uses.
+ */
+async function searchApplicants(ctx: Ctx): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, "applicant");
+  let qb = AppDataSource.getRepository(RecruitingApplication)
+    .createQueryBuilder("a")
+    .select(["a.id", "a.candidateName", "a.candidateEmail", "a.stage", "a.updatedAt"])
+    .where("a.companyId = :cid", { cid: ctx.companyId });
+  qb = andWhereTokens(qb, ["a.candidateName", "a.candidateEmail"], tokens);
+  qb = orderByPrefixFirst(qb, "a.candidateName", q, "a.updatedAt");
+  const rows = await qb.getMany();
+  return rows.map((row) => ({
+    kind: "applicant" as const,
+    id: row.id,
+    label: row.candidateName,
+    sublabel: row.candidateEmail,
+    path: `/recruiting/applicants/${row.id}`,
+    score: scoreKindLabel(ctx, row.candidateName, q, tokens),
+    updatedAt: row.updatedAt,
+  }));
+}
+
+/**
+ * Support tickets, by subject, customer or number. Bespoke so the query reads only
+ * the columns a result needs. A ticket holds what a stranger wrote, and a Member
+ * may read any of them, so a hit shows the same subject the queue does.
+ */
+async function searchTickets(ctx: Ctx): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, "ticket");
+  let qb = AppDataSource.getRepository(SupportTicket)
+    .createQueryBuilder("t")
+    .select(["t.id", "t.number", "t.subject", "t.requesterName", "t.requesterEmail", "t.updatedAt"])
+    .where("t.companyId = :cid", { cid: ctx.companyId })
+    .andWhere("t.mergedIntoId IS NULL")
+    .andWhere("t.status != :spam", { spam: "spam" });
+  const number = /^#?(\d{1,9})$/.exec(q.trim());
+  if (number) qb = qb.andWhere("t.number = :number", { number: Number(number[1]) });
+  else qb = andWhereTokens(qb, ["t.subject", "t.requesterName", "t.requesterEmail"], tokens);
+  qb = orderByPrefixFirst(qb, "t.subject", q, "t.updatedAt");
+  const rows = await qb.getMany();
+  return rows.map((row) => ({
+    kind: "ticket" as const,
+    id: row.id,
+    label: row.subject || `Ticket #${row.number}`,
+    sublabel: `#${row.number} · ${row.requesterName || row.requesterEmail}`,
+    path: `/support/tickets/${row.id}`,
+    score: number ? 100 : scoreKindLabel(ctx, row.subject, q, tokens),
+    updatedAt: row.updatedAt,
+  }));
+}
+
+/**
+ * A customer row is one account seen from two sections, and the viewer's
+ * Finance access picks which one a hit opens. The Customers pages load
+ * through the finance routes, so with Read or Full access a hit opens the
+ * customer and carries its billing email.
+ */
+const CUSTOMER_SPEC: SimpleSpec = {
+  kind: "customer",
+  entity: Customer,
+  nameCol: "name",
+  secondaryCols: ["t.email"],
+  softDeletes: true,
+  hasUpdatedAt: true,
+  path: (r) => `/customers/${r.slug}`,
+  sublabel: (r) => r.email || null,
+};
+
+/**
+ * With finance access None those pages are closed, so the same row comes back
+ * as its Revenue account: Revenue → Accounts lists the same accounts and is
+ * open to every Member. The hit is matched and described only by what that
+ * page shows — name, domain, industry. The billing email is neither displayed
+ * nor matched, since a match alone would tie the address to the account.
+ */
+const ACCOUNT_SPEC: SimpleSpec = {
+  kind: "account",
+  entity: Customer,
+  nameCol: "name",
+  secondaryCols: ["t.domain"],
+  softDeletes: true,
+  hasUpdatedAt: true,
+  path: (r) => `/revenue/accounts/${r.id}`,
+  sublabel: (r) => r.domain || r.industry || null,
+};
+
+/**
+ * A Finance product is a reusable line item, not a product area. It opens the
+ * catalogue at `?q=<its name>`, where the same word rules filter the table, so
+ * a search hit lands on the row instead of somewhere to hunt for it.
+ *
+ * Only offered when Finance access is not None: the catalogue is served by the
+ * finance routes, and a result that can only answer 403 is not a result.
+ */
+const PRODUCT_SPEC: SimpleSpec = {
+  kind: "catalogProduct",
+  entity: Product,
+  nameCol: "name",
+  secondaryCols: ["t.description"],
+  softDeletes: true,
+  hasUpdatedAt: true,
+  path: (r) => financeProductPath(r.name),
+  sublabel: (r) => r.description || null,
+};
+
+/** A query made only of a kind word is a request for that kind, not a title. */
+const KIND_ONLY_SCORE = KIND_MATCH_SCORE.exact;
+
+/**
+ * Split a query into the words that must appear in the row and the words that
+ * name the row's kind. "revenue dashboard" asks for a Dashboard whose title
+ * says revenue, not for a title containing both words; "revenue quarterly"
+ * still requires both. A kind word works in the singular, the plural, its
+ * synonyms, and as far as the person has typed it ("revenue dash"), because
+ * the table of kind words is shared with the rest of search
+ * (`shared/searchKinds.ts`). A query made only of kind words keeps its raw
+ * text for ordering and scoring, so a row named for the kind still leads.
+ */
+function splitKindTokens(
+  ctx: Ctx,
+  kind: SearchResultKind,
+): { tokens: Token[]; q: string } {
+  const kept = ctx.tokens.filter((token) => matchKindToken(kind, token.lo) === null);
+  // A kind-only query keeps its raw words for ordering and scoring: a row
+  // literally called "Dashboard" should lead the dashboards, not fall back to
+  // recency just because the qualifier was also the whole query.
+  return { tokens: kept, q: kept.length ? kept.map((token) => token.lo).join(" ") : ctx.q };
+}
+
+/**
+ * How far below the same tier a title ranks when it answers the query only
+ * once the kind word is set aside. One point is enough for "Sales dashboard"
+ * to lead "Sales" on "sales dashboard", and never enough to drop a name below
+ * a looser tier: "Revenue" (99 on "revenue dashboard") still leads a title
+ * that merely starts with the whole phrase (90).
+ */
+const QUALIFIED_MATCH_DISCOUNT = 1;
+
+/**
+ * Rank a title on the words that survived the kind split, never below what
+ * the words as typed earn. A title that says the whole phrase keeps its full
+ * score, so it leads one that answers only without the kind word. A kind-only
+ * query still ranks a row whose title carries the word ("Dashboard") above the
+ * rest, which fall back to {@link KIND_ONLY_SCORE} rather than to a
+ * description hit.
+ */
+function scoreKindLabel(ctx: Ctx, label: string, q: string, tokens: Token[]): number {
+  // Spacing folded the way the split joins its words, so "sales   dashboard"
+  // is still the whole phrase.
+  const phrase = ctx.tokens.map((token) => token.lo).join(" ");
+  const literal = scoreLabel(label, phrase, ctx.tokens);
+  if (tokens.length === ctx.tokens.length) return literal;
+  if (tokens.length === 0) return Math.max(KIND_ONLY_SCORE, literal);
+  return Math.max(literal, scoreLabel(label, q, tokens) - QUALIFIED_MATCH_DISCOUNT);
+}
+
+async function searchSimple(ctx: Ctx, spec: SimpleSpec): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, spec.kind);
+  let qb = AppDataSource.getRepository(spec.entity)
+    .createQueryBuilder("t")
+    .where("t.companyId = :cid", { cid: ctx.companyId });
+  if (spec.softDeletes) qb = qb.andWhere("t.archivedAt IS NULL");
+  qb = andWhereTokens(qb, [`t.${spec.nameCol}`, ...(spec.secondaryCols ?? [])], tokens);
+  qb = orderByPrefixFirst(
+    qb,
+    `t.${spec.nameCol}`,
+    q,
+    spec.hasUpdatedAt ? "t.updatedAt" : null,
+  );
+  const rows: Record<string, string>[] = await qb.getMany();
+  return rows.map((r) => ({
+    kind: spec.kind,
+    id: r.id,
+    label: r[spec.nameCol],
+    sublabel: spec.sublabel(r),
+    path: spec.path(r),
+    score: scoreKindLabel(ctx, r[spec.nameCol], q, tokens),
+    updatedAt: spec.hasUpdatedAt
+      ? (r as Record<string, unknown>).updatedAt as Date
+      : null,
+  }));
+}
+
+/** Projects, filtered to the ones this member may read. */
+async function searchProjects(
+  ctx: Ctx,
+  accessibleIds: Set<string>,
+): Promise<Scored[]> {
+  if (accessibleIds.size === 0) return [];
+  const { tokens, q } = splitKindTokens(ctx, "project");
+  let qb = AppDataSource.getRepository(Project)
+    .createQueryBuilder("p")
+    .where("p.companyId = :cid", { cid: ctx.companyId })
+    .andWhere("p.id IN (:...pids)", { pids: [...accessibleIds] });
+  qb = andWhereTokens(qb, ["p.name", "p.key"], tokens);
+  qb = orderByPrefixFirst(qb, "p.name", q, null);
+  const rows = await qb.getMany();
+  return rows.map((p) => ({
+    kind: "project" as const,
+    id: p.id,
+    label: p.name,
+    sublabel: p.key || null,
+    path: `/tasks/p/${p.slug}`,
+    score: scoreKindLabel(ctx, p.name, q, tokens),
+    updatedAt: null,
+  }));
+}
+
+/**
+ * Todos land on their project's board — a todo has no URL of its own, so
+ * ↵ takes you to the board and the sublabel carries the ticket number to
+ * find it by. Cancelled todos stay out: nobody types ⌘K to reach work
+ * that was called off.
+ */
+async function searchTodos(
+  ctx: Ctx,
+  accessibleIds: Set<string>,
+): Promise<Scored[]> {
+  if (accessibleIds.size === 0) return [];
+  const { tokens, q } = splitKindTokens(ctx, "todo");
+  let qb = AppDataSource.getRepository(Todo)
+    .createQueryBuilder("t")
+    .innerJoin(Project, "p", "CAST(p.id AS text) = t.projectId")
+    .where("p.companyId = :cid", { cid: ctx.companyId })
+    .andWhere("t.projectId IN (:...pids)", { pids: [...accessibleIds] })
+    .andWhere("t.status != 'cancelled'");
+  qb = andWhereTokens(qb, ["t.title"], tokens);
+  qb = orderByPrefixFirst(qb, "t.title", q, "t.updatedAt")
+    .select("t.id", "id")
+    .addSelect("t.title", "label")
+    .addSelect("t.number", "number")
+    .addSelect("t.updatedAt", "updatedAt")
+    .addSelect("p.key", "projectKey")
+    .addSelect("p.name", "projectName")
+    .addSelect("p.slug", "projectSlug");
+  const rows = await qb.getRawMany();
+  return rows.map((r) => ({
+    kind: "todo" as const,
+    id: r.id,
+    label: r.label,
+    sublabel: `${r.projectKey}-${r.number} · ${r.projectName}`,
+    path: `/tasks/p/${r.projectSlug}`,
+    score: scoreKindLabel(ctx, r.label, q, tokens),
+    updatedAt: rawDate(r.updatedAt),
+  }));
+}
+
+/** Skills and Routines scope to the company through their employee. */
+async function searchEmployeeChildren(
+  ctx: Ctx,
+  kind: "skill" | "routine",
+): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, kind);
+  let qb = AppDataSource.getRepository(kind === "skill" ? Skill : Routine)
+    .createQueryBuilder("s")
+    .innerJoin(AIEmployee, "e", "CAST(e.id AS text) = s.employeeId")
+    .where("e.companyId = :cid", { cid: ctx.companyId });
+  qb = andWhereTokens(qb, ["s.name"], tokens);
+  qb = orderByPrefixFirst(qb, "s.name", q, null)
+    .select("s.id", "id")
+    .addSelect("s.name", "label")
+    .addSelect("s.slug", "slug")
+    .addSelect("e.slug", "empSlug")
+    .addSelect("e.name", "empName");
+  const rows = await qb.getRawMany();
+  return rows.map((r) => ({
+    kind,
+    id: r.id,
+    label: r.label,
+    sublabel: r.empName || null,
+    path: `/${kind === "skill" ? "skills" : "routines"}/${r.empSlug}/${r.slug}`,
+    score: scoreKindLabel(ctx, r.label, q, tokens),
+    updatedAt: null,
+  }));
+}
+
+/** Notes link through their notebook (the URL carries both slugs). */
+async function searchNotes(ctx: Ctx): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, "note");
+  let qb = AppDataSource.getRepository(Note)
+    .createQueryBuilder("n")
+    .innerJoin(Notebook, "nb", "CAST(nb.id AS text) = n.notebookId")
+    .where("n.companyId = :cid", { cid: ctx.companyId })
+    .andWhere("n.archivedAt IS NULL");
+  qb = andWhereTokens(qb, ["n.title"], tokens);
+  qb = orderByPrefixFirst(qb, "n.title", q, "n.updatedAt")
+    .select("n.id", "id")
+    .addSelect("n.title", "label")
+    .addSelect("n.slug", "slug")
+    .addSelect("n.updatedAt", "updatedAt")
+    .addSelect("nb.slug", "nbSlug")
+    .addSelect("nb.title", "nbTitle");
+  const rows = await qb.getRawMany();
+  return rows.map((r) => ({
+    kind: "note" as const,
+    id: r.id,
+    label: r.label,
+    sublabel: r.nbTitle || null,
+    path: `/notes/${r.nbSlug}/${r.slug}`,
+    score: scoreKindLabel(ctx, r.label, q, tokens),
+    updatedAt: rawDate(r.updatedAt),
+  }));
+}
+
+/**
+ * Channels a member may see: public ones, plus private ones and group chats
+ * they belong to — the same rule `listChannelsForUser` applies, folded into
+ * SQL. DMs are skipped (their `name` is null; they're people, not
+ * destinations), and so is a group chat with no name, which has nothing to
+ * match.
+ */
+async function searchChannels(ctx: Ctx, userId: string): Promise<Scored[]> {
+  const { tokens, q } = splitKindTokens(ctx, "channel");
+  let qb = AppDataSource.getRepository(Channel)
+    .createQueryBuilder("c")
+    .leftJoin(
+      ChannelMember,
+      "cm",
+      "cm.channelId = CAST(c.id AS text) AND cm.userId = :uid",
+      { uid: userId },
+    )
+    .where("c.companyId = :cid", { cid: ctx.companyId })
+    .andWhere("c.archivedAt IS NULL")
+    .andWhere("c.kind != 'dm'")
+    .andWhere("c.name IS NOT NULL")
+    .andWhere("(c.kind = 'public' OR cm.id IS NOT NULL)");
+  qb = andWhereTokens(qb, ["c.name", "c.topic"], tokens);
+  qb = orderByPrefixFirst(qb, "c.name", q, "c.lastMessageAt")
+    .select("c.id", "id")
+    .addSelect("c.name", "label")
+    .addSelect("c.kind", "kind")
+    .addSelect("c.topic", "topic")
+    .addSelect("c.lastMessageAt", "lastMessageAt");
+  const rows = await qb.getRawMany();
+  return rows.map((r) => ({
+    kind: "channel" as const,
+    id: r.id,
+    label: r.kind === "group" ? r.label : `#${r.label}`,
+    sublabel: r.topic || null,
+    path: `/workspace/${r.id}`,
+    // Score against the bare name — the query won't carry our # prefix.
+    score: scoreKindLabel(ctx, r.label, q, tokens),
+    updatedAt: rawDate(r.lastMessageAt),
+  }));
+}
+
+// ─────────────────────────── entry point ───────────────────────────
+
+export async function searchCompany(opts: {
+  companyId: string;
+  userId: string;
+  role: Role;
+  /**
+   * The Finance level on the viewer's membership, as stored. Owners and
+   * admins count as `full` whatever it says — `financeAccessFor`, the rule
+   * every finance route applies — so callers pass it unresolved.
+   */
+  financeAccess: FinanceAccess | undefined;
+  query: string;
+}): Promise<CompanySearchResult[]> {
+  const qRaw = opts.query.trim();
+  const q = qRaw.toLowerCase();
+  // One character matches half the database; the palette gates the same way.
+  if (q.length < 2) return [];
+  const tokens: Token[] = tokenizeQuery(qRaw);
+  const ctx: Ctx = { companyId: opts.companyId, q, tokens };
+
+  const accessibleProjects = await listAccessibleProjectIds(opts.companyId, {
+    kind: "user",
+    id: opts.userId,
+    role: opts.role,
+  });
+  const financeAccess = financeAccessFor(opts.role, opts.financeAccess);
+  const customerSpec = financeAccess === "none" ? ACCOUNT_SPEC : CUSTOMER_SPEC;
+
+  const perKind = await Promise.all([
+    ...SIMPLE_SPECS.map((spec) => searchSimple(ctx, spec)),
+    searchSimple(ctx, customerSpec),
+    // Products & services is a Finance page; None means no catalogue to open.
+    ...(financeAccess === "none" ? [] : [searchSimple(ctx, PRODUCT_SPEC)]),
+    searchEmployeeChildren(ctx, "skill"),
+    searchEmployeeChildren(ctx, "routine"),
+    searchNotes(ctx),
+    searchProjects(ctx, accessibleProjects),
+    searchTodos(ctx, accessibleProjects),
+    searchChannels(ctx, opts.userId),
+    searchApplicants(ctx),
+    searchTickets(ctx),
+  ]);
+
+  const merged: Scored[] = [];
+  merged.push(
+    ...searchChatProductReferences(qRaw)
+      // Before the cap, so an area this viewer can't open never takes the
+      // place of one they can.
+      .filter((reference) => canOpenProductReference(reference, financeAccess))
+      .slice(0, PER_KIND_CAP)
+      .map((reference) => ({
+        kind: "product" as const,
+        id: `product:${reference.key}`,
+        label: reference.label,
+        sublabel: reference.description,
+        path: reference.path,
+        score: reference.score,
+        updatedAt: null,
+      })),
+  );
+  for (const results of perKind) {
+    merged.push(
+      ...results
+        .sort(byRank)
+        .slice(0, PER_KIND_CAP),
+    );
+  }
+  return merged
+    .sort(byRank)
+    .slice(0, TOTAL_CAP)
+    .map(({ kind, id, label, sublabel, path }) => ({
+      kind,
+      id,
+      label,
+      sublabel,
+      path,
+    }));
+}
+
+/**
+ * AI Employees come first whatever else matched: the people a company runs on
+ * are who a search most often means, and ranking them ahead keeps `TOTAL_CAP`
+ * from ever crowding them out. Then the best match, the most recent, A–Z.
+ */
+function byRank(a: Scored, b: Scored): number {
+  const lead = Number(b.kind === "employee") - Number(a.kind === "employee");
+  if (lead !== 0) return lead;
+  if (a.score !== b.score) return b.score - a.score;
+  const at = a.updatedAt?.getTime() ?? 0;
+  const bt = b.updatedAt?.getTime() ?? 0;
+  if (at !== bt) return bt - at;
+  return a.label.localeCompare(b.label);
+}

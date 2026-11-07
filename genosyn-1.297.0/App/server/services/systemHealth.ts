@@ -1,0 +1,667 @@
+import {
+  FindManyOptions,
+  In,
+  IsNull,
+  LessThan,
+  MoreThanOrEqual,
+  ObjectLiteral,
+  Repository,
+} from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { AIModel } from "../db/entities/AIModel.js";
+import { AIModelOutage } from "../db/entities/AIModelOutage.js";
+import { EmployeeModel } from "../db/entities/EmployeeModel.js";
+import { Approval } from "../db/entities/Approval.js";
+import { Company } from "../db/entities/Company.js";
+import { EmailLog } from "../db/entities/EmailLog.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run } from "../db/entities/Run.js";
+import { Standdown } from "../db/entities/Standdown.js";
+import { findLiveRunFailures } from "./runFailures.js";
+import { anyRetryAt } from "./runRecovery.js";
+import { waitingWorkByModel } from "./modelOutageViews.js";
+import { unavailableReasonText, waitingWorkText } from "../../shared/modelAvailability.js";
+
+/**
+ * System Health — a company-scoped roll-up of "is anything broken?" signals,
+ * computed entirely from existing tables (no new entity / migration). Powers
+ * two surfaces: the Settings → System Health page (the full report, with
+ * example items + deep-links) and a compact summary embedded on the Home page
+ * card. Both call into {@link computeChecks} so the two views never disagree.
+ *
+ * A **probe** is one named condition (failed runs, stuck runs, broken
+ * integrations, …). Each reports a severity, a count of affected things, a
+ * one-line human summary, and up to {@link MAX_ITEMS} example rows that each
+ * deep-link to where the member can act.
+ *
+ * It used to be called a "check", and was renamed when M58 gave **Check** a
+ * product meaning — a machine-verifiable assertion a Run must pass. Two
+ * unrelated meanings on one word is exactly what AGENTS.md §3 exists to
+ * prevent, and a reader seeing "checks" on a Routine page and "checks" here
+ * would have had no way to know they were unrelated. The wire field is still
+ * `checks`, deliberately: renaming a published JSON key buys nothing and would
+ * break any client mid-upgrade.
+ */
+
+export type HealthSeverity = "ok" | "warn" | "error";
+
+export type HealthItem = {
+  /** Primary label — routine / employee / connection name, etc. */
+  label: string;
+  /** Secondary context line (who, when, why). */
+  sublabel?: string;
+  /** Short status pill, e.g. "exit 1", "timeout", "running 9h". */
+  badge?: string;
+  /** App-relative path the row links to (e.g. a routine's run history). */
+  link?: string;
+};
+
+export type HealthProbe = {
+  /** Stable key, e.g. "failed_runs". */
+  id: string;
+  title: string;
+  /** What this check watches for, in one sentence. */
+  description: string;
+  severity: HealthSeverity;
+  /** Number of affected things (0 when healthy). */
+  count: number;
+  /** One-line current status. */
+  summary: string;
+  /** Up to MAX_ITEMS example rows; empty when healthy. */
+  items: HealthItem[];
+};
+
+export type SystemHealthReport = {
+  generatedAt: string;
+  windowHours: number;
+  /** Worst severity across all checks. */
+  status: HealthSeverity;
+  /** How many checks are not "ok". */
+  issueCount: number;
+  checks: HealthProbe[];
+};
+
+/** Trimmed shape embedded in HomeData for the Home page card. */
+export type SystemHealthSummary = {
+  status: HealthSeverity;
+  issueCount: number;
+  checks: { id: string; title: string; severity: HealthSeverity; count: number }[];
+};
+
+const RECENT_WINDOW_HOURS = 24;
+const RECENT_WINDOW_MS = RECENT_WINDOW_HOURS * 60 * 60 * 1000;
+/** A run still "running" past this is almost certainly orphaned — the max
+ *  configurable routine timeout is 6h, so 8h leaves headroom for a legit
+ *  long run before we flag it. */
+const STUCK_RUN_HOURS = 8;
+const STUCK_RUN_MS = STUCK_RUN_HOURS * 60 * 60 * 1000;
+const STALE_APPROVAL_HOURS = 48;
+const STALE_APPROVAL_MS = STALE_APPROVAL_HOURS * 60 * 60 * 1000;
+const MAX_ITEMS = 5;
+
+const SEVERITY_RANK: Record<HealthSeverity, number> = { ok: 0, warn: 1, error: 2 };
+
+function worstSeverity(severities: HealthSeverity[]): HealthSeverity {
+  return severities.reduce<HealthSeverity>(
+    (acc, s) => (SEVERITY_RANK[s] > SEVERITY_RANK[acc] ? s : acc),
+    "ok",
+  );
+}
+
+// Fully relative on purpose — these strings are pre-rendered server-side and
+// shipped in the payload, so a server-locale calendar date would leak the
+// server's timezone to viewers elsewhere. Relative phrasing stays correct
+// regardless of where it's read.
+function relativeTime(d: Date): string {
+  const sec = Math.round((Date.now() - d.getTime()) / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  const week = Math.round(day / 7);
+  if (week < 5) return `${week}w ago`;
+  const month = Math.round(day / 30);
+  if (month < 12) return `${month}mo ago`;
+  return `${Math.round(day / 365)}y ago`;
+}
+
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/**
+ * Get a check's count plus (optionally) up to `itemLimit` example rows. The
+ * Home summary passes itemLimit 0 — it only needs counts — so we issue a
+ * cheap COUNT instead of materializing and discarding example rows.
+ */
+async function sampleOrCount<T extends ObjectLiteral>(
+  repo: Repository<T>,
+  options: FindManyOptions<T>,
+  itemLimit: number,
+): Promise<[T[], number]> {
+  if (itemLimit <= 0) {
+    const count = await repo.count(options);
+    return [[], count];
+  }
+  return repo.findAndCount({ ...options, take: itemLimit });
+}
+
+/**
+ * Compute every health check for a company. Returns checks in a stable order
+ * (healthy ones included, so the Settings page can show "all clear" rows).
+ */
+async function computeChecks(companyId: string, itemLimit: number): Promise<HealthProbe[]> {
+  const company = await AppDataSource.getRepository(Company).findOneBy({
+    id: companyId,
+  });
+  if (!company) return [];
+  const slug = company.slug;
+  const now = Date.now();
+  const recentSince = new Date(now - RECENT_WINDOW_MS);
+  const stuckBefore = new Date(now - STUCK_RUN_MS);
+  const staleApprovalBefore = new Date(now - STALE_APPROVAL_MS);
+
+  const employees = await AppDataSource.getRepository(AIEmployee).find({
+    where: { companyId },
+    select: ["id", "name", "slug"],
+  });
+  const empIds = employees.map((e) => e.id);
+  const empById = new Map(employees.map((e) => [e.id, e]));
+
+  const routines = empIds.length
+    ? await AppDataSource.getRepository(Routine).find({
+        where: { employeeId: In(empIds) },
+        select: ["id", "name", "slug", "employeeId", "enabled", "acceptanceCriteria"],
+      })
+    : [];
+  const routineIds = routines.map((r) => r.id);
+  const routineById = new Map(routines.map((r) => [r.id, r]));
+
+  // Deep-link into a routine's run history (optionally selecting a run) — the
+  // same target the Journal / Home failed-routine rows use.
+  const routineLink = (routineId: string, runId?: string): string | undefined => {
+    const r = routineById.get(routineId);
+    if (!r) return undefined;
+    const emp = empById.get(r.employeeId);
+    if (!emp) return undefined;
+    const params = new URLSearchParams({ routine: routineId });
+    if (runId) params.set("run", runId);
+    return `/c/${slug}/employees/${emp.slug}/routines?${params.toString()}`;
+  };
+  const empName = (routineId: string): string =>
+    empById.get(routineById.get(routineId)?.employeeId ?? "")?.name ?? "";
+
+  // Only a Routine that declares acceptance criteria is ever graded, so only
+  // those can be *un*graded. A Routine with no criteria is not "unverified" —
+  // it never asked to be verified.
+  const criteriaRoutineIds = routines
+    .filter((r) => r.acceptanceCriteria.trim().length > 0)
+    .map((r) => r.id);
+
+  const runRepo = AppDataSource.getRepository(Run);
+  const standdownRepo = AppDataSource.getRepository(Standdown);
+  const approvalRepo = AppDataSource.getRepository(Approval);
+  const emailRepo = AppDataSource.getRepository(EmailLog);
+  const integrationRepo = AppDataSource.getRepository(IntegrationConnection);
+  const attachmentRepo = AppDataSource.getRepository(EmployeeModel);
+
+  const [
+    failed,
+    pendingRetries,
+    stuck,
+    skipped,
+    staleApprovals,
+    failedEmails,
+    brokenIntegrations,
+    modelRows,
+    unverified,
+    activeStanddowns,
+  ] = await Promise.all([
+    // Shares its filter with the Home "Failed routines" panel, so a failure a
+    // member dismissed there — or one the routine's next run already fixed by
+    // itself — does not keep this check red.
+    findLiveRunFailures({ routineIds, since: recentSince, take: itemLimit }).then(
+      ({ rows, count }) => [rows, count] as [Run[], number],
+    ),
+    // Not windowed: a retry chain with a six-hour backoff can outlive the
+    // 24-hour window it started in, and a pending retry stays actionable.
+    // `anyRetryAt()` reads the few Runs owed one through the `retryAt`
+    // index, where `IS NOT NULL` read every Run the Routines ever had.
+    routineIds.length
+      ? sampleOrCount(
+          runRepo,
+          {
+            where: { routineId: In(routineIds), retryAt: anyRetryAt() },
+            order: { retryAt: "ASC" },
+          },
+          itemLimit,
+        )
+      : Promise.resolve([[], 0] as [Run[], number]),
+    routineIds.length
+      ? sampleOrCount(
+          runRepo,
+          {
+            where: {
+              routineId: In(routineIds),
+              status: "running",
+              startedAt: LessThan(stuckBefore),
+            },
+            order: { startedAt: "ASC" },
+          },
+          itemLimit,
+        )
+      : Promise.resolve([[], 0] as [Run[], number]),
+    routineIds.length
+      ? sampleOrCount(
+          runRepo,
+          {
+            where: {
+              routineId: In(routineIds),
+              status: "skipped",
+              startedAt: MoreThanOrEqual(recentSince),
+            },
+            order: { startedAt: "DESC" },
+          },
+          itemLimit,
+        )
+      : Promise.resolve([[], 0] as [Run[], number]),
+    sampleOrCount(
+      approvalRepo,
+      {
+        where: {
+          companyId,
+          status: "pending",
+          requestedAt: LessThan(staleApprovalBefore),
+        },
+        order: { requestedAt: "ASC" },
+      },
+      itemLimit,
+    ),
+    sampleOrCount(
+      emailRepo,
+      {
+        where: {
+          companyId,
+          status: "failed",
+          createdAt: MoreThanOrEqual(recentSince),
+        },
+        order: { createdAt: "DESC" },
+      },
+      itemLimit,
+    ),
+    sampleOrCount(
+      integrationRepo,
+      {
+        where: { companyId, status: In(["error", "expired"]) },
+        order: { updatedAt: "DESC" },
+      },
+      itemLimit,
+    ),
+    empIds.length
+      ? attachmentRepo.find({
+          where: { employeeId: In(empIds) },
+          select: ["employeeId"],
+        })
+      : Promise.resolve([] as EmployeeModel[]),
+    // Runs that finished green and were never actually graded (M58). Before
+    // this, a checker outage was indistinguishable from a clean record —
+    // `unverified` and a null verdict both read as "nothing wrong", and both
+    // counted toward earning the right to work unattended.
+    criteriaRoutineIds.length
+      ? sampleOrCount(
+          runRepo,
+          {
+            where: [
+              {
+                routineId: In(criteriaRoutineIds),
+                status: "completed",
+                startedAt: MoreThanOrEqual(recentSince),
+                outcomeVerdict: "unverified",
+              },
+              {
+                routineId: In(criteriaRoutineIds),
+                status: "completed",
+                startedAt: MoreThanOrEqual(recentSince),
+                outcomeVerdict: IsNull(),
+                outcomeCheckedAt: IsNull(),
+              },
+            ],
+            order: { startedAt: "DESC" },
+          },
+          itemLimit,
+        )
+      : Promise.resolve([[], 0] as [Run[], number]),
+    sampleOrCount(
+      standdownRepo,
+      {
+        where: { companyId, liftedAt: IsNull() },
+        order: { placedAt: "DESC" },
+      },
+      itemLimit,
+    ),
+  ]);
+
+  const [failedRows, failedCount] = failed;
+  const [retryRows, retryCount] = pendingRetries;
+  const [stuckRows, stuckCount] = stuck;
+  const [skippedRows, skippedCount] = skipped;
+  const [staleRows, staleCount] = staleApprovals;
+  const [emailRows, emailCount] = failedEmails;
+  const [integrationRows, integrationCount] = brokenIntegrations;
+  const [unverifiedRows, unverifiedCount] = unverified;
+  const [standdownRows, standdownCount] = activeStanddowns;
+
+  // Employees that own at least one enabled routine but have no AI Model
+  // attached at all — their routines will silently skip every time they fire.
+  const empWithModel = new Set(modelRows.map((m) => m.employeeId));
+  const empWithEnabledRoutine = new Set(routines.filter((r) => r.enabled).map((r) => r.employeeId));
+  const offlineEmpIds = [...empWithEnabledRoutine].filter((id) => !empWithModel.has(id));
+
+  const checks: HealthProbe[] = [];
+
+  checks.push({
+    id: "failed_runs",
+    title: "Routines needing attention",
+    description:
+      `Routine Runs that failed or ended with an Error in the last ` +
+      `${RECENT_WINDOW_HOURS} hours, and are not scheduled for a retry.`,
+    severity: failedCount > 0 ? "error" : "ok",
+    count: failedCount,
+    summary:
+      failedCount > 0
+        ? `${plural(failedCount, "run", "runs")} failed or ended with an Error in the last ${RECENT_WINDOW_HOURS} hours.`
+        : `No Routine Runs failed or ended with an Error in the last ${RECENT_WINDOW_HOURS} hours.`,
+    items: failedRows.map((r) => ({
+      label: routineById.get(r.routineId)?.name ?? "Unknown routine",
+      sublabel: `${empName(r.routineId)} · ${relativeTime(r.startedAt)}`,
+      badge: r.status === "failed" ? "Failed" : "Error",
+      link: routineLink(r.routineId, r.id),
+    })),
+  });
+
+  checks.push({
+    id: "unverified_runs",
+    title: "Runs nobody verified",
+    // The gap this closes: a Run whose outcome check errored, timed out, or
+    // never ran at all used to be indistinguishable from a graded success, and
+    // earned the employee the same credit toward working unattended.
+    description:
+      `Runs in the last ${RECENT_WINDOW_HOURS} hours that finished on a Routine with acceptance ` +
+      `criteria but were never actually graded — the outcome check errored, timed out, or has ` +
+      `not run. Unverified is not the same as fine, and it no longer earns autonomy.`,
+    severity: unverifiedCount > 0 ? "warn" : "ok",
+    count: unverifiedCount,
+    summary:
+      unverifiedCount > 0
+        ? `${plural(unverifiedCount, "run", "runs")} finished without a verdict in the last ${RECENT_WINDOW_HOURS} hours.`
+        : `Every graded run in the last ${RECENT_WINDOW_HOURS} hours got a verdict.`,
+    items: unverifiedRows.map((r) => ({
+      label: routineById.get(r.routineId)?.name ?? "Unknown routine",
+      sublabel: `${empName(r.routineId)} · ${relativeTime(r.startedAt)}`,
+      badge: r.outcomeVerdict === "unverified" ? "unverified" : "not graded",
+      link: routineLink(r.routineId, r.id),
+    })),
+  });
+
+  checks.push({
+    id: "standdowns",
+    title: "Work stood down",
+    description:
+      "Standdowns currently in force. Nothing under one runs — no scheduled runs, no retries, " +
+      "no wakeups, and (at company or employee scope) no chat. An admin lifts one.",
+    // Deliberately `warn`, never `error`: a standdown a human placed on purpose
+    // is the system working. What matters is that it stays visible, because a
+    // stop nobody remembers placing is how a company quietly stops running.
+    severity: standdownCount > 0 ? "warn" : "ok",
+    count: standdownCount,
+    summary:
+      standdownCount > 0
+        ? `${plural(standdownCount, "standdown", "standdowns")} in force.`
+        : "Nothing is stood down.",
+    items: standdownRows.map((s) => ({
+      label:
+        s.scope === "company"
+          ? "The whole company"
+          : s.scope === "employee"
+            ? (empById.get(s.scopeId ?? "")?.name ?? "An AI employee")
+            : (routineById.get(s.scopeId ?? "")?.name ?? "A routine"),
+      sublabel: `${s.source === "breaker" ? "Circuit breaker" : "Stood down"} ${relativeTime(s.placedAt)} · ${s.reason}`,
+      badge: s.scope,
+      link: `/c/${slug}/settings/standdowns`,
+    })),
+  });
+
+  // AI Models that are unavailable right now (`services/modelAvailability.ts`).
+  // `warn`, like a Standdown: the work on them waits rather than failing, and
+  // carries on by itself when they answer — but someone may want to switch the
+  // employees to another model, so it stays in sight.
+  const outages = await AppDataSource.getRepository(AIModelOutage).find({
+    where: { companyId, endedAt: IsNull() },
+    order: { startedAt: "ASC" },
+  });
+  const outageModels = outages.length
+    ? await AppDataSource.getRepository(AIModel).find({
+        where: { id: In([...new Set(outages.map((o) => o.modelId))]), companyId },
+        select: ["id", "provider", "model"],
+      })
+    : [];
+  const outageModelById = new Map(outageModels.map((m) => [m.id, m]));
+  const outageWaiting =
+    itemLimit > 0 && outages.length
+      ? await waitingWorkByModel(
+          companyId,
+          outages.map((o) => o.modelId),
+        ).catch(() => new Map<string, { runs: number; chats: number }>())
+      : new Map<string, { runs: number; chats: number }>();
+  checks.push({
+    id: "model_outages",
+    title: "AI Models unavailable",
+    description:
+      "AI Models whose service can't be reached, is failing, is overloaded or keeps every key " +
+      "rate-limited. Work on them waits instead of failing — Runs pause, chat messages wait to be " +
+      "answered — and carries on by itself once a check finds the model answering again.",
+    severity: outages.length > 0 ? "warn" : "ok",
+    count: outages.length,
+    summary:
+      outages.length > 0
+        ? `${plural(outages.length, "AI Model is", "AI Models are")} unavailable; the work on ${outages.length === 1 ? "it" : "them"} is waiting.`
+        : "Every AI Model is answering.",
+    items: outages.slice(0, itemLimit).map((outage) => {
+      const model = outageModelById.get(outage.modelId);
+      const waiting = waitingWorkText(outageWaiting.get(outage.modelId) ?? { runs: 0, chats: 0 });
+      return {
+        label: model?.model ?? "An AI Model",
+        sublabel: [
+          unavailableReasonText(outage.cause),
+          `since ${relativeTime(outage.startedAt)}`,
+          waiting,
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        badge: outage.checks > 0 ? `${plural(outage.checks, "check", "checks")} failed` : "unavailable",
+        link: `/c/${slug}/settings/ai-models`,
+      };
+    }),
+  });
+
+  checks.push({
+    id: "pending_retries",
+    title: "Runs waiting to retry",
+    description:
+      "Failed runs the scheduler will automatically re-attempt. Nothing to do — this is " +
+      "here so an in-progress retry chain is visible rather than silent.",
+    severity: retryCount > 0 ? "warn" : "ok",
+    count: retryCount,
+    summary:
+      retryCount > 0
+        ? `${plural(retryCount, "run", "runs")} waiting to be retried automatically.`
+        : "No runs are waiting to retry.",
+    items: retryRows.map((r) => ({
+      label: routineById.get(r.routineId)?.name ?? "Unknown routine",
+      sublabel: `${empName(r.routineId)} · failed ${relativeTime(r.startedAt)}`,
+      badge: `retry #${r.attempt + 1}`,
+      link: routineLink(r.routineId, r.id),
+    })),
+  });
+
+  checks.push({
+    id: "stuck_runs",
+    title: "Stuck runs",
+    // Crash recovery now clears orphaned rows within a heartbeat, so this is
+    // no longer the normal aftermath of a restart — it means recovery itself
+    // isn't running.
+    description:
+      `Runs still executing after ${STUCK_RUN_HOURS} hours. Crash recovery clears these ` +
+      `within a heartbeat, so anything here means the scheduler is not running.`,
+    severity: stuckCount > 0 ? "warn" : "ok",
+    count: stuckCount,
+    summary:
+      stuckCount > 0
+        ? `${plural(stuckCount, "run", "runs")} stuck running for over ${STUCK_RUN_HOURS} hours.`
+        : "No runs are stuck.",
+    items: stuckRows.map((r) => {
+      const hours = Math.floor((now - r.startedAt.getTime()) / (60 * 60 * 1000));
+      return {
+        label: routineById.get(r.routineId)?.name ?? "Unknown routine",
+        sublabel: `${empName(r.routineId)} · started ${relativeTime(r.startedAt)}`,
+        badge: `running ${hours}h`,
+        link: routineLink(r.routineId, r.id),
+      };
+    }),
+  });
+
+  checks.push({
+    id: "skipped_runs",
+    title: "Skipped runs",
+    description: `Runs skipped in the last ${RECENT_WINDOW_HOURS} hours before doing any work — usually no AI model connected for the employee.`,
+    severity: skippedCount > 0 ? "warn" : "ok",
+    count: skippedCount,
+    summary:
+      skippedCount > 0
+        ? `${plural(skippedCount, "run", "runs")} skipped in the last ${RECENT_WINDOW_HOURS} hours — connect an AI model (an API key or custom endpoint) so they actually run.`
+        : `No routine runs were skipped in the last ${RECENT_WINDOW_HOURS} hours.`,
+    items: skippedRows.map((r) => ({
+      label: routineById.get(r.routineId)?.name ?? "Unknown routine",
+      sublabel: `${empName(r.routineId)} · ${relativeTime(r.startedAt)}`,
+      badge: "skipped",
+      link: routineLink(r.routineId, r.id),
+    })),
+  });
+
+  checks.push({
+    id: "employees_without_model",
+    title: "Employees missing an AI model",
+    description:
+      "Employees that own scheduled routines but have no AI model connected, so those routines never run.",
+    severity: offlineEmpIds.length > 0 ? "warn" : "ok",
+    count: offlineEmpIds.length,
+    summary:
+      offlineEmpIds.length > 0
+        ? `${plural(offlineEmpIds.length, "employee has", "employees have")} routines but no AI model connected.`
+        : "Every employee with routines has an AI model connected.",
+    items: offlineEmpIds.slice(0, itemLimit).map((id) => {
+      const emp = empById.get(id)!;
+      return {
+        label: emp.name,
+        sublabel: "No AI model connected — routines will skip",
+        badge: "no model",
+        link: `/c/${slug}/employees/${emp.slug}/settings/model`,
+      };
+    }),
+  });
+
+  checks.push({
+    id: "stale_approvals",
+    title: "Approvals waiting too long",
+    description: `Approvals left pending for over ${STALE_APPROVAL_HOURS} hours — automation is blocked until a human decides.`,
+    severity: staleCount > 0 ? "warn" : "ok",
+    count: staleCount,
+    summary:
+      staleCount > 0
+        ? `${plural(staleCount, "approval has", "approvals have")} been pending for over ${STALE_APPROVAL_HOURS} hours.`
+        : "No approvals are stuck waiting on a decision.",
+    items: staleRows.map((a) => ({
+      label:
+        a.title ||
+        (a.routineId
+          ? `Run "${routineById.get(a.routineId)?.name ?? "routine"}"`
+          : "Approval requested"),
+      sublabel: `${a.kind.replace(/_/g, " ")} · ${relativeTime(a.requestedAt)}`,
+      badge: "pending",
+      link: `/c/${slug}/decisions/approvals`,
+    })),
+  });
+
+  checks.push({
+    id: "email_failures",
+    title: "Email delivery failures",
+    description: `Notification emails that failed to send in the last ${RECENT_WINDOW_HOURS} hours.`,
+    severity: emailCount > 0 ? "warn" : "ok",
+    count: emailCount,
+    summary:
+      emailCount > 0
+        ? `${plural(emailCount, "email", "emails")} failed to send in the last ${RECENT_WINDOW_HOURS} hours.`
+        : `No email delivery failures in the last ${RECENT_WINDOW_HOURS} hours.`,
+    items: emailRows.map((e) => ({
+      label: e.toAddress,
+      sublabel:
+        e.errorMessage?.slice(0, 120) ||
+        `${e.purpose} · ${relativeTime(e.createdAt)}`,
+      badge: "failed",
+      link: `/c/${slug}/settings/email/logs`,
+    })),
+  });
+
+  checks.push({
+    id: "integration_errors",
+    title: "Integration connections",
+    description:
+      "Connected integrations whose credentials have errored or expired and need re-authentication.",
+    severity: integrationCount > 0 ? "error" : "ok",
+    count: integrationCount,
+    summary:
+      integrationCount > 0
+        ? `${plural(integrationCount, "integration connection", "integration connections")} ${integrationCount === 1 ? "needs" : "need"} attention.`
+        : "All integration connections are healthy.",
+    items: integrationRows.map((c) => ({
+      label: c.label,
+      sublabel: `${c.provider}${c.statusMessage ? ` · ${c.statusMessage}` : ""}`,
+      badge: c.status,
+      link: `/c/${slug}/settings/integrations`,
+    })),
+  });
+
+  return checks;
+}
+
+export async function getSystemHealthReport(companyId: string): Promise<SystemHealthReport> {
+  const checks = await computeChecks(companyId, MAX_ITEMS);
+  return {
+    generatedAt: new Date().toISOString(),
+    windowHours: RECENT_WINDOW_HOURS,
+    status: worstSeverity(checks.map((c) => c.severity)),
+    issueCount: checks.filter((c) => c.severity !== "ok").length,
+    checks,
+  };
+}
+
+export async function getSystemHealthSummary(companyId: string): Promise<SystemHealthSummary> {
+  // itemLimit 0 — the Home card only needs counts, so skip materializing the
+  // per-check example rows.
+  const checks = await computeChecks(companyId, 0);
+  return {
+    status: worstSeverity(checks.map((c) => c.severity)),
+    issueCount: checks.filter((c) => c.severity !== "ok").length,
+    checks: checks.map((c) => ({
+      id: c.id,
+      title: c.title,
+      severity: c.severity,
+      count: c.count,
+    })),
+  };
+}

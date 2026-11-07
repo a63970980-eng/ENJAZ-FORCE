@@ -1,0 +1,182 @@
+import { Callout, Code, DocLink, H2, KeyList, LI, P, PageHeader, Strong, UL } from "@/docs/Prose";
+
+export function Standdowns() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Operations"
+        title="Standdowns"
+        lead={
+          <>
+            Every other guardrail in Genosyn is per-action and decided before the fact: an Approval
+            holds one call, a Budget refuses one payment, a Policy blocks one recipient. A{" "}
+            <Strong>Standdown</Strong> is the other instrument — a revocable stop on all AI work at
+            company, employee, or Routine scope, placed by an owner or admin.
+          </>
+        }
+      />
+
+      <H2 id="routines-list">Spot stood-down Routines</H2>
+      <P>
+        Open <Strong>Routines</Strong> to see a red <Strong>Stood down</Strong> badge on every
+        affected Routine, including those covered by an AI Employee or company Standdown.
+        Select the <Strong>Stood down</Strong> filter to see them together. Hover over a badge
+        for the scope and reason, or open the Routine for the full banner. These Routines are
+        excluded from <Strong>Active</Strong>, and their <Strong>Run</Strong> button is disabled
+        until the Standdown is lifted. Their ordinary enabled switch stays unchanged.
+      </P>
+
+      <Callout kind="info" title='"Standdown" is the word.'>
+        Genosyn never says &quot;pause,&quot; &quot;hold,&quot; &quot;suspend,&quot; or
+        &quot;freeze&quot; for this — <Strong>hold</Strong> already means a tainted-turn call
+        waiting on an Approval. A Standdown is the exact inverse of a{" "}
+        <DocLink to="/docs/autonomy">Waiver</DocLink>: a Waiver is earned, narrow, and widens what
+        an employee may do without a human; a Standdown is imposed, broad, and stops it.
+      </Callout>
+
+      <H2 id="why">Why the switch had to exist</H2>
+      <P>
+        Before this row, the honest answers to &quot;stop, now, everything&quot; were toggling{" "}
+        <Code>enabled</Code> on Routines one at a time — which stops no Wakeup, no Trigger, no mail
+        automation, no sequence tick, and nobody who is chatting with the employee right now — or
+        deleting the employee. Neither is a stop. A control that a colleague can accidentally route
+        around by opening a chat window is not one either, which is why the two wider scopes cover
+        interactive chat and the narrow one does not.
+      </P>
+
+      <H2 id="scopes">The three scopes, exactly</H2>
+      <P>
+        Wider scopes subsume narrower ones. What each covers is worth reading precisely, because the
+        difference between them is the difference between an incident contained and an incident that
+        kept going somewhere you weren&apos;t looking.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Company",
+            def: (
+              <>
+                <Strong>Everything.</Strong> Every Routine, every automatic retry, every{" "}
+                <DocLink to="/docs/reactivity">Wakeup</DocLink> and{" "}
+                <DocLink to="/docs/reactivity">Trigger</DocLink>, and interactive chat with every AI
+                Employee in the company. Humans keep using the app in full; the roster stops
+                working.
+              </>
+            ),
+          },
+          {
+            term: "Employee",
+            def: (
+              <>
+                <Strong>One employee, chat included.</Strong> That employee&apos;s Routines,
+                retries, Wakeups, Triggers, and any conversation someone opens with it. Its
+                colleagues carry on untouched.
+              </>
+            ),
+          },
+          {
+            term: "Routine",
+            def: (
+              <>
+                <Strong>One Routine&apos;s scheduled and triggered Runs</Strong> — including its
+                queued retries and a manual &quot;Run now&quot;. It does <Strong>not</Strong> stop
+                chat with the employee that owns it: this is the surgical scope, for one broken
+                piece of work, not for an employee you have stopped trusting.
+              </>
+            ),
+          },
+        ]}
+      />
+
+      <H2 id="in-flight">What happens to work already moving</H2>
+      <UL>
+        <LI>
+          <Strong>In-flight Runs are aborted.</Strong> A covered Run stops where it is and finalizes
+          {" "}
+          <Strong>Error</Strong> with an interruption reason. The log shows what was captured
+          before work stopped; anything after its final line is unknown. This records the
+          interruption without judging whether the intended work was done.
+        </LI>
+        <LI>
+          <Strong>Queued retries are deferred, not cancelled.</Strong> A Run with a retry pending
+          keeps its due time. The dispatcher declines to start it while the Standdown is active, and
+          it fires after the lift. Standing a Routine down does not silently throw away the recovery
+          attempt you may still want.
+        </LI>
+        <LI>
+          <Strong>Work on todos waits too.</Strong> A{" "}
+          <DocLink to="/docs/tasks#auto-start">todo on an AI Employee&apos;s work queue</DocLink>{" "}
+          stays queued, says it is stood down in its panel, and starts by itself after the lift.
+        </LI>
+        <LI>
+          <Strong>Skipped scheduled slots still advance the schedule.</Strong> A slot that arrives
+          during a Standdown is declined and the next occurrence is computed as usual, so lifting a
+          month-old Standdown produces no catch-up storm — the same ceiling{" "}
+          <DocLink to="/docs/routines#missed-slots">downtime recovery</DocLink> keeps, for the same
+          reason.
+        </LI>
+        <LI>
+          <Strong>Everyone covered is told.</Strong> The reason lands on a banner, in the bell for
+          owners and admins, and in the Journal of every covered employee. Journal entries name
+          the scope: standing down one Routine does not stand down its AI Employee or other work.
+        </LI>
+      </UL>
+
+      <H2 id="who">Admin-only, in both directions</H2>
+      <P>
+        Placing a Standdown and lifting one are both owner/admin. Placing requires a{" "}
+        <Strong>reason</Strong>: a stop nobody explained is a stop nobody can safely lift. To lift
+        one, open the affected Routine, AI Employee, or company, choose{" "}
+        <Strong>Return to work</Strong> on its Standdown banner, and say what changed. The row stays
+        as history — lifted Standdowns enforce nothing and are never deleted, so &quot;when did we
+        stop the roster, and why&quot; stays answerable afterwards.
+      </P>
+      <P>
+        Standdowns are human actions. Repeated Run failures do not automatically stand a Routine
+        or its AI Employee down. Later scheduled Runs remain eligible, while failures, alerts, and{" "}
+        <DocLink to="/docs/verification">Check results</DocLink> stay visible. Existing Standdowns,
+        including ones placed automatically by an earlier version, stay effective until an owner
+        or admin lifts them.
+      </P>
+      <P>
+        An <DocLink to="/docs/models#unavailable">unavailable AI Model</DocLink> places no
+        Standdown either: its work waits and carries on by itself once the model is back. The two
+        compose — work a Standdown placed meanwhile covers stays held until it is lifted, and
+        lifting a Standdown starts nothing on a model that is still unavailable.
+      </P>
+      <P>
+        New and resumed Runs use the current Standdown state. An old Journal entry or saved progress
+        checkpoint describing a Standdown is history and does not require another lift after that
+        Standdown has been lifted. Any other active Standdown covering the Routine still applies:
+        returning one Routine to work does not lift an AI Employee or company Standdown. Run
+        explanations distinguish what the saved Run reported from the current Standdown state.
+      </P>
+      <Callout kind="warn" title="There is no MCP tool for this — deliberately.">
+        No AI Employee can place a Standdown, and far more importantly, none can lift one. A stop
+        the roster could lift is not a stop. This is the one control in Genosyn with no AI-facing
+        surface in either direction.
+      </Callout>
+
+      <H2 id="not-enabled">
+        It is not the <Code>enabled</Code> switch
+      </H2>
+      <P>
+        <Code>Routine.enabled</Code> remains exactly what it was: the ordinary, per-Routine on/off
+        for work you are done with, editing, or seasonally retiring. It is untouched by Standdowns
+        and unchanged by lifting one. A Routine disabled before a Standdown is still disabled after
+        it.
+      </P>
+      <P>
+        Use the switch for housekeeping. Use a Standdown for an incident — it is the emergency
+        instrument, it records who and why, it covers the surfaces the switch cannot reach, and it
+        is designed to be lifted rather than to be lived with.
+      </P>
+
+      <Callout kind="info" title="Stopping should be as easy as starting.">
+        Genosyn spends a lot of design on letting an AI Employee do more without asking — Waivers,
+        Triggers, Wakeups, Initiatives. All of that is only defensible if the other direction is one
+        button, available to a human at three scopes, that the roster cannot reach.
+      </Callout>
+    </>
+  );
+}

@@ -1,0 +1,2765 @@
+import React from "react";
+import { Select } from "@/components/ui/Select";
+import { Link, useOutletContext, useSearchParams } from "react-router-dom";
+import {
+  Phone,
+  AlertCircle,
+  Antenna,
+  BarChart3,
+  BookOpen,
+  Building2,
+  Check,
+  CheckCircle2,
+  Copy,
+  CreditCard,
+  Database,
+  GitFork,
+  Github,
+  Hash,
+  Inbox,
+  Landmark,
+  Layers,
+  Linkedin,
+  Mail,
+  Megaphone,
+  MessageCircle,
+  Pencil,
+  Plug,
+  Plug2,
+  RefreshCw,
+  Search,
+  Send,
+  Server,
+  Table2,
+  Trash2,
+  Twitter,
+  Users,
+  Workflow,
+  X,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
+import {
+  api,
+  Company,
+  ConnectionGrantWithEmployee,
+  Employee,
+  IntegrationCatalogEntry,
+  IntegrationCatalogField,
+  IntegrationConnection,
+  INTEGRATION_CATEGORY_ORDER,
+  type IntegrationCategory,
+} from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { connectWithOauth, type IntegrationOauthStart } from "@/lib/integrationOauth";
+import { copyToClipboard } from "../lib/clipboard";
+import { formatRelative } from "../components/decisions/relative";
+import { chatSurfaceLabel, isChatSurfaceProvider } from "./LinkChat";
+import { CustomerChannelsModal } from "../components/customerChannels/CustomerChannelsModal";
+import { Avatar, employeeAvatarUrl } from "../components/ui/Avatar";
+import { Button } from "../components/ui/Button";
+import { Input } from "../components/ui/Input";
+import { Card, CardBody, CardHeader } from "../components/ui/Card";
+import { Spinner } from "../components/ui/Spinner";
+import { Modal } from "../components/ui/Modal";
+import { EmptyState } from "../components/ui/EmptyState";
+import { FormError, FormSuccess } from "../components/ui/FormError";
+import { Breadcrumbs, ContextualLayout, TopBar } from "../components/AppShell";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import type { SettingsOutletCtx } from "./SettingsLayout";
+import { useLiveRefetch } from "../components/CompanySocket";
+import {
+  PRODUCT_INTEGRATION_SCOPES,
+  type ProductIntegrationKey,
+  type ProductIntegrationScope,
+} from "../lib/productIntegrations";
+import { resolveReconnectTarget } from "../lib/integrationReconnect";
+
+/**
+ * Company-level **Integrations** page. Two panels:
+ *   - "Your connections" — every IntegrationConnection for this company,
+ *     with status, account hint, refresh, and delete.
+ *   - "Available" — the static catalog. Click to add a connection
+ *     (API-key → modal; OAuth → popup).
+ *
+ * AI employees gain access to a connection via a Grant, managed at the
+ * employee's Settings → Connections.
+ */
+
+const ICONS: Record<string, LucideIcon> = {
+  Phone,
+  Antenna,
+  Inbox,
+  BarChart3,
+  BookOpen,
+  Building2,
+  CreditCard,
+  Database,
+  GitFork,
+  Github,
+  Landmark,
+  Layers,
+  Linkedin,
+  Mail,
+  Megaphone,
+  MessageCircle,
+  Plug,
+  Search,
+  Send,
+  Server,
+  Table2,
+  Twitter,
+  Workflow,
+  Zap,
+};
+
+/**
+ * The Integrations whose Connections carry a repository allowlist.
+ *
+ * A set rather than a second literal beside the first: both forges answer the
+ * same `/forge/repos` endpoints, and the next one to arrive should be a word
+ * added here rather than a `||` somebody has to notice.
+ */
+const REPO_ALLOWLIST_PROVIDERS = new Set(["github", "forgejo"]);
+
+function useCtx(): SettingsOutletCtx {
+  return useOutletContext<SettingsOutletCtx>();
+}
+
+export function SettingsIntegrations() {
+  const { company } = useCtx();
+  return <IntegrationsPage company={company} />;
+}
+
+export function ProductIntegrationsPage({
+  company,
+  product,
+}: {
+  company: Company;
+  product: ProductIntegrationKey;
+}) {
+  const scope = PRODUCT_INTEGRATION_SCOPES[product];
+
+  return (
+    <ContextualLayout>
+      <div className="page-shell px-6 py-8 sm:px-8">
+        <div className="mb-4">
+          <Breadcrumbs
+            items={[
+              { label: scope.label, to: `/c/${company.slug}/${product}` },
+              { label: "Integrations" },
+            ]}
+          />
+        </div>
+        <IntegrationsPage company={company} scope={scope} />
+      </div>
+    </ContextualLayout>
+  );
+}
+
+function IntegrationsPage({
+  company,
+  scope,
+}: {
+  company: Company;
+  scope?: ProductIntegrationScope;
+}) {
+  const dialog = useDialog();
+  const background = useBackgroundAction();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedReconnectId = searchParams.get("reconnect");
+  const searchParamsString = searchParams.toString();
+  const handledReconnectId = React.useRef<string | null>(null);
+
+  const [catalog, setCatalog] = React.useState<IntegrationCatalogEntry[] | null>(null);
+  const [connections, setConnections] = React.useState<IntegrationConnection[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [addingApiKey, setAddingApiKey] = React.useState<IntegrationCatalogEntry | null>(null);
+  const [addingGoogle, setAddingGoogle] = React.useState<IntegrationCatalogEntry | null>(null);
+  const [reconnecting, setReconnecting] = React.useState<{
+    entry: IntegrationCatalogEntry;
+    conn: IntegrationConnection;
+  } | null>(null);
+  const [refreshingId, setRefreshingId] = React.useState<string | null>(null);
+  // A healthy verdict from "Check status" changes nothing on the row, so it
+  // needs a line of its own. One object, so checking another row retires the
+  // previous row's notice.
+  const [checkNotice, setCheckNotice] = React.useState<{ id: string; message: string } | null>(
+    null,
+  );
+  const [managing, setManaging] = React.useState<IntegrationConnection | null>(null);
+  const [pickingRepos, setPickingRepos] = React.useState<IntegrationConnection | null>(null);
+  const [chatSurface, setChatSurface] = React.useState<IntegrationConnection | null>(null);
+  const [customerChannels, setCustomerChannels] = React.useState<IntegrationConnection | null>(
+    null,
+  );
+  const [search, setSearch] = React.useState("");
+  // The chat-surface reads are admin-only server-side (the identity list is an
+  // org chart of everyone's external handles), so a Member is not offered a
+  // button that can only answer 403.
+  const canAdminister = company.role === "owner" || company.role === "admin";
+
+  const reload = React.useCallback(async () => {
+    // The rows are about to be replaced wholesale — including by the socket
+    // refetch — so a check notice from the old list would be describing a
+    // status this reload may have just changed.
+    setCheckNotice(null);
+    try {
+      const [cat, conns] = await Promise.all([
+        api.get<IntegrationCatalogEntry[]>(`/api/companies/${company.id}/integrations/catalog`),
+        api.get<IntegrationConnection[]>(`/api/companies/${company.id}/integrations/connections`),
+      ]);
+      setCatalog(cat);
+      setConnections(conns);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the integrations"));
+      setCatalog([]);
+      setConnections([]);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  React.useEffect(() => {
+    if (
+      !requestedReconnectId ||
+      handledReconnectId.current === requestedReconnectId ||
+      catalog === null ||
+      connections === null
+    ) {
+      return;
+    }
+
+    handledReconnectId.current = requestedReconnectId;
+    const nextParams = new URLSearchParams(searchParamsString);
+    nextParams.delete("reconnect");
+    setSearchParams(nextParams, { replace: true });
+
+    const target = resolveReconnectTarget(
+      requestedReconnectId,
+      connections,
+      catalog,
+      scope?.providers ?? null,
+    );
+    if (!target) {
+      void dialog.error("That connection is no longer available.", { title: "Couldn’t reconnect" });
+      return;
+    }
+    setReconnecting(target);
+  }, [
+    catalog,
+    connections,
+    requestedReconnectId,
+    searchParamsString,
+    setSearchParams,
+    scope?.providers,
+    dialog,
+  ]);
+
+  useLiveRefetch("connection", reload);
+
+  const allowedProviders = React.useMemo(
+    () => (scope?.providers ? new Set(scope.providers) : null),
+    [scope],
+  );
+  const visibleCatalog = React.useMemo(
+    () =>
+      catalog?.filter(
+        (entry) => allowedProviders === null || allowedProviders.has(entry.provider),
+      ) ?? null,
+    [allowedProviders, catalog],
+  );
+  const visibleConnections = React.useMemo(
+    () =>
+      connections?.filter(
+        (connection) => allowedProviders === null || allowedProviders.has(connection.provider),
+      ) ?? null,
+    [allowedProviders, connections],
+  );
+
+  const groupedCatalog = React.useMemo(() => {
+    if (!visibleCatalog)
+      return [] as Array<{ category: IntegrationCategory; entries: IntegrationCatalogEntry[] }>;
+    const needle = search.trim().toLowerCase();
+    const filtered = needle
+      ? visibleCatalog.filter((e) => {
+          const hay =
+            `${e.name} ${e.tagline} ${e.description ?? ""} ${e.provider} ${e.category}`.toLowerCase();
+          return hay.includes(needle);
+        })
+      : visibleCatalog;
+    const groups = new Map<IntegrationCategory, IntegrationCatalogEntry[]>();
+    for (const entry of filtered) {
+      const arr = groups.get(entry.category) ?? [];
+      arr.push(entry);
+      groups.set(entry.category, arr);
+    }
+    return INTEGRATION_CATEGORY_ORDER.flatMap((category) => {
+      const entries = groups.get(category);
+      if (!entries || entries.length === 0) return [];
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      return [{ category, entries }];
+    });
+  }, [search, visibleCatalog]);
+
+  const byProvider = React.useMemo(() => {
+    const out = new Map<string, IntegrationConnection[]>();
+    if (!visibleConnections) return out;
+    for (const c of visibleConnections) {
+      const arr = out.get(c.provider) ?? [];
+      arr.push(c);
+      out.set(c.provider, arr);
+    }
+    return out;
+  }, [visibleConnections]);
+
+  async function startConnect(entry: IntegrationCatalogEntry) {
+    if (!entry.enabled) {
+      void dialog.error(entry.disabledReason ?? "Integration not enabled", {
+        title: `Couldn’t connect ${entry.name}`,
+      });
+      return;
+    }
+    // OAuth / Service-Account / GitHub-App integrations all share the
+    // unified connect modal (it grows tabs based on which auth modes the
+    // entry advertises). Pure API-key integrations keep the simpler form.
+    if (entry.oauth || entry.serviceAccount || entry.githubApp) {
+      setAddingGoogle(entry);
+      return;
+    }
+    setAddingApiKey(entry);
+  }
+
+  async function reconnect(conn: IntegrationConnection) {
+    if (conn.retired) {
+      void dialog.error(
+        `${conn.retired.name} was retired in ${conn.retired.retiredIn}. ${conn.retired.reason}`,
+        { title: "Couldn’t reconnect" },
+      );
+      return;
+    }
+    const entry = catalog?.find((e) => e.provider === conn.provider);
+    if (!entry) {
+      void dialog.error(`Unknown integration: ${conn.provider}`, { title: "Couldn’t reconnect" });
+      return;
+    }
+    // Browser login is retired, so there is no form to reopen for a
+    // connection created under it. Say that here rather than opening a
+    // modal whose only button would fail on submit.
+    if (conn.authMode === "browser") {
+      void dialog.error(
+        `Browser login for ${entry.name} has been retired. Disconnect this connection and connect over OAuth instead; keep the site password in the Vault.`,
+        { title: "Couldn’t reconnect" },
+      );
+      return;
+    }
+    setReconnecting({ entry, conn });
+  }
+
+  async function refreshStatus(conn: IntegrationConnection) {
+    setRefreshingId(conn.id);
+    setCheckNotice(null);
+    try {
+      const updated = await api.post<IntegrationConnection>(
+        `/api/companies/${company.id}/integrations/connections/${conn.id}/check`,
+      );
+      setConnections((prev) => (prev ?? []).map((c) => (c.id === updated.id ? updated : c)));
+      // A failed check is carried by the row itself — the badge flips and the
+      // status message prints under the label. A healthy one prints nothing
+      // (the "Connected" pill was already there), so say it here or the click
+      // looks like it never registered.
+      if (updated.status === "connected") {
+        setCheckNotice({ id: updated.id, message: "Connection is healthy" });
+      }
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t check the connection" });
+    } finally {
+      setRefreshingId(null);
+    }
+  }
+
+  async function renameConnection(conn: IntegrationConnection) {
+    const next = await dialog.prompt({
+      title: "Rename connection",
+      defaultValue: conn.label,
+      placeholder: "Stripe US",
+      confirmLabel: "Rename",
+      validate: (v) => (v.trim().length === 0 ? "Label is required" : null),
+    });
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (trimmed === conn.label) return;
+    setConnections(
+      (current) =>
+        current?.map((item) => (item.id === conn.id ? { ...item, label: trimmed } : item)) ??
+        current,
+    );
+    background(
+      () =>
+        api.patch<IntegrationConnection>(
+          `/api/companies/${company.id}/integrations/connections/${conn.id}`,
+          { label: trimmed },
+        ),
+      {
+        title: "Couldn’t rename the Connection",
+        error: (error) => `${errorMessage(error)} The previous name has been restored.`,
+        onSuccess: (updated) => {
+          setConnections(
+            (current) =>
+              current?.map((item) => (item.id === updated.id ? updated : item)) ?? current,
+          );
+        },
+        onError: () => {
+          setConnections(
+            (current) => current?.map((item) => (item.id === conn.id ? conn : item)) ?? current,
+          );
+        },
+      },
+    );
+  }
+
+  async function removeConnection(conn: IntegrationConnection) {
+    const ok = await dialog.confirm({
+      title: `Disconnect ${conn.label}?`,
+      message:
+        "Every AI employee that has a grant on this connection will lose access on their next spawn.",
+      confirmLabel: "Disconnect",
+      variant: "danger",
+    });
+    if (!ok) return;
+    const originalIndex = connections?.findIndex((item) => item.id === conn.id) ?? -1;
+    setConnections((current) => current?.filter((item) => item.id !== conn.id) ?? current);
+    background(() => api.del(`/api/companies/${company.id}/integrations/connections/${conn.id}`), {
+      title: "Couldn’t disconnect",
+      error: (error) => `${errorMessage(error)} The Connection has been restored.`,
+      onError: () => {
+        setConnections((current) => {
+          if (!current || current.some((item) => item.id === conn.id)) return current;
+          const next = [...current];
+          next.splice(Math.max(0, Math.min(originalIndex, next.length)), 0, conn);
+          return next;
+        });
+      },
+    });
+  }
+
+  return (
+    <>
+      <TopBar title="Integrations" />
+
+      {/*
+        The catalog and the connections are fetched together, so one failure
+        empties both panels below — the banner sits above both rather than
+        being repeated inside each one.
+      */}
+      <FormError message={loadError} className="mb-6" />
+
+      {scope && (
+        <div className="mb-6 flex flex-col gap-3 rounded-xl border border-indigo-100 bg-indigo-50/60 p-4 sm:flex-row sm:items-center dark:border-indigo-900/60 dark:bg-indigo-950/30">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              Connections for {scope.label}
+            </h2>
+            <p className="mt-1 text-xs leading-5 text-slate-600 dark:text-slate-300">
+              {scope.description}
+            </p>
+          </div>
+          <Link
+            to={`/c/${company.slug}/settings/integrations`}
+            className="shrink-0 text-xs font-medium text-indigo-700 hover:text-indigo-900 dark:text-indigo-300 dark:hover:text-indigo-200"
+          >
+            View all integrations in Settings →
+          </Link>
+        </div>
+      )}
+
+      <section className="mb-6">
+        <Card>
+          <CardHeader>
+            <h2 className="text-sm font-semibold">
+              {scope ? `${scope.label} connections` : "Your connections"}
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              {scope
+                ? `Third-party accounts available to ${scope.label}. Credentials are encrypted at rest.`
+                : "Third-party accounts your company and AI Employees can use. Credentials are encrypted at rest."}
+            </p>
+          </CardHeader>
+          <CardBody>
+            {visibleConnections === null ? (
+              <Spinner />
+            ) : visibleConnections.length === 0 ? (
+              <EmptyState
+                title={scope ? `No ${scope.label} connections yet` : "No connections yet"}
+                description={
+                  scope
+                    ? `Pick an integration below to connect an account for ${scope.label}.`
+                    : "Pick an integration below to connect your first account."
+                }
+              />
+            ) : (
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                {visibleConnections.map((c) => {
+                  const entry = catalog?.find((e) => e.provider === c.provider);
+                  const Icon = entry ? (ICONS[entry.icon] ?? Plug) : Plug;
+                  return (
+                    <li key={c.id} className="flex items-center gap-3 py-3">
+                      <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                        <Icon size={16} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 text-sm font-medium">
+                          <span className="truncate">{c.label}</span>
+                          <AuthModeBadge mode={c.authMode} />
+                          <StatusBadge status={c.status} message={c.statusMessage} />
+                        </div>
+                        <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                          {c.retired?.name ?? entry?.name ?? c.provider} · {c.accountHint || "—"}
+                        </div>
+                        {c.retired ? (
+                          // A retired connector has no catalog entry, so
+                          // nothing else on this row can explain why it stopped
+                          // working.
+                          //
+                          // The upgrade DELETES every row whose credential it
+                          // managed to move into the Vault, so a row still
+                          // rendering this banner is by construction one the
+                          // backfill could not decrypt — its secret is still
+                          // sealed in this row and nowhere else. Saying
+                          // anything that reads as "it is safe in the Vault
+                          // now, tidy this up" would talk the operator into
+                          // destroying the only copy, which is the exact thing
+                          // the backfill declined to do on their behalf.
+                          <p className="mt-1 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+                            Retired in {c.retired.retiredIn}. {c.retired.reason}{" "}
+                            {c.statusMessage ? `${c.statusMessage} ` : ""}
+                            This connection still holds the only copy of that secret, and
+                            disconnecting deletes it for good. Restore the previous encryption key
+                            first if you need the value back; otherwise keep new credentials in the{" "}
+                            <Link
+                              to={`/c/${company.slug}/vault`}
+                              className="underline underline-offset-2"
+                            >
+                              Vault
+                            </Link>
+                            .
+                          </p>
+                        ) : c.status !== "connected" && c.statusMessage ? (
+                          // Not a tooltip: a connection that needs the
+                          // operator to *do* something carries the
+                          // instructions in its status message, and the
+                          // instructions are the fix.
+                          <p className="mt-1 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+                            {c.statusMessage}
+                          </p>
+                        ) : null}
+                        {checkNotice && checkNotice.id === c.id && (
+                          <FormSuccess message={checkNotice.message} className="mt-1" />
+                        )}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setManaging(c)}
+                          title="Manage employee access"
+                        >
+                          <Users size={12} /> Access
+                        </Button>
+                        {REPO_ALLOWLIST_PROVIDERS.has(c.provider) && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setPickingRepos(c)}
+                            title="Pick which repos this connection can clone for granted employees"
+                          >
+                            <BookOpen size={12} /> Repos
+                          </Button>
+                        )}
+                        {canAdminister && isChatSurfaceProvider(c.provider) && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setChatSurface(c)}
+                            title="Delivery URL, and who has linked their Genosyn account"
+                          >
+                            <MessageCircle size={12} /> Chat
+                          </Button>
+                        )}
+                        {canAdminister && c.provider === "slack" && !c.retired && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setCustomerChannels(c)}
+                            title="Link Slack channels to Customers — the AI Employee keeps notes and answers there"
+                          >
+                            <Hash size={12} /> Channels
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => renameConnection(c)}
+                          title="Rename"
+                        >
+                          <Pencil size={12} />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => refreshStatus(c)}
+                          loading={refreshingId === c.id}
+                          title="Check status"
+                        >
+                          <RefreshCw size={12} />
+                        </Button>
+                        {!c.retired && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => reconnect(c)}
+                            title="Reconnect"
+                          >
+                            <Plug2 size={12} />
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => removeConnection(c)}
+                          title="Disconnect"
+                        >
+                          <Trash2 size={12} />
+                        </Button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </CardBody>
+        </Card>
+      </section>
+
+      <section>
+        <div className="mb-3 flex items-center gap-3">
+          <h2 className="text-sm font-semibold">
+            {scope ? `${scope.label} integrations` : "Available integrations"}
+          </h2>
+          <div className="relative ml-auto w-full max-w-xs">
+            <Search
+              size={14}
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500"
+            />
+            <input
+              type="search"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search integrations…"
+              className="w-full rounded-lg border border-slate-200 bg-white py-1.5 pl-8 pr-8 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:ring-indigo-500/25"
+            />
+            {search && (
+              <button
+                type="button"
+                onClick={() => setSearch("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+                aria-label="Clear search"
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+        {visibleCatalog === null ? (
+          <Spinner />
+        ) : groupedCatalog.length === 0 ? (
+          <EmptyState
+            title={search.trim() ? "No matching integrations" : "No integrations available"}
+            description={
+              search.trim()
+                ? `No integrations match "${search.trim()}". Try a different keyword or clear the search.`
+                : `There are no integrations available for ${scope?.label ?? "this company"}.`
+            }
+          />
+        ) : (
+          <div className="flex flex-col gap-6">
+            {groupedCatalog.map(({ category, entries }) => (
+              <div key={category}>
+                <div className="mb-2 flex items-baseline gap-2">
+                  <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                    {category}
+                  </h3>
+                  <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                    {entries.length}
+                  </span>
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {entries.map((entry) => {
+                    const Icon = ICONS[entry.icon] ?? Plug;
+                    const existing = byProvider.get(entry.provider)?.length ?? 0;
+                    return (
+                      <button
+                        key={entry.provider}
+                        onClick={() => startConnect(entry)}
+                        disabled={!entry.enabled}
+                        className="group flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-4 text-left transition hover:border-indigo-300 hover:bg-indigo-50/40 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-800 dark:bg-slate-900 dark:hover:border-indigo-700 dark:hover:bg-indigo-950/30"
+                      >
+                        <div className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-slate-100 text-slate-700 group-hover:bg-indigo-100 group-hover:text-indigo-600 dark:bg-slate-800 dark:text-slate-200 dark:group-hover:bg-indigo-900 dark:group-hover:text-indigo-300">
+                          <Icon size={18} />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                              {entry.name}
+                            </span>
+                            {existing > 0 && (
+                              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                                {existing} connected
+                              </span>
+                            )}
+                            {/* How connecting works, in words: you sign in at
+                                the provider, or paste a key it gave you. */}
+                            <span className="ml-auto text-xs font-medium text-slate-500 dark:text-slate-400">
+                              {entry.authMode === "oauth2"
+                                ? entry.oauth?.instanceApp
+                                  ? "Sign in · 1-click"
+                                  : "Sign in"
+                                : "API key"}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                            {entry.tagline}
+                          </p>
+                          {!entry.enabled && entry.disabledReason && (
+                            <p className="mt-2 flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
+                              <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                              <span>{entry.disabledReason}</span>
+                            </p>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <ApiKeyModal
+        open={
+          addingApiKey !== null ||
+          (reconnecting !== null && reconnecting.conn.authMode === "apikey")
+        }
+        entry={
+          addingApiKey ?? (reconnecting?.conn.authMode === "apikey" ? reconnecting.entry : null)
+        }
+        reconnect={
+          reconnecting?.conn.authMode === "apikey"
+            ? { connectionId: reconnecting.conn.id, label: reconnecting.conn.label }
+            : null
+        }
+        companyId={company.id}
+        onClose={() => {
+          setAddingApiKey(null);
+          setReconnecting(null);
+        }}
+        onSaved={async () => {
+          setAddingApiKey(null);
+          setReconnecting(null);
+          await reload();
+        }}
+      />
+      <OauthOrServiceAccountModal
+        open={
+          addingGoogle !== null ||
+          (reconnecting !== null &&
+            (reconnecting.conn.authMode === "oauth2" ||
+              reconnecting.conn.authMode === "service_account" ||
+              reconnecting.conn.authMode === "github_app"))
+        }
+        entry={
+          addingGoogle ??
+          (reconnecting?.conn.authMode === "oauth2" ||
+          reconnecting?.conn.authMode === "service_account" ||
+          reconnecting?.conn.authMode === "github_app"
+            ? reconnecting.entry
+            : null)
+        }
+        reconnect={
+          reconnecting?.conn.authMode === "oauth2" ||
+          reconnecting?.conn.authMode === "service_account" ||
+          reconnecting?.conn.authMode === "github_app"
+            ? {
+                connectionId: reconnecting.conn.id,
+                label: reconnecting.conn.label,
+                authMode: reconnecting.conn.authMode,
+                scopeGroups: reconnecting.conn.scopeGroups,
+                hostedSignIn: reconnecting.conn.hostedSignIn,
+              }
+            : null
+        }
+        companyId={company.id}
+        onClose={() => {
+          setAddingGoogle(null);
+          setReconnecting(null);
+        }}
+        onSaved={async () => {
+          setAddingGoogle(null);
+          setReconnecting(null);
+          await reload();
+        }}
+      />
+      <ManageAccessModal
+        open={managing !== null}
+        connection={managing}
+        company={company}
+        catalog={catalog ?? []}
+        onClose={() => setManaging(null)}
+      />
+      <RepoAllowlistModal
+        open={pickingRepos !== null}
+        connection={pickingRepos}
+        companyId={company.id}
+        onClose={() => setPickingRepos(null)}
+      />
+      <ChatSurfaceModal
+        open={chatSurface !== null}
+        connection={chatSurface}
+        company={company}
+        onClose={() => setChatSurface(null)}
+      />
+      <CustomerChannelsModal
+        open={customerChannels !== null}
+        connection={customerChannels}
+        company={company}
+        onClose={() => setCustomerChannels(null)}
+      />
+    </>
+  );
+}
+
+function defaultLabel(entry: IntegrationCatalogEntry): string {
+  return entry.name;
+}
+
+/**
+ * Per-connection grant manager. Shows every AI employee in the company and
+ * lets the user toggle access on/off without leaving the Integrations page.
+ * Mirrors the per-employee `EmployeeConnections` flow with the axes flipped.
+ */
+function ManageAccessModal({
+  open,
+  connection,
+  company,
+  catalog,
+  onClose,
+}: {
+  open: boolean;
+  connection: IntegrationConnection | null;
+  company: Company;
+  catalog: IntegrationCatalogEntry[];
+  onClose: () => void;
+}) {
+  const [employees, setEmployees] = React.useState<Employee[] | null>(null);
+  const [grants, setGrants] = React.useState<ConnectionGrantWithEmployee[] | null>(null);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!open || !connection) return;
+    let cancelled = false;
+    setEmployees(null);
+    setGrants(null);
+    setLoadError(null);
+    setError(null);
+    (async () => {
+      try {
+        const [emps, gs] = await Promise.all([
+          api.get<Employee[]>(`/api/companies/${company.id}/employees`),
+          api.get<ConnectionGrantWithEmployee[]>(
+            `/api/companies/${company.id}/integrations/connections/${connection.id}/grants`,
+          ),
+        ]);
+        if (cancelled) return;
+        setEmployees(emps);
+        setGrants(gs);
+      } catch (err) {
+        if (cancelled) return;
+        setLoadError(errorMessage(err, "Could not load the AI employees"));
+        setEmployees([]);
+        setGrants([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, connection, company.id]);
+
+  const grantedIds = React.useMemo(
+    () => new Set((grants ?? []).map((g) => g.employeeId)),
+    [grants],
+  );
+
+  async function grant(emp: Employee) {
+    if (!connection) return;
+    setBusyId(emp.id);
+    setError(null);
+    try {
+      const created = await api.post<ConnectionGrantWithEmployee>(
+        `/api/companies/${company.id}/integrations/employees/${emp.id}/grants`,
+        { connectionId: connection.id },
+      );
+      // The /employees/:eid/grants response embeds `connection`, not
+      // `employee` — synthesize the employee shape locally so the row
+      // updates without a refetch.
+      setGrants((prev) => [
+        ...(prev ?? []),
+        {
+          id: created.id,
+          employeeId: emp.id,
+          connectionId: connection.id,
+          createdAt: created.createdAt,
+          employee: {
+            id: emp.id,
+            name: emp.name,
+            slug: emp.slug,
+            role: emp.role,
+            avatarKey: emp.avatarKey ?? null,
+          },
+        },
+      ]);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function revoke(emp: Employee) {
+    if (!connection) return;
+    setBusyId(emp.id);
+    setError(null);
+    try {
+      await api.del(
+        `/api/companies/${company.id}/integrations/employees/${emp.id}/grants/${connection.id}`,
+      );
+      setGrants((prev) => (prev ?? []).filter((g) => g.employeeId !== emp.id));
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (!connection) return null;
+
+  const entry = catalog.find((e) => e.provider === connection.provider);
+  const Icon = entry ? (ICONS[entry.icon] ?? Plug) : Plug;
+  const ready = employees !== null && grants !== null;
+
+  return (
+    <Modal open={open} onClose={onClose} title={`Manage access · ${connection.label}`} size="lg">
+      <div className="flex flex-col gap-4">
+        <div className="flex items-start gap-3 rounded-lg bg-slate-50 p-3 dark:bg-slate-800/60">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-white text-slate-700 shadow-sm dark:bg-slate-900 dark:text-slate-200">
+            <Icon size={16} />
+          </div>
+          <div className="min-w-0 flex-1 text-xs text-slate-600 dark:text-slate-300">
+            <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+              {entry?.name ?? connection.provider}
+              {connection.accountHint && (
+                <span className="ml-1 font-normal text-slate-500 dark:text-slate-400">
+                  · {connection.accountHint}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5">
+              Pick which AI employees can use this connection through their MCP tools on the next
+              spawn.
+            </p>
+          </div>
+        </div>
+
+        {loadError ? (
+          <FormError message={loadError} />
+        ) : !ready ? (
+          <div className="flex justify-center py-6">
+            <Spinner />
+          </div>
+        ) : employees!.length === 0 ? (
+          <EmptyState
+            title="No AI employees yet"
+            description="Create an AI employee before granting connection access."
+            action={
+              <Link
+                to={`/c/${company.slug}/employees`}
+                className="text-sm font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              >
+                Open Employees →
+              </Link>
+            }
+          />
+        ) : (
+          // The list scrolls inside itself rather than growing the modal body:
+          // a grant/revoke failure lands in the banner below, and that banner
+          // has to stay on screen no matter how many AI employees there are or
+          // how far down the list the failing row sits.
+          <ul className="flex max-h-96 flex-col gap-1.5 overflow-y-auto">
+            {employees!.map((emp) => {
+              const isGranted = grantedIds.has(emp.id);
+              const isBusy = busyId === emp.id;
+              return (
+                <li
+                  key={emp.id}
+                  className="flex items-center gap-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900"
+                >
+                  <Avatar
+                    name={emp.name}
+                    kind="ai"
+                    size="md"
+                    src={employeeAvatarUrl(company.id, emp.id, emp.avatarKey ?? null)}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                      {emp.name}
+                    </div>
+                    <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                      {emp.role}
+                    </div>
+                  </div>
+                  {isGranted ? (
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                        <Check size={10} /> Granted
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => revoke(emp)}
+                        loading={isBusy}
+                      >
+                        Revoke
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button size="sm" onClick={() => grant(emp)} loading={isBusy}>
+                      Grant access
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <FormError message={error} />
+
+        <div className="flex justify-end pt-1">
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Done
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** `GET /chat-surfaces/webhook-url` — the delivery address, and its caveats. */
+type ChatSurfaceWebhookEndpoint = {
+  provider: string;
+  connectionId: string;
+  url: string;
+  publicUrlConfigured: boolean;
+  requiresPublicUrl: boolean;
+  supportsWebhook: boolean;
+};
+
+/** One row of `GET /chat-surfaces/identities`. */
+type ExternalChatIdentitySummary = {
+  id: string;
+  provider: string;
+  connectionId: string;
+  externalUserId: string;
+  externalUserLabel: string | null;
+  bound: boolean;
+  userId: string | null;
+  userName: string | null;
+  userEmail: string | null;
+  boundAt: string | null;
+  lastSeenAt: string | null;
+};
+
+/** What to say about the delivery URL, per surface. */
+function webhookHint(provider: string): string {
+  if (provider === "microsoft-teams") {
+    return "Paste this into the Azure Bot's Messaging endpoint.";
+  }
+  if (provider === "whatsapp") {
+    return "Paste this into the Meta app's Webhooks callback URL, with the verify token from this Connection.";
+  }
+  if (provider === "slack") {
+    return "Only needed if you would rather run the Events API than Socket Mode. With an app-level token, Genosyn dials Slack and needs no public URL at all.";
+  }
+  return "Paste this into the platform's webhook settings.";
+}
+
+/**
+ * The operator's half of an external chat surface (M59).
+ *
+ * Two questions a Slack / Microsoft Teams / WhatsApp / Telegram Connection
+ * raises that no other Connection does, kept in one small modal beside the
+ * row rather than on a page of its own:
+ *
+ *  - **Where do deliveries go?** Only for the surfaces that are actually
+ *    reachable over HTTP. Telegram dials out and Slack can too, so the URL is
+ *    decoration there — `supportsWebhook` decides that, not the provider id.
+ *  - **Who is on the other end?** Everyone who has written to this Connection,
+ *    whether or not they have proved which Member they are. An admin can cut a
+ *    binding from here, because standing authority to act as a Member from
+ *    outside Genosyn is exactly the kind of thing somebody has to be able to
+ *    revoke.
+ *
+ * Both reads are admin-only server-side, which is why the row only offers the
+ * button to an owner or an admin.
+ */
+function ChatSurfaceModal({
+  open,
+  connection,
+  company,
+  onClose,
+}: {
+  open: boolean;
+  connection: IntegrationConnection | null;
+  company: Company;
+  onClose: () => void;
+}) {
+  const dialog = useDialog();
+  const [endpoint, setEndpoint] = React.useState<ChatSurfaceWebhookEndpoint | null>(null);
+  const [identities, setIdentities] = React.useState<ExternalChatIdentitySummary[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [copied, setCopied] = React.useState(false);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+
+  const connectionId = connection?.id ?? null;
+
+  React.useEffect(() => {
+    if (!open || !connectionId) return;
+    let cancelled = false;
+    setEndpoint(null);
+    setIdentities(null);
+    setLoadError(null);
+    setError(null);
+    setCopied(false);
+    (async () => {
+      try {
+        const [url, people] = await Promise.all([
+          api.get<ChatSurfaceWebhookEndpoint>(
+            `/api/companies/${company.id}/chat-surfaces/webhook-url?connectionId=${encodeURIComponent(connectionId)}`,
+          ),
+          api.get<{ identities: ExternalChatIdentitySummary[] }>(
+            `/api/companies/${company.id}/chat-surfaces/identities?connectionId=${encodeURIComponent(connectionId)}`,
+          ),
+        ]);
+        if (cancelled) return;
+        setEndpoint(url);
+        setIdentities(people.identities);
+      } catch (err) {
+        if (cancelled) return;
+        setLoadError(errorMessage(err, "Could not load this chat surface"));
+        setIdentities([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, connectionId, company.id]);
+
+  async function unbind(identity: ExternalChatIdentitySummary) {
+    const who = identity.userName ?? identity.userEmail ?? "this Member";
+    const ok = await dialog.confirm({
+      title: "Unlink this chat account?",
+      message: `${identity.externalUserLabel ?? identity.externalUserId} will stop being recognised as ${who}. The AI Employee keeps answering them, but as a stranger — with no Soul, no Skills and no company tools — until they link again.`,
+      confirmLabel: "Unlink",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setBusyId(identity.id);
+    setError(null);
+    try {
+      await api.del(`/api/companies/${company.id}/chat-surfaces/identities/${identity.id}`);
+      setIdentities(
+        (prev) =>
+          prev?.map((row) =>
+            row.id === identity.id
+              ? {
+                  ...row,
+                  bound: false,
+                  userId: null,
+                  userName: null,
+                  userEmail: null,
+                  boundAt: null,
+                }
+              : row,
+          ) ?? prev,
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Could not unlink that chat account"));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (!connection) return null;
+
+  const surface = chatSurfaceLabel(connection.provider);
+  const ready = identities !== null;
+
+  return (
+    <Modal open={open} onClose={onClose} title={`${surface} · ${connection.label}`} size="lg">
+      <div className="flex flex-col gap-5">
+        <div className="flex items-start gap-3 rounded-lg bg-slate-50 p-3 dark:bg-slate-800/60">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-white text-slate-700 shadow-sm dark:bg-slate-900 dark:text-slate-200">
+            <MessageCircle size={16} />
+          </div>
+          <p className="min-w-0 flex-1 text-xs leading-5 text-slate-600 dark:text-slate-300">
+            People reach the AI Employees granted this Connection from {surface} itself. In a
+            channel or group it answers when it is @-mentioned; in a direct message it answers
+            everything. Approvals and Standdowns stay in Genosyn.
+            {connection.provider === "slack" &&
+              " A Slack channel linked to a Customer under Channels works differently: the employee reads all of it, keeps notes, and answers from that channel’s own instructions."}
+          </p>
+        </div>
+
+        <FormError message={loadError} />
+
+        {endpoint?.supportsWebhook && (
+          <section className="flex flex-col gap-2">
+            <div>
+              <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                Delivery URL
+              </h3>
+              <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
+                {webhookHint(endpoint.provider)}
+              </p>
+            </div>
+            {endpoint.publicUrlConfigured ? (
+              <div className="flex items-center gap-2">
+                <code className="flex-1 overflow-x-auto whitespace-nowrap rounded border border-slate-200 bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200">
+                  {endpoint.url}
+                </code>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={async () => {
+                    if (!(await copyToClipboard(endpoint.url))) return;
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1500);
+                  }}
+                >
+                  {copied ? <Check size={12} /> : <Copy size={12} />}
+                  {copied ? "Copied" : "Copy"}
+                </Button>
+              </div>
+            ) : (
+              // Rendering the localhost URL here would be worse than rendering
+              // nothing: it is a perfectly valid string that no platform on the
+              // internet can reach, and it would be pasted before anyone read
+              // the caveat.
+              <p className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+                <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                <span>
+                  This instance has no Public URL, so there is no address to paste yet. Set it at
+                  Admin → General → Public URL and reopen this panel.
+                </span>
+              </p>
+            )}
+          </section>
+        )}
+
+        {endpoint && !endpoint.supportsWebhook && (
+          // Not an omission worth wondering about: Telegram long-polls out of
+          // Genosyn, which is what lets it work from a laptop behind NAT.
+          <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+            {surface} has no delivery URL to paste — Genosyn dials out to it, so this Connection
+            works without a publicly reachable address.
+          </p>
+        )}
+
+        <section className="flex flex-col gap-2">
+          <div>
+            <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">
+              People on {surface}
+            </h3>
+            <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
+              Until someone opens the one-time link the AI Employee replies with, it answers them as
+              a stranger: no Soul, no Skills, no Goals, no Policies and no company tools.
+            </p>
+          </div>
+          {loadError ? null : !ready ? (
+            <div className="flex justify-center py-6">
+              <Spinner />
+            </div>
+          ) : (identities?.length ?? 0) === 0 ? (
+            <p className="rounded-lg border border-dashed border-slate-200 px-3 py-6 text-center text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+              Nobody has written to this Connection yet. Whoever messages an AI Employee here shows
+              up in this list.
+            </p>
+          ) : (
+            <ul className="flex max-h-72 flex-col gap-1.5 overflow-y-auto">
+              {identities!.map((identity) => (
+                <li
+                  key={identity.id}
+                  className="flex items-center gap-3 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                        {identity.externalUserLabel || identity.externalUserId}
+                      </span>
+                      {identity.bound ? (
+                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                          <Check size={10} /> Linked
+                        </span>
+                      ) : (
+                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+                          Pending
+                        </span>
+                      )}
+                    </div>
+                    <div className="truncate text-xs text-slate-500 dark:text-slate-400">
+                      {identity.bound
+                        ? (identity.userName ?? identity.userEmail ?? "A Member")
+                        : "Not linked to a Member"}
+                      {identity.lastSeenAt
+                        ? ` · last message ${formatRelative(identity.lastSeenAt)}`
+                        : ""}
+                    </div>
+                  </div>
+                  {identity.bound && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      loading={busyId === identity.id}
+                      onClick={() => unbind(identity)}
+                    >
+                      Unlink
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <FormError message={error} />
+
+        <div className="flex justify-end pt-1">
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Done
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AuthModeBadge({ mode }: { mode: IntegrationConnection["authMode"] }) {
+  const label =
+    mode === "oauth2"
+      ? "OAuth"
+      : mode === "service_account"
+        ? "Service account"
+        : mode === "github_app"
+          ? "GitHub App"
+          : mode === "browser"
+            ? // Retired mode; only pre-existing rows still carry it.
+              "Browser"
+            : "API key";
+  return (
+    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300 inline-block first-letter:uppercase">
+      {label}
+    </span>
+  );
+}
+
+function StatusBadge({
+  status,
+  message,
+}: {
+  status: IntegrationConnection["status"];
+  message: string;
+}) {
+  if (status === "connected") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+        <CheckCircle2 size={10} /> Connected
+      </span>
+    );
+  }
+  return (
+    <span
+      title={message}
+      className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-300"
+    >
+      <AlertCircle size={10} /> {status === "expired" ? "Expired" : "Error"}
+    </span>
+  );
+}
+
+export function ApiKeyModal({
+  open,
+  entry,
+  reconnect,
+  companyId,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  entry: IntegrationCatalogEntry | null;
+  reconnect: { connectionId: string; label: string } | null;
+  companyId: string;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [label, setLabel] = React.useState("");
+  const [fields, setFields] = React.useState<Record<string, string>>({});
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const formId = React.useId();
+
+  React.useEffect(() => {
+    if (open && entry) {
+      setLabel(reconnect?.label ?? entry.name);
+      setFields({});
+      setError(null);
+    }
+  }, [open, entry, reconnect]);
+
+  if (!entry || entry.authMode !== "apikey") return null;
+
+  const isReconnect = reconnect !== null;
+  const title = isReconnect ? `Reconnect ${reconnect.label}` : `Connect ${entry.name}`;
+  const fieldId = (key: string) => `${formId}-${key}`;
+
+  return (
+    <Modal open={open} onClose={onClose} title={title} size="lg">
+      <form
+        className="flex flex-col gap-4"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError(null);
+          try {
+            if (isReconnect) {
+              await api.put(
+                `/api/companies/${companyId}/integrations/connections/${reconnect.connectionId}/credentials`,
+                { fields },
+              );
+            } else {
+              await api.post(`/api/companies/${companyId}/integrations/connections`, {
+                provider: entry.provider,
+                label: label.trim() || entry.name,
+                fields,
+              });
+            }
+            // No confirmation message: onSaved closes this modal and
+            // reloads the connection list behind it.
+            onSaved();
+          } catch (err) {
+            setError(errorMessage(err));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {entry.description && (
+          <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+            {isReconnect
+              ? `Replace the credentials for "${reconnect.label}". Existing employee grants and the connection id are preserved.`
+              : entry.description}
+          </p>
+        )}
+        {!isReconnect && (
+          <Input
+            label="Label"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder={entry.name}
+            required
+          />
+        )}
+        {/* The Label arrives filled in, so the cursor starts in the first
+          credential — the field there is to paste. */}
+        {(entry.fields ?? []).map((f: IntegrationCatalogField, index: number) => (
+          <div key={f.key}>
+            <label
+              htmlFor={fieldId(f.key)}
+              className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300"
+            >
+              {f.label}
+              {f.required && <span className="ml-1 text-red-500">*</span>}
+            </label>
+            {f.type === "textarea" ? (
+              <textarea
+                id={fieldId(f.key)}
+                autoFocus={index === 0}
+                required={f.required}
+                placeholder={f.placeholder}
+                value={fields[f.key] ?? ""}
+                onChange={(e) => setFields((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                rows={6}
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+              />
+            ) : (
+              <input
+                id={fieldId(f.key)}
+                autoFocus={index === 0}
+                type={f.type === "password" ? "password" : "text"}
+                required={f.required}
+                placeholder={f.placeholder}
+                value={fields[f.key] ?? ""}
+                onChange={(e) => setFields((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+              />
+            )}
+            {f.hint && (
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">{f.hint}</p>
+            )}
+          </div>
+        ))}
+        <FormError message={error} />
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy}>
+            {busy ? "Testing…" : isReconnect ? "Reconnect" : "Connect"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+type ConnectMode = "oauth" | "service_account" | "apikey" | "github_app";
+
+type GithubAppInstallation = {
+  id: number;
+  account: string;
+  accountType: string;
+  targetType: string;
+  htmlUrl: string;
+};
+
+type GithubAppDiscovery = {
+  app: { id: number; name: string; slug: string; htmlUrl: string };
+  installations: GithubAppInstallation[];
+};
+
+export function OauthOrServiceAccountModal({
+  open,
+  entry,
+  reconnect,
+  companyId,
+  initialScopeGroups,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  entry: IntegrationCatalogEntry | null;
+  reconnect: {
+    connectionId: string;
+    label: string;
+    authMode: "oauth2" | "service_account" | "github_app";
+    scopeGroups: string[];
+    hostedSignIn?: boolean;
+  } | null;
+  companyId: string;
+  initialScopeGroups?: string[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const supportsOauth = !!entry?.oauth;
+  const supportsSa = !!entry?.serviceAccount;
+  // An entry advertises API-key as a *secondary* mode whenever it has
+  // both OAuth metadata AND a non-empty `fields` block (today: GitHub).
+  // Pure API-key providers never reach this modal — `startConnect` routes
+  // them straight to `ApiKeyModal`.
+  const supportsApiKey = !!entry?.oauth && (entry?.fields?.length ?? 0) > 0;
+  const supportsGithubApp = !!entry?.githubApp;
+  const isReconnect = reconnect !== null;
+  // This instance registered the underlying OAuth app (Admin → Integrations),
+  // so a new Connection needs no credentials of its own — the whole Client
+  // ID / Secret half of the form disappears. Reconnect is unaffected: it
+  // reuses whatever credentials the existing Connection already stores.
+  const instanceAppAvailable = !!entry?.oauth?.instanceApp;
+  // …but a company that needs its own client (a Workspace tenant with its own
+  // consent policy, a separate API quota) can still opt out and supply one.
+  const [ownClient, setOwnClient] = React.useState(false);
+  const usesInstanceApp = instanceAppAvailable && !ownClient;
+  // Reconnect locks the auth mode to whatever the existing connection
+  // already uses; we never silently change auth modes mid-flight (that
+  // would orphan the client credentials).
+  const [mode, setMode] = React.useState<ConnectMode>("oauth");
+  const [label, setLabel] = React.useState("");
+  const [clientId, setClientId] = React.useState("");
+  const [clientSecret, setClientSecret] = React.useState("");
+  const [keyJson, setKeyJson] = React.useState("");
+  const [impersonationEmail, setImpersonationEmail] = React.useState("");
+  const [apiKeyFields, setApiKeyFields] = React.useState<Record<string, string>>({});
+  const [appId, setAppId] = React.useState("");
+  const [appPrivateKey, setAppPrivateKey] = React.useState("");
+  const [appDiscovery, setAppDiscovery] = React.useState<GithubAppDiscovery | null>(null);
+  const [selectedInstallationId, setSelectedInstallationId] = React.useState("");
+  const [discovering, setDiscovering] = React.useState(false);
+  const [selectedScopeGroups, setSelectedScopeGroups] = React.useState<string[]>([]);
+  const [oauthExtraFields, setOauthExtraFields] = React.useState<Record<string, string>>({});
+  const [busy, setBusy] = React.useState(false);
+  // One banner per form; only one mode's form is mounted at a time.
+  const [error, setError] = React.useState<string | null>(null);
+  const [waitingForOauth, setWaitingForOauth] = React.useState(false);
+  const oauthController = React.useRef<AbortController | null>(null);
+  // Genosyn Connect, the hosted sign-in service, is the default way in when
+  // this instance registered no app. It may offer only some of the products:
+  // picking one it does not offer means bringing an OAuth client of your own.
+  const hostedGroups = entry?.oauth?.hostedSignIn ? (entry.oauth.hostedScopeGroups ?? []) : [];
+  const hostedAvailable = !instanceAppAvailable && hostedGroups.length > 0;
+  const hostedLabels = (entry?.oauth?.scopeGroups ?? [])
+    .filter((group) => hostedGroups.includes(group.key))
+    .map((group) => group.label);
+  const uncoveredLabels = (entry?.oauth?.scopeGroups ?? [])
+    .filter((group) => selectedScopeGroups.includes(group.key) && !hostedGroups.includes(group.key))
+    .map((group) => group.label);
+  const usesHostedSignIn =
+    !usesInstanceApp &&
+    !ownClient &&
+    hostedAvailable &&
+    selectedScopeGroups.length > 0 &&
+    uncoveredLabels.length === 0;
+  const usesSharedApp = usesInstanceApp || usesHostedSignIn;
+  // Back to Genosyn Connect: keep what it offers, and if that leaves nothing
+  // chosen, start from everything it offers.
+  function switchToHostedSignIn() {
+    setOwnClient(false);
+    setSelectedScopeGroups((current) => {
+      const kept = current.filter((key) => hostedGroups.includes(key));
+      return kept.length > 0 ? kept : hostedGroups;
+    });
+  }
+
+  React.useEffect(
+    () => () => {
+      oauthController.current?.abort();
+    },
+    [open, companyId],
+  );
+
+  React.useEffect(() => {
+    if (open && entry) {
+      const initialMode: ConnectMode = isReconnect
+        ? reconnect.authMode === "oauth2"
+          ? "oauth"
+          : reconnect.authMode === "service_account"
+            ? "service_account"
+            : "github_app"
+        : supportsOauth
+          ? "oauth"
+          : supportsSa
+            ? "service_account"
+            : supportsGithubApp
+              ? "github_app"
+              : "oauth";
+      setMode(initialMode);
+      setLabel(reconnect?.label ?? defaultLabel(entry));
+      setClientId("");
+      setClientSecret("");
+      setKeyJson("");
+      setImpersonationEmail("");
+      setApiKeyFields({});
+      setAppId("");
+      setAppPrivateKey("");
+      setAppDiscovery(null);
+      setSelectedInstallationId("");
+      setOauthExtraFields({});
+      setError(null);
+      setOwnClient(false);
+      // Providers may declare a safer starting set when some permissions
+      // require a separate review (LinkedIn company-page posting, for
+      // example). Providers without explicit defaults preserve the
+      // historical all-selected behaviour.
+      const availableGroups =
+        (initialMode === "oauth" ? entry.oauth?.scopeGroups : entry.serviceAccount?.scopeGroups) ??
+        [];
+      const allGroupKeys = availableGroups.map((g) => g.key);
+      const defaultGroupKeys = availableGroups
+        .filter((group) => group.defaultSelected)
+        .map((group) => group.key);
+      const stored = reconnect?.scopeGroups ?? [];
+      const preferred = (initialScopeGroups ?? []).filter((key) => allGroupKeys.includes(key));
+      // A fresh hosted Connection starts from the defaults Genosyn Connect
+      // can grant, so the first thing on screen needs no client setup.
+      const offered =
+        initialMode === "oauth" && entry.oauth?.hostedSignIn && !entry.oauth.instanceApp
+          ? (entry.oauth.hostedScopeGroups ?? [])
+          : [];
+      const startingKeys = defaultGroupKeys.length > 0 ? defaultGroupKeys : allGroupKeys;
+      const hostedStart = startingKeys.filter((key) => offered.includes(key));
+      setSelectedScopeGroups(
+        stored.length > 0
+          ? stored
+          : preferred.length > 0
+            ? preferred
+            : offered.length > 0
+              ? hostedStart.length > 0
+                ? hostedStart
+                : offered
+              : startingKeys,
+      );
+    }
+  }, [
+    open,
+    entry,
+    supportsOauth,
+    supportsSa,
+    supportsGithubApp,
+    isReconnect,
+    reconnect,
+    initialScopeGroups,
+  ]);
+
+  if (!entry) return null;
+
+  // Each tab owns its own failure, so a message from the form the user just
+  // left must not follow them into the next one.
+  function chooseMode(next: ConnectMode) {
+    setMode(next);
+    setError(null);
+  }
+
+  async function submitOauth(e: React.FormEvent) {
+    e.preventDefault();
+    if (!entry) return;
+    setBusy(true);
+    setError(null);
+    const controller = new AbortController();
+    oauthController.current = controller;
+    try {
+      const isOauthReconnect = isReconnect && reconnect.authMode === "oauth2";
+      await connectWithOauth({
+        companyId,
+        signal: controller.signal,
+        onWaiting: () => setWaitingForOauth(true),
+        start: () =>
+          isOauthReconnect
+            ? api.post<IntegrationOauthStart>(
+                `/api/companies/${companyId}/integrations/connections/${reconnect.connectionId}/reconnect/oauth`,
+                { scopeGroups: selectedScopeGroups },
+              )
+            : api.post<IntegrationOauthStart>(
+                `/api/companies/${companyId}/integrations/oauth/start`,
+                {
+                  provider: entry.provider,
+                  label: label.trim() || entry.name,
+                  // Omitted entirely when the instance has a registered app, so
+                  // the server resolves the credentials rather than receiving
+                  // blanks it would have to reject.
+                  ...(usesSharedApp
+                    ? {}
+                    : { clientId: clientId.trim(), clientSecret: clientSecret.trim() }),
+                  scopeGroups: selectedScopeGroups,
+                  ...(entry.oauth?.extraFields?.length ? { extraFields: oauthExtraFields } : {}),
+                },
+              ),
+      });
+      onSaved();
+    } catch (err) {
+      if (!controller.signal.aborted) setError(errorMessage(err));
+    } finally {
+      oauthController.current = null;
+      setWaitingForOauth(false);
+      setBusy(false);
+    }
+  }
+
+  async function discoverGithubApp() {
+    if (!entry) return;
+    setDiscovering(true);
+    setError(null);
+    try {
+      const out = await api.post<GithubAppDiscovery>(
+        `/api/companies/${companyId}/integrations/github-app/discover`,
+        { appId: appId.trim(), privateKey: appPrivateKey.trim() },
+      );
+      setAppDiscovery(out);
+      // Auto-pick when there's exactly one installation — saves a click in
+      // the common case (single-org App, single install).
+      if (out.installations.length === 1) {
+        setSelectedInstallationId(String(out.installations[0].id));
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
+  async function submitGithubApp(e: React.FormEvent) {
+    e.preventDefault();
+    if (!entry) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (isReconnect && reconnect.authMode === "github_app") {
+        await api.put(
+          `/api/companies/${companyId}/integrations/connections/${reconnect.connectionId}/github-app`,
+          {
+            appId: appId.trim(),
+            privateKey: appPrivateKey.trim(),
+            installationId: selectedInstallationId.trim(),
+          },
+        );
+      } else {
+        await api.post(`/api/companies/${companyId}/integrations/connections/github-app`, {
+          provider: entry.provider,
+          label: label.trim() || entry.name,
+          appId: appId.trim(),
+          privateKey: appPrivateKey.trim(),
+          installationId: selectedInstallationId.trim(),
+        });
+      }
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitApiKey(e: React.FormEvent) {
+    e.preventDefault();
+    if (!entry) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/api/companies/${companyId}/integrations/connections`, {
+        provider: entry.provider,
+        label: label.trim() || entry.name,
+        fields: apiKeyFields,
+      });
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitServiceAccount(e: React.FormEvent) {
+    e.preventDefault();
+    if (!entry) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (isReconnect) {
+        await api.put(
+          `/api/companies/${companyId}/integrations/connections/${reconnect.connectionId}/service-account`,
+          {
+            keyJson,
+            impersonationEmail: impersonationEmail.trim() || undefined,
+            scopeGroups: selectedScopeGroups,
+          },
+        );
+      } else {
+        await api.post(`/api/companies/${companyId}/integrations/connections/service-account`, {
+          provider: entry.provider,
+          label: label.trim() || entry.name,
+          keyJson,
+          impersonationEmail: impersonationEmail.trim() || undefined,
+          scopeGroups: selectedScopeGroups,
+        });
+      }
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleScopeGroup(key: string) {
+    setSelectedScopeGroups((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+    );
+  }
+
+  const oauthApp = entry?.oauth?.app ?? "google";
+  const redirectUri =
+    typeof window !== "undefined"
+      ? `${window.location.origin}/api/integrations/oauth/callback/${oauthApp}`
+      : "";
+  // Per-provider OAuth setup copy. Each entry knows where the user must
+  // register the OAuth client and what the resulting client id looks
+  // like, so the connect form can show concrete instructions instead of
+  // generic OAuth boilerplate.
+  const oauthSetup =
+    oauthApp === "x"
+      ? {
+          consoleStep:
+            "developer.x.com → Projects & Apps → your project → Keys and tokens → User authentication settings → enable OAuth 2.0 (Confidential client).",
+          clientIdPlaceholder: "Client ID (looks like a 25-char base64-ish string)",
+          clientSecretPlaceholder: "Client Secret",
+          consentTitle: "X",
+        }
+      : oauthApp === "github"
+        ? {
+            consoleStep:
+              "github.com/settings/developers → OAuth Apps → New OAuth App. Name it, set Homepage URL to your Genosyn instance, and paste the redirect URI below as the Authorization callback URL.",
+            clientIdPlaceholder: "Iv1.abc123def456…",
+            clientSecretPlaceholder: "GitHub OAuth client secret",
+            consentTitle: "GitHub",
+          }
+        : oauthApp === "microsoft"
+          ? {
+              consoleStep:
+                "Azure portal → Microsoft Entra ID → App registrations → New registration (Web platform). Add a client secret under Certificates & secrets, and paste the redirect URI below.",
+              clientIdPlaceholder: "00000000-0000-0000-0000-000000000000",
+              clientSecretPlaceholder: "Entra app client secret value",
+              consentTitle: "Microsoft",
+            }
+          : oauthApp === "linkedin"
+            ? {
+                consoleStep:
+                  "LinkedIn Developer Portal → your app → Auth → add the redirect URL below, then Products → enable 'Sign In with LinkedIn using OpenID Connect' and 'Share on LinkedIn'.",
+                clientIdPlaceholder: "LinkedIn Client ID",
+                clientSecretPlaceholder: "LinkedIn Primary Client Secret",
+                consentTitle: "LinkedIn",
+              }
+            : {
+                consoleStep:
+                  "Google Cloud Console → APIs & Services → Credentials → Create OAuth Client ID (Web application).",
+                clientIdPlaceholder: "123456789-abcdef.apps.googleusercontent.com",
+                clientSecretPlaceholder: "GOCSPX-…",
+                consentTitle: "Google",
+              };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={isReconnect ? `Reconnect ${reconnect.label}` : `Connect ${entry.name}`}
+      size="lg"
+    >
+      <div className="flex flex-col gap-4">
+        {isReconnect ? (
+          <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+            {reconnect.authMode === "oauth2"
+              ? `Re-run ${oauthSetup.consentTitle}'s consent screen for "${reconnect.label}" to refresh tokens or change which products this connection can access. The connection id and existing employee grants are preserved.`
+              : `Replace the service-account JSON for "${reconnect.label}". Existing employee grants and the connection id are preserved.`}
+          </p>
+        ) : entry.description ? (
+          <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+            {entry.description}
+          </p>
+        ) : null}
+
+        {!isReconnect &&
+          (supportsOauth ? 1 : 0) +
+            (supportsSa ? 1 : 0) +
+            (supportsApiKey ? 1 : 0) +
+            (supportsGithubApp ? 1 : 0) >=
+            2 && (
+            <div className="flex gap-1 rounded-lg bg-slate-100 p-1 text-xs dark:bg-slate-800">
+              {supportsOauth && (
+                <button
+                  type="button"
+                  onClick={() => chooseMode("oauth")}
+                  className={`flex-1 rounded-md px-3 py-1.5 font-medium transition ${
+                    mode === "oauth"
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                      : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  }`}
+                >
+                  OAuth
+                </button>
+              )}
+              {supportsGithubApp && (
+                <button
+                  type="button"
+                  onClick={() => chooseMode("github_app")}
+                  className={`flex-1 rounded-md px-3 py-1.5 font-medium transition ${
+                    mode === "github_app"
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                      : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  }`}
+                >
+                  GitHub App
+                </button>
+              )}
+              {supportsSa && (
+                <button
+                  type="button"
+                  onClick={() => chooseMode("service_account")}
+                  className={`flex-1 rounded-md px-3 py-1.5 font-medium transition ${
+                    mode === "service_account"
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                      : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  }`}
+                >
+                  Service account
+                </button>
+              )}
+              {supportsApiKey && (
+                <button
+                  type="button"
+                  onClick={() => chooseMode("apikey")}
+                  className={`flex-1 rounded-md px-3 py-1.5 font-medium transition ${
+                    mode === "apikey"
+                      ? "bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100"
+                      : "text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  }`}
+                >
+                  Personal token
+                </button>
+              )}
+            </div>
+          )}
+
+        {mode === "oauth" && supportsOauth ? (
+          <form className="flex flex-col gap-3" onSubmit={submitOauth}>
+            {!isReconnect && (
+              <>
+                {usesSharedApp ? (
+                  <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300">
+                    <p className="font-medium">Nothing to set up</p>
+                    <p className="mt-1">
+                      {usesHostedSignIn
+                        ? `Genosyn Connect handles ${oauthSetup.consentTitle} sign-in and token renewal, so there is no OAuth app to register. Your data syncs directly between this installation and ${oauthSetup.consentTitle}.`
+                        : `This Genosyn instance already has a registered ${entry.name} app. Pick what it may access below, then continue to sign in.`}
+                    </p>
+                    <button
+                      type="button"
+                      className="mt-1.5 font-medium underline underline-offset-2"
+                      onClick={() => setOwnClient(true)}
+                    >
+                      Use my own OAuth client instead
+                    </button>
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+                    <p className="font-medium">Set up an OAuth Client ID first</p>
+                    {hostedAvailable && !ownClient && uncoveredLabels.length > 0 && (
+                      <p className="mt-1">
+                        Genosyn Connect offers {hostedLabels.join(", ")} without any setup.{" "}
+                        {uncoveredLabels.join(", ")}{" "}
+                        {uncoveredLabels.length === 1 ? "needs" : "need"} an OAuth client of your
+                        own.
+                      </p>
+                    )}
+                    <ol className="mt-1 list-decimal space-y-0.5 pl-4">
+                      <li>{oauthSetup.consoleStep}</li>
+                      <li>
+                        Add this redirect URI under <em>Authorized redirect URIs</em>:
+                        <code className="ml-1 break-all rounded bg-amber-100 px-1 py-0.5 font-mono dark:bg-amber-900/40">
+                          {redirectUri}
+                        </code>
+                      </li>
+                      <li>Paste the resulting Client ID and Client Secret below.</li>
+                    </ol>
+                    {instanceAppAvailable || hostedAvailable ? (
+                      <button
+                        type="button"
+                        className="mt-1.5 font-medium underline underline-offset-2"
+                        onClick={() => {
+                          if (instanceAppAvailable) setOwnClient(false);
+                          else switchToHostedSignIn();
+                        }}
+                      >
+                        {instanceAppAvailable
+                          ? "Use this instance’s registered app instead"
+                          : `Use Genosyn Connect for ${hostedLabels.join(", ")} instead`}
+                      </button>
+                    ) : (
+                      <p className="mt-1.5">
+                        An instance admin can register {entry.name} once at Admin &rarr;
+                        Integrations so nobody has to do this again.
+                      </p>
+                    )}
+                  </div>
+                )}
+                <Input
+                  label="Label"
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder={entry.name}
+                  required
+                />
+                {!usesSharedApp && (
+                  <>
+                    <Input
+                      label="OAuth Client ID"
+                      value={clientId}
+                      onChange={(e) => setClientId(e.target.value)}
+                      placeholder={oauthSetup.clientIdPlaceholder}
+                      required
+                    />
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                        OAuth Client Secret <span className="ml-1 text-red-500">*</span>
+                      </label>
+                      <input
+                        type="password"
+                        required
+                        value={clientSecret}
+                        onChange={(e) => setClientSecret(e.target.value)}
+                        placeholder={oauthSetup.clientSecretPlaceholder}
+                        className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+                      />
+                      <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                        Encrypted at rest with the app&apos;s session secret. Used to refresh access
+                        tokens.
+                      </p>
+                    </div>
+                  </>
+                )}
+                {(entry.oauth?.extraFields ?? []).map((f) => (
+                  <div key={f.key}>
+                    <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                      {f.label}
+                      {f.required && <span className="ml-1 text-red-500">*</span>}
+                    </label>
+                    <input
+                      type={f.type === "password" ? "password" : "text"}
+                      required={f.required}
+                      value={oauthExtraFields[f.key] ?? ""}
+                      onChange={(e) =>
+                        setOauthExtraFields((prev) => ({
+                          ...prev,
+                          [f.key]: e.target.value,
+                        }))
+                      }
+                      placeholder={f.placeholder}
+                      className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+                    />
+                    {f.hint && (
+                      <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                        {f.hint}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
+            <ScopeGroupPicker
+              // A Connection made through Genosyn Connect reconnects through it,
+              // so it can only choose among what the service offers.
+              groups={(entry.oauth?.scopeGroups ?? []).filter(
+                (group) =>
+                  !reconnect?.hostedSignIn ||
+                  (hostedGroups.length > 0
+                    ? hostedGroups.includes(group.key)
+                    : reconnect.scopeGroups.includes(group.key)),
+              )}
+              selected={selectedScopeGroups}
+              onToggle={toggleScopeGroup}
+              needsOwnClient={
+                !isReconnect && hostedAvailable && !ownClient
+                  ? (entry.oauth?.scopeGroups ?? [])
+                      .map((group) => group.key)
+                      .filter((key) => !hostedGroups.includes(key))
+                  : []
+              }
+            />
+            <FormError message={error} />
+            {waitingForOauth && (
+              <p role="status" className="text-xs text-slate-500">
+                Waiting for sign-in…
+              </p>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  if (busy) oauthController.current?.abort();
+                  else onClose();
+                }}
+              >
+                {busy ? "Cancel sign-in" : "Cancel"}
+              </Button>
+              <Button
+                type="submit"
+                loading={busy}
+                disabled={
+                  selectedScopeGroups.length === 0 ||
+                  (!isReconnect && !usesSharedApp && (!clientId.trim() || !clientSecret.trim()))
+                }
+              >
+                {busy ? "Starting…" : isReconnect ? "Reconnect" : `Connect with ${entry.name}`}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+
+        {mode === "service_account" && supportsSa ? (
+          <form className="flex flex-col gap-3" onSubmit={submitServiceAccount}>
+            <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-800/50 dark:text-slate-300">
+              <p className="font-medium">Service account JSON key</p>
+              <p className="mt-1">
+                Google Cloud Console → IAM &amp; Admin → Service Accounts → pick or create one →
+                Keys → Add key → JSON. Paste the entire downloaded file below.
+              </p>
+              {entry.serviceAccount?.impersonation && (
+                <p className="mt-2">
+                  Service accounts can&apos;t read personal Gmail. To act on a Workspace user&apos;s
+                  mailbox, set <em>domain-wide delegation</em> in the Workspace Admin Console
+                  (Security → API controls) and provide the user&apos;s email below.
+                </p>
+              )}
+            </div>
+            {!isReconnect && (
+              <Input
+                label="Label"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                placeholder={entry.name}
+                required
+              />
+            )}
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                Service account JSON <span className="ml-1 text-red-500">*</span>
+              </label>
+              <textarea
+                required
+                value={keyJson}
+                onChange={(e) => setKeyJson(e.target.value)}
+                placeholder='{ "type": "service_account", "project_id": "…", "private_key": "…", "client_email": "…", … }'
+                rows={8}
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 font-mono text-[11px] shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+              />
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                Encrypted at rest. The private key never leaves the server.
+              </p>
+            </div>
+            {entry.serviceAccount?.impersonation && (
+              <Input
+                label="Impersonate user (optional)"
+                value={impersonationEmail}
+                onChange={(e) => setImpersonationEmail(e.target.value)}
+                placeholder="user@yourcompany.com"
+                type="email"
+              />
+            )}
+            <ScopeGroupPicker
+              groups={entry.serviceAccount?.scopeGroups ?? []}
+              selected={selectedScopeGroups}
+              onToggle={toggleScopeGroup}
+            />
+            <FormError message={error} />
+            <div className="flex justify-end gap-2 pt-2">
+              <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                loading={busy}
+                disabled={!keyJson.trim() || selectedScopeGroups.length === 0}
+              >
+                {busy ? "Validating…" : isReconnect ? "Reconnect" : "Save service account"}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+
+        {mode === "github_app" && supportsGithubApp ? (
+          <form className="flex flex-col gap-3" onSubmit={submitGithubApp}>
+            <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+              <p className="font-medium">Register a GitHub App first</p>
+              <ol className="mt-1 list-decimal space-y-0.5 pl-4">
+                <li>
+                  github.com/settings/apps → New GitHub App. Pick repository permissions:{" "}
+                  <em>Contents: Read &amp; write</em>, <em>Pull requests: Read &amp; write</em>,{" "}
+                  <em>Issues: Read &amp; write</em>, plus <em>Workflows: Read &amp; write</em> if
+                  the AI edits CI.
+                </li>
+                <li>Generate a private key and download the .pem file.</li>
+                <li>Install the App on the org or user that owns the target repos.</li>
+                <li>Paste the App ID and the .pem contents below.</li>
+              </ol>
+            </div>
+            {!isReconnect && (
+              <Input
+                label="Label"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                placeholder={entry.name}
+                required
+              />
+            )}
+            <Input
+              label="App ID"
+              value={appId}
+              onChange={(e) => {
+                setAppId(e.target.value);
+                setAppDiscovery(null);
+                setSelectedInstallationId("");
+              }}
+              placeholder="123456"
+              required
+            />
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                Private key (.pem) <span className="ml-1 text-red-500">*</span>
+              </label>
+              <textarea
+                required
+                value={appPrivateKey}
+                onChange={(e) => {
+                  setAppPrivateKey(e.target.value);
+                  setAppDiscovery(null);
+                  setSelectedInstallationId("");
+                }}
+                placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;…&#10;-----END RSA PRIVATE KEY-----"
+                rows={6}
+                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 font-mono text-[11px] shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+              />
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                Encrypted at rest. The private key never leaves the server.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={discoverGithubApp}
+                loading={discovering}
+                disabled={!appId.trim() || !appPrivateKey.trim()}
+              >
+                {discovering ? "Discovering…" : "Discover installations"}
+              </Button>
+              {appDiscovery ? (
+                <span className="text-xs text-slate-500 dark:text-slate-400">
+                  {appDiscovery.app.name || `App ${appDiscovery.app.id}`} ·{" "}
+                  {appDiscovery.installations.length} installation
+                  {appDiscovery.installations.length === 1 ? "" : "s"}
+                </span>
+              ) : null}
+            </div>
+            {appDiscovery ? (
+              appDiscovery.installations.length === 0 ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+                  This App has no installations yet. Install it on the org or user that owns the
+                  repos you want, then click Discover again.
+                </div>
+              ) : (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                    Installation <span className="ml-1 text-red-500">*</span>
+                  </label>
+                  <Select
+                    required
+                    value={selectedInstallationId}
+                    onChange={(e) => setSelectedInstallationId(e.target.value)}
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600 dark:text-slate-100"
+                  >
+                    <option value="">Pick an installation…</option>
+                    {appDiscovery.installations.map((i) => (
+                      <option key={i.id} value={String(i.id)}>
+                        {i.account} ({i.targetType}) · #{i.id}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              )
+            ) : null}
+            {/* Covers both Discover and submit — a failed discovery leaves
+                the installation block above unrendered, so the banner lands
+                directly under the button that failed. */}
+            <FormError message={error} />
+            <div className="flex justify-end gap-2 pt-2">
+              <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                loading={busy}
+                disabled={!appId.trim() || !appPrivateKey.trim() || !selectedInstallationId.trim()}
+              >
+                {busy ? "Saving…" : isReconnect ? "Reconnect" : "Connect"}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+
+        {mode === "apikey" && supportsApiKey && !isReconnect ? (
+          <form className="flex flex-col gap-3" onSubmit={submitApiKey}>
+            <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-800/50 dark:text-slate-300">
+              <p className="font-medium">Personal Access Token</p>
+              <p className="mt-1">
+                Headless setups (CI / scripts) where running the OAuth consent flow isn&apos;t
+                practical. Generate a fine-grained token at
+                github.com/settings/personal-access-tokens scoped to the repos and orgs you trust —
+                the token needs{" "}
+                <code className="rounded bg-slate-100 px-1 py-0.5 font-mono dark:bg-slate-800">
+                  repo
+                </code>{" "}
+                at minimum to clone and push.
+              </p>
+            </div>
+            <Input
+              label="Label"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              placeholder={entry.name}
+              required
+            />
+            {(entry.fields ?? []).map((f) => (
+              <div key={f.key}>
+                <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                  {f.label}
+                  {f.required && <span className="ml-1 text-red-500">*</span>}
+                </label>
+                <input
+                  type={f.type === "password" ? "password" : "text"}
+                  required={f.required}
+                  placeholder={f.placeholder}
+                  value={apiKeyFields[f.key] ?? ""}
+                  onChange={(e) =>
+                    setApiKeyFields((prev) => ({ ...prev, [f.key]: e.target.value }))
+                  }
+                  className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-mono shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:bg-slate-900 dark:border-slate-600"
+                />
+                {f.hint && (
+                  <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">{f.hint}</p>
+                )}
+              </div>
+            ))}
+            <FormError message={error} />
+            <div className="flex justify-end gap-2 pt-2">
+              <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button type="submit" loading={busy}>
+                {busy ? "Testing…" : "Connect"}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+type ForgeRepoRow = {
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  description?: string;
+  private?: boolean;
+};
+
+/**
+ * Per-Connection repository picker for a git forge — GitHub, or a Forgejo /
+ * Gitea server. Loads the live list the Connection's token can see and lets
+ * the operator toggle which ones the runner is allowed to materialize on disk
+ * for granted AI employees.
+ *
+ * The allowlist is persisted server-side inside the encrypted config blob,
+ * so disconnect / reconnect rebuilds the picker against fresh credentials.
+ */
+function RepoAllowlistModal({
+  open,
+  connection,
+  companyId,
+  onClose,
+}: {
+  open: boolean;
+  connection: IntegrationConnection | null;
+  companyId: string;
+  onClose: () => void;
+}) {
+  const [allowed, setAllowed] = React.useState<ForgeRepoRow[]>([]);
+  const [discoverable, setDiscoverable] = React.useState<ForgeRepoRow[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [search, setSearch] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!open || !connection) return;
+    let cancelled = false;
+    setDiscoverable(null);
+    setAllowed([]);
+    setLoadError(null);
+    setSaveError(null);
+    setSearch("");
+    (async () => {
+      try {
+        const data = await api.get<{
+          allowed: ForgeRepoRow[];
+          discoverable: ForgeRepoRow[];
+        }>(`/api/companies/${companyId}/integrations/connections/${connection.id}/forge/repos`);
+        if (cancelled) return;
+        setAllowed(data.allowed);
+        setDiscoverable(data.discoverable);
+      } catch (err) {
+        if (cancelled) return;
+        setLoadError(errorMessage(err, "Could not load the repos"));
+        setDiscoverable([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, connection, companyId]);
+
+  const allowedKey = React.useCallback(
+    (r: ForgeRepoRow) => `${r.owner.toLowerCase()}/${r.name.toLowerCase()}`,
+    [],
+  );
+  const allowedSet = React.useMemo(() => new Set(allowed.map(allowedKey)), [allowed, allowedKey]);
+
+  function toggle(repo: ForgeRepoRow) {
+    const key = allowedKey(repo);
+    if (allowedSet.has(key)) {
+      setAllowed((prev) => prev.filter((r) => allowedKey(r) !== key));
+    } else {
+      setAllowed((prev) => [
+        ...prev,
+        {
+          owner: repo.owner,
+          name: repo.name,
+          defaultBranch: repo.defaultBranch,
+        },
+      ]);
+    }
+  }
+
+  async function save() {
+    if (!connection) return;
+    setBusy(true);
+    setSaveError(null);
+    try {
+      await api.put(
+        `/api/companies/${companyId}/integrations/connections/${connection.id}/forge/repos`,
+        {
+          repos: allowed.map((r) => ({
+            owner: r.owner,
+            name: r.name,
+            defaultBranch: r.defaultBranch,
+          })),
+        },
+      );
+      // The modal closing is the confirmation.
+      onClose();
+    } catch (err) {
+      setSaveError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const filteredDiscoverable = React.useMemo(() => {
+    if (!discoverable) return null;
+    const q = search.trim().toLowerCase();
+    if (!q) return discoverable;
+    return discoverable.filter((r) => `${r.owner}/${r.name}`.toLowerCase().includes(q));
+  }, [discoverable, search]);
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={connection ? `Repos · ${connection.label}` : "Repos"}
+      size="lg"
+    >
+      <div className="flex flex-col gap-3">
+        <p className="rounded-md bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800/60 dark:text-slate-300">
+          AI employees with a grant on this Connection get every selected repo cloned into their
+          working directory before each spawn. They use plain{" "}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono dark:bg-slate-900">git</code>{" "}
+          to branch, commit, and push, and the{" "}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono dark:bg-slate-900">
+            create_pull_request
+          </code>{" "}
+          tool to ship work back as a PR.
+        </p>
+
+        {loadError ? (
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+            {loadError}
+          </div>
+        ) : null}
+
+        <div className="relative">
+          <Search
+            size={14}
+            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500"
+          />
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter repos…"
+            className="w-full rounded-lg border border-slate-200 bg-white py-1.5 pl-8 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:ring-indigo-500/25"
+          />
+        </div>
+
+        {filteredDiscoverable === null ? (
+          <div className="flex justify-center py-6">
+            <Spinner />
+          </div>
+        ) : filteredDiscoverable.length === 0 ? (
+          <EmptyState
+            title={search ? "No matching repos" : "No accessible repos"}
+            description={
+              search
+                ? `No repos on this connection match "${search.trim()}".`
+                : "This connection's token can't see any repos. Check the token's scopes and org access."
+            }
+          />
+        ) : (
+          <ul className="max-h-96 divide-y divide-slate-100 overflow-y-auto rounded-md border border-slate-200 dark:divide-slate-800 dark:border-slate-700">
+            {filteredDiscoverable.map((r) => {
+              const key = allowedKey(r);
+              const checked = allowedSet.has(key);
+              return (
+                <li key={key}>
+                  <label className="flex cursor-pointer items-start gap-3 p-2.5 transition hover:bg-slate-50 dark:hover:bg-slate-800/40">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggle(r)}
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 dark:border-slate-600 dark:bg-slate-900"
+                    />
+                    <span className="flex-1 min-w-0">
+                      <span className="flex items-center gap-1.5 text-sm font-medium text-slate-900 dark:text-slate-100">
+                        <span className="truncate">
+                          {r.owner}/{r.name}
+                        </span>
+                        {r.private ? (
+                          <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-xs font-normal text-slate-500 dark:bg-slate-800 dark:text-slate-400 inline-block first-letter:uppercase">
+                            Private
+                          </span>
+                        ) : null}
+                        <span className="ml-auto text-[10px] font-normal text-slate-400 dark:text-slate-500">
+                          {r.defaultBranch}
+                        </span>
+                      </span>
+                      {r.description ? (
+                        <span className="mt-0.5 block truncate text-[11px] text-slate-500 dark:text-slate-400">
+                          {r.description}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <FormError message={saveError} />
+
+        <div className="flex items-center justify-between gap-2 pt-1">
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            {allowed.length} selected
+          </span>
+          <div className="flex gap-2">
+            <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={save} loading={busy}>
+              {busy ? "Saving…" : "Save selection"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * Render a list of provider-defined scope bundles as checkboxes. Used by
+ * both the OAuth and Service Account flows so the user can pick which
+ * services (Mail, Calendar, Drive, …) the connection is allowed to touch.
+ */
+function ScopeGroupPicker({
+  groups,
+  selected,
+  onToggle,
+  needsOwnClient = [],
+}: {
+  groups: {
+    key: string;
+    label: string;
+    description: string;
+    required?: boolean;
+    workspaceOnly?: boolean;
+  }[];
+  selected: string[];
+  onToggle: (key: string) => void;
+  /** Groups Genosyn Connect does not offer, marked before anyone picks one. */
+  needsOwnClient?: string[];
+}) {
+  if (groups.length === 0) return null;
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-slate-700 dark:text-slate-200">
+        What can this connection access?
+      </label>
+      <p className="mb-2 text-[11px] text-slate-500 dark:text-slate-400">
+        Pick the products this connection can touch. You can change this later by reconnecting.
+      </p>
+      <div className="flex flex-col divide-y divide-slate-100 rounded-md border border-slate-200 dark:divide-slate-800 dark:border-slate-700">
+        {groups.map((g) => {
+          const checked = selected.includes(g.key) || !!g.required;
+          return (
+            <label
+              key={g.key}
+              className="flex cursor-pointer items-start gap-2.5 p-2.5 transition hover:bg-slate-50 dark:hover:bg-slate-800/40"
+            >
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={!!g.required}
+                onChange={() => onToggle(g.key)}
+                className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 dark:border-slate-600 dark:bg-slate-900"
+              />
+              <span className="flex-1 text-xs">
+                <span className="flex items-center gap-1.5 font-medium text-slate-900 dark:text-slate-100">
+                  {g.label}
+                  {g.workspaceOnly && (
+                    <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-xs font-normal text-slate-500 dark:bg-slate-800 dark:text-slate-400 inline-block first-letter:uppercase">
+                      Workspace only
+                    </span>
+                  )}
+                  {g.required && (
+                    <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-xs font-normal text-slate-500 dark:bg-slate-800 dark:text-slate-400 inline-block first-letter:uppercase">
+                      Required
+                    </span>
+                  )}
+                  {needsOwnClient.includes(g.key) && (
+                    <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-xs font-normal text-amber-700 dark:bg-amber-950/40 dark:text-amber-300 inline-block first-letter:uppercase">
+                      Own OAuth client
+                    </span>
+                  )}
+                </span>
+                <span className="mt-0.5 block text-[11px] text-slate-500 dark:text-slate-400">
+                  {g.description}
+                </span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

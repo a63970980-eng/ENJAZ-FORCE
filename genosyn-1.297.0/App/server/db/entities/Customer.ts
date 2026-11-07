@@ -1,0 +1,130 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  Index,
+} from "typeorm";
+
+/**
+ * A Customer is the shared company/account record from prospect through
+ * billing. It becomes a billable counterparty when an `Invoice` is issued;
+ * merely creating a prospect account does not create finance activity.
+ *
+ * Per-company by id; slug is unique per company so URLs read like
+ * `/c/<co>/finance/customers/<slug>`. Renames change the display name
+ * but not the slug, matching how AI Employees and Projects are handled
+ * elsewhere in the codebase.
+ *
+ * Addresses are stored as plain text blobs (one address per field, with
+ * embedded newlines) rather than structured columns. Phase A doesn't do
+ * anything jurisdiction-aware with the address — the printable invoice
+ * just dumps it verbatim — so structure would be premature.
+ */
+@Entity("customers")
+@Index(["companyId", "slug"], { unique: true })
+@Index(["companyId", "archivedAt"])
+@Index(["companyId", "accountStatus"])
+@Index(["companyId", "domain"])
+export class Customer {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  @Column({ type: "varchar" })
+  name!: string;
+
+  @Column({ type: "varchar" })
+  slug!: string;
+
+  /** Primary contact email — used as the default `to` for invoice "Send". */
+  @Column({ type: "varchar", default: "" })
+  email!: string;
+
+  @Column({ type: "varchar", default: "" })
+  phone!: string;
+
+  /**
+   * Customers are the account record throughout the lifecycle. A prospect is
+   * not billable merely because this row exists; billing starts with invoices.
+   */
+  @Column({ type: "varchar", default: "customer" })
+  accountStatus!: "prospect" | "customer" | "former";
+
+  /** Lowercase bare hostname used for dedupe and mail-domain association. */
+  @Column({ type: "varchar", default: "" })
+  domain!: string;
+
+  @Column({ type: "varchar", default: "" })
+  websiteUrl!: string;
+
+  @Column({ type: "varchar", default: "" })
+  industry!: string;
+
+  /** 0 means unknown. */
+  @Column({ type: "int", default: 0 })
+  employeeCount!: number;
+
+  /** Provider-sourced or manually entered headquarters; separate from the
+   * billing and shipping addresses used on Finance documents. */
+  @Column({ type: "text", default: "" })
+  headquartersAddress!: string;
+
+  /** Display-only parent-company facts. Enrichment never creates or links a
+   * parent Account automatically. */
+  @Column({ type: "varchar", default: "" })
+  parentCompanyName!: string;
+
+  @Column({ type: "varchar", default: "" })
+  parentCompanyDomain!: string;
+
+  @Column({ type: "varchar", nullable: true })
+  ownerId!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  ownerEmployeeId!: string | null;
+
+  @Column({ type: "text", default: "" })
+  billingAddress!: string;
+
+  @Column({ type: "text", default: "" })
+  shippingAddress!: string;
+
+  /** VAT / GST / EIN — printed on invoices in jurisdictions that require it. */
+  @Column({ type: "varchar", default: "" })
+  taxNumber!: string;
+
+  /** ISO 4217 default currency for new invoices to this customer. Per-invoice
+   *  override still wins. Phase E (multi-currency) introduces FX rates. */
+  @Column({ type: "varchar", default: "USD" })
+  currency!: string;
+
+  /** Annual Contract Value, in minor units (cents) of the customer's
+   *  `currency`. A sales/account metric — the expected yearly revenue from
+   *  this account — kept independent of issued invoices. Stored as an
+   *  integer like every other money column; capped at 2_000_000_000 by the
+   *  write schema to stay within a 32-bit `int` on Postgres. 0 means unset. */
+  @Column({ type: "int", default: 0 })
+  annualContractValueCents!: number;
+
+  @Column({ type: "text", default: "" })
+  notes!: string;
+
+  /** Soft-delete: archived customers stay queryable for historical invoices
+   *  but are hidden from the default customer list and the new-invoice picker. */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  archivedAt!: Date | null;
+
+  @Column({ type: "varchar", nullable: true })
+  createdById!: string | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}

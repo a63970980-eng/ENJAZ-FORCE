@@ -1,0 +1,87 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from "typeorm";
+
+/**
+ * One line off a bank feed. Phase D of the Finance milestone (M19) —
+ * see ROADMAP.md.
+ *
+ * Positive `amountCents` = money in (deposit). Negative = money out
+ * (withdrawal / fee). Stored signed so the auto-match heuristic and
+ * reconciliation UI don't have to remember a separate side column.
+ *
+ * `matchedPaymentId` and `matchedLedgerEntryId` are the two outcomes
+ * of a successful match: either the row corresponds to an
+ * `InvoicePayment` we already recorded (the common case), or to a
+ * `LedgerEntry` (manual entry, future bill payment). At most one is
+ * set at a time. `reconciledAt` stamps the moment the human (or
+ * auto-matcher) confirmed the match.
+ */
+@Entity("bank_transactions")
+@Index(["feedId"])
+@Index(["companyId", "feedId", "date"])
+@Index(["companyId", "reconciledAt"])
+@Index(["feedId", "externalId"])
+// Banking's list across every account, newest first, one keyset page at a time
+// (`services/bankingQueue.ts`): a page reads its own rows, not the whole history.
+@Index(["companyId", "date", "id"])
+export class BankTransaction {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  @Column({ type: "varchar" })
+  feedId!: string;
+
+  /** Provider id (Stripe payout id, etc.) used for dedupe on re-sync.
+   *  Null for CSV imports — we dedupe those by `(date, amount,
+   *  description)` triple in the import code. */
+  @Column({ type: "varchar", nullable: true })
+  externalId!: string | null;
+
+  @Column({ type: dateTimeColumnType })
+  date!: Date;
+
+  @Column({ type: "int" })
+  amountCents!: number;
+
+  @Column({ type: "varchar", default: "" })
+  description!: string;
+
+  /** Free-form bank-supplied reference number, if any. Stored separately
+   *  from `description` so the auto-matcher can score them differently. */
+  @Column({ type: "varchar", default: "" })
+  reference!: string;
+
+  /** Verbatim provider/CSV row, JSON-stringified, for debug & re-parse. */
+  @Column({ type: "text", default: "" })
+  raw!: string;
+
+  @Column({ type: "varchar", nullable: true })
+  matchedPaymentId!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  matchedLedgerEntryId!: string | null;
+
+  /** A customer deposit or overpayment arriving on the bank feed, matched
+   *  to the `CustomerCredit` it created. */
+  @Column({ type: "varchar", nullable: true })
+  matchedCreditId!: string | null;
+
+  /** Money leaving on the bank feed, matched to the `CustomerRefund` that
+   *  sent it. Refunds are the money-out side the reconciler previously had
+   *  no way to match at all. */
+  @Column({ type: "varchar", nullable: true })
+  matchedRefundId!: string | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  reconciledAt!: Date | null;
+
+  /** Who reconciled this row. Null for auto-matched rows. */
+  @Column({ type: "varchar", nullable: true })
+  reconciledById!: string | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+}

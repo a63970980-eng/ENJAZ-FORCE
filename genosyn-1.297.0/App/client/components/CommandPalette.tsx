@@ -1,0 +1,1114 @@
+import React from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import {
+  LifeBuoy,
+  BarChart3,
+  Briefcase,
+  Building2,
+  CalendarClock,
+  Contact2,
+  CornerDownLeft,
+  FolderGit2,
+  GitBranch,
+  Library,
+  ListChecks,
+  type LucideIcon,
+  MessageSquare,
+  NotebookText,
+  Package,
+  Search,
+  SearchX,
+  Table2,
+  UserRound,
+  Users,
+  WalletCards,
+  Wrench,
+  Zap,
+} from "lucide-react";
+import { api, CompanySearchResult, SearchResultKind } from "../lib/api";
+import {
+  ACCOUNT_SECTION,
+  HELP_SECTION,
+  SECTION_BY_KEY,
+  SECTION_GROUPS,
+  SectionGroup,
+  SectionItem,
+  SectionMatch,
+  activeSection,
+  searchSections,
+} from "../lib/sections";
+import {
+  EMPLOYEE_PAGES,
+  PALETTE_SUBPAGES,
+  SUBPAGE_RESULT_LIMIT,
+  type SubpageMatch,
+  type SubpageViewer,
+  currentEmployeeSlug,
+  isCurrentSubpage,
+  pagesLead,
+  queryNamesEmployeePage,
+  searchEmployeePages,
+  searchSubpages,
+} from "../lib/subpages";
+import { canOpenSection, listedGroups } from "../lib/sectionVisibility";
+import { type Command, searchCommands, useCommandSnapshot } from "./CommandRegistry";
+import { anotherDialogIsOpen } from "../lib/keyboard";
+import { useNavigationGuard } from "./NavigationGuard";
+import { clsx } from "./ui/clsx";
+
+/**
+ * ⌘K command palette — the way you move around Genosyn.
+ *
+ * Replaces the mega-menu that used to hang off the top-nav section pill. Same
+ * catalog, but centred, searchable, and reachable without the mouse: type a few
+ * letters, hit ↵, you're there. The pill is still the click target for anyone
+ * who'd rather point at it.
+ *
+ * Two modes, one list:
+ *   - empty query  → browse, grouped like the catalog reads, listing every
+ *     section this person can open
+ *   - typing       → AI Employees first: the people a company runs on are who
+ *     a search most often means. Then navigation (the palette's other job):
+ *     sections ranked by `searchSections`, and the pages inside them — Finance
+ *     → Recurring invoices, Settings → Members — ranked by `searchSubpages`
+ *     over the same catalogue the section rails draw. Whichever group holds the
+ *     single best match leads, so with no employee matching ↵ opens the best
+ *     destination. The rest of `/search` — notes, bases, channels, … — follows,
+ *     grouped by kind underneath.
+ * Either way the keyboard walks a single flat index in visual order, so ↓↓↵
+ * means the same thing in both.
+ */
+
+// ───────────────────────────────── context ─────────────────────────────────
+
+type CommandPaletteState = { open: () => void };
+
+const CommandPaletteContext = React.createContext<CommandPaletteState | null>(null);
+
+/** Open the palette from anywhere inside `<CommandPaletteProvider>`. */
+export function useCommandPalette(): CommandPaletteState {
+  const ctx = React.useContext(CommandPaletteContext);
+  if (!ctx) {
+    throw new Error("useCommandPalette must be used inside <CommandPaletteProvider>");
+  }
+  return ctx;
+}
+
+/** `⌘K` on Apple hardware, `Ctrl K` everywhere else. */
+const IS_APPLE =
+  typeof navigator !== "undefined" &&
+  /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent || "");
+
+/** Label for the shortcut, for hints rendered outside this file (the nav pill). */
+export const PALETTE_SHORTCUT = IS_APPLE ? "⌘K" : "Ctrl K";
+
+/** Help and Account: the palette's own group, listed whatever the company uses. */
+const YOU_GROUP: SectionGroup = { label: "You", items: [HELP_SECTION, ACCOUNT_SECTION] };
+
+/**
+ * Help and Account sit outside `SECTION_GROUPS` because they aren't scoped to
+ * the current company — but a palette is a search-everything surface, so they
+ * get a group here rather than being unreachable to someone typing "password".
+ *
+ * Admin is the deliberate exception: it's an instance-operator surface, not
+ * somewhere you navigate between day to day, so it stays out of the palette
+ * and is reached from the avatar menu (or the `G =` chord) instead.
+ */
+const PALETTE_GROUPS: SectionGroup[] = [...SECTION_GROUPS, YOU_GROUP];
+
+/** The same set flattened, which is what ranking a query runs over. */
+const PALETTE_ITEMS: SectionItem[] = PALETTE_GROUPS.flatMap((g) => g.items);
+
+/**
+ * How each entity kind renders: the group header it files under and the icon
+ * treatment of its home section, so a Note result reads like the Notes
+ * section it lives in.
+ */
+const KIND_META: Record<SearchResultKind, { group: string; icon: LucideIcon; iconBg: string }> = {
+  product: {
+    group: "Product areas",
+    icon: WalletCards,
+    iconBg: "bg-teal-100 text-teal-600 dark:bg-teal-500/15 dark:text-teal-300",
+  },
+  ticket: {
+    group: "Support tickets",
+    icon: LifeBuoy,
+    iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+  },
+  catalogProduct: {
+    group: "Products & services",
+    icon: Package,
+    iconBg: "bg-cyan-100 text-cyan-600 dark:bg-cyan-500/15 dark:text-cyan-300",
+  },
+  employee: {
+    group: "AI Employees",
+    icon: Users,
+    iconBg: "bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
+  },
+  skill: {
+    group: "Skills",
+    icon: Wrench,
+    iconBg: "bg-green-100 text-green-600 dark:bg-green-500/15 dark:text-green-300",
+  },
+  routine: {
+    group: "Routines",
+    icon: CalendarClock,
+    iconBg: "bg-purple-100 text-purple-600 dark:bg-purple-500/15 dark:text-purple-300",
+  },
+  channel: {
+    group: "Channels",
+    icon: MessageSquare,
+    iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+  },
+  project: {
+    group: "Projects",
+    icon: ListChecks,
+    iconBg: "bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300",
+  },
+  todo: {
+    group: "Todos",
+    icon: ListChecks,
+    iconBg: "bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300",
+  },
+  base: {
+    group: "Bases",
+    icon: Table2,
+    iconBg: "bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300",
+  },
+  notebook: {
+    group: "Notebooks",
+    icon: NotebookText,
+    iconBg: "bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300",
+  },
+  note: {
+    group: "Notes",
+    icon: NotebookText,
+    iconBg: "bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300",
+  },
+  resource: {
+    group: "Resources",
+    icon: Library,
+    iconBg: "bg-fuchsia-100 text-fuchsia-600 dark:bg-fuchsia-500/15 dark:text-fuchsia-300",
+  },
+  chart: {
+    group: "Charts",
+    icon: BarChart3,
+    iconBg: "bg-blue-100 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300",
+  },
+  dashboard: {
+    group: "Dashboards",
+    icon: BarChart3,
+    iconBg: "bg-blue-100 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300",
+  },
+  repository: {
+    group: "Repositories",
+    icon: FolderGit2,
+    iconBg: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  },
+  pipeline: {
+    group: "Pipelines",
+    icon: GitBranch,
+    iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+  },
+  customer: {
+    group: "Customers",
+    icon: Contact2,
+    iconBg: "bg-pink-100 text-pink-600 dark:bg-pink-500/15 dark:text-pink-300",
+  },
+  // The same accounts, for a Member whose finance access keeps Customers
+  // closed: they open in Revenue, so they read like Revenue → Accounts.
+  account: {
+    group: "Revenue accounts",
+    icon: Building2,
+    iconBg: "bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300",
+  },
+  opening: {
+    group: "Openings",
+    icon: Briefcase,
+    iconBg: "bg-cyan-100 text-cyan-600 dark:bg-cyan-500/15 dark:text-cyan-300",
+  },
+  applicant: {
+    group: "Applicants",
+    icon: UserRound,
+    iconBg: "bg-cyan-100 text-cyan-600 dark:bg-cyan-500/15 dark:text-cyan-300",
+  },
+};
+
+// ──────────────────────────────── provider ─────────────────────────────────
+
+export function CommandPaletteProvider({
+  companyId,
+  companySlug,
+  viewer,
+  children,
+}: {
+  companyId: string;
+  companySlug: string;
+  /** Who is looking — decides which pages the palette may offer. */
+  viewer: SubpageViewer;
+  children: React.ReactNode;
+}) {
+  const [isOpen, setIsOpen] = React.useState(false);
+  const restoreRef = React.useRef<HTMLElement | null>(null);
+
+  const open = React.useCallback(() => {
+    restoreRef.current = document.activeElement as HTMLElement | null;
+    setIsOpen(true);
+  }, []);
+
+  const close = React.useCallback(() => {
+    setIsOpen(false);
+    // Put the caret back where it was — ⌘K is often hit mid-sentence.
+    restoreRef.current?.focus?.();
+    restoreRef.current = null;
+  }, []);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Someone closer to the keystroke already claimed it — the notes block
+      // editor binds ⌘K to "insert link", for one.
+      if (e.defaultPrevented) return;
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        if (isOpen) close();
+        // Every modal sits above the palette, so opening under one would only take
+        // the cursor out of its form and into a search box nobody can see.
+        else if (!anotherDialogIsOpen()) open();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isOpen, open, close]);
+
+  const value = React.useMemo<CommandPaletteState>(() => ({ open }), [open]);
+
+  return (
+    <CommandPaletteContext.Provider value={value}>
+      {children}
+      {isOpen && (
+        <CommandPalette
+          companyId={companyId}
+          companySlug={companySlug}
+          viewer={viewer}
+          onClose={close}
+        />
+      )}
+    </CommandPaletteContext.Provider>
+  );
+}
+
+// ───────────────────────────── entity search ───────────────────────────────
+
+/** Entity search kicks in at two characters — one matches half the company. */
+const ENTITY_QUERY_MIN = 2;
+const ENTITY_DEBOUNCE_MS = 200;
+
+/**
+ * Debounced company-wide entity search. Previous results stay on screen while
+ * the next request is in flight so the list doesn't flicker on every
+ * keystroke; a stale response (the query moved on) is dropped.
+ */
+function useEntitySearch(companyId: string, query: string) {
+  const [hits, setHits] = React.useState<CompanySearchResult[]>([]);
+  const [pending, setPending] = React.useState(false);
+  // Keyed by company AND query: a slow response for the same words typed in
+  // a previously-viewed company must not surface here.
+  const latestRef = React.useRef("");
+  const companyRef = React.useRef(companyId);
+
+  React.useEffect(() => {
+    const q = query.trim();
+    const key = `${companyId} ${q}`;
+    latestRef.current = key;
+    if (companyRef.current !== companyId) {
+      companyRef.current = companyId;
+      setHits([]);
+    }
+    if (q.length < ENTITY_QUERY_MIN) {
+      setHits([]);
+      setPending(false);
+      return;
+    }
+    setPending(true);
+    const t = setTimeout(() => {
+      api
+        .get<{ results: CompanySearchResult[] }>(
+          `/api/companies/${companyId}/search?q=${encodeURIComponent(q)}`,
+        )
+        .then((data) => {
+          if (latestRef.current !== key) return;
+          // Drop kinds this bundle doesn't know (server newer than client) —
+          // an unknown kind would crash KIND_META lookups during render.
+          setHits(data.results.filter((r) => KIND_META[r.kind]));
+          setPending(false);
+        })
+        .catch(() => {
+          // A palette has nowhere sensible for an error toast; an empty
+          // entity list (sections still work) is the graceful floor.
+          if (latestRef.current !== key) return;
+          setHits([]);
+          setPending(false);
+        });
+    }, ENTITY_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [companyId, query]);
+
+  return { hits, pending };
+}
+
+/** At most this many employees' pages in one search — the current one first. */
+const EMPLOYEE_PAGE_RESULT_LIMIT = 4;
+const NO_EMPLOYEES: Array<{ slug: string; name: string }> = [];
+
+/**
+ * The company's AI Employees, for their pages in search. Fetched once per
+ * palette, and only when asked for; a failure leaves the list empty, which
+ * only means those rows do not appear.
+ */
+function useEmployeeRoster(
+  companyId: string,
+  enabled: boolean,
+): Array<{ slug: string; name: string }> {
+  const [roster, setRoster] = React.useState<{
+    companyId: string;
+    list: Array<{ slug: string; name: string }>;
+  } | null>(null);
+  const requested = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!enabled || requested.current === companyId) return;
+    requested.current = companyId;
+    api
+      .get<Array<{ slug: string; name: string }>>(`/api/companies/${companyId}/employees`)
+      .then((list) =>
+        setRoster({
+          companyId,
+          list: list.map((employee) => ({ slug: employee.slug, name: employee.name })),
+        }),
+      )
+      .catch(() => {
+        requested.current = null;
+      });
+  }, [companyId, enabled]);
+  return roster?.companyId === companyId ? roster.list : NO_EMPLOYEES;
+}
+
+// ───────────────────────────────── palette ─────────────────────────────────
+
+/** One keyboard-walkable row — an action, a section or page match, or an entity hit. */
+type PaletteEntry =
+  | { type: "command"; command: Command }
+  | { type: "section"; match: SectionMatch }
+  | { type: "page"; match: SubpageMatch }
+  | { type: "entity"; hit: CompanySearchResult };
+
+function entryId(entry: PaletteEntry): string {
+  switch (entry.type) {
+    case "command":
+      return `command-palette-opt-cmd-${entry.command.id}`;
+    case "section":
+      return `command-palette-opt-${entry.match.item.key}`;
+    case "page":
+      return `command-palette-opt-page-${entry.match.page.id}`;
+    case "entity":
+      return `command-palette-opt-ent-${entry.hit.kind}-${entry.hit.id}`;
+  }
+}
+
+/** Entity hits of one kind, under that kind's header. */
+type EntityGroup = { label: string; hits: CompanySearchResult[] };
+
+function entityEntries(groups: EntityGroup[]): PaletteEntry[] {
+  return groups.flatMap((g) => g.hits.map((hit): PaletteEntry => ({ type: "entity", hit })));
+}
+
+function CommandPalette({
+  companyId,
+  companySlug,
+  viewer,
+  onClose,
+}: {
+  companyId: string;
+  companySlug: string;
+  viewer: SubpageViewer;
+  onClose: () => void;
+}) {
+  const navigate = useNavigate();
+  const navigationGuard = useNavigationGuard();
+  const location = useLocation();
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const listRef = React.useRef<HTMLDivElement>(null);
+  const [query, setQuery] = React.useState("");
+  // The highlighted row, held by identity rather than position: AI Employees
+  // arrive from the server after navigation has drawn, above it, and must not
+  // slide another row under the cursor. Null is the top row, where ↵ goes
+  // until the person moves.
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+
+  // Browsing and typing both cover every section this person can open.
+  const browseGroups = React.useMemo(
+    () => [...listedGroups(SECTION_GROUPS, viewer), YOU_GROUP],
+    [viewer],
+  );
+  const searchable = React.useMemo(
+    () => PALETTE_ITEMS.filter((item) => canOpenSection(item.key, viewer)),
+    [viewer],
+  );
+
+  const searching = query.trim().length > 0;
+  const matches = React.useMemo(
+    () => searchSections(searching ? searchable : browseGroups.flatMap((g) => g.items), query),
+    [query, searching, searchable, browseGroups],
+  );
+  // Pages the viewer can open, minus any that land exactly where a listed
+  // section row already does ("revenue" shouldn't offer Revenue twice).
+  const sectionPageMatches = React.useMemo(
+    () =>
+      searchSubpages(PALETTE_SUBPAGES, query, {
+        viewer,
+        excludePaths: matches.map((m) => m.item.path),
+      }),
+    [query, viewer, matches],
+  );
+  // Pages inside one AI Employee — "access", "ada access" — ranked with the
+  // section pages. The roster is fetched only once a query names such a page.
+  const employeeSlug = currentEmployeeSlug(location.pathname, companySlug);
+  const roster = useEmployeeRoster(
+    companyId,
+    searching && queryNamesEmployeePage(EMPLOYEE_PAGES, query),
+  );
+  const employeePageMatches = React.useMemo(
+    () =>
+      searchEmployeePages(EMPLOYEE_PAGES, roster, query, {
+        viewer,
+        currentSlug: employeeSlug,
+        limit: EMPLOYEE_PAGE_RESULT_LIMIT,
+      }),
+    [roster, query, viewer, employeeSlug],
+  );
+  const pageMatches = React.useMemo(
+    () =>
+      [...sectionPageMatches, ...employeePageMatches]
+        .map((match, order) => ({ match, order }))
+        .sort((a, b) => b.match.score - a.match.score || a.order - b.order)
+        .slice(0, SUBPAGE_RESULT_LIMIT)
+        .map(({ match }) => match),
+    [sectionPageMatches, employeePageMatches],
+  );
+  const pagesFirst = pagesLead(matches, pageMatches);
+  const currentKey = activeSection(location.pathname);
+  const { hits: entityHits, pending: entityPending } = useEntitySearch(companyId, query);
+
+  // Actions the page on screen published. They lead the list: someone who hits
+  // ⌘K while staring at a selection almost always means "do something to this",
+  // and there are only ever a handful, so navigation stays a keystroke away.
+  const registered = useCommandSnapshot();
+  const commandMatches = React.useMemo(
+    () => searchCommands(registered, query),
+    [registered, query],
+  );
+
+  // Entity hits arrive score-ordered; the palette files each under its kind's
+  // header, first-hit order deciding which group comes first. AI Employees are
+  // set apart to lead the whole list. Flattening the groups back out gives the
+  // keyboard index in exactly the rendered order.
+  const entityGroups = React.useMemo(() => {
+    const employees: EntityGroup[] = [];
+    const rest: EntityGroup[] = [];
+    if (!searching) return { employees, rest };
+    const byLabel = new Map<string, EntityGroup>();
+    for (const hit of entityHits) {
+      const label = KIND_META[hit.kind].group;
+      let g = byLabel.get(label);
+      if (!g) {
+        g = { label, hits: [] };
+        byLabel.set(label, g);
+        (hit.kind === "employee" ? employees : rest).push(g);
+      }
+      g.hits.push(hit);
+    }
+    return { employees, rest };
+  }, [entityHits, searching]);
+
+  // The single flat index the keyboard walks: AI Employees first, then
+  // navigation — the palette is how you move around — then the other entity
+  // groups in order. Within navigation, sections and pages keep their own
+  // groups, and whichever holds the best match leads.
+  const entries = React.useMemo<PaletteEntry[]>(() => {
+    const sections = matches.map((match): PaletteEntry => ({ type: "section", match }));
+    const pages = pageMatches.map((match): PaletteEntry => ({ type: "page", match }));
+    return [
+      ...commandMatches.map((command): PaletteEntry => ({ type: "command", command })),
+      ...entityEntries(entityGroups.employees),
+      ...(pagesFirst ? [...pages, ...sections] : [...sections, ...pages]),
+      ...entityEntries(entityGroups.rest),
+    ];
+  }, [commandMatches, matches, pageMatches, pagesFirst, entityGroups]);
+
+  // One id → position map keeps the rendered order and the keyboard index in
+  // lockstep no matter which groups are present.
+  const indexByEntryId = React.useMemo(
+    () => new Map(entries.map((entry, i) => [entryId(entry), i])),
+    [entries],
+  );
+  // A highlighted row that has left the list hands the cursor back to the top.
+  const active = (activeId === null ? undefined : indexByEntryId.get(activeId)) ?? 0;
+
+  /** Highlight whichever row sits at `i` now. */
+  const highlight = (i: number) => {
+    const entry = entries[i];
+    setActiveId(entry ? entryId(entry) : null);
+  };
+
+  React.useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  React.useEffect(() => {
+    setActiveId(null);
+  }, [query]);
+
+  React.useEffect(() => {
+    listRef.current?.querySelector(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [active, entries]);
+
+  const select = React.useCallback(
+    (entry: PaletteEntry) => {
+      // `onClose` hands focus back to whatever opened us — usually the nav
+      // pill, which survives the navigation, so the keyboard lands somewhere
+      // sensible.
+      onClose();
+      if (entry.type === "command") {
+        // Closed first: a command may open its own dialog, and two modals
+        // fighting over focus is worse than either.
+        entry.command.run();
+        return;
+      }
+      const path =
+        entry.type === "section"
+          ? entry.match.item.path
+          : entry.type === "page"
+            ? entry.match.page.path
+            : entry.hit.path;
+      const destination = `/c/${companySlug}${path}`;
+      if (!navigationGuard.request(destination)) navigate(destination);
+    },
+    [onClose, navigate, companySlug, navigationGuard],
+  );
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (entries.length) highlight((active + 1) % entries.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (entries.length) highlight((active - 1 + entries.length) % entries.length);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const entry = entries[active];
+      if (entry) select(entry);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onClose();
+    } else if (e.key === "Tab") {
+      // The input is the only focusable thing in here; don't let Tab wander
+      // off into the page behind the scrim.
+      e.preventDefault();
+    }
+  }
+
+  // "Nothing at all" only counts once the entity request has answered too —
+  // until then the sections may be empty while a hit is milliseconds away.
+  const empty = entries.length === 0 && !entityPending;
+  const idxOf = (entry: PaletteEntry) => indexByEntryId.get(entryId(entry)) ?? 0;
+
+  const sectionGroup = matches.length > 0 && (
+    <div key="sections" className="mb-1">
+      <GroupHeader>Sections</GroupHeader>
+      {matches.map((m) => {
+        const i = idxOf({ type: "section", match: m });
+        return (
+          <PaletteRow
+            key={m.item.key}
+            match={m}
+            index={i}
+            active={i === active}
+            isCurrent={m.item.key === currentKey}
+            onHover={highlight}
+            onSelect={() => select({ type: "section", match: m })}
+          />
+        );
+      })}
+    </div>
+  );
+  const pageGroup = pageMatches.length > 0 && (
+    <div key="pages" className="mb-1">
+      <GroupHeader>Pages</GroupHeader>
+      {pageMatches.map((m) => {
+        const i = idxOf({ type: "page", match: m });
+        return (
+          <PageRow
+            key={m.page.id}
+            match={m}
+            index={i}
+            active={i === active}
+            isCurrent={isCurrentSubpage(m.page, companySlug, location)}
+            onHover={highlight}
+            onSelect={() => select({ type: "page", match: m })}
+          />
+        );
+      })}
+    </div>
+  );
+  const entityGroupView = (g: EntityGroup) => (
+    <div key={g.label} className="mb-1 last:mb-0">
+      <GroupHeader>{g.label}</GroupHeader>
+      {g.hits.map((hit) => {
+        const i = idxOf({ type: "entity", hit });
+        return (
+          <EntityRow
+            key={`${hit.kind}-${hit.id}`}
+            hit={hit}
+            query={query}
+            index={i}
+            active={i === active}
+            onHover={highlight}
+            onSelect={() => select({ type: "entity", hit })}
+          />
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center bg-slate-900/40 p-4 pt-[12vh] backdrop-blur-[2px] dark:bg-black/60"
+      onMouseDown={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Search"
+        className="flex max-h-[min(32rem,calc(100dvh-16vh))] w-full max-w-xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {/* Search field — doubles as the dialog's header. */}
+        <div className="group flex shrink-0 items-center gap-3 border-b border-slate-100 px-4 transition-colors focus-within:border-indigo-300 focus-within:bg-indigo-50/40 dark:border-slate-800 dark:focus-within:border-indigo-700 dark:focus-within:bg-indigo-950/20">
+          <Search
+            size={16}
+            className="shrink-0 text-slate-400 transition-colors group-focus-within:text-indigo-500 dark:group-focus-within:text-indigo-400"
+            aria-hidden="true"
+          />
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Search employees, sections, pages, notes…"
+            className="min-w-0 flex-1 bg-transparent py-3.5 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus-visible:outline-none dark:text-slate-100 dark:placeholder:text-slate-500"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="command-palette-list"
+            aria-activedescendant={entries[active] ? entryId(entries[active]) : undefined}
+            aria-autocomplete="list"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <Kbd className="shrink-0">esc</Kbd>
+        </div>
+
+        {/* Results. */}
+        <div
+          ref={listRef}
+          id="command-palette-list"
+          role="listbox"
+          aria-label="Results"
+          className="min-h-0 flex-1 overflow-y-auto p-2"
+        >
+          {empty ? (
+            <div className="flex flex-col items-center gap-2 px-4 py-12 text-center">
+              <SearchX size={20} className="text-slate-300 dark:text-slate-600" />
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                No matches for {`“${query.trim()}”`}
+              </p>
+            </div>
+          ) : (
+            <>
+              {commandMatches.length > 0 && (
+                <div className="mb-1">
+                  <GroupHeader>Actions</GroupHeader>
+                  {commandMatches.map((command) => {
+                    const i = idxOf({ type: "command", command });
+                    return (
+                      <CommandRow
+                        key={command.id}
+                        command={command}
+                        index={i}
+                        active={i === active}
+                        onHover={highlight}
+                        onSelect={() => select({ type: "command", command })}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+              {searching ? (
+                <>
+                  {entityGroups.employees.map(entityGroupView)}
+                  {pagesFirst ? [pageGroup, sectionGroup] : [sectionGroup, pageGroup]}
+                  {entityGroups.rest.map(entityGroupView)}
+                  {entityPending && entityHits.length === 0 && (
+                    <div className="px-2 py-2 text-xs text-slate-400 dark:text-slate-500">
+                      Searching your company…
+                    </div>
+                  )}
+                </>
+              ) : (
+                browseGroups.map((g) => (
+                  <div key={g.label} className="mb-1 last:mb-0">
+                    <GroupHeader>{g.label}</GroupHeader>
+                    {g.items.map((item) => {
+                      const match: SectionMatch = { item, hit: null, score: 0 };
+                      const i = idxOf({ type: "section", match });
+                      return (
+                        <PaletteRow
+                          key={item.key}
+                          match={match}
+                          index={i}
+                          active={i === active}
+                          isCurrent={item.key === currentKey}
+                          onHover={highlight}
+                          onSelect={() => select({ type: "section", match })}
+                        />
+                      );
+                    })}
+                  </div>
+                ))
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Keyboard legend. */}
+        <div className="flex shrink-0 items-center gap-4 border-t border-slate-100 px-4 py-2 text-[11px] text-slate-400 dark:border-slate-800 dark:text-slate-500">
+          <span className="flex items-center gap-1.5">
+            <Kbd>↑</Kbd>
+            <Kbd>↓</Kbd>
+            navigate
+          </span>
+          <span className="flex items-center gap-1.5">
+            <Kbd>↵</Kbd>
+            open
+          </span>
+          <span className="ml-auto hidden items-center gap-1.5 sm:flex">
+            <Kbd>{PALETTE_SHORTCUT}</Kbd>
+            anywhere
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────── rows ──────────────────────────────────
+
+function GroupHeader({ children }: { children: React.ReactNode }) {
+  return (
+    <div data-palette-group="" className="px-2 pb-1 pt-2 text-xs font-medium text-slate-500 dark:text-slate-400">
+      {children}
+    </div>
+  );
+}
+
+/** An action published by the page on screen, rather than a place to go. */
+function CommandRow({
+  command,
+  index,
+  active,
+  onHover,
+  onSelect,
+}: {
+  command: Command;
+  index: number;
+  active: boolean;
+  onHover: (i: number) => void;
+  onSelect: () => void;
+}) {
+  const Icon = command.icon ?? Zap;
+  return (
+    <button
+      id={`command-palette-opt-cmd-${command.id}`}
+      role="option"
+      aria-selected={active}
+      data-idx={index}
+      onMouseMove={() => onHover(index)}
+      onClick={onSelect}
+      className={clsx(
+        "flex w-full items-center gap-3 rounded-lg p-2 text-left transition-colors",
+        active ? "bg-slate-100 dark:bg-slate-800" : "bg-transparent",
+      )}
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300">
+        <Icon size={18} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+          {command.label}
+        </span>
+        {command.group && (
+          <span className="block truncate text-xs text-slate-500 dark:text-slate-400">
+            {command.group}
+          </span>
+        )}
+      </span>
+      {command.hint && <Kbd className="shrink-0">{command.hint}</Kbd>}
+      {active && (
+        <CornerDownLeft
+          size={14}
+          className="shrink-0 text-slate-400 dark:text-slate-500"
+          aria-hidden="true"
+        />
+      )}
+    </button>
+  );
+}
+
+function PaletteRow({
+  match,
+  index,
+  active,
+  isCurrent,
+  onHover,
+  onSelect,
+}: {
+  match: SectionMatch;
+  index: number;
+  active: boolean;
+  isCurrent: boolean;
+  onHover: (i: number) => void;
+  onSelect: (item: SectionItem) => void;
+}) {
+  const { item, hit } = match;
+  const Icon = item.icon;
+  return (
+    <button
+      id={`command-palette-opt-${item.key}`}
+      role="option"
+      aria-selected={active}
+      data-idx={index}
+      onMouseMove={() => onHover(index)}
+      onClick={() => onSelect(item)}
+      className={clsx(
+        "flex w-full items-center gap-3 rounded-lg p-2 text-left transition-colors",
+        active ? "bg-slate-100 dark:bg-slate-800" : "bg-transparent",
+      )}
+    >
+      <span
+        className={clsx(
+          "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg",
+          item.iconBg,
+        )}
+      >
+        <Icon size={18} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+          <Highlighted text={item.label} hit={hit} />
+        </span>
+        <span className="block truncate text-xs text-slate-500 dark:text-slate-400">
+          {item.description}
+        </span>
+      </span>
+      <span
+        className="hidden shrink-0 items-center gap-0.5 sm:flex"
+        aria-label={`Shortcut G then ${item.shortcut}`}
+      >
+        <Kbd>G</Kbd>
+        <Kbd>{item.shortcut}</Kbd>
+      </span>
+      {isCurrent && (
+        <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500 dark:bg-slate-700/60 dark:text-slate-300">
+          Current
+        </span>
+      )}
+      {active && (
+        <CornerDownLeft
+          size={14}
+          className="shrink-0 text-slate-400 dark:text-slate-500"
+          aria-hidden="true"
+        />
+      )}
+    </button>
+  );
+}
+
+/**
+ * A page inside a section. It wears its section's colours with its own rail
+ * icon, and names the section underneath, so "Recurring invoices" reads as
+ * Finance's page at a glance — and never as a section of its own.
+ */
+function PageRow({
+  match,
+  index,
+  active,
+  isCurrent,
+  onHover,
+  onSelect,
+}: {
+  match: SubpageMatch;
+  index: number;
+  active: boolean;
+  isCurrent: boolean;
+  onHover: (i: number) => void;
+  onSelect: () => void;
+}) {
+  const { page, hit } = match;
+  const section = SECTION_BY_KEY[page.section];
+  const Icon = page.icon;
+  return (
+    <button
+      id={`command-palette-opt-page-${page.id}`}
+      role="option"
+      aria-selected={active}
+      data-idx={index}
+      onMouseMove={() => onHover(index)}
+      onClick={onSelect}
+      className={clsx(
+        "flex w-full items-center gap-3 rounded-lg p-2 text-left transition-colors",
+        active ? "bg-slate-100 dark:bg-slate-800" : "bg-transparent",
+      )}
+    >
+      <span
+        className={clsx(
+          "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg",
+          section.iconBg,
+        )}
+      >
+        <Icon size={18} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+          <Highlighted text={page.label} hit={hit} />
+        </span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-slate-500 dark:text-slate-400">
+          <span className="sr-only">in </span>
+          <span className="truncate">{section.label}</span>
+        </span>
+      </span>
+      {isCurrent && (
+        <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500 dark:bg-slate-700/60 dark:text-slate-300">
+          Current
+        </span>
+      )}
+      {active && (
+        <CornerDownLeft
+          size={14}
+          className="shrink-0 text-slate-400 dark:text-slate-500"
+          aria-hidden="true"
+        />
+      )}
+    </button>
+  );
+}
+
+/** Where `query` (or its first word) lands inside `label`, for highlighting. */
+function labelHit(label: string, query: string): [number, number] | null {
+  const l = label.toLowerCase();
+  // Offsets are found in the lowercased label but sliced from the original;
+  // if case-folding changed the length ("İ" → "i̇"), they wouldn't line up —
+  // skip the highlight rather than mark the wrong span.
+  if (l.length !== label.length) return null;
+  const q = query.trim().toLowerCase();
+  let at = l.indexOf(q);
+  if (at >= 0) return [at, at + q.length];
+  const tok = q.split(/\s+/).find((t) => t && l.includes(t));
+  if (!tok) return null;
+  at = l.indexOf(tok);
+  return [at, at + tok.length];
+}
+
+function EntityRow({
+  hit,
+  query,
+  index,
+  active,
+  onHover,
+  onSelect,
+}: {
+  hit: CompanySearchResult;
+  query: string;
+  index: number;
+  active: boolean;
+  onHover: (i: number) => void;
+  onSelect: () => void;
+}) {
+  const meta = KIND_META[hit.kind];
+  const Icon = meta.icon;
+  return (
+    <button
+      id={`command-palette-opt-ent-${hit.kind}-${hit.id}`}
+      role="option"
+      aria-selected={active}
+      data-idx={index}
+      onMouseMove={() => onHover(index)}
+      onClick={onSelect}
+      className={clsx(
+        "flex w-full items-center gap-3 rounded-lg p-2 text-left transition-colors",
+        active ? "bg-slate-100 dark:bg-slate-800" : "bg-transparent",
+      )}
+    >
+      <span
+        className={clsx(
+          "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg",
+          meta.iconBg,
+        )}
+      >
+        <Icon size={18} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+          <Highlighted text={hit.label} hit={labelHit(hit.label, query)} />
+        </span>
+        {hit.sublabel && (
+          <span className="block truncate text-xs text-slate-500 dark:text-slate-400">
+            {hit.sublabel}
+          </span>
+        )}
+      </span>
+      {active && (
+        <CornerDownLeft
+          size={14}
+          className="shrink-0 text-slate-400 dark:text-slate-500"
+          aria-hidden="true"
+        />
+      )}
+    </button>
+  );
+}
+
+/** Draws the matched span of a label in the accent colour. */
+function Highlighted({ text, hit }: { text: string; hit: [number, number] | null }) {
+  if (!hit) return <>{text}</>;
+  const [s, e] = hit;
+  return (
+    <>
+      {text.slice(0, s)}
+      <mark className="bg-transparent font-semibold text-indigo-600 dark:text-indigo-400">
+        {text.slice(s, e)}
+      </mark>
+      {text.slice(e)}
+    </>
+  );
+}
+
+function Kbd({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <kbd
+      className={clsx(
+        "inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded border border-slate-200 bg-slate-50 px-1 font-sans text-xs font-medium text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400",
+        className,
+      )}
+    >
+      {children}
+    </kbd>
+  );
+}

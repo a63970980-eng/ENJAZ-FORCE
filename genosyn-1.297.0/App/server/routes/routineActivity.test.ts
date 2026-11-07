@@ -1,0 +1,632 @@
+import assert from "node:assert/strict";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { after, before, beforeEach, test } from "node:test";
+import express from "express";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Company } from "../db/entities/Company.js";
+import { Membership } from "../db/entities/Membership.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run, type RunStatus } from "../db/entities/Run.js";
+import { User } from "../db/entities/User.js";
+import { errorHandler } from "../middleware/error.js";
+import {
+  ROUTINE_ACTIVITY_QUEUED_LIMIT,
+  type RoutineActivityRun,
+} from "../services/routineActivity.js";
+import { closeTestDb, initTestDb, insert, resetTestDb } from "../test/dbHarness.js";
+import { persistTestSession } from "../test/userSession.js";
+import { routinesRouter } from "./routines.js";
+
+let server: Server;
+let baseUrl: string;
+let actingUserId: string | null;
+let company: Company;
+let member: User;
+let outsider: User;
+let employee: AIEmployee;
+let routine: Routine;
+
+// Midnight in the Member's timezone, rather than the server's calendar day.
+const from = "2026-09-17T00:00:00+01:00";
+const to = "2026-09-18T00:00:00+01:00";
+const at = (hours: number) => new Date(Date.parse(from) + hours * 60 * 60 * 1000);
+type RunBody = Omit<RoutineActivityRun, "startedAt" | "finishedAt" | "retryAt"> & {
+  startedAt: string;
+  finishedAt: string | null;
+  retryAt: string | null;
+};
+type QueuedBody = RunBody & {
+  queuedAt: string;
+  pauseCount: number;
+  pausedAt: string | null;
+  pauseReason: "upgrade" | "restart" | "outage" | null;
+  priority: "normal" | "high";
+  position: number | null;
+};
+type ActivityBody = {
+  running: RunBody[];
+  queued: QueuedBody[];
+  queuedCount: number;
+  today: { routineId: string; runCount: number; latestRun: RunBody }[];
+};
+
+before(async () => {
+  await initTestDb();
+  const app = express();
+  app.use(async (req, _res, next) => {
+    (req as unknown as { session: unknown }).session = actingUserId
+      ? { userId: actingUserId, sessionVersion: 0, authenticatedAt: Date.now() }
+      : null;
+    await persistTestSession(req);
+    next();
+  });
+  app.use("/api/companies/:cid", routinesRouter);
+  app.use(errorHandler);
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, resolve);
+  });
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+after(async () => {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  await closeTestDb();
+});
+
+beforeEach(async () => {
+  await resetTestDb();
+  member = await insert(User, {
+    email: "member@example.test",
+    name: "Member",
+    passwordHash: "x",
+    sessionVersion: 0,
+  });
+  outsider = await insert(User, {
+    email: "outsider@example.test",
+    name: "Outsider",
+    passwordHash: "x",
+    sessionVersion: 0,
+  });
+  company = await insert(Company, { name: "Acme", slug: "acme", ownerId: member.id });
+  await insert(Membership, { companyId: company.id, userId: member.id, role: "member" });
+  employee = await insert(AIEmployee, {
+    companyId: company.id,
+    name: "Rey",
+    slug: "rey",
+    role: "Support",
+    soulBody: "private soul",
+  });
+  routine = await seedRoutine();
+  actingUserId = member.id;
+});
+
+async function seedRoutine(employeeId = employee.id, name = "Daily report") {
+  return insert(Routine, {
+    employeeId,
+    name,
+    slug: name.toLowerCase().replaceAll(" ", "-"),
+    cronExpr: "0 9 * * *",
+    body: "private brief",
+  });
+}
+
+async function seedRun(overrides: Partial<Run> = {}): Promise<Run> {
+  return insert(Run, {
+    routineId: routine.id,
+    status: "completed",
+    startedAt: at(8),
+    finishedAt: at(9),
+    logContent: "private transcript",
+    outcomeNote: "private assessment",
+    failureReason: "private failure",
+    exitCode: 0,
+    ...overrides,
+  });
+}
+
+async function call(query: Record<string, string> = { from, to }, companyId = company.id) {
+  const response = await fetch(
+    `${baseUrl}/api/companies/${companyId}/routines/activity?${new URLSearchParams(query)}`,
+  );
+  return { status: response.status, body: (await response.json()) as ActivityBody };
+}
+
+test("ordinary Members can read the overview; strangers and anonymous callers cannot", async () => {
+  assert.equal((await call()).status, 200);
+  actingUserId = outsider.id;
+  assert.equal((await call()).status, 403);
+  actingUserId = null;
+  assert.equal((await call()).status, 401);
+});
+
+test("a company with no Runs returns empty sections", async () => {
+  const empty = { running: [], queued: [], queuedCount: 0, today: [] };
+  assert.deepEqual((await call()).body, empty);
+  await AppDataSource.getRepository(Routine).delete(routine.id);
+  await AppDataSource.getRepository(AIEmployee).delete(employee.id);
+  assert.deepEqual((await call()).body, empty);
+});
+
+test("every section follows Routine ownership and excludes another company's work", async () => {
+  const otherCompany = await insert(Company, {
+    name: "Other",
+    slug: "other",
+    ownerId: outsider.id,
+  });
+  const otherEmployee = await insert(AIEmployee, {
+    companyId: otherCompany.id,
+    name: "Other",
+    slug: "other",
+    role: "Support",
+    soulBody: "",
+  });
+  const otherRoutine = await seedRoutine(otherEmployee.id);
+  await seedRun({ routineId: otherRoutine.id });
+  await seedRun({ routineId: otherRoutine.id, status: "running", finishedAt: null });
+  await seedRun({ routineId: otherRoutine.id, status: "queued", finishedAt: null });
+  const ours = await seedRun();
+  const running = await seedRun({ status: "running", finishedAt: null });
+  const queued = await seedRun({ status: "queued", finishedAt: null });
+  const { body } = await call();
+  assert.deepEqual(
+    body.running.map((run) => run.id),
+    [running.id],
+  );
+  assert.deepEqual(
+    body.queued.map((run) => run.id),
+    [queued.id],
+  );
+  assert.equal(body.queuedCount, 1);
+  assert.deepEqual(
+    body.today.map((row) => row.latestRun.id),
+    [ours.id],
+  );
+  assert.equal((await call({ from, to }, otherCompany.id)).status, 403);
+});
+
+test("all active Runs appear, including overnight work and concurrent Runs of one Routine", async () => {
+  const overnight = await seedRun({ status: "running", startedAt: at(-30), finishedAt: null });
+  const current = await seedRun({ status: "running", startedAt: at(2), finishedAt: null });
+  const { body } = await call();
+  assert.deepEqual(
+    body.running.map((run) => run.id),
+    [current.id, overnight.id],
+  );
+  assert.deepEqual(body.today, []);
+  await AppDataSource.getRepository(Run).update([overnight.id, current.id], {
+    status: "completed",
+    finishedAt: at(3),
+  });
+  const finished = (await call()).body;
+  assert.deepEqual(finished.running, []);
+  assert.equal(finished.today[0].runCount, 2);
+});
+
+test("Runs waiting to start are listed in start order, apart from running and finished work", async () => {
+  const digest = await seedRoutine(employee.id, "Weekly digest");
+  const waiting = {
+    status: "queued" as const,
+    finishedAt: null,
+    exitCode: null,
+    employeeId: employee.id,
+  };
+  const newest = await seedRun({ ...waiting, startedAt: at(11), createdAt: at(11) });
+  const retry = await seedRun({
+    ...waiting,
+    routineId: digest.id,
+    startedAt: at(9),
+    createdAt: at(9),
+    triggerKind: "retry",
+    attempt: 2,
+  });
+  // Paused for a restart: it started before it waited, and keeps its transcript.
+  // It was already working, so it resumes before anything new starts.
+  const paused = await seedRun({
+    ...waiting,
+    startedAt: at(8),
+    createdAt: at(10),
+    pauseCount: 1,
+    pausedAt: at(10.5),
+  });
+  const running = await seedRun({
+    status: "running",
+    finishedAt: null,
+    exitCode: null,
+    employeeId: employee.id,
+  });
+  const { body } = await call();
+  assert.deepEqual(
+    body.queued.map((run) => run.id),
+    [paused.id, retry.id, newest.id],
+  );
+  assert.deepEqual(
+    body.queued.map((run) => run.position),
+    [1, 2, 3],
+  );
+  assert.deepEqual(
+    body.queued.map((run) => run.priority),
+    ["normal", "normal", "normal"],
+  );
+  assert.equal(body.queuedCount, 3);
+  assert.deepEqual(
+    body.running.map((run) => run.id),
+    [running.id],
+  );
+  assert.deepEqual(body.today, []);
+  assert.equal(body.queued[1].routineId, digest.id);
+  assert.equal(body.queued[1].status, "queued");
+  assert.equal(body.queued[1].attempt, 2);
+  assert.equal(body.queued[1].queuedAt, at(9).toISOString());
+  assert.equal(body.queued[1].pauseCount, 0);
+  assert.equal(body.queued[1].pausedAt, null);
+  assert.equal(body.queued[0].pauseCount, 1);
+  assert.equal(body.queued[0].pausedAt, at(10.5).toISOString());
+  assert.equal(body.queued[0].queuedAt, at(10).toISOString());
+
+  // Marking the newest Routine High moves its waiting Run ahead of the older
+  // fresh one — never ahead of the Run resuming after the restart.
+  await AppDataSource.getRepository(Routine).update(routine.id, { priority: "high" });
+  const prioritized = (await call()).body;
+  assert.deepEqual(
+    prioritized.queued.map((run) => [run.id, run.position, run.priority]),
+    [
+      [paused.id, 1, "high"],
+      [newest.id, 2, "high"],
+      [retry.id, 3, "normal"],
+    ],
+  );
+  await AppDataSource.getRepository(Routine).update(routine.id, { priority: "normal" });
+
+  await AppDataSource.getRepository(Run).update(newest.id, { status: "running" });
+  const started = (await call()).body;
+  assert.deepEqual(
+    started.queued.map((run) => run.id),
+    [paused.id, retry.id],
+  );
+  assert.deepEqual(new Set(started.running.map((run) => run.id)), new Set([running.id, newest.id]));
+});
+
+test("a long queue lists its oldest Runs and counts every one", async () => {
+  const runs: Run[] = [];
+  for (let n = 0; n <= ROUTINE_ACTIVITY_QUEUED_LIMIT; n++) {
+    runs.push(
+      await seedRun({
+        status: "queued",
+        finishedAt: null,
+        exitCode: null,
+        createdAt: new Date(at(1).getTime() + n * 1000),
+      }),
+    );
+  }
+  const { body } = await call();
+  assert.equal(body.queued.length, ROUTINE_ACTIVITY_QUEUED_LIMIT);
+  assert.equal(body.queuedCount, ROUTINE_ACTIVITY_QUEUED_LIMIT + 1);
+  assert.deepEqual(
+    body.queued.map((run) => run.id),
+    runs.slice(0, ROUTINE_ACTIVITY_QUEUED_LIMIT).map((run) => run.id),
+  );
+});
+
+test("local midnight is inclusive, the next midnight is exclusive, and overnight completion counts", async () => {
+  const cases: Array<{ name: string; startedAt: Date; finishedAt: Date | null; include: boolean }> =
+    [
+      { name: "Starts at midnight", startedAt: at(0), finishedAt: null, include: true },
+      { name: "Ends at midnight", startedAt: at(-2), finishedAt: at(0), include: true },
+      { name: "Overnight", startedAt: at(-2), finishedAt: at(1), include: true },
+      { name: "Ends tomorrow", startedAt: at(23), finishedAt: at(25), include: true },
+      { name: "Only yesterday", startedAt: at(-2), finishedAt: at(-1), include: false },
+      { name: "Starts tomorrow", startedAt: at(24), finishedAt: at(25), include: false },
+      { name: "Neither edge today", startedAt: at(-1), finishedAt: at(24), include: false },
+    ];
+  const expected = new Set<string>();
+  for (const item of cases) {
+    const row = await seedRoutine(employee.id, item.name);
+    await seedRun({ routineId: row.id, startedAt: item.startedAt, finishedAt: item.finishedAt });
+    if (item.include) expected.add(row.id);
+  }
+  const { body } = await call();
+  assert.deepEqual(new Set(body.today.map((row) => row.routineId)), expected);
+  assert.ok(body.today.every((row) => row.runCount === 1));
+});
+
+test("today counts every terminal Run except skipped ticks and retains the latest completion", async () => {
+  const statuses: RunStatus[] = [
+    "completed",
+    "reviewed",
+    "failed",
+    "error",
+    "timeout",
+    "interrupted",
+  ];
+  for (const [index, status] of statuses.entries()) {
+    await seedRun({ status, startedAt: at(index), finishedAt: at(index + 0.5) });
+  }
+  const latest = await seedRun({ startedAt: at(-1), finishedAt: at(7), status: "failed" });
+  await seedRun({ status: "skipped", startedAt: at(9), finishedAt: at(10) });
+  await seedRun({ status: "queued", startedAt: at(12), finishedAt: null });
+  await seedRun({ status: "running", startedAt: at(11), finishedAt: null });
+  const { body } = await call();
+  assert.equal(body.today.length, 1);
+  assert.equal(body.today[0].runCount, statuses.length + 1);
+  assert.equal(body.today[0].latestRun.id, latest.id);
+  assert.equal(body.today[0].latestRun.status, "failed");
+});
+
+test("latest Run ties are deterministic and older full history does not affect the daily count", async () => {
+  await seedRun({ startedAt: at(-24), finishedAt: at(-23) });
+  await seedRun({ id: "00000000-0000-4000-8000-000000000001", startedAt: at(9), finishedAt: null });
+  const latest = await seedRun({
+    id: "00000000-0000-4000-8000-000000000002",
+    startedAt: at(9),
+    finishedAt: null,
+  });
+  const { body } = await call();
+  assert.equal(body.today.length, 1);
+  assert.equal(body.today[0].runCount, 2);
+  assert.equal(body.today[0].latestRun.id, latest.id);
+});
+
+test("summaries contain only safe metadata and preserve independent outcome and Check verdicts", async () => {
+  await seedRun({ outcomeVerdict: "unverified", checksVerdict: "failed" });
+  await seedRun({ status: "running", finishedAt: null });
+  await seedRun({
+    status: "queued",
+    finishedAt: null,
+    pauseCount: 1,
+    pausedAt: at(10),
+    pauseReason: "outage",
+    outagePauses: 1,
+    checkpointJson: "private checkpoint",
+  });
+  const { body } = await call();
+  const fields = [
+    "id",
+    "routineId",
+    "status",
+    "errorKind",
+    "startedAt",
+    "finishedAt",
+    "exitCode",
+    "attempt",
+    "retryAt",
+    "hasUnfinishedWork",
+    "continuationPending",
+    "continuationCount",
+    "continuationStopReason",
+    "followUpRun",
+    "missedSlots",
+    "outcomeVerdict",
+    "checksVerdict",
+  ].sort();
+  assert.deepEqual(Object.keys(body.running[0]).sort(), fields);
+  assert.deepEqual(Object.keys(body.today[0].latestRun).sort(), fields);
+  assert.deepEqual(
+    Object.keys(body.queued[0]).sort(),
+    [...fields, "queuedAt", "pauseCount", "pausedAt", "pauseReason", "priority", "position"].sort(),
+  );
+  // Why a waiting Run paused is safe to show; how many outage pauses it took is not needed.
+  assert.equal(body.queued[0].pauseReason, "outage");
+  assert.equal(body.running[0].hasUnfinishedWork, false);
+  assert.equal(body.today[0].latestRun.hasUnfinishedWork, false);
+  assert.equal(body.today[0].latestRun.outcomeVerdict, "unverified");
+  assert.equal(body.today[0].latestRun.checksVerdict, "failed");
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /private|logContent|failureReason|outcomeNote|soulBody|body/,
+  );
+});
+
+test("Run history, logs and daily activity resolve a continuation that has taken over unfinished work", async () => {
+  const source = await seedRun({
+    status: "failed",
+    startedAt: at(7),
+    finishedAt: at(8),
+    failureReason: "Original report",
+    checksVerdict: "failed",
+    outcomeVerdict: "off_goal",
+  });
+  const child = await seedRun({
+    parentRunId: source.id,
+    triggerKind: "continuation",
+    continuationCount: 1,
+    status: "running",
+    startedAt: at(9),
+    finishedAt: null,
+    logContent: "private child log",
+    checkpointJson: "private child checkpoint",
+  });
+  for (const status of [
+    "queued",
+    "running",
+    "completed",
+    "failed",
+    "reviewed",
+    "skipped",
+  ] as const) {
+    await AppDataSource.getRepository(Run).update(child.id, { status });
+    const listResponse = await fetch(
+      `${baseUrl}/api/companies/${company.id}/routines/${routine.id}/runs`,
+    );
+    const rows = (await listResponse.json()) as Array<{
+      id: string;
+      status: string;
+      followUpRun: { id: string; status: string };
+      checksVerdict: string;
+      outcomeVerdict: string;
+    }>;
+    const row = rows.find((run) => run.id === source.id)!;
+    assert.equal(row.status, "failed");
+    assert.equal(row.followUpRun.id, child.id);
+    assert.equal(row.followUpRun.status, status);
+    assert.equal(row.checksVerdict, "failed");
+    assert.equal(row.outcomeVerdict, "off_goal");
+    const log = await (
+      await fetch(`${baseUrl}/api/companies/${company.id}/runs/${source.id}/log`)
+    ).json();
+    assert.deepEqual(log.followUpRun, row.followUpRun);
+    assert.equal(log.continuationPending, false);
+    assert.equal(log.retryAt, null);
+    assert.equal(log.failureReason, "Original report");
+    assert.doesNotMatch(JSON.stringify(row.followUpRun), /private|checkpoint|logContent/);
+    if (status === "running" || status === "queued") {
+      const { body } = await call();
+      assert.equal(body.today[0].latestRun.id, source.id);
+      assert.equal(body.today[0].latestRun.followUpRun?.id, child.id);
+    }
+  }
+});
+
+test("historical Run links resolve beyond the 50-row history window and remain company scoped", async () => {
+  const source = await seedRun({ status: "failed", startedAt: at(10), finishedAt: at(11) });
+  const child = await seedRun({
+    parentRunId: source.id,
+    triggerKind: "continuation",
+    startedAt: at(1),
+    finishedAt: at(2),
+  });
+  for (let n = 0; n < 51; n++) await seedRun({ startedAt: at(3), finishedAt: at(4) });
+  const list = await (
+    await fetch(`${baseUrl}/api/companies/${company.id}/routines/${routine.id}/runs`)
+  ).json();
+  assert.equal(list.length, 50);
+  assert.equal(
+    list.some((row: Run) => row.id === child.id),
+    false,
+  );
+  assert.equal(list.find((row: Run) => row.id === source.id).followUpRun.id, child.id);
+  actingUserId = outsider.id;
+  assert.equal(
+    (await fetch(`${baseUrl}/api/companies/${company.id}/runs/${source.id}/log`)).status,
+    403,
+  );
+  actingUserId = null;
+  assert.equal(
+    (await fetch(`${baseUrl}/api/companies/${company.id}/runs/${source.id}/log`)).status,
+    401,
+  );
+});
+
+test("a continuation hands off again and all historical API responses follow the new leaf", async () => {
+  const source = await seedRun({ status: "failed", startedAt: at(6), finishedAt: at(7) });
+  const child = await seedRun({
+    parentRunId: source.id,
+    triggerKind: "continuation",
+    status: "failed",
+    startedAt: at(8),
+    finishedAt: at(9),
+  });
+  const leaf = await seedRun({
+    parentRunId: child.id,
+    triggerKind: "continuation",
+    status: "queued",
+    startedAt: at(10),
+    finishedAt: null,
+  });
+  const rows = await (
+    await fetch(`${baseUrl}/api/companies/${company.id}/routines/${routine.id}/runs`)
+  ).json();
+  for (const ancestor of [source, child]) {
+    const row = rows.find((row: Run) => row.id === ancestor.id);
+    assert.equal(row.followUpRun.id, leaf.id);
+    assert.equal(row.followUpRun.isLatest, true);
+  }
+  assert.equal(rows.find((row: Run) => row.id === leaf.id).followUpRun, null);
+});
+
+test("Run surfaces expose unfinished-work flags without exposing saved checkpoints", async () => {
+  const run = await seedRun({
+    status: "failed",
+    retryAt: at(10),
+    continuationCount: 0,
+    checkpointJson: JSON.stringify({
+      state: "continue",
+      completed: "Reviewed first page",
+      remaining: "Review remaining pages",
+      resume: "private-source-anchor-123",
+      progressKey: "page-1",
+    }),
+  });
+  for (const unfinished of [true, false]) {
+    if (!unfinished) {
+      await AppDataSource.getRepository(Run).update(run.id, {
+        status: "completed",
+        retryAt: null,
+        checkpointJson: JSON.stringify({
+          state: "complete",
+          completed: "Reviewed all pages from private-source-anchor-123",
+          remaining: "",
+          resume: "",
+          progressKey: "all-pages",
+        }),
+      });
+    }
+    const { body } = await call();
+    assert.equal(body.today[0].latestRun.hasUnfinishedWork, unfinished);
+    assert.equal(body.today[0].latestRun.continuationPending, unfinished);
+    assert.equal(body.today[0].latestRun.continuationCount, 0);
+    assert.doesNotMatch(JSON.stringify(body), /checkpointJson|private-source-anchor-123/);
+
+    for (const path of [`routines/${routine.id}/runs`, `runs/${run.id}/log`]) {
+      const response = await fetch(`${baseUrl}/api/companies/${company.id}/${path}`);
+      assert.equal(response.status, 200);
+      const payload = (await response.json()) as
+        | { continuationPending: boolean; hasUnfinishedWork: boolean }
+        | { continuationPending: boolean; hasUnfinishedWork: boolean }[];
+      const metadata = Array.isArray(payload) ? payload[0] : payload;
+      assert.equal(metadata.hasUnfinishedWork, unfinished);
+      assert.equal(metadata.continuationPending, unfinished);
+      assert.doesNotMatch(
+        JSON.stringify(payload),
+        /checkpointJson|private-source-anchor-123|continuationDeadlineAt|continuationTokensUsed|continuationOriginTriggerKind/,
+      );
+    }
+  }
+});
+
+test("Run history and logs expose the persisted Check verdict", async () => {
+  const run = await seedRun({ checksVerdict: "passed", checkRemediations: 1 });
+  for (const path of [`routines/${routine.id}/runs`, `runs/${run.id}/log`]) {
+    const response = await fetch(`${baseUrl}/api/companies/${company.id}/${path}`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    const metadata = Array.isArray(payload) ? payload[0] : payload;
+    assert.equal(metadata.checksVerdict, "passed");
+    assert.equal(metadata.checkRemediations, 1);
+  }
+});
+
+test("the API requires valid instants, a company UUID, and a bounded forward interval", async () => {
+  const invalid: Record<string, string>[] = [
+    {},
+    { from },
+    { to },
+    { from: "bad", to },
+    { from: "2026-09-17", to },
+    { from: "2026-09-17T00:00:00", to },
+    { from, to: from },
+    { from: to, to: from },
+    { from, to: at(26.1).toISOString() },
+    { from, to, hours: "100" },
+  ];
+  for (const query of invalid) {
+    assert.equal((await call(query)).status, 400, JSON.stringify(query));
+  }
+  assert.equal((await call({ from, to }, "invalid-company-id")).status, 400);
+  assert.equal((await call({ from, to: at(26).toISOString() })).status, 200);
+});
+
+test("a 25-hour day spanning the autumn clock change is accepted", async () => {
+  const autumnFrom = "2026-10-25T00:00:00+01:00";
+  const autumnTo = "2026-10-26T00:00:00+00:00";
+  const latest = await seedRun({
+    startedAt: new Date("2026-10-25T23:30:00Z"),
+    finishedAt: new Date("2026-10-25T23:45:00Z"),
+  });
+  const { status, body } = await call({ from: autumnFrom, to: autumnTo });
+  assert.equal(status, 200);
+  assert.equal(body.today[0].latestRun.id, latest.id);
+});

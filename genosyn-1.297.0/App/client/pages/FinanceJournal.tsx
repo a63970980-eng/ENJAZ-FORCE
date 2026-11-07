@@ -1,0 +1,648 @@
+import React from "react";
+import { Select } from "@/components/ui/Select";
+import { Link, useOutletContext } from "react-router-dom";
+import { useAskAiPageContext } from "../components/askAi/AskAiProvider";
+import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
+import {
+  Account,
+  api,
+  CompanyFinanceSettings,
+  formatMoney,
+  LedgerEntry,
+  LedgerEntrySource,
+  parseMoneyToCents,
+} from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { isDeletableManualEntry, ledgerSourceLabel } from "../lib/ledgerSources";
+import { canWriteFinance } from "../lib/subpages";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { Button } from "../components/ui/Button";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import { Modal } from "../components/ui/Modal";
+import { Input } from "../components/ui/Input";
+import { FormError, FormSuccess } from "../components/ui/FormError";
+import { useDialog } from "../components/ui/Dialog";
+import { FinanceOutletCtx } from "./FinanceLayout";
+
+/** Each origin's badge colour; `lib/ledgerSources.ts` holds its words. */
+const SOURCE_TONE: Record<LedgerEntrySource, string> = {
+  manual: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  credit_note_issue: "bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300",
+  credit_note_apply: "bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300",
+  credit_note_unapply: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  credit_note_void: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  customer_refund: "bg-orange-100 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300",
+  customer_refund_void: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  invoice_writeoff: "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
+  invoice_writeoff_reversal: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  vendor_credit_issue: "bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300",
+  vendor_credit_apply: "bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300",
+  vendor_credit_unapply: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  vendor_credit_void: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  vendor_refund: "bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300",
+  vendor_refund_void: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  bank_categorization: "bg-cyan-100 text-cyan-700 dark:bg-cyan-500/15 dark:text-cyan-300",
+  bank_categorization_void: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+  invoice_issue: "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300",
+  invoice_revision: "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300",
+  invoice_payment: "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
+  invoice_void: "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
+  brex_card_expense: "bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300",
+  brex_card_refund: "bg-teal-100 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300",
+  brex_card_payment: "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
+  brex_card_reclass: "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-500/15 dark:text-fuchsia-300",
+  ledger_reclass: "bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300",
+};
+
+const UNKNOWN_SOURCE_TONE = "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200";
+
+/**
+ * Journal — chronological feed of every `LedgerEntry`. Phase B of the
+ * Finance milestone (M19).
+ *
+ * Each row expands to show its `LedgerLine` legs. Only an entry someone
+ * posted by hand can be deleted, and only until it is approved
+ * (`isDeletableManualEntry`): bills, the period close, and applied proposals
+ * post as `manual` too, but their own flows undo them. Deleting one, like
+ * posting or proposing one, needs Full finance access, so a read-only Member
+ * is offered neither.
+ */
+export default function FinanceJournal() {
+  const { company } = useOutletContext<FinanceOutletCtx>();
+  const canWrite = canWriteFinance(company);
+  const dialog = useDialog();
+  const [entries, setEntries] = React.useState<LedgerEntry[] | null>(null);
+  const [accounts, setAccounts] = React.useState<Account[]>([]);
+  const [homeCurrency, setHomeCurrency] = React.useState("USD");
+  const [loadError, setLoadError] = React.useState(false);
+  const [retrying, setRetrying] = React.useState(false);
+  const [deletingId, setDeletingId] = React.useState<string | null>(null);
+  const [showNew, setShowNew] = React.useState(false);
+  // A proposal never lands in this feed, so staging one leaves nothing on
+  // screen to show for it. Everything else here confirms itself.
+  const [notice, setNotice] = React.useState<string | null>(null);
+
+  const reload = React.useCallback(async () => {
+    const [es, as, settings] = await Promise.all([
+      api.get<LedgerEntry[]>(`/api/companies/${company.id}/ledger-entries`),
+      api.get<Account[]>(`/api/companies/${company.id}/accounts`),
+      api.get<CompanyFinanceSettings>(`/api/companies/${company.id}/finance-settings`),
+    ]);
+    setEntries(es);
+    setAccounts(as);
+    setHomeCurrency(settings.homeCurrency);
+    setLoadError(false);
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload().catch(() => {
+      setEntries([]);
+      setLoadError(true);
+    });
+  }, [reload]);
+
+  useLiveRefetch(["ledger", "financeaccount"], reload);
+
+  async function retry() {
+    setRetrying(true);
+    try {
+      await reload();
+    } catch {
+      setEntries([]);
+      setLoadError(true);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  async function remove(e: LedgerEntry) {
+    setNotice(null);
+    const ok = await dialog.confirm({
+      title: "Delete this manual entry?",
+      message: "The lines disappear from the trial balance immediately.",
+      variant: "danger",
+      confirmLabel: "Delete",
+    });
+    if (!ok) return;
+    setDeletingId(e.id);
+    try {
+      await api.del(`/api/companies/${company.id}/ledger-entries/${e.id}`);
+      reload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t delete the entry" });
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  const accountById = React.useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <div className="mb-6">
+        <Breadcrumbs
+          items={[
+            { label: "Finance", to: `/c/${company.slug}/finance` },
+            { label: "Journal entries" },
+          ]}
+        />
+      </div>
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">
+            Journal entries
+          </h1>
+          <p className="mt-1 max-w-3xl text-sm text-slate-500 dark:text-slate-400">
+            Every change to your books, newest first. Invoices, bills, payments, and bank and card
+            transactions post here on their own; add a manual entry for an adjustment your
+            accountant asks for.
+          </p>
+        </div>
+        {canWrite && (
+          <Button
+            onClick={() => {
+              setNotice(null);
+              setShowNew(true);
+            }}
+          >
+            <Plus size={14} /> Manual entry
+          </Button>
+        )}
+      </div>
+
+      <FormSuccess message={notice} className="mb-4" />
+
+      {loadError ? (
+        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center dark:border-slate-700 dark:bg-slate-900">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            Couldn&apos;t load the journal
+          </h3>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Something went wrong fetching the ledger.
+          </p>
+          <Button variant="secondary" className="mt-4" loading={retrying} onClick={retry}>
+            Try again
+          </Button>
+        </div>
+      ) : entries === null ? (
+        <div className="flex justify-center p-16">
+          <Spinner size={20} />
+        </div>
+      ) : entries.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center dark:border-slate-700 dark:bg-slate-900">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            No journal entries yet
+          </h3>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Issue an invoice, categorize a bank transaction, or post a manual entry, and it shows
+            up here.
+          </p>
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+            {entries.map((e) => (
+              <EntryRow
+                key={e.id}
+                entry={e}
+                accountById={accountById}
+                companySlug={company.slug}
+                homeCurrency={homeCurrency}
+                deleting={deletingId === e.id}
+                onDelete={canWrite ? () => remove(e) : null}
+              />
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {showNew && (
+        <NewEntryModal
+          companyId={company.id}
+          accounts={accounts}
+          homeCurrency={homeCurrency}
+          onClose={() => setShowNew(false)}
+          onSaved={(message) => {
+            setShowNew(false);
+            setNotice(message ?? null);
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function EntryRow({
+  entry,
+  accountById,
+  companySlug,
+  homeCurrency,
+  deleting,
+  onDelete,
+}: {
+  entry: LedgerEntry;
+  accountById: Map<string, Account>;
+  companySlug: string;
+  homeCurrency: string;
+  deleting: boolean;
+  /** Null for a read-only Member, who sees manual entries without Delete. */
+  onDelete: (() => void) | null;
+}) {
+  const [open, setOpen] = React.useState(false);
+  // An expanded entry is what Ask AI means by "this entry".
+  useAskAiPageContext(open ? [{ kind: "journal_entry", id: entry.id }] : null);
+  // Ledger sources are persisted strings. Keep the Journal usable if a newer
+  // backend source reaches an older client before its dedicated badge ships.
+  const tone = SOURCE_TONE[entry.source] ?? UNKNOWN_SOURCE_TONE;
+  const total = entry.lines.reduce((s, l) => s + l.debitCents, 0);
+
+  return (
+    <li>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setOpen((o) => !o);
+          }
+        }}
+        className="flex w-full cursor-pointer items-center gap-3 px-4 py-3 text-left hover:bg-slate-50 dark:hover:bg-slate-800/40"
+      >
+        <span className="text-slate-400">
+          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </span>
+        <span className="w-24 font-mono text-xs text-slate-500 dark:text-slate-400">
+          {new Date(entry.date).toISOString().slice(0, 10)}
+        </span>
+        <span
+          className={
+            "inline-block rounded-full px-2 py-0.5 text-xs font-medium first-letter:uppercase " +
+            tone
+          }
+        >
+          {ledgerSourceLabel(entry.source, entry.sourceRefId)}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm text-slate-700 dark:text-slate-200">
+          {entry.memo || <span className="text-slate-400">(no memo)</span>}
+        </span>
+        <span className="tabular-nums text-sm font-medium text-slate-900 dark:text-slate-100">
+          {formatMoney(total, homeCurrency)}
+        </span>
+        {onDelete && isDeletableManualEntry(entry) && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            disabled={deleting}
+            aria-busy={deleting || undefined}
+            className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+            aria-label="Delete entry"
+          >
+            {deleting ? <ButtonSpinner size={14} /> : <Trash2 size={14} />}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="border-t border-slate-100 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-800/30">
+          {entry.sourceRefId && entry.source !== "manual" && (
+            <div className="mb-2 text-xs text-slate-500 dark:text-slate-400">
+              Source ref: <span className="font-mono">{entry.sourceRefId}</span>
+              {(entry.source === "invoice_issue" || entry.source === "invoice_revision") && (
+                <>
+                  {" · "}
+                  <Link
+                    to={`/c/${companySlug}/finance/invoices`}
+                    className="text-indigo-600 hover:underline dark:text-indigo-400"
+                  >
+                    open invoice
+                  </Link>
+                </>
+              )}
+            </div>
+          )}
+          <table className="w-full text-xs">
+            <thead className="text-slate-400">
+              <tr>
+                <th className="w-20 px-2 py-1 text-left font-medium">Code</th>
+                <th className="px-2 py-1 text-left font-medium">Account</th>
+                <th className="px-2 py-1 text-left font-medium">Description</th>
+                <th className="w-32 px-2 py-1 text-right font-medium">Debit</th>
+                <th className="w-32 px-2 py-1 text-right font-medium">Credit</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entry.lines.map((l) => {
+                const a = accountById.get(l.accountId);
+                return (
+                  <tr key={l.id} className="border-t border-slate-100 dark:border-slate-700">
+                    <td className="px-2 py-1 font-mono text-slate-500 dark:text-slate-400">
+                      {a?.code ?? "—"}
+                    </td>
+                    <td className="px-2 py-1 text-slate-700 dark:text-slate-200">
+                      {a?.name ?? "(missing account)"}
+                    </td>
+                    <td className="px-2 py-1 text-slate-500 dark:text-slate-400">
+                      {l.description}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-slate-900 dark:text-slate-100">
+                      {l.debitCents > 0 ? formatMoney(l.debitCents, homeCurrency) : ""}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums text-slate-900 dark:text-slate-100">
+                      {l.creditCents > 0 ? formatMoney(l.creditCents, homeCurrency) : ""}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </li>
+  );
+}
+
+type DraftLine = {
+  key: string;
+  accountId: string;
+  side: "debit" | "credit";
+  amountText: string;
+  description: string;
+};
+
+function emptyLine(side: "debit" | "credit"): DraftLine {
+  return {
+    key: Math.random().toString(36).slice(2, 10),
+    accountId: "",
+    side,
+    amountText: "",
+    description: "",
+  };
+}
+
+function NewEntryModal({
+  companyId,
+  accounts,
+  homeCurrency,
+  onClose,
+  onSaved,
+}: {
+  companyId: string;
+  accounts: Account[];
+  homeCurrency: string;
+  onClose: () => void;
+  /** `notice` is surfaced by the page once the modal has closed. */
+  onSaved: (notice?: string) => void;
+}) {
+  const [date, setDate] = React.useState(new Date().toISOString().slice(0, 10));
+  const [memo, setMemo] = React.useState("");
+  const [lines, setLines] = React.useState<DraftLine[]>([emptyLine("debit"), emptyLine("credit")]);
+  const [busy, setBusy] = React.useState<null | "post" | "propose">(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const totals = React.useMemo(() => {
+    let d = 0;
+    let c = 0;
+    for (const l of lines) {
+      const cents = parseMoneyToCents(l.amountText);
+      if (l.side === "debit") d += cents;
+      else c += cents;
+    }
+    return { d, c, balanced: d === c && d > 0 };
+  }, [lines]);
+
+  function patch(idx: number, p: Partial<DraftLine>) {
+    setLines((ls) => ls.map((l, i) => (i === idx ? { ...l, ...p } : l)));
+  }
+
+  function add(side: "debit" | "credit") {
+    setLines((ls) => [...ls, emptyLine(side)]);
+  }
+
+  function remove(idx: number) {
+    setLines((ls) => (ls.length <= 2 ? ls : ls.filter((_, i) => i !== idx)));
+  }
+
+  function buildBody() {
+    const payload = lines
+      .filter((l) => l.accountId && parseMoneyToCents(l.amountText) > 0)
+      .map((l) => {
+        const cents = parseMoneyToCents(l.amountText);
+        return {
+          accountId: l.accountId,
+          debitCents: l.side === "debit" ? cents : 0,
+          creditCents: l.side === "credit" ? cents : 0,
+          description: l.description,
+        };
+      });
+    return { date: new Date(date).toISOString(), memo, lines: payload };
+  }
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!totals.balanced) {
+      setError("Debits and credits must match");
+      return;
+    }
+    setBusy("post");
+    try {
+      await api.post(`/api/companies/${companyId}/ledger-entries`, buildBody());
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Maker-checker: stage the same entry as a `FinanceProposal` instead of
+  // posting it, so a second member applies it from Proposed entries. Nothing
+  // hits the ledger until they do.
+  async function propose() {
+    setError(null);
+    if (!totals.balanced) {
+      setError("Debits and credits must match");
+      return;
+    }
+    setBusy("propose");
+    try {
+      await api.post(`/api/companies/${companyId}/finance-proposals`, buildBody());
+      onSaved("Staged for review — it waits under Proposed entries until someone applies it.");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="New manual entry" size="xl">
+      <form onSubmit={save} className="space-y-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <Input
+            label="Date"
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            required
+          />
+          <div className="sm:col-span-2">
+            <Input
+              label="Memo"
+              value={memo}
+              onChange={(e) => setMemo(e.target.value)}
+              maxLength={1000}
+              placeholder="e.g. Bank charge for July"
+            />
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-700">
+          <table className="w-full text-sm">
+            <thead className="border-b border-slate-200 bg-slate-50/80 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-800/40 dark:text-slate-400">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Account</th>
+                <th className="px-3 py-2 text-left font-medium">Description</th>
+                <th className="w-24 px-3 py-2 text-left font-medium">Side</th>
+                <th className="w-32 px-3 py-2 text-right font-medium">Amount</th>
+                <th className="w-10" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+              {lines.map((l, i) => (
+                <tr key={l.key}>
+                  <td className="px-2 py-2">
+                    <Select
+                      value={l.accountId}
+                      onChange={(e) => patch(i, { accountId: e.target.value })}
+                      className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                      required
+                    >
+                      <option value="">— Pick account —</option>
+                      {accounts
+                        .filter((a) => !a.archivedAt)
+                        .map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.code} {a.name}
+                          </option>
+                        ))}
+                    </Select>
+                  </td>
+                  <td className="px-2 py-2">
+                    <input
+                      value={l.description}
+                      onChange={(e) => patch(i, { description: e.target.value })}
+                      placeholder="Optional"
+                      className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <Select
+                      value={l.side}
+                      onChange={(e) => patch(i, { side: e.target.value as "debit" | "credit" })}
+                      className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                    >
+                      <option value="debit">Debit</option>
+                      <option value="credit">Credit</option>
+                    </Select>
+                  </td>
+                  <td className="px-2 py-2">
+                    <input
+                      value={l.amountText}
+                      onChange={(e) => patch(i, { amountText: e.target.value })}
+                      inputMode="decimal"
+                      placeholder="0.00"
+                      className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-right text-sm tabular-nums dark:border-slate-700 dark:bg-slate-900"
+                    />
+                  </td>
+                  <td className="px-2 py-2 text-center">
+                    <button
+                      type="button"
+                      onClick={() => remove(i)}
+                      disabled={lines.length <= 2}
+                      className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-30 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                      aria-label="Remove line"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => add("debit")}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+            >
+              <Plus size={12} /> Debit line
+            </button>
+            <button
+              type="button"
+              onClick={() => add("credit")}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+            >
+              <Plus size={12} /> Credit line
+            </button>
+          </div>
+          <div className="flex gap-6 text-sm">
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Debits:</span>{" "}
+              <span className="tabular-nums text-slate-900 dark:text-slate-100">
+                {formatMoney(totals.d, homeCurrency)}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-500 dark:text-slate-400">Credits:</span>{" "}
+              <span className="tabular-nums text-slate-900 dark:text-slate-100">
+                {formatMoney(totals.c, homeCurrency)}
+              </span>
+            </div>
+            <div
+              className={
+                totals.balanced
+                  ? "font-semibold text-emerald-600 dark:text-emerald-400"
+                  : "font-semibold text-amber-600 dark:text-amber-400"
+              }
+            >
+              {totals.balanced ? "Balanced" : "Unbalanced"}
+            </div>
+          </div>
+        </div>
+
+        <FormError message={error} />
+
+        <div className="flex justify-end gap-2 pt-2">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy !== null}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={propose}
+            loading={busy === "propose"}
+            disabled={busy !== null || !totals.balanced}
+          >
+            Propose for review
+          </Button>
+          <Button
+            type="submit"
+            loading={busy === "post"}
+            disabled={busy !== null || !totals.balanced}
+          >
+            Post entry
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

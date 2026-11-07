@@ -1,0 +1,912 @@
+import React from "react";
+import { Link, useNavigate, useOutletContext } from "react-router-dom";
+import {
+  Archive,
+  ArchiveRestore,
+  Ban,
+  ChevronLeft,
+  ChevronRight,
+  MoreHorizontal,
+  Plus,
+  Search,
+  Users,
+} from "lucide-react";
+import { api, Employee, Member } from "../lib/api";
+import { CONTACT_PAGE_SIZE, type ContactPageResponse, contactPageUrl } from "../lib/contactPages";
+import {
+  cursorPageRange,
+  firstCursorPage,
+  nextCursorPage,
+  openPageCursor,
+  previousCursorPage,
+} from "../lib/cursorPages";
+import { customerOptionLabel } from "../lib/customerLabel";
+import type { RevenueAccount } from "../lib/revenue";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { Badge, type BadgeTone } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
+import { FormError } from "../components/ui/FormError";
+import { Input } from "../components/ui/Input";
+import { Menu, MenuItem, MenuSeparator } from "../components/ui/Menu";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { Spinner } from "../components/ui/Spinner";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { errorMessage } from "../lib/errors";
+import { RevenueOutletCtx } from "./RevenueLayout";
+
+/**
+ * Contacts — the people layer of the Revenue section, and the landing page of
+ * the whole section.
+ *
+ * The list answers one question: who have we not spoken to lately. The server
+ * already orders by `lastActivityAt` with never-touched rows last, so nothing
+ * here re-sorts — a client-side sort would silently disagree with the next
+ * page the server returns. Pages follow the server's cursor rather than an
+ * offset, so contacts moving to the top or leaving the list between pages
+ * never make Next skip or repeat anyone (`lib/contactPages.ts`).
+ *
+ * The other thing this page owes the person scanning it is who they must not
+ * mail. A do-not-contact flag or an unsubscribe is enforced at the outbound
+ * choke-point regardless, but finding out only after drafting is a waste of
+ * somebody's afternoon, so both are marked on the row itself.
+ */
+
+export type ContactLifecycleStage =
+  | "subscriber"
+  | "lead"
+  | "qualified"
+  | "opportunity"
+  | "customer"
+  | "churned"
+  | "unqualified";
+
+export const CONTACT_LIFECYCLE_STAGES: ContactLifecycleStage[] = [
+  "subscriber",
+  "lead",
+  "qualified",
+  "opportunity",
+  "customer",
+  "churned",
+  "unqualified",
+];
+
+/** A contact row as `GET /revenue/contacts` serializes it. */
+export type RevenueContact = {
+  id: string;
+  companyId: string;
+  name: string;
+  email: string;
+  phone: string;
+  title: string;
+  linkedinUrl: string;
+  websiteUrl: string;
+  customerId: string | null;
+  companyName: string;
+  lifecycleStage: ContactLifecycleStage;
+  ownerId: string | null;
+  ownerEmployeeId: string | null;
+  source: string;
+  sourceDetail: string;
+  score: number;
+  notes: string;
+  doNotContact: boolean;
+  unsubscribedAt: string | null;
+  bouncedAt: string | null;
+  lastActivityAt: string | null;
+  archivedAt: string | null;
+  createdById: string | null;
+  createdByEmployeeId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Attached by the list endpoint only — null when there is no account yet. */
+  customerName?: string | null;
+};
+
+const STAGE_LABELS: Record<ContactLifecycleStage, string> = {
+  subscriber: "Subscriber",
+  lead: "Lead",
+  qualified: "Qualified",
+  opportunity: "Opportunity",
+  customer: "Customer",
+  churned: "Churned",
+  unqualified: "Unqualified",
+};
+
+const STAGE_TONE: Record<ContactLifecycleStage, BadgeTone> = {
+  subscriber: "neutral",
+  lead: "info",
+  qualified: "accent",
+  opportunity: "ai",
+  customer: "success",
+  churned: "danger",
+  unqualified: "warning",
+};
+
+/** Lifecycle-stage badge. Exported so the contact detail renders the same chip. */
+export function LifecycleStagePill({ stage }: { stage: ContactLifecycleStage }) {
+  return <Badge tone={STAGE_TONE[stage] ?? STAGE_TONE.lead}>{STAGE_LABELS[stage] ?? stage}</Badge>;
+}
+
+/**
+ * The "you must not mail this person" markers, in one place so the list row
+ * and the detail header can never drift apart on what counts as blocked.
+ */
+export function ContactFlagPills({
+  contact,
+  showArchived = true,
+}: {
+  contact: RevenueContact;
+  showArchived?: boolean;
+}) {
+  const flags: { key: string; label: string; tone: BadgeTone }[] = [];
+  if (contact.doNotContact) flags.push({ key: "dnc", label: "do not contact", tone: "danger" });
+  if (contact.unsubscribedAt) flags.push({ key: "unsub", label: "unsubscribed", tone: "warning" });
+  if (contact.bouncedAt) flags.push({ key: "bounced", label: "bounced", tone: "warning" });
+  if (showArchived && contact.archivedAt) {
+    flags.push({ key: "archived", label: "archived", tone: "neutral" });
+  }
+  if (flags.length === 0) return null;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      {flags.map((f) => (
+        <Badge key={f.key} tone={f.tone}>
+          {f.label}
+        </Badge>
+      ))}
+    </span>
+  );
+}
+
+export function formatRelative(iso: string | null): string {
+  if (!iso) return "Never";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "—";
+  const diff = Date.now() - then;
+  if (diff < 0) return "Just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.floor(months / 12)}y ago`;
+}
+
+/** Look up an owner's display name from the two possible principal lists. */
+export function ownerLabel(
+  contact: { ownerId: string | null; ownerEmployeeId: string | null },
+  members: Member[],
+  employees: Employee[],
+): { name: string; kind: "human" | "ai" } | null {
+  if (contact.ownerId) {
+    const m = members.find((x) => x.userId === contact.ownerId);
+    return { name: m?.name || m?.email || "Unknown member", kind: "human" };
+  }
+  if (contact.ownerEmployeeId) {
+    const e = employees.find((x) => x.id === contact.ownerEmployeeId);
+    return { name: e?.name ?? "Unknown employee", kind: "ai" };
+  }
+  return null;
+}
+
+export default function RevenueContacts() {
+  const { company } = useOutletContext<RevenueOutletCtx>();
+  const navigate = useNavigate();
+  const background = useBackgroundAction();
+  const dialog = useDialog();
+
+  // `null` is the loading state — there is no separate loading flag. `total`
+  // rides alongside because the pagination footer needs the server's count.
+  const [rows, setRows] = React.useState<RevenueContact[] | null>(null);
+  const [total, setTotal] = React.useState(0);
+  const [nextCursor, setNextCursor] = React.useState<string | null>(null);
+  const [loadError, setLoadError] = React.useState(false);
+  const [retrying, setRetrying] = React.useState(false);
+  const [stage, setStage] = React.useState<ContactLifecycleStage | "">("");
+  const [search, setSearch] = React.useState("");
+  const [query, setQuery] = React.useState("");
+  const [showArchived, setShowArchived] = React.useState(false);
+  const [creating, setCreating] = React.useState(false);
+  const [members, setMembers] = React.useState<Member[]>([]);
+  const [employees, setEmployees] = React.useState<Employee[]>([]);
+  const [accounts, setAccounts] = React.useState<RevenueAccount[]>([]);
+
+  const base = `/c/${company.slug}/revenue`;
+
+  React.useEffect(() => {
+    const t = setTimeout(() => setQuery(search.trim()), 250);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // The pages visited, kept with the filters they were read under: changing a
+  // filter is back to page one in the same render, so no request ever pairs a
+  // cursor with filters it was not issued for (the server refuses that).
+  const filterKey = JSON.stringify([query, stage, showArchived]);
+  const [visited, setVisited] = React.useState(() => ({ key: filterKey, ...firstCursorPage() }));
+  const pages = visited.key === filterKey ? visited : { key: filterKey, ...firstCursorPage() };
+  const pageIndex = pages.index;
+  const pageCursor = openPageCursor(pages);
+  const latestRead = React.useRef(0);
+
+  const reload = React.useCallback(async () => {
+    const read = ++latestRead.current;
+    try {
+      const data = await api.get<ContactPageResponse<RevenueContact>>(
+        contactPageUrl(company.id, { query, stage, showArchived }, pageCursor),
+      );
+      // A newer read (another page, a filter, a live update) is on its way.
+      if (read !== latestRead.current) return;
+      if (data.rows.length === 0 && pageIndex > 0) {
+        // Everything on this page left the list — archived, say: show the
+        // page before rather than an empty list with pages behind it.
+        setVisited((current) =>
+          current.key === filterKey ? { ...current, ...previousCursorPage(current) } : current,
+        );
+        return;
+      }
+      // The API already orders by most recent activity with never-touched rows
+      // last, and pages against that order — re-sorting here would disagree
+      // with whatever the next page comes back with.
+      setRows(data.rows);
+      setTotal(data.total);
+      setNextCursor(data.hasMore ? data.nextCursor : null);
+      setLoadError(false);
+    } catch (error) {
+      if (read !== latestRead.current) return;
+      setRows([]);
+      setTotal(0);
+      setNextCursor(null);
+      setLoadError(true);
+      throw error;
+    }
+  }, [company.id, filterKey, pageCursor, pageIndex, query, stage, showArchived]);
+
+  const load = React.useCallback(() => {
+    reload().catch(() => {
+      // The page already shows that it could not load.
+    });
+  }, [reload]);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  useLiveRefetch(["contact", "activity", "suppression"], load);
+
+  // Owner names are not on the contact payload, so the two principal lists are
+  // fetched once per company rather than per row.
+  React.useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      api.get<Member[]>(`/api/companies/${company.id}/members`),
+      api.get<Employee[]>(`/api/companies/${company.id}/employees`),
+      api.get<{ rows: RevenueAccount[] }>(
+        `/api/companies/${company.id}/revenue/accounts?limit=200`,
+      ),
+    ])
+      .then(([m, e, a]) => {
+        if (cancelled) return;
+        setMembers(m);
+        setEmployees(e);
+        setAccounts(a.rows);
+      })
+      .catch(() => {
+        // Owners degrade to "Unassigned"; the list is still usable.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [company.id]);
+
+  const list = rows ?? [];
+  const hasPrev = pageIndex > 0;
+  const hasNext = nextCursor !== null;
+  const range = cursorPageRange(pages, CONTACT_PAGE_SIZE, list.length, total);
+
+  function patchRow(id: string, patch: Partial<RevenueContact>) {
+    setRows((current) =>
+      current ? current.map((r) => (r.id === id ? { ...r, ...patch } : r)) : current,
+    );
+  }
+
+  function archive(contact: RevenueContact) {
+    const archived = !contact.archivedAt;
+    const before = { ...contact };
+    const dropped = archived && !showArchived;
+    setRows((current) => {
+      if (!current) return current;
+      if (dropped) return current.filter((r) => r.id !== contact.id);
+      return current.map((r) =>
+        r.id === contact.id
+          ? { ...r, archivedAt: archived ? new Date().toISOString() : null }
+          : r,
+      );
+    });
+    if (dropped) setTotal((t) => Math.max(0, t - 1));
+    background(
+      () =>
+        api.post<RevenueContact>(
+          `/api/companies/${company.id}/revenue/contacts/${contact.id}/${
+            archived ? "archive" : "restore"
+          }`,
+        ),
+      {
+        title: `Couldn’t update ${before.name}`,
+        error: (error) => `${errorMessage(error)} The change was undone.`,
+        onSuccess: () => load(),
+        onError: () => {
+          setRows((current) => {
+            if (!current) return current;
+            if (current.some((r) => r.id === before.id)) {
+              return current.map((r) => (r.id === before.id ? before : r));
+            }
+            return [before, ...current];
+          });
+          if (dropped) setTotal((t) => t + 1);
+        },
+      },
+    );
+  }
+
+  async function toggleDoNotContact(contact: RevenueContact) {
+    const next = !contact.doNotContact;
+    if (next) {
+      const confirmed = await dialog.confirm({
+        title: `Mark ${contact.name} as do not contact?`,
+        message:
+          "Every send path refuses mail to them from then on — a human pressing Send, a bulk send, and any sequence an AI employee runs.",
+        confirmLabel: "Mark do not contact",
+      });
+      if (!confirmed) return;
+    }
+    patchRow(contact.id, { doNotContact: next });
+    background(
+      () =>
+        api.patch<RevenueContact>(
+          `/api/companies/${company.id}/revenue/contacts/${contact.id}`,
+          { doNotContact: next },
+        ),
+      {
+        title: `Couldn’t update ${contact.name}`,
+        error: (error) => `${errorMessage(error)} The change was undone.`,
+        onError: () => patchRow(contact.id, { doNotContact: contact.doNotContact }),
+      },
+    );
+  }
+
+  function retry() {
+    setRetrying(true);
+    reload()
+      .catch(() => {
+        // Still failing: the page keeps saying so.
+      })
+      .finally(() => setRetrying(false));
+  }
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <div className="mb-6">
+        <Breadcrumbs items={[{ label: "Revenue", to: base }, { label: "Contacts" }]} />
+      </div>
+
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">
+            Contacts
+          </h1>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Everyone in the sales process, most recently touched first.
+          </p>
+        </div>
+        <Button onClick={() => setCreating(true)}>
+          <Plus size={14} /> New contact
+        </Button>
+      </div>
+
+      {/* Search + filters */}
+      <div className="mb-4 space-y-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="relative min-w-[220px] flex-1">
+            <Search
+              size={14}
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500"
+            />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search name, email, company or title…"
+              aria-label="Search contacts"
+              className="h-10 w-full rounded-lg border border-slate-200 bg-white pl-9 pr-3 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:ring-indigo-500/25"
+            />
+          </div>
+          <label className="touch-target relative flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+              className="rounded border-slate-300 text-indigo-600 dark:border-slate-600 dark:bg-slate-900"
+            />
+            Show archived
+          </label>
+        </div>
+
+        <div className="flex flex-wrap gap-1.5">
+          <StageChip label="All stages" active={stage === ""} onClick={() => setStage("")} />
+          {CONTACT_LIFECYCLE_STAGES.map((s) => (
+            <StageChip
+              key={s}
+              label={STAGE_LABELS[s]}
+              active={stage === s}
+              onClick={() => setStage(stage === s ? "" : s)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {loadError ? (
+        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center dark:border-slate-700 dark:bg-slate-900">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            Couldn&apos;t load contacts
+          </h3>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Something went wrong fetching this list.
+          </p>
+          <Button variant="secondary" className="mt-4" onClick={retry} loading={retrying}>
+            Try again
+          </Button>
+        </div>
+      ) : rows === null ? (
+        <div className="flex justify-center p-16">
+          <Spinner size={20} />
+        </div>
+      ) : list.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-12 text-center dark:border-slate-700 dark:bg-slate-900">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            {query || stage ? "No contacts match those filters" : "No contacts yet"}
+          </h3>
+          <p className="mx-auto mt-1 max-w-md text-sm text-slate-500 dark:text-slate-400">
+            {query || stage
+              ? "Try a different search, or clear the stage filter."
+              : "Add the first person you are selling to. Once mail is connected, their conversations land on the timeline on their own."}
+          </p>
+          <div className="mt-4">
+            {query || stage ? (
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setSearch("");
+                  setStage("");
+                }}
+              >
+                Clear filters
+              </Button>
+            ) : (
+              <Button onClick={() => setCreating(true)}>
+                <Plus size={14} /> New contact
+              </Button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50/80 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-800/40 dark:text-slate-400">
+                  <tr>
+                    <th className="px-4 py-2 text-left font-medium">Name</th>
+                    <th className="hidden px-4 py-2 text-left font-medium md:table-cell">
+                      Company
+                    </th>
+                    <th className="hidden px-4 py-2 text-left font-medium lg:table-cell">
+                      Title
+                    </th>
+                    <th className="px-4 py-2 text-left font-medium">Stage</th>
+                    <th className="hidden px-4 py-2 text-left font-medium lg:table-cell">
+                      Owner
+                    </th>
+                    <th className="px-4 py-2 text-right font-medium">Last activity</th>
+                    <th className="px-4 py-2 text-right font-medium">&nbsp;</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {list.map((c) => {
+                    const owner = ownerLabel(c, members, employees);
+                    return (
+                      <tr
+                        key={c.id}
+                        className={
+                          "hover:bg-slate-50 dark:hover:bg-slate-800/50 " +
+                          (c.archivedAt ? "opacity-60" : "")
+                        }
+                      >
+                        <td className="px-4 py-3">
+                          <Link
+                            to={`${base}/contacts/${c.id}`}
+                            className="font-medium text-slate-900 hover:text-indigo-600 hover:underline dark:text-slate-100 dark:hover:text-indigo-400"
+                          >
+                            {c.name || "Unnamed contact"}
+                          </Link>
+                          <div className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+                            {c.email || "No email"}
+                          </div>
+                          <div className="mt-1">
+                            <ContactFlagPills contact={c} />
+                          </div>
+                        </td>
+                        <td className="hidden px-4 py-3 text-slate-600 dark:text-slate-300 md:table-cell">
+                          {c.customerName || c.companyName || (
+                            <span className="text-slate-400 dark:text-slate-500">—</span>
+                          )}
+                        </td>
+                        <td className="hidden px-4 py-3 text-slate-600 dark:text-slate-300 lg:table-cell">
+                          {c.title || (
+                            <span className="text-slate-400 dark:text-slate-500">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <LifecycleStagePill stage={c.lifecycleStage} />
+                        </td>
+                        <td className="hidden px-4 py-3 text-slate-600 dark:text-slate-300 lg:table-cell">
+                          {owner ? (
+                            <span className="inline-flex items-center gap-1">
+                              {owner.name}
+                              {owner.kind === "ai" && (
+                                <span className="rounded bg-violet-100 px-1 py-0.5 text-xs font-medium text-violet-700 dark:bg-violet-500/15 dark:text-violet-300">
+                                  AI
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-slate-400 dark:text-slate-500">
+                              Unassigned
+                            </span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-right text-slate-500 dark:text-slate-400">
+                          {formatRelative(c.lastActivityAt)}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <RowMenu
+                            archived={!!c.archivedAt}
+                            doNotContact={c.doNotContact}
+                            onOpen={() => navigate(`${base}/contacts/${c.id}`)}
+                            onArchive={() => archive(c)}
+                            onToggleDnc={() => void toggleDoNotContact(c)}
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+            <span className="tabular-nums">
+              {range.start}–{range.end} of {range.of} contact{range.of === 1 ? "" : "s"}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={!hasPrev}
+                onClick={() => {
+                  // Next waits for the page it would continue from.
+                  setNextCursor(null);
+                  setVisited({ ...pages, ...previousCursorPage(pages) });
+                }}
+              >
+                <ChevronLeft size={14} /> Previous
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={!hasNext}
+                onClick={() => {
+                  setNextCursor(null);
+                  setVisited({ ...pages, ...nextCursorPage(pages, nextCursor) });
+                }}
+              >
+                Next <ChevronRight size={14} />
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Mounted only while open, so the form starts empty every time. */}
+      {creating && (
+        <NewContactModal
+          companyId={company.id}
+          members={members}
+          employees={employees}
+          accounts={accounts}
+          onClose={() => setCreating(false)}
+          onCreated={(contact) => {
+            setCreating(false);
+            navigate(`${base}/contacts/${contact.id}`);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function StageChip({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={
+        "touch-target relative rounded-full border px-3 py-1 text-xs font-medium transition-colors " +
+        (active
+          ? "border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-300"
+          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800")
+      }
+    >
+      {label}
+    </button>
+  );
+}
+
+function RowMenu({
+  archived,
+  doNotContact,
+  onOpen,
+  onArchive,
+  onToggleDnc,
+}: {
+  archived: boolean;
+  doNotContact: boolean;
+  onOpen: () => void;
+  onArchive: () => void;
+  onToggleDnc: () => void;
+}) {
+  return (
+    <Menu
+      align="right"
+      width={200}
+      trigger={({ ref, onClick }) => (
+        <button
+          ref={ref}
+          onClick={onClick}
+          className="touch-target relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+          aria-label="Row menu"
+        >
+          <MoreHorizontal size={16} />
+        </button>
+      )}
+    >
+      {(close) => (
+        <>
+          <MenuItem
+            icon={<Users size={14} />}
+            label="Open contact"
+            onSelect={() => {
+              close();
+              onOpen();
+            }}
+          />
+          <MenuItem
+            icon={<Ban size={14} />}
+            label={doNotContact ? "Allow contact" : "Mark do not contact"}
+            onSelect={() => {
+              close();
+              onToggleDnc();
+            }}
+          />
+          <MenuSeparator />
+          <MenuItem
+            icon={archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+            label={archived ? "Restore" : "Archive"}
+            onSelect={() => {
+              close();
+              onArchive();
+            }}
+          />
+        </>
+      )}
+    </Menu>
+  );
+}
+
+/**
+ * New contact.
+ *
+ * The one failure worth designing for is the 409: the service refuses a
+ * duplicate address rather than merging into the existing row, so the message
+ * has to name the address that clashed instead of saying "create failed" and
+ * throwing away what was typed.
+ */
+function NewContactModal({
+  companyId,
+  members,
+  employees,
+  accounts,
+  onClose,
+  onCreated,
+}: {
+  companyId: string;
+  members: Member[];
+  employees: Employee[];
+  accounts: RevenueAccount[];
+  onClose: () => void;
+  onCreated: (contact: RevenueContact) => void;
+}) {
+  const [name, setName] = React.useState("");
+  const [email, setEmail] = React.useState("");
+  const [title, setTitle] = React.useState("");
+  const [companyName, setCompanyName] = React.useState("");
+  const [customerId, setCustomerId] = React.useState("");
+  const [phone, setPhone] = React.useState("");
+  const [stage, setStage] = React.useState<ContactLifecycleStage>("lead");
+  const [owner, setOwner] = React.useState("");
+  const [error, setError] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("A name is required.");
+      return;
+    }
+    const trimmedEmail = email.trim();
+    const body: Record<string, unknown> = {
+      name: trimmedName,
+      lifecycleStage: stage,
+    };
+    if (trimmedEmail) body.email = trimmedEmail;
+    if (title.trim()) body.title = title.trim();
+    if (companyName.trim()) body.companyName = companyName.trim();
+    if (customerId) body.customerId = customerId;
+    if (phone.trim()) body.phone = phone.trim();
+    if (owner.startsWith("u:")) body.ownerId = owner.slice(2);
+    if (owner.startsWith("e:")) body.ownerEmployeeId = owner.slice(2);
+
+    setError(null);
+    setSaving(true);
+    try {
+      const contact = await api.post<RevenueContact>(
+        `/api/companies/${companyId}/revenue/contacts`,
+        body,
+      );
+      onCreated(contact);
+    } catch (err) {
+      const message = errorMessage(err);
+      // `api` throws a bare Error, so the 409 is recognised by the message
+      // the service writes. Anything else is reported verbatim.
+      setError(
+        /already exists/i.test(message)
+          ? `${trimmedEmail || "That address"} is already on a contact in this company. Search for it in the list and open that record instead of creating a second one.`
+          : message,
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="New contact">
+      <form onSubmit={submit} className="space-y-4">
+        <FormError message={error} />
+        <Input
+          label="Name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Dana Reyes"
+          autoFocus
+          required
+        />
+        <Input
+          label="Email"
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="dana@acme.com"
+        />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <Input
+            label="Title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="VP Engineering"
+          />
+          <Input
+            label="Company"
+            value={companyName}
+            onChange={(e) => setCompanyName(e.target.value)}
+            placeholder="Acme Inc."
+          />
+          <Select
+            label="Account"
+            value={customerId}
+            onChange={(e) => {
+              const nextId = e.target.value;
+              setCustomerId(nextId);
+              const account = accounts.find((row) => row.id === nextId);
+              if (account) setCompanyName(account.name);
+            }}
+          >
+            <option value="">No linked account</option>
+            {accounts.map((account) => (
+              <option key={account.id} value={account.id}>
+                {customerOptionLabel(account)}
+              </option>
+            ))}
+          </Select>
+          <Input
+            label="Phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            placeholder="+1 555 0100"
+          />
+          <Select
+            label="Lifecycle stage"
+            value={stage}
+            onChange={(e) => setStage(e.target.value as ContactLifecycleStage)}
+          >
+            {CONTACT_LIFECYCLE_STAGES.map((s) => (
+              <option key={s} value={s}>
+                {STAGE_LABELS[s]}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <Select
+          label="Owner"
+          value={owner}
+          onChange={(e) => setOwner(e.target.value)}
+        >
+          <option value="">Unassigned</option>
+          {members.length > 0 && (
+            <optgroup label="People">
+              {members.map((m) => (
+                <option key={m.userId} value={`u:${m.userId}`}>
+                  {m.name || m.email || m.userId}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {employees.length > 0 && (
+            <optgroup label="AI employees">
+              {employees.map((emp) => (
+                <option key={emp.id} value={`e:${emp.id}`}>
+                  {emp.name}
+                </option>
+              ))}
+            </optgroup>
+          )}
+        </Select>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          An address must be unique in this company — the same person cannot be
+          created twice.
+        </p>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={saving}>
+            <Plus size={14} /> Create contact
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

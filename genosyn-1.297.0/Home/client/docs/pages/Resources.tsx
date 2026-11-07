@@ -1,0 +1,251 @@
+import { Callout, Code, DocLink, H2, KeyList, LI, P, PageHeader, Strong, UL } from "@/docs/Prose";
+
+export function Resources() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Core concepts"
+        title="Resources"
+        lead={
+          <>
+            Resources are the material your company did not write — articles, PDFs, ebooks,
+            transcripts, a page you pasted the URL of. You ingest it once; your AI Employees search
+            it and quote from it instead of guessing.
+          </>
+        }
+      />
+
+      <H2 id="what">What counts as a Resource</H2>
+      <P>
+        Genosyn keeps three different kinds of knowledge apart on purpose, and picking the right one
+        is most of getting good answers out of an AI Employee.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Resource",
+            def: "Someone else's words, ingested for study. A vendor's API guide, a competitor's pricing page, the ebook your founder keeps recommending. Read on demand, never automatically injected.",
+          },
+          {
+            term: "Note",
+            def: (
+              <>
+                A page your team and your AI Employees write together — see{" "}
+                <DocLink to="/docs/notes">Notes</DocLink>, and{" "}
+                <DocLink to="/docs/workspace-chat">workspace chat</DocLink> for how they get
+                referenced in conversation.
+              </>
+            ),
+          },
+          {
+            term: "Memory",
+            def: "A short durable fact about how your company works, injected into every prompt. Facts, not documents.",
+          },
+        ]}
+      />
+
+      <H2 id="add">Add one</H2>
+      <P>
+        Go to <Strong>Resources</Strong> in the sidebar under Knowledge. Three tiles:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Paste a URL</Strong> — paste it and press Enter; Genosyn fetches the page and
+          extracts its readable text. The text is a snapshot taken at that moment; it does not
+          re-fetch later.
+        </LI>
+        <LI>
+          <Strong>Write in Markdown</Strong> — notes, a transcript, a primer, anything you can type
+          or copy. The <Strong>Write</Strong> tab is a Markdown editor with a toolbar and a live
+          preview: headings, bold and italics, lists, links, tables and code all render. It stays
+          editable afterwards in the same editor, where <Code>⌘S</Code> saves.
+        </LI>
+        <LI>
+          <Strong>Upload a file</Strong> — PDF, EPUB, Word, plain text, Markdown or HTML, up to
+          25&nbsp;MB. Video files are stored and playable but not transcribed yet.
+        </LI>
+      </UL>
+      <P>
+        Whatever you add, the original is kept and the extracted text is what gets searched. A
+        Resource can carry any number of <DocLink to="/docs/tags">tags</DocLink>, and lives in at
+        most one <DocLink to="/docs/resources#folders">folder</DocLink>. A text Resource&apos;s
+        card shows its words without the Markdown syntax.
+      </P>
+
+      <H2 id="folders">Files and folders</H2>
+      <P>
+        The Resources sidebar is a folder tree: <Strong>All resources</Strong>, your folders with
+        how much each holds, and <Strong>Unfiled</Strong> for anything in no folder. Folders nest
+        up to five levels deep, and a Resource lives in one folder at a time — like a file on a
+        drive. Tags still group Resources across folders.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Make a folder</Strong> with <Strong>New folder</Strong> on the page or the folder
+          button in the sidebar. A folder&apos;s menu adds a subfolder, renames it, moves it back
+          to the top level, or deletes it.
+        </LI>
+        <LI>
+          <Strong>Open a folder</Strong> to see its subfolders first and then the Resources filed
+          directly in it. Searching inside a folder also finds what is in its subfolders.{" "}
+          <Strong>All resources</Strong> lists everything, with each card saying which folder it
+          is in.
+        </LI>
+        <LI>
+          <Strong>File a Resource</Strong> by dragging its card onto a folder — a folder on the
+          page or one in the sidebar, or onto <Strong>Unfiled</Strong> to take it out of every
+          folder. Its own page has a <Strong>Folder</Strong> picker too, and a new Resource lands
+          in the folder you are looking at.
+        </LI>
+        <LI>
+          <Strong>Deleting a folder never deletes what is in it.</Strong> Its Resources and
+          subfolders move up to the folder above it, or to Unfiled for a top-level folder.
+        </LI>
+      </UL>
+      <P>
+        Renaming or moving a folder keeps its address, so a link to it keeps working. Any Member
+        can organise folders, just as any Member can add or edit Resources.
+      </P>
+
+      <Callout kind="info" title="If nothing could be extracted, the Resource says so.">
+        A scanned PDF has no text layer, and a page built entirely in JavaScript returns no prose.
+        Both used to be filed as ready with an empty body — stored, listed, and permanently
+        invisible to search. They are now marked <Strong>Failed</Strong> with the reason and the
+        fix: run the scan through OCR, or save the page as a PDF. The file itself is still stored,
+        still viewable, and a PDF can still be sent for{" "}
+        <DocLink to="/docs/signatures">signature</DocLink>. The same guard refuses to index a
+        spreadsheet or an image as if it were prose, and an EPUB that can&apos;t be opened —
+        damaged, or not an EPUB at all — is marked Failed with that reason.
+      </Callout>
+
+      <H2 id="ai">How an AI Employee uses one</H2>
+      <P>
+        Resources are read through tools, on demand — they never sit in an employee&apos;s prompt.
+        There are three read tools and they are designed to be used in order.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "search_resources",
+            def: "Finds the passage. Every word of the query has to appear somewhere, in any order — “refund policy” matches a handbook that says “our policy for refunds”. Each hit comes back with a snippet of the matching text and the exact character offset it came from.",
+          },
+          {
+            term: "get_resource",
+            def: "Reads from that offset. A window at a time, with the offset to resume from, so an employee can work through a 300-page book instead of receiving the first chapter and a note saying the rest was discarded.",
+          },
+          {
+            term: "list_resources",
+            def: "Browses the shelf — titles, summaries, tags and the folder each is filed in, newest first, paginated. Pass a folder path such as Research/Competitors to browse one folder and its subfolders. For when the employee wants to know what exists rather than answer a question.",
+          },
+        ]}
+      />
+      <P>
+        Employees can also curate: <Code>create_resource</Code> files a URL, a Markdown document,
+        or a file it already holds — an emailed contract, a form it downloaded — optionally into a
+        folder path, which is created if it does not exist yet. <Code>update_resource</Code> can
+        move a Resource to another folder, or out of every folder. <Code>update_resource</Code> and{" "}
+        <Code>delete_resource</Code> need a higher grant. <Code>export_resource</Code> renders the
+        body as PDF, HTML, Markdown or plain text and attaches it to the reply. None of the three
+        write tools work for an employee set to{" "}
+        <DocLink to="/docs/resources#ai-access">Read only</DocLink>.
+      </P>
+
+      <H2 id="access">Who can read it</H2>
+      <P>
+        Every Member of the company sees every Resource. AI Employees are granted access one row at
+        a time, at three escalating levels — <Strong>View only</Strong>, <Strong>Can edit</Strong>,
+        and <Strong>Can delete</Strong>. Open a Resource and use <Strong>Share</Strong> to change
+        them. <Strong>Resources → AI access</Strong>, below, can then cap all of them for an
+        employee at once.
+      </P>
+      <P>
+        You rarely have to. A new Resource is granted <Strong>View only</Strong> to every AI
+        Employee in the company as it is created, and an employee hired later is granted the
+        company&apos;s existing library as it is hired — so the order in which you fill the shelf
+        and grow the team no longer decides who can read anything. An employee that files its own
+        Resource gets full control of that row; teammates start at view-only.
+      </P>
+
+      <Callout kind="warn" title="An employee with no grants says so.">
+        If an AI Employee genuinely has no access to any Resource, its search comes back with an
+        explanation rather than an empty list — otherwise it cannot tell &quot;we have nothing on
+        this&quot; from &quot;I was not given the shelf&quot;, and it will confidently tell you the
+        first one.
+      </Callout>
+
+      <H2 id="ai-access">AI access: read + write or read only</H2>
+      <P>
+        Open <Strong>Resources → AI access</Strong> to see every AI Employee in the company and what
+        it may do across the whole library. Each one is at one of two levels:
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Read + write",
+            def: "The default, and what every AI Employee could already do. It lists, searches, reads and exports the Resources shared with it, files new ones, and edits or deletes them as each Resource's Share settings allow.",
+          },
+          {
+            term: "Read only",
+            def: (
+              <>
+                It still lists, searches, reads and exports every Resource shared with it, and uses
+                them wherever its other Grants allow — attaching one to an email, or preparing a
+                signature request from a PDF. <Code>create_resource</Code>,{" "}
+                <Code>update_resource</Code> and <Code>delete_resource</Code> are refused.
+              </>
+            ),
+          },
+        ]}
+      />
+      <P>
+        Read only is a ceiling over the Share settings, not a replacement for them. An employee set
+        to Read only cannot edit or delete a Resource even where its Share settings say{" "}
+        <Strong>Can edit</Strong> or <Strong>Can delete</Strong>, and the Share dialog marks those
+        rows <Strong>Paused</Strong>. Nothing is removed when you switch, so moving the employee
+        back to Read + write restores exactly what the Share settings said.
+      </P>
+      <P>
+        Every Member can open the page and see who is read only; only owners and admins can change a
+        level, and each change is recorded in the{" "}
+        <DocLink to="/docs/security#audit-log">audit log</DocLink> with the level before and after.
+        A read-only employee is told so in its briefing, so it says it can&apos;t make a change
+        instead of attempting one — and a Member chatting with it cannot lend it write access. The
+        setting governs only what AI Employees do through their tools; Members keep filing and
+        editing Resources on the Resources page.
+      </P>
+      <Callout kind="info" title="Two addresses are reserved.">
+        The Resources section uses <Code>/resources/ai-access</Code> and{" "}
+        <Code>/resources/integrations</Code> for its own pages, so a new Resource is never given
+        either slug: one titled “AI access” is filed as <Code>ai-access-2</Code>.
+      </Callout>
+
+      <H2 id="reading">Reading and exporting</H2>
+      <P>
+        The detail page is type-aware: PDFs open in the browser&apos;s viewer, EPUBs in a reader
+        with a table of contents and saved position, text Resources as a rendered Markdown
+        document you edit in the same Markdown editor, and a URL Resource shows a card linking the
+        original. Everything can be exported
+        as PDF, HTML, Markdown or plain text from the Download menu.
+      </P>
+      <P>
+        Originals you uploaded are served as downloads rather than rendered in the page, except for
+        the three kinds Genosyn has a viewer for — PDF, EPUB and video. An uploaded HTML or SVG file
+        is stored and downloadable but never rendered on the app&apos;s own origin.
+      </P>
+
+      <H2 id="limits">Limits</H2>
+      <UL>
+        <LI>25&nbsp;MB per uploaded file.</LI>
+        <LI>
+          1&nbsp;MiB of extracted text per Resource. A longer ebook is stored whole and its text
+          truncated at that point.
+        </LI>
+        <LI>8&nbsp;MiB per export.</LI>
+        <LI>
+          Retrieval is lexical — it matches the words you use. Embeddings and vector search are not
+          shipped yet.
+        </LI>
+      </UL>
+    </>
+  );
+}

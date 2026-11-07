@@ -1,0 +1,95 @@
+import { randomUUID } from "node:crypto";
+import { AppDataSource } from "../db/datasource.js";
+import { AIModel } from "../db/entities/AIModel.js";
+import { assertSafeOutboundUrl } from "../lib/outboundUrl.js";
+import { encryptSecret, maskSecret } from "../lib/secret.js";
+import { previewBaseURL, readCustomEndpoint } from "./customEndpoint.js";
+import { ModelSetupError } from "./modelCatalog.js";
+import { saveVerifiedModel, verifyOpenCodeModel } from "./modelSetup.js";
+import { saveNewModel } from "./models.js";
+import { soleServedModel } from "./servedModels.js";
+
+export type CustomModelSetup = {
+  companyId: string;
+  baseURL: string;
+  /** Blank uses the model the server serves, when it serves exactly one. */
+  modelId?: string;
+  apiKey?: string;
+  /**
+   * AI Employees a new model is attached to, as their active model. Ignored
+   * when changing an existing model's endpoint.
+   */
+  attachTo?: readonly string[];
+};
+
+/**
+ * Validate the target and its tool API before saving any credential or
+ * attaching a new model to anyone.
+ */
+export async function connectCustomModel(
+  options: CustomModelSetup,
+  previous?: AIModel,
+): Promise<AIModel> {
+  try {
+    await assertSafeOutboundUrl(options.baseURL);
+  } catch {
+    throw new ModelSetupError(
+      "This custom endpoint is not allowed by the outbound network policy. Check its URL and allowed hosts.",
+      400,
+    );
+  }
+  if (previous && (previous.authMode !== "customEndpoint" || previous.provider !== "custom")) {
+    throw new ModelSetupError("This AI Model is not configured for a custom endpoint.", 400);
+  }
+  let modelId = options.modelId?.trim() ?? "";
+  if (!modelId) {
+    try {
+      modelId = (await soleServedModel(options.baseURL, options.apiKey ?? null)).id;
+    } catch (error) {
+      throw new ModelSetupError(
+        error instanceof Error && error.message.startsWith("The server")
+          ? error.message
+          : "Could not read the server's model list. Check the Base URL, or enter the Model id.",
+        400,
+      );
+    }
+  }
+  const repo = AppDataSource.getRepository(AIModel);
+  const candidate = previous
+    ? Object.assign(new AIModel(), previous)
+    : repo.create({
+        id: randomUUID(),
+        companyId: options.companyId,
+        provider: "custom",
+        authMode: "customEndpoint",
+        model: modelId,
+        configJson: "{}",
+        connectedAt: null,
+      });
+  const oldTarget = previous ? readCustomEndpoint(previous) : null;
+  const config = JSON.parse(candidate.configJson || "{}") as Record<string, unknown>;
+  config.baseURLEncrypted = encryptSecret(options.baseURL, options.companyId);
+  config.baseURLPreview = previewBaseURL(options.baseURL);
+  config.modelId = modelId;
+  if (options.apiKey) {
+    config.apiKeyEncrypted = encryptSecret(options.apiKey, options.companyId);
+    config.apiKeyPreview = maskSecret(options.apiKey);
+  } else {
+    delete config.apiKeyEncrypted;
+    delete config.apiKeyPreview;
+  }
+  candidate.configJson = JSON.stringify(config);
+  candidate.model = modelId;
+  const changedTarget =
+    !oldTarget || oldTarget.baseURL !== options.baseURL || oldTarget.modelId !== modelId;
+  if (changedTarget) {
+    candidate.contextWindow = null;
+    candidate.contextWindowSource = null;
+  }
+  await verifyOpenCodeModel(candidate);
+  candidate.connectedAt = new Date();
+  if (previous) {
+    return saveVerifiedModel(previous, candidate, { resetContext: changedTarget });
+  }
+  return saveNewModel(candidate, options.attachTo ?? []);
+}

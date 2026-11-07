@@ -1,0 +1,53 @@
+import React from "react";
+import type { QueryResult, VizConfig } from "./ChartRenderer";
+import { exploreScalarMeasure } from "@/lib/explore";
+
+/**
+ * Single big number. Picks `vizConfig.measure` if present, otherwise the
+ * first numeric column of the first row. Optional `prefix` / `suffix` for
+ * unit decoration ("$", "%"). Renders the value with the same locale
+ * formatting as the table cells.
+ */
+export function ChartScalar({ config, result }: { config: VizConfig; result: QueryResult }) {
+  const row = result.rows[0];
+  if (!row) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-slate-400 dark:text-slate-500">
+        No rows.
+      </div>
+    );
+  }
+  const measure = exploreScalarMeasure(row, config);
+  const raw = row[measure];
+  const value = formatScalar(raw);
+  const text = `${config.prefix ?? ""}${value}${config.suffix ?? ""}`;
+  // Sized by the card it sits in rather than the window: as large as its
+  // width allows at about 0.6em a character, up to 4rem.
+  const fontSize = `clamp(1.25rem, ${(150 / Math.max(text.length, 1)).toFixed(1)}cqw, 4rem)`;
+  return (
+    <div className="flex h-full w-full flex-col items-center justify-center px-4 [container-type:inline-size]">
+      <div
+        className="whitespace-nowrap font-semibold leading-none text-slate-900 tabular-nums dark:text-slate-100"
+        style={{ fontSize }}
+      >
+        {text}
+      </div>
+      <div className="text-xs font-medium mt-2 text-slate-500 dark:text-slate-400">
+        {measure}
+      </div>
+    </div>
+  );
+}
+
+function formatScalar(raw: unknown): string {
+  if (raw === null || raw === undefined) return "—";
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (Number.isFinite(n)) {
+    // Compact >=1k: 1.2K, 3.4M, 1.5B. Below that, plain locale.
+    if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (Math.abs(n) >= 1e4) return (n / 1e3).toFixed(1) + "K";
+    return n.toLocaleString();
+  }
+  return String(raw);
+}

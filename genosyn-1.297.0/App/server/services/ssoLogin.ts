@@ -1,0 +1,424 @@
+import crypto from "node:crypto";
+import bcrypt from "bcrypt";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { User } from "../db/entities/User.js";
+import { ensureUserHandle } from "./userHandle.js";
+import { resolveSsoRuntime, ssoCallbackUrl, type ResolvedSso } from "./ssoSettings.js";
+import { createAuthFlowState, consumeAuthFlowState } from "./authFlowState.js";
+import { assertSafeOutboundUrl, safeFetchBuffer } from "../lib/outboundUrl.js";
+
+/**
+ * The OpenID Connect login handshake behind the login page's SSO button.
+ *
+ * Deliberately spec-minimal and dependency-free: the authorization-code flow
+ * with the provider's discovery document, then the `userinfo` endpoint for
+ * identity claims. Reading `userinfo` over TLS (instead of decoding the
+ * `id_token`) keeps JWT parsing/validation out of the codebase entirely —
+ * the claims come straight from the issuer we just exchanged the code with.
+ * Google is "just" an OIDC provider here (issuer accounts.google.com);
+ * anything OIDC-compliant (Okta, Keycloak, Entra ID, Auth0, …) works the
+ * same way.
+ *
+ * State tokens are encrypted in the database with a 10-minute TTL so the
+ * callback may land on any application replica. Each token is single-use,
+ * bound to the browser's signed cookie, and carries a PKCE verifier.
+ */
+
+/** A login failure whose message is safe to show the person signing in. */
+export class SsoLoginError extends Error {}
+
+// ─────────────────────────── state store ───────────────────────────────────
+
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+type SsoState = {
+  browserBindingHash: string;
+  codeVerifier: string;
+  /** Caller-supplied payload (e.g. the company id for per-company SSO). */
+  extra?: Record<string, unknown>;
+};
+
+function sha256Base64Url(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("base64url");
+}
+
+function sameDigest(left: string, right: string): boolean {
+  const a = Buffer.from(left, "utf8");
+  const b = Buffer.from(right, "utf8");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// ─────────────────────────── discovery ─────────────────────────────────────
+
+export type OidcEndpoints = {
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  userinfoEndpoint: string;
+};
+
+const DISCOVERY_TTL_MS = 10 * 60 * 1000;
+const discoveryCache = new Map<string, { endpoints: OidcEndpoints; expiresAt: number }>();
+
+/**
+ * Fetch and validate the issuer's discovery document. Exported for the
+ * Admin → SSO "check issuer" probe as well as the live handshake.
+ */
+export async function discoverOidcEndpoints(issuer: string): Promise<OidcEndpoints> {
+  const base = issuer.trim().replace(/\/+$/, "");
+  if (!/^https:\/\//.test(base)) {
+    throw new SsoLoginError("Issuer URL must start with https://");
+  }
+  const cached = discoveryCache.get(base);
+  if (cached && cached.expiresAt > Date.now()) return cached.endpoints;
+
+  const url = `${base}/.well-known/openid-configuration`;
+  let res: Awaited<ReturnType<typeof safeFetchBuffer>>;
+  try {
+    res = await safeFetchBuffer(url, {}, { maxBytes: 1024 * 1024 });
+  } catch (err) {
+    throw new SsoLoginError(
+      `Could not reach the identity provider (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  if (!res.ok) {
+    throw new SsoLoginError(`Identity provider discovery failed: ${res.status} from ${url}`);
+  }
+  let doc: Record<string, unknown>;
+  try {
+    doc = JSON.parse(res.body.toString("utf8")) as Record<string, unknown>;
+  } catch {
+    throw new SsoLoginError("Identity provider discovery returned invalid JSON");
+  }
+  const endpoints: OidcEndpoints = {
+    authorizationEndpoint: httpsUrlField(doc, "authorization_endpoint"),
+    tokenEndpoint: httpsUrlField(doc, "token_endpoint"),
+    userinfoEndpoint: httpsUrlField(doc, "userinfo_endpoint"),
+  };
+  await Promise.all([
+    assertSafeOutboundUrl(endpoints.authorizationEndpoint),
+    assertSafeOutboundUrl(endpoints.tokenEndpoint),
+    assertSafeOutboundUrl(endpoints.userinfoEndpoint),
+  ]);
+  discoveryCache.set(base, { endpoints, expiresAt: Date.now() + DISCOVERY_TTL_MS });
+  return endpoints;
+}
+
+function httpsUrlField(doc: Record<string, unknown>, key: string): string {
+  const v = doc[key];
+  if (typeof v !== "string" || !/^https:\/\//.test(v)) {
+    throw new SsoLoginError(
+      `Identity provider discovery document is missing "${key}" — is the issuer URL right?`,
+    );
+  }
+  return v;
+}
+
+// ─────────────────────────── the handshake ─────────────────────────────────
+
+/**
+ * The transport-level identity a handshake runs against. The instance flow
+ * fills this from `resolveSsoRuntime()`; per-company SSO (M56 Phase B) fills
+ * it from the company's own `CompanySso` row. The helpers below only ever
+ * read this object — they never touch the instance settings themselves.
+ */
+export type OidcClientConfig = {
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  /** The redirect URI registered with the identity provider. */
+  callbackUrl: string;
+};
+
+/**
+ * Build the redirect that sends the browser off to the identity provider,
+ * minting a single-use encrypted state token (kind `stateKind`) that binds
+ * the eventual callback to this browser and carries `extraStatePayload`
+ * through the round-trip.
+ */
+export async function startOidcHandshake(args: {
+  client: OidcClientConfig;
+  stateKind: string;
+  extraStatePayload?: Record<string, unknown>;
+}): Promise<{ authorizeUrl: string; browserBinding: string }> {
+  const endpoints = await discoverOidcEndpoints(args.client.issuer);
+  const browserBinding = crypto.randomBytes(32).toString("base64url");
+  const codeVerifier = crypto.randomBytes(32).toString("base64url");
+  const u = new URL(endpoints.authorizationEndpoint);
+  u.searchParams.set("client_id", args.client.clientId);
+  u.searchParams.set("redirect_uri", args.client.callbackUrl);
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("scope", "openid email profile");
+  u.searchParams.set("code_challenge", sha256Base64Url(codeVerifier));
+  u.searchParams.set("code_challenge_method", "S256");
+  u.searchParams.set(
+    "state",
+    await createAuthFlowState(
+      args.stateKind,
+      {
+        browserBindingHash: sha256Base64Url(browserBinding),
+        codeVerifier,
+        ...(args.extraStatePayload ? { extra: args.extraStatePayload } : {}),
+      } satisfies SsoState,
+      STATE_TTL_MS,
+    ),
+  );
+  return { authorizeUrl: u.toString(), browserBinding };
+}
+
+/**
+ * Consume the callback's state token and enforce the browser binding. Runs
+ * BEFORE any code exchange so a stolen state can never be redeemed from a
+ * different browser. Returns the PKCE verifier plus whatever extra payload
+ * `startOidcHandshake` stashed.
+ */
+export async function consumeOidcHandshakeState(
+  stateKind: string,
+  args: { state: string; browserBinding: string },
+): Promise<{ codeVerifier: string; extra: Record<string, unknown> }> {
+  const state = await consumeAuthFlowState<SsoState>(stateKind, args.state);
+  if (!state) {
+    throw new SsoLoginError("The sign-in attempt expired or was already used — try again.");
+  }
+  if (
+    !args.browserBinding ||
+    !sameDigest(state.browserBindingHash, sha256Base64Url(args.browserBinding))
+  ) {
+    throw new SsoLoginError("The sign-in attempt did not originate in this browser — try again.");
+  }
+  return { codeVerifier: state.codeVerifier, extra: state.extra ?? {} };
+}
+
+/** Exchange the authorization code and read verified identity claims. */
+export async function completeOidcCodeExchange(args: {
+  client: OidcClientConfig;
+  code: string;
+  codeVerifier: string;
+}): Promise<SsoClaims> {
+  const endpoints = await discoverOidcEndpoints(args.client.issuer);
+  const accessToken = await exchangeCode({
+    client: args.client,
+    endpoints,
+    code: args.code,
+    codeVerifier: args.codeVerifier,
+  });
+  return fetchClaims(endpoints.userinfoEndpoint, accessToken);
+}
+
+function instanceClient(sso: ResolvedSso): OidcClientConfig {
+  return {
+    issuer: sso.issuer,
+    clientId: sso.clientId,
+    clientSecret: sso.clientSecret,
+    callbackUrl: ssoCallbackUrl(),
+  };
+}
+
+/** Build the redirect that sends the browser off to the identity provider.
+ *  Throws `SsoLoginError` when SSO is disabled or misconfigured. */
+export async function startSsoLogin(): Promise<{
+  authorizeUrl: string;
+  browserBinding: string;
+}> {
+  const sso = await requireSsoRuntime();
+  return startOidcHandshake({ client: instanceClient(sso), stateKind: "sso" });
+}
+
+/**
+ * Complete the handshake: validate state, exchange the code, read identity
+ * claims from `userinfo`, and resolve them to a Genosyn user — linking an
+ * existing account by verified email, or provisioning a fresh one when the
+ * operator has auto-provision on.
+ */
+export async function finishSsoLogin(args: {
+  code: string;
+  state: string;
+  browserBinding: string;
+}): Promise<User> {
+  const { codeVerifier } = await consumeOidcHandshakeState("sso", {
+    state: args.state,
+    browserBinding: args.browserBinding,
+  });
+  const sso = await requireSsoRuntime();
+  const claims = await completeOidcCodeExchange({
+    client: instanceClient(sso),
+    code: args.code,
+    codeVerifier,
+  });
+  return resolveSsoUser({ sso, claims });
+}
+
+async function requireSsoRuntime(): Promise<ResolvedSso> {
+  const sso = await resolveSsoRuntime();
+  if (!sso) {
+    throw new SsoLoginError("SSO sign-in is not enabled on this instance.");
+  }
+  return sso;
+}
+
+async function exchangeCode(args: {
+  client: OidcClientConfig;
+  endpoints: OidcEndpoints;
+  code: string;
+  codeVerifier: string;
+}): Promise<string> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: args.code,
+    redirect_uri: args.client.callbackUrl,
+    client_id: args.client.clientId,
+    client_secret: args.client.clientSecret,
+    code_verifier: args.codeVerifier,
+  });
+  const res = await fetch(args.endpoints.tokenEndpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+    redirect: "error",
+  });
+  const parsed = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!res.ok || !parsed) {
+    throw new SsoLoginError(oidcErrorMessage(parsed, `Token exchange failed (${res.status})`));
+  }
+  const access = typeof parsed.access_token === "string" ? parsed.access_token : "";
+  if (!access) {
+    throw new SsoLoginError("The identity provider did not return an access token.");
+  }
+  return access;
+}
+
+export type SsoClaims = {
+  subject: string;
+  email: string;
+  name: string;
+};
+
+async function fetchClaims(userinfoEndpoint: string, accessToken: string): Promise<SsoClaims> {
+  const res = await fetch(userinfoEndpoint, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    redirect: "error",
+  });
+  const parsed = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!res.ok || !parsed) {
+    throw new SsoLoginError(
+      oidcErrorMessage(
+        parsed,
+        `Could not read your profile from the identity provider (${res.status})`,
+      ),
+    );
+  }
+  const subject = typeof parsed.sub === "string" ? parsed.sub : "";
+  const email = typeof parsed.email === "string" ? parsed.email.toLowerCase() : "";
+  if (!subject || !email) {
+    throw new SsoLoginError(
+      "The identity provider did not share an email address — make sure the email scope is granted.",
+    );
+  }
+  // Refuse rather than normalize: " bob@acme.com" would miss the exact
+  // account lookup and mint a lookalike of Bob's account.
+  if (email !== email.trim() || !z.string().email().safeParse(email).success) {
+    throw new SsoLoginError("The identity provider shared an email address Genosyn cannot use.");
+  }
+  // Email-based account linking is safe only with an affirmative claim. An
+  // omitted value is not evidence of mailbox ownership.
+  if (parsed.email_verified !== true) {
+    throw new SsoLoginError(`${email} is not a verified address at your identity provider.`);
+  }
+  const name = typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "";
+  return { subject, email, name };
+}
+
+/**
+ * Map verified claims onto a Genosyn account:
+ *   1. A user already linked to this issuer + subject signs straight in.
+ *   2. Otherwise an existing account with the same email is linked — the
+ *      match is on the pair, so a subject from a previously-configured
+ *      issuer can never impersonate anyone here.
+ *   3. Otherwise a fresh account is created when auto-provision is on. The
+ *      password hash is random and unusable; "forgot password" mints a real
+ *      one later if the person ever needs password login.
+ */
+async function resolveSsoUser(args: { sso: ResolvedSso; claims: SsoClaims }): Promise<User> {
+  const { sso, claims } = args;
+  const repo = AppDataSource.getRepository(User);
+
+  const linked = await repo.findOneBy({
+    ssoIssuer: sso.issuer,
+    ssoSubject: claims.subject,
+  });
+  if (linked) {
+    if (!linked.emailVerifiedAt) {
+      linked.emailVerifiedAt = new Date();
+      linked.emailVerificationTokenHash = null;
+      linked.emailVerificationExpiresAt = null;
+      await repo.save(linked);
+    }
+    return linked;
+  }
+
+  const byEmail = await repo.findOneBy({ email: claims.email });
+  if (byEmail) {
+    byEmail.ssoIssuer = sso.issuer;
+    byEmail.ssoSubject = claims.subject;
+    byEmail.emailVerifiedAt = new Date();
+    byEmail.emailVerificationTokenHash = null;
+    byEmail.emailVerificationExpiresAt = null;
+    await repo.save(byEmail);
+    return byEmail;
+  }
+
+  if (!sso.autoProvision) {
+    throw new SsoLoginError(
+      `No Genosyn account matches ${claims.email}. Ask an administrator to invite you first.`,
+    );
+  }
+
+  return provisionSsoUser({ issuer: sso.issuer, claims, emailVerified: true });
+}
+
+/**
+ * Create a brand-new account for verified SSO claims, bound to the issuer +
+ * subject pair. The password hash is random and unusable; "forgot password"
+ * mints a real one later if the person ever needs password login. Shared by
+ * the instance auto-provision branch and per-company SSO auto-join.
+ *
+ * `emailVerified` says whether the issuer's email claim counts as proof of
+ * the mailbox. It does for the instance IdP a master admin configured; it
+ * does not for an IdP any company admin can point at, which could assert
+ * anyone's address — that account verifies through the emailed link, the
+ * same as signup.
+ */
+export async function provisionSsoUser(args: {
+  issuer: string;
+  claims: SsoClaims;
+  emailVerified: boolean;
+}): Promise<User> {
+  const { issuer, claims, emailVerified } = args;
+  const repo = AppDataSource.getRepository(User);
+  const user = repo.create({
+    email: claims.email,
+    name: claims.name || claims.email.split("@")[0],
+    passwordHash: await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12),
+    isMasterAdmin: false,
+    resetToken: null,
+    resetExpiresAt: null,
+    emailVerifiedAt: emailVerified ? new Date() : null,
+    emailVerificationTokenHash: null,
+    emailVerificationExpiresAt: null,
+    sessionVersion: 0,
+    ssoIssuer: issuer,
+    ssoSubject: claims.subject,
+  });
+  await repo.save(user);
+  await ensureUserHandle(user);
+  return user;
+}
+
+function oidcErrorMessage(parsed: Record<string, unknown> | null, fallback: string): string {
+  if (!parsed || typeof parsed !== "object") return fallback;
+  const desc = parsed.error_description;
+  if (typeof desc === "string" && desc) return desc;
+  const err = parsed.error;
+  if (typeof err === "string" && err) return err;
+  return fallback;
+}

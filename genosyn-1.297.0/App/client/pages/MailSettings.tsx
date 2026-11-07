@@ -1,0 +1,620 @@
+import React from "react";
+import { Link, useNavigate, useOutletContext } from "react-router-dom";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Mail,
+  Pause,
+  Pencil,
+  Play,
+  Plug2,
+  Plus,
+  RefreshCw,
+  Trash2,
+  Users,
+} from "lucide-react";
+import {
+  MailAccessLevel,
+  MailAccount,
+  MailGrant,
+  MailGrantCandidate,
+  mailApi,
+  shortMailDate,
+} from "../lib/mail";
+import { MAX_SENDER_NAME_LENGTH, normalizeSenderName } from "../../shared/mailSenderName";
+import { mailReconnectHref } from "../lib/integrationReconnect";
+import { errorMessage } from "../lib/errors";
+import { MailAnalysisSettingsCard } from "./MailAnalysisSettings";
+import { MailOutletCtx } from "./MailLayout";
+import { Avatar, employeeAvatarUrl } from "../components/ui/Avatar";
+import { Button } from "../components/ui/Button";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { FormError } from "../components/ui/FormError";
+import { ConnectMailboxDialog } from "../components/mail/ConnectMailbox";
+import { Input } from "../components/ui/Input";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { Spinner } from "../components/ui/Spinner";
+
+/**
+ * Email settings: the mailbox account (sync status, pause/resume,
+ * disconnect), AI analysis of newly-arrived mail, a way to connect additional
+ * mailboxes, and the AI-access panel — which employees can act on this inbox
+ * and at what level.
+ */
+
+const LEVEL_HINT: Record<MailAccessLevel, string> = {
+  read: "Browse threads and labels",
+  draft: "Also write drafts, label, archive, mark read",
+  send: "Also send mail on this account's behalf",
+};
+
+export default function MailSettings() {
+  const { company, account, accounts, refresh, syncing, syncNow } =
+    useOutletContext<MailOutletCtx>();
+  const background = useBackgroundAction();
+  const dialog = useDialog();
+  const navigate = useNavigate();
+
+  const [grants, setGrants] = React.useState<MailGrant[] | null>(null);
+  const [grantsError, setGrantsError] = React.useState<string | null>(null);
+  const [candidates, setCandidates] = React.useState<MailGrantCandidate[]>([]);
+  const [addOpen, setAddOpen] = React.useState(false);
+  const [connectOpen, setConnectOpen] = React.useState(false);
+  const [disconnecting, setDisconnecting] = React.useState(false);
+  const [pendingStatusByAccount, setPendingStatusByAccount] = React.useState<
+    Partial<Record<string, "active" | "paused">>
+  >({});
+  const pendingStatus = pendingStatusByAccount[account.id];
+  const displayStatus = pendingStatus ?? account.status;
+  const pausePending = pendingStatus !== undefined;
+  const reconnectHref = mailReconnectHref(company.role, company.slug, account.connectionId);
+  // The server enforces this on AI access and on disconnecting; hiding the
+  // controls just stops a Member from composing a change that will be refused.
+  // Pausing, the sender name and AI analysis stay open to every Member.
+  const canManage = company.role !== "member";
+
+  const loadGrants = React.useCallback(async () => {
+    const [g, cand] = await Promise.all([
+      mailApi.grants(company.id, account.id),
+      mailApi.grantCandidates(company.id, account.id),
+    ]);
+    setGrants(g.direct);
+    setCandidates(cand.candidates);
+  }, [company.id, account.id]);
+
+  React.useEffect(() => {
+    setGrants(null);
+    setGrantsError(null);
+    loadGrants().catch((err: unknown) => {
+      setGrantsError(errorMessage(err, "Could not load the AI access list"));
+      setGrants([]);
+    });
+  }, [loadGrants]);
+
+  const togglePause = () => {
+    if (pausePending) return;
+    const accountId = account.id;
+    const next = displayStatus === "paused" ? "active" : "paused";
+    setPendingStatusByAccount((current) => ({ ...current, [accountId]: next }));
+    const clearPending = () => {
+      setPendingStatusByAccount((current) => {
+        if (current[accountId] !== next) return current;
+        const updated = { ...current };
+        delete updated[accountId];
+        return updated;
+      });
+    };
+    background(() => mailApi.patchAccount(company.id, accountId, next), {
+      title: "Couldn’t update sync",
+      error: (error) => `${errorMessage(error)} The change was undone.`,
+      onSuccess: () => {
+        clearPending();
+        void refresh();
+      },
+      onError: clearPending,
+    });
+  };
+
+  const disconnect = async () => {
+    const ok = await dialog.confirm({
+      title: `Disconnect ${account.address}?`,
+      message:
+        "Removes the local mirror (threads, rules, handovers, AI grants) here. The mail itself and the Connection behind it are untouched.",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setDisconnecting(true);
+    try {
+      await mailApi.deleteAccount(company.id, account.id);
+      await refresh();
+      navigate(`/c/${company.slug}/mail`);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t disconnect the mailbox" });
+    } finally {
+      setDisconnecting(false);
+    }
+  };
+
+  const setLevel = (grant: MailGrant, level: MailAccessLevel) => {
+    setGrants(
+      (current) =>
+        current?.map((item) => (item.id === grant.id ? { ...item, accessLevel: level } : item)) ??
+        current,
+    );
+    background(() => mailApi.patchGrant(company.id, account.id, grant.id, level), {
+      title: "Couldn’t update AI access",
+      error: (error) => `${errorMessage(error)} The change was undone.`,
+      onSuccess: ({ grant: updated }) => {
+        setGrants(
+          (current) => current?.map((item) => (item.id === updated.id ? updated : item)) ?? current,
+        );
+      },
+      onError: () => {
+        setGrants(
+          (current) => current?.map((item) => (item.id === grant.id ? grant : item)) ?? current,
+        );
+      },
+    });
+  };
+
+  const revoke = (grant: MailGrant) => {
+    const originalIndex = grants?.findIndex((item) => item.id === grant.id) ?? -1;
+    setGrants((current) => current?.filter((item) => item.id !== grant.id) ?? current);
+    background(() => mailApi.deleteGrant(company.id, account.id, grant.id), {
+      title: "Couldn’t revoke AI access",
+      error: (error) => `${errorMessage(error)} The grant has been restored.`,
+      onSuccess: () => void loadGrants(),
+      onError: () => {
+        setGrants((current) => {
+          if (!current || current.some((item) => item.id === grant.id)) return current;
+          const next = [...current];
+          next.splice(Math.max(0, Math.min(originalIndex, next.length)), 0, grant);
+          return next;
+        });
+      },
+    });
+  };
+
+  return (
+    <div className="mx-auto max-w-3xl px-4 py-6 sm:px-6">
+      <h1 className="mb-5 text-lg font-semibold text-slate-900 dark:text-slate-100">
+        Email settings
+      </h1>
+
+      {/* Account card */}
+      <section className="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex items-start gap-3">
+          <div className="rounded-lg bg-indigo-100 p-2 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300">
+            <Mail size={18} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-slate-900 dark:text-slate-100">{account.address}</div>
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs">
+              {displayStatus === "paused" ? (
+                <span className="text-slate-500">Sync paused</span>
+              ) : syncing ? (
+                <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400">
+                  <RefreshCw size={12} className="animate-spin" /> Sync in progress…
+                </span>
+              ) : displayStatus === "error" ? (
+                <span className="flex items-center gap-1 text-red-600 dark:text-red-400">
+                  <AlertTriangle size={12} /> {account.statusMessage || "Sync error"}
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 size={12} />{" "}
+                  {account.backfilledAt
+                    ? `Last synced successfully ${shortMailDate(account.lastSyncAt)}`
+                    : "First sync in progress…"}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={syncing}
+            disabled={pausePending || displayStatus === "paused"}
+            onClick={() => void syncNow()}
+          >
+            <RefreshCw size={14} className="mr-1.5" />{" "}
+            {syncing ? "Syncing…" : displayStatus === "error" ? "Retry sync" : "Sync now"}
+          </Button>
+          {reconnectHref && (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={pausePending || syncing}
+              onClick={() => navigate(reconnectHref)}
+              title="Refresh the Google credentials without removing this mailbox"
+            >
+              <Plug2 size={14} className="mr-1.5" /> Reconnect Google
+            </Button>
+          )}
+          <Button size="sm" variant="secondary" disabled={pausePending} onClick={togglePause}>
+            {displayStatus === "paused" ? (
+              <>
+                <Play size={14} className="mr-1.5" /> Resume sync
+              </>
+            ) : (
+              <>
+                <Pause size={14} className="mr-1.5" /> Pause sync
+              </>
+            )}
+          </Button>
+          {canManage && (
+            <Button
+              size="sm"
+              variant="danger"
+              loading={disconnecting}
+              disabled={pausePending}
+              onClick={disconnect}
+            >
+              <Trash2 size={14} className="mr-1.5" /> Disconnect
+            </Button>
+          )}
+        </div>
+        <SenderNameSetting
+          key={account.id}
+          companyId={company.id}
+          account={account}
+          onSaved={refresh}
+        />
+      </section>
+
+      {/* AI analysis of newly-arrived mail */}
+      <MailAnalysisSettingsCard
+        companyId={company.id}
+        accountId={account.id}
+        canManageAccess={canManage}
+      />
+
+      {/* AI access */}
+      <section className="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-1 flex items-center gap-2">
+          <Users size={16} className="text-slate-400" />
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">AI access</h2>
+          {canManage && (
+            <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setAddOpen(true)}>
+              <Plus size={14} className="mr-1" /> Grant access
+            </Button>
+          )}
+        </div>
+        <p className="mb-4 text-xs text-slate-500 dark:text-slate-400">
+          Which AI employees can act on this mailbox through their tools and via rules. Members
+          always have full access; this only governs AI.
+          {!canManage && " Only owners and admins can change it."}
+        </p>
+
+        {grantsError ? (
+          <FormError message={grantsError} />
+        ) : grants === null ? (
+          <div className="flex justify-center py-6">
+            <Spinner size={18} />
+          </div>
+        ) : grants.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-500 dark:border-slate-700">
+            No AI employees have access yet.{" "}
+            {canManage
+              ? "Grant one so it can triage, draft, or reply."
+              : "An owner or admin can grant one so it can triage, draft, or reply."}
+          </p>
+        ) : (
+          <ul className="divide-y divide-slate-100 dark:divide-slate-800/70">
+            {grants.map((g) => (
+              <li key={g.id} className="flex items-center gap-3 py-2.5">
+                <Avatar
+                  name={g.employee?.name ?? "?"}
+                  src={employeeAvatarUrl(company.id, g.employee?.id ?? "", g.employee?.avatarKey)}
+                  kind="ai"
+                  size="sm"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-slate-900 dark:text-slate-100">
+                    {g.employee?.name ?? "Unknown employee"}
+                  </div>
+                  <div className="truncate text-xs text-slate-400">{LEVEL_HINT[g.accessLevel]}</div>
+                </div>
+                <Select
+                  value={g.accessLevel}
+                  onChange={(e) => setLevel(g, e.target.value as MailAccessLevel)}
+                  disabled={!canManage}
+                  aria-label={`Access level for ${g.employee?.name ?? "this employee"}`}
+                  className="w-28"
+                >
+                  <option value="read">Read</option>
+                  <option value="draft">Draft</option>
+                  <option value="send">Send</option>
+                </Select>
+                {canManage && (
+                  <button
+                    onClick={() => revoke(g)}
+                    className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10"
+                    title="Revoke"
+                    aria-label={`Revoke ${g.employee?.name ?? "this employee"}'s access`}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Other mailboxes / connect */}
+      <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            Connected mailboxes
+          </h2>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto"
+            onClick={() => setConnectOpen(true)}
+          >
+            <Plus size={14} className="mr-1" /> Connect another
+          </Button>
+        </div>
+        <ul className="space-y-1.5">
+          {accounts.map((a) => (
+            <li
+              key={a.id}
+              className="flex items-center gap-2 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-slate-800"
+            >
+              <Mail size={14} className="text-slate-400" />
+              <span className="min-w-0 flex-1 truncate text-slate-700 dark:text-slate-300">
+                {a.address}
+              </span>
+              <span className="text-xs capitalize text-slate-400">
+                {a.syncState === "queued" || a.syncState === "running" ? "syncing" : a.status}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+          Need a mailbox that is not listed? <span className="font-medium">Connect another</span>{" "}
+          above asks for the address and works the rest out. Existing Connections live under{" "}
+          <Link
+            to={`/c/${company.slug}/mail/integrations`}
+            className="text-indigo-600 hover:underline dark:text-indigo-400"
+          >
+            Email → Integrations
+          </Link>
+          .
+        </p>
+      </section>
+
+      {addOpen && canManage && (
+        <GrantModal
+          companyId={company.id}
+          accountId={account.id}
+          candidates={candidates}
+          onClose={() => setAddOpen(false)}
+          onGranted={async () => {
+            setAddOpen(false);
+            await loadGrants();
+          }}
+        />
+      )}
+      <ConnectMailboxDialog
+        companyId={company.id}
+        canConnect={company.role === "owner" || company.role === "admin"}
+        open={connectOpen}
+        onClose={() => setConnectOpen(false)}
+        onConnected={async () => {
+          setConnectOpen(false);
+          await refresh();
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * The name recipients see beside this mailbox's address.
+ *
+ * Editable for IMAP mailboxes only. An IMAP server keeps no name for an
+ * account — every mail client stores one and writes it into each message — so
+ * Genosyn, being the client, has to. Gmail stamps `From` itself from its own
+ * Send mail as setting, so for a Gmail mailbox this only says where that is.
+ */
+function SenderNameSetting({
+  companyId,
+  account,
+  onSaved,
+}: {
+  companyId: string;
+  account: MailAccount;
+  onSaved: () => Promise<void>;
+}) {
+  const [current, setCurrent] = React.useState(account.senderName);
+  /** The text being edited, or null when the editor is closed. */
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const hintId = React.useId();
+
+  // Somebody else may rename it; the realtime refresh hands the new row down.
+  React.useEffect(() => setCurrent(account.senderName), [account.senderName]);
+
+  if (account.provider !== "imap") {
+    return (
+      <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800">
+        <h2 className="text-sm font-medium text-slate-900 dark:text-slate-100">Sender name</h2>
+        <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+          Gmail adds the name from its own settings to every message from this mailbox. Change it in
+          Gmail under Settings → Accounts → Send mail as.
+        </p>
+      </div>
+    );
+  }
+
+  const next = normalizeSenderName(draft ?? "");
+  const cancel = () => {
+    setDraft(null);
+    setError(null);
+  };
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (draft === null || next === current) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const { account: saved } = await mailApi.setSenderName(companyId, account.id, next);
+      setCurrent(saved.senderName);
+      setDraft(null);
+      void onSaved();
+    } catch (err) {
+      setError(errorMessage(err, "Couldn’t save the sender name"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <h2 className="text-sm font-medium text-slate-900 dark:text-slate-100">Sender name</h2>
+          {current ? (
+            <p className="mt-0.5 truncate text-sm text-slate-700 dark:text-slate-300">
+              {current} <span className="text-slate-400">&lt;{account.address}&gt;</span>
+            </p>
+          ) : (
+            <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
+              Not set — recipients see only {account.address}.
+            </p>
+          )}
+        </div>
+        {draft === null && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setDraft(current);
+              setError(null);
+            }}
+          >
+            <Pencil size={14} className="mr-1.5" /> {current ? "Edit" : "Set name"}
+          </Button>
+        )}
+      </div>
+      {draft !== null && (
+        <form onSubmit={save} className="mt-3 space-y-2">
+          <Input
+            aria-label="Sender name"
+            aria-describedby={hintId}
+            autoFocus
+            autoComplete="off"
+            maxLength={MAX_SENDER_NAME_LENGTH}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && !saving) {
+                e.preventDefault();
+                cancel();
+              }
+            }}
+          />
+          <p id={hintId} className="text-xs text-slate-500 dark:text-slate-400">
+            Used on everything sent from this mailbox, by Members and AI Employees alike — drafts
+            already waiting included. Leave it empty to send from the address alone.
+          </p>
+          <FormError message={error} />
+          <div className="flex gap-2">
+            <Button type="submit" size="sm" loading={saving} disabled={next === current}>
+              Save
+            </Button>
+            <Button type="button" size="sm" variant="ghost" disabled={saving} onClick={cancel}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function GrantModal({
+  companyId,
+  accountId,
+  candidates,
+  onClose,
+  onGranted,
+}: {
+  companyId: string;
+  accountId: string;
+  candidates: MailGrantCandidate[];
+  onClose: () => void;
+  onGranted: () => Promise<void>;
+}) {
+  const available = candidates.filter((c) => !c.alreadyGranted);
+  const [employeeId, setEmployeeId] = React.useState(available[0]?.id ?? "");
+  const [level, setLevel] = React.useState<MailAccessLevel>("draft");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await mailApi.createGrant(companyId, accountId, {
+        employeeId,
+        accessLevel: level,
+      });
+      await onGranted();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal open onClose={onClose} title="Grant mailbox access">
+      {available.length === 0 ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Every AI employee already has access to this mailbox.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          <Select
+            label="Employee"
+            value={employeeId}
+            onChange={(e) => setEmployeeId(e.target.value)}
+          >
+            {available.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </Select>
+          <Select
+            label="Access level"
+            value={level}
+            onChange={(e) => setLevel(e.target.value as MailAccessLevel)}
+          >
+            <option value="read">Read — browse only</option>
+            <option value="draft">Draft — triage + write drafts</option>
+            <option value="send">Send — can send mail</option>
+          </Select>
+          <p className="text-xs text-slate-500 dark:text-slate-400">{LEVEL_HINT[level]}.</p>
+          <FormError message={error} />
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button onClick={submit} loading={busy} disabled={!employeeId}>
+              Grant
+            </Button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "genosyn",
+  // The Cloudflare account that owns the genosyn.com zone and the two custom
+  // domains (genosyn.com, www.genosyn.com) bound to this Worker. Pinned here
+  // because leaving it implicit is what broke the site: a hand-run
+  // `wrangler deploy` picked up a different account, created a `genosyn`
+  // Worker there with no domain attached, and reported success — so the deploy
+  // "worked" while genosyn.com went on serving a build from days earlier. With
+  // the account named in config, a deploy either reaches the real site or
+  // fails loudly.
+  "account_id": "9448e23d8c7cbea2d77e88ae4a0e9b99",
+  "compatibility_date": "2024-12-01",
+  "assets": {
+    "directory": "./dist/client",
+    // Prerendered routes are emitted as <route>/index.html with slash-free
+    // canonical URLs (see prerender.ts); drop-trailing-slash makes the asset
+    // host serve /products/email directly instead of 307-ing to the slashed
+    // variant. Unknown URLs get the prerendered 404.html with a 404 status.
+    "html_handling": "drop-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}

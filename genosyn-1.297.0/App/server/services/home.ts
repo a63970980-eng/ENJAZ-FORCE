@@ -1,0 +1,459 @@
+import { In, Not } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Approval } from "../db/entities/Approval.js";
+import { Role } from "../db/entities/Membership.js";
+import { Project } from "../db/entities/Project.js";
+import { Routine } from "../db/entities/Routine.js";
+import { RunErrorKind, RunStatus } from "../db/entities/Run.js";
+import { Todo, TodoPriority } from "../db/entities/Todo.js";
+import { countUnreadForUser, listUnreadForUser, NotificationDTO } from "./notifications.js";
+import { listAccessibleProjectIds } from "./projects.js";
+import { getSystemHealthSummary, SystemHealthSummary } from "./systemHealth.js";
+import { listChannelsForUser } from "./workspaceChat.js";
+import { redactApprovalSummary, redactSensitiveText } from "./approvalRedaction.js";
+import { isVaultCaptureApproval } from "./approvals.js";
+import {
+  proactiveWorkReviewDetails,
+  reconcileProactiveWorkApprovals,
+} from "./proactive/approvals.js";
+import { mailReviewDetails, reconcileMailReviewApprovals } from "./mail/reviewApprovals.js";
+import { approvalInboxSelect } from "./approvalInbox.js";
+import { DecisionDTO, listPendingDecisions } from "./decisions.js";
+import { listHomeTldrs, type TldrDTO } from "./tldrs.js";
+import type { BoardLetterSummaryDTO } from "./boardLetters.js";
+import { listUnreadBoardLetters, notificationKindsHiddenFrom } from "./boardLetterReads.js";
+import { findLiveRunFailures } from "./runFailures.js";
+import { loadRunFollowUps, runContinuationView, type RunFollowUp } from "./runContinuationView.js";
+import { listHomeRepositoryWork, type HomeRepositoryWork } from "./homeRepositoryWork.js";
+import {
+  listHomeDraftEmails,
+  type HomeDraftEmail,
+  type HomeEmailAccountCount,
+} from "./mail/drafts.js";
+
+/**
+ * Aggregation behind the Home page — the landing surface after sign-in.
+ * One round-trip gathers everything that might need the member's
+ * attention: unread bell rows, todos assigned to them, reviews waiting on
+ * their sign-off, pending approvals, unread channels/DMs, the newest unread
+ * TLDR, the newest unread letter to the board for owners and admins, and a
+ * one-line digest of today's AI activity. Each card deep-links to the full
+ * section.
+ */
+
+export type HomeTodo = {
+  id: string;
+  number: number;
+  title: string;
+  status: string;
+  priority: TodoPriority;
+  dueAt: string | null;
+  parentTodoId: string | null;
+  project: { id: string; key: string; name: string; slug: string };
+};
+
+export type HomeApproval = {
+  id: string;
+  kind: string;
+  title: string | null;
+  summary: string | null;
+  review:
+    | ReturnType<typeof proactiveWorkReviewDetails>
+    | ReturnType<typeof mailReviewDetails>
+    | null;
+  requestedAt: string;
+  employee: { id: string; name: string; slug: string } | null;
+  routine: { id: string; name: string; slug: string } | null;
+};
+
+export type HomeDecision = DecisionDTO;
+
+export type HomeChannel = {
+  id: string;
+  kind: string;
+  /** Display label — channel name, or the counterparty for DMs. */
+  label: string;
+  unreadCount: number;
+  /** Boundary the unread count is measured from; null when never opened. */
+  lastReadAt: string | null;
+};
+
+export type HomeFailedRun = {
+  followUpRun: RunFollowUp | null;
+  hasUnfinishedWork: boolean;
+  continuationPending: boolean;
+  runId: string;
+  routineId: string;
+  routineName: string;
+  status: RunStatus;
+  errorKind: RunErrorKind | null;
+  failureReason: string | null;
+  exitCode: number | null;
+  startedAt: string;
+  employee: { id: string; name: string; slug: string; avatarKey: string | null };
+};
+
+export type HomeData = {
+  /** Latest company TLDRs this Member has not dismissed. */
+  tldrs: TldrDTO[];
+  unreadTldrCount: number;
+  /**
+   * The newest letter to the board sent to this owner or admin that they have
+   * not read (`services/boardLetterReads.ts`). Always null for a Member:
+   * letters are owner/admin-only, reads included.
+   */
+  boardLetter: BoardLetterSummaryDTO | null;
+  unreadBoardLetterCount: number;
+  notifications: NotificationDTO[];
+  unreadNotificationCount: number;
+  /** The Decision Stack — questions AI employees raised, highest urgency first. */
+  decisions: HomeDecision[];
+  pendingDecisionCount: number;
+  myTodos: HomeTodo[];
+  myTodoCount: number;
+  reviewTodos: HomeTodo[];
+  reviewTodoCount: number;
+  /** Unarchived Repository AI work waiting for a Member to review or continue. */
+  repositoryWork: HomeRepositoryWork[];
+  repositoryWorkCount: number;
+  approvals: HomeApproval[];
+  pendingApprovalCount: number;
+  decisionApprovals: HomeApproval[];
+  pendingDecisionApprovalCount: number;
+  /** Draft messages awaiting review, excluding emails already queued to send. */
+  draftEmails: HomeDraftEmail[];
+  draftEmailCount: number;
+  draftEmailAccounts: HomeEmailAccountCount[];
+  /** Starred conversations, matching the Email section's Starred view. */
+  starredEmailCount: number;
+  starredEmailAccounts: HomeEmailAccountCount[];
+  unreadChannels: HomeChannel[];
+  /** Routine runs that failed (or timed out) in the last 24h — surfaced so a
+   *  human notices a broken routine without digging through the Journal. */
+  failedRuns: HomeFailedRun[];
+  failedRunCount: number;
+  /** Compact roll-up powering the Home "System health" card. */
+  systemHealth: SystemHealthSummary;
+  counts: { employees: number; projects: number };
+};
+
+/** How far back the Home page looks for failed routine runs. */
+const FAILED_RUN_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const PRIORITY_WEIGHT: Record<TodoPriority, number> = {
+  urgent: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  none: 4,
+};
+
+function toHomeTodo(t: Todo, p: Project): HomeTodo {
+  return {
+    id: t.id,
+    number: t.number,
+    title: t.title,
+    status: t.status,
+    priority: t.priority,
+    dueAt: t.dueAt?.toISOString() ?? null,
+    parentTodoId: t.parentTodoId,
+    project: { id: p.id, key: p.key, name: p.name, slug: p.slug },
+  };
+}
+
+/** Due-soonest first (no due date sinks), then priority, then age. */
+function compareTodos(a: Todo, b: Todo): number {
+  const aDue = a.dueAt?.getTime() ?? Number.POSITIVE_INFINITY;
+  const bDue = b.dueAt?.getTime() ?? Number.POSITIVE_INFINITY;
+  if (aDue !== bDue) return aDue - bDue;
+  const pw = PRIORITY_WEIGHT[a.priority] - PRIORITY_WEIGHT[b.priority];
+  if (pw !== 0) return pw;
+  return a.createdAt.getTime() - b.createdAt.getTime();
+}
+
+export async function getHomeData(params: {
+  companyId: string;
+  userId: string;
+  /** The caller's company role — `requireCompanyMember` has already stamped it
+   *  on the request. Needed to resolve project access; never assume a value. */
+  role: Role;
+  /** Repository content is browser-only, even though Home also accepts API keys. */
+  canReadRepositoryWork?: boolean;
+  /** Work plans share the Approvals inbox's browser-session-only visibility. */
+  canReadWorkReviews?: boolean;
+}): Promise<HomeData> {
+  const { companyId, userId, role, canReadRepositoryWork = true } = params;
+
+  // Home is a feed, not a named lookup, so restricted projects the member
+  // can't reach are filtered out rather than 403'd. Narrowing the project set
+  // here is what keeps their todo titles off this page: every query below
+  // scopes to `projectIds`.
+  const accessibleIds = await listAccessibleProjectIds(companyId, {
+    kind: "user",
+    id: userId,
+    role,
+  });
+  const projects = (
+    await AppDataSource.getRepository(Project).find({
+      where: { companyId },
+      select: ["id", "key", "name", "slug"],
+    })
+  ).filter((p) => accessibleIds.has(p.id));
+  const projectById = new Map(projects.map((p) => [p.id, p]));
+  const projectIds = projects.map((p) => p.id);
+
+  const todoRepo = AppDataSource.getRepository(Todo);
+  const [mine, reviews] = await Promise.all([
+    projectIds.length
+      ? todoRepo.find({
+          where: {
+            projectId: In(projectIds),
+            assigneeUserId: userId,
+            status: In(["backlog", "todo", "in_progress"]),
+          },
+        })
+      : Promise.resolve([] as Todo[]),
+    projectIds.length
+      ? todoRepo.find({
+          where: {
+            projectId: In(projectIds),
+            reviewerUserId: userId,
+            status: "in_review",
+          },
+          order: { updatedAt: "ASC" },
+        })
+      : Promise.resolve([] as Todo[]),
+  ]);
+  mine.sort(compareTodos);
+
+  const canReviewWork =
+    params.canReadWorkReviews !== false && (role === "owner" || role === "admin");
+  // Home renders the same actionable reviews as the full Decision stack, so
+  // it must apply the same source-freshness boundary before showing a Send or
+  // Approve button. Ordinary Members cannot see these rows and should not pay
+  // the cost of hashing their sources.
+  if (canReviewWork) {
+    await Promise.all([
+      reconcileProactiveWorkApprovals(companyId),
+      reconcileMailReviewApprovals(companyId),
+    ]);
+  }
+  const approvalRepo = AppDataSource.getRepository(Approval);
+  const [decisionApprovals, pendingDecisionApprovalCount] = canReviewWork
+    ? await approvalRepo.findAndCount({
+        where: { companyId, status: "pending", kind: In(["proactive_work", "mail_send"]) },
+        select: approvalInboxSelect,
+        order: { requestedAt: "ASC" },
+        take: 5,
+      })
+    : ([[], 0] as [Approval[], number]);
+  const [allPendingApprovals, pendingApprovalCount] = await approvalRepo.findAndCount({
+    where: {
+      companyId,
+      status: "pending",
+      kind: Not(In(["proactive_work", "mail_send"])),
+    },
+    order: { requestedAt: "DESC" },
+    // Wider than the five we render because the vault-capture filter below runs
+    // in memory — `payloadJson` is opaque to SQL. Fifty is far past any real
+    // pending backlog; past it a Member could see fewer than five rows, which
+    // degrades the card rather than leaking anything.
+    take: 50,
+  });
+  // Home must not show a Member what `GET /approvals` refuses them. Vault
+  // capture rows name the origin a stored credential would be written to, so
+  // they are owner/admin-only there and owner/admin-only here; every surviving
+  // row still has its copy redacted below, exactly as the inbox does. The
+  // count stays the company's true backlog — that was never the sensitive part.
+  const canSeeVaultCaptures = role === "owner" || role === "admin";
+  const pendingApprovals = allPendingApprovals
+    .filter((a) => canSeeVaultCaptures || !isVaultCaptureApproval(a))
+    .slice(0, 5);
+  const displayedApprovals = [...pendingApprovals, ...decisionApprovals];
+  const routineIds = [...new Set(displayedApprovals.map((a) => a.routineId).filter(Boolean))];
+  const approvalEmpIds = [...new Set(displayedApprovals.map((a) => a.employeeId).filter(Boolean))];
+  const [routines, approvalEmps] = await Promise.all([
+    routineIds.length
+      ? AppDataSource.getRepository(Routine).find({ where: { id: In(routineIds) } })
+      : Promise.resolve([] as Routine[]),
+    approvalEmpIds.length
+      ? AppDataSource.getRepository(AIEmployee).find({
+          where: { id: In(approvalEmpIds) },
+        })
+      : Promise.resolve([] as AIEmployee[]),
+  ]);
+  const routineById = new Map(routines.map((r) => [r.id, r]));
+  const approvalEmpById = new Map(approvalEmps.map((e) => [e.id, e]));
+  const approvalPreview = (a: Approval): HomeApproval => {
+    const routine = a.routineId ? routineById.get(a.routineId) : null;
+    const employee = a.employeeId ? approvalEmpById.get(a.employeeId) : null;
+    return {
+      id: a.id,
+      kind: a.kind,
+      title: redactApprovalSummary(a.title),
+      summary: redactApprovalSummary(a.summary),
+      review:
+        a.kind === "proactive_work"
+          ? proactiveWorkReviewDetails(a)
+          : a.kind === "mail_send"
+            ? mailReviewDetails(a)
+            : null,
+      requestedAt: a.requestedAt.toISOString(),
+      employee: employee ? { id: employee.id, name: employee.name, slug: employee.slug } : null,
+      routine: routine ? { id: routine.id, name: routine.name, slug: routine.slug } : null,
+    };
+  };
+  const decisionApprovalPreviews: HomeApproval[] = [];
+  for (const listed of decisionApprovals) {
+    const approval = await approvalRepo.findOneBy({
+      id: listed.id,
+      companyId,
+      status: "pending",
+      kind: In(["proactive_work", "mail_send"]),
+    });
+    if (approval) decisionApprovalPreviews.push(approvalPreview(approval));
+  }
+
+  const channels = await listChannelsForUser(companyId, userId);
+  const unreadChannels: HomeChannel[] = channels
+    .filter((c) => c.unreadCount > 0)
+    .sort(
+      (a, b) => new Date(b.lastMessageAt ?? 0).getTime() - new Date(a.lastMessageAt ?? 0).getTime(),
+    )
+    .slice(0, 6)
+    .map((c) => {
+      const others = c.members.filter((m) => !(m.kind === "user" && m.id === userId));
+      const label =
+        c.kind === "dm"
+          ? others.map((m) => m.name).join(", ") || "Direct message"
+          : c.kind === "group"
+            ? c.name || others.map((m) => m.name).join(", ") || "Group chat"
+            : `#${c.name ?? c.slug ?? "channel"}`;
+      return {
+        id: c.id,
+        kind: c.kind,
+        label,
+        unreadCount: c.unreadCount,
+        lastReadAt: c.lastReadAt,
+      };
+    });
+
+  const employees = await AppDataSource.getRepository(AIEmployee).find({
+    where: { companyId },
+    select: ["id", "name", "slug", "avatarKey"],
+  });
+  const empIds = employees.map((e) => e.id);
+  const empById = new Map(employees.map((e) => [e.id, e]));
+
+  // Recent failed routine runs, newest first. We join through the routine to
+  // its owning employee so each card can deep-link into that employee's
+  // Routines tab (and select the failing run).
+  const compRoutines = empIds.length
+    ? await AppDataSource.getRepository(Routine).find({
+        where: { employeeId: In(empIds) },
+        select: ["id", "name", "employeeId"],
+      })
+    : [];
+  const compRoutineById = new Map(compRoutines.map((r) => [r.id, r]));
+  let failedRuns: HomeFailedRun[] = [];
+  let failedRunCount = 0;
+  if (compRoutineById.size > 0) {
+    // Dismissed rows, rows still owed a retry, and failures a later successful
+    // run has already made history are all filtered out by the shared rule —
+    // see `findLiveRunFailures`.
+    const { rows, count } = await findLiveRunFailures({
+      routineIds: [...compRoutineById.keys()],
+      since: new Date(Date.now() - FAILED_RUN_WINDOW_MS),
+      take: 6,
+    });
+    failedRunCount = count;
+    const followUps = await loadRunFollowUps(companyId, rows);
+    failedRuns = rows
+      .map((run): HomeFailedRun | null => {
+        const routine = compRoutineById.get(run.routineId);
+        if (!routine) return null;
+        const emp = empById.get(routine.employeeId);
+        if (!emp) return null;
+        return {
+          runId: run.id,
+          routineId: routine.id,
+          routineName: routine.name,
+          status: run.status,
+          followUpRun: followUps.get(run.id) ?? null,
+          hasUnfinishedWork: runContinuationView(run).hasUnfinishedWork,
+          continuationPending: runContinuationView(run).continuationPending,
+          errorKind: run.errorKind,
+          failureReason: run.failureReason ? redactSensitiveText(run.failureReason) : null,
+          exitCode: run.exitCode,
+          startedAt: run.startedAt.toISOString(),
+          employee: {
+            id: emp.id,
+            name: emp.name,
+            slug: emp.slug,
+            avatarKey: emp.avatarKey ?? null,
+          },
+        };
+      })
+      .filter((r): r is HomeFailedRun => r !== null);
+  }
+
+  // A letter to the board is owner/admin-only, reads included, so a Member's
+  // Home carries none of one: not the letter, and not the bell row a former
+  // admin still holds from when they were on the board.
+  const hiddenNotificationKinds = notificationKindsHiddenFrom(role);
+  const [
+    notifications,
+    unreadNotificationCount,
+    systemHealth,
+    decisionStack,
+    homeTldrs,
+    boardLetters,
+    repositoryWork,
+    homeDrafts,
+  ] = await Promise.all([
+    listUnreadForUser({ companyId, userId, limit: 8, excludeKinds: hiddenNotificationKinds }),
+    countUnreadForUser({ companyId, userId, excludeKinds: hiddenNotificationKinds }),
+    getSystemHealthSummary(companyId),
+    listPendingDecisions({ companyId, limit: 5, viewer: { userId, role } }),
+    listHomeTldrs({ companyId, userId, limit: 3 }),
+    listUnreadBoardLetters({ companyId, userId, role }),
+    canReadRepositoryWork
+      ? listHomeRepositoryWork({ companyId })
+      : Promise.resolve({ items: [], total: 0 }),
+    listHomeDraftEmails(companyId),
+  ]);
+
+  return {
+    tldrs: homeTldrs.items,
+    unreadTldrCount: homeTldrs.unreadCount,
+    boardLetter: boardLetters.letter,
+    unreadBoardLetterCount: boardLetters.unreadCount,
+    notifications,
+    unreadNotificationCount,
+    decisions: decisionStack.decisions,
+    pendingDecisionCount: decisionStack.total,
+    myTodos: mine
+      .slice(0, 8)
+      .map((t) => toHomeTodo(t, projectById.get(t.projectId)!))
+      .filter((t) => t.project),
+    myTodoCount: mine.length,
+    reviewTodos: reviews
+      .slice(0, 8)
+      .map((t) => toHomeTodo(t, projectById.get(t.projectId)!))
+      .filter((t) => t.project),
+    reviewTodoCount: reviews.length,
+    repositoryWork: repositoryWork.items,
+    repositoryWorkCount: repositoryWork.total,
+    approvals: pendingApprovals.map(approvalPreview),
+    pendingApprovalCount,
+    decisionApprovals: decisionApprovalPreviews,
+    pendingDecisionApprovalCount,
+    ...homeDrafts,
+    unreadChannels,
+    failedRuns,
+    failedRunCount,
+    systemHealth,
+    counts: { employees: employees.length, projects: projects.length },
+  };
+}

@@ -1,0 +1,393 @@
+import { Customer } from "../db/entities/Customer.js";
+import type { Estimate } from "../db/entities/Estimate.js";
+import { EstimateLineItem } from "../db/entities/EstimateLineItem.js";
+import { Company } from "../db/entities/Company.js";
+import { AppDataSource } from "../db/datasource.js";
+import { formatMoney } from "../lib/money.js";
+import { discountLabel } from "../../shared/documentDiscount.js";
+import { anyLineTaxed, lineAmountCents, lineTaxLabel } from "../../shared/lineTax.js";
+import { getFinanceSettings } from "./fx.js";
+import { htmlToPdf } from "./htmlToPdf.js";
+import { documentIssuerFields } from "./subsidiaries.js";
+
+/**
+ * Render an Estimate as a self-contained HTML document. Used as both
+ * the email body when the user clicks "Send" and the printable view
+ * served at `/api/.../estimates/:slug/html` (browser → "Save as PDF").
+ *
+ * Inline CSS only — no external assets, no JS, no custom fonts. The
+ * stylesheet is print-friendly: A4 size, `@page` margins, two-decimal
+ * tabular numerals so columns align cleanly. Lifted from
+ * `invoiceHtml.ts` with the labels swapped from "Invoice" / "Bill to"
+ * to "Estimate" / "Prepared for".
+ */
+
+export type EstimateHtmlInput = {
+  estimate: Estimate;
+  customer: Customer;
+  lines: EstimateLineItem[];
+  /** Optional company override so callers that already have it don't
+   *  pay for a second query. */
+  companyName?: string;
+  /** Multi-line text shown in the "From" column. Falls back to
+   *  `companyName` when empty so legacy companies keep working. */
+  defaultFromBlock?: string;
+  /** Default footer when the estimate has no `footer` of its own. */
+  defaultFooter?: string;
+  /** Optional note shown above the estimate in an email body. It is never
+   *  included in the separately rendered PDF attachment. */
+  emailMessage?: string;
+};
+
+const STYLES = `
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color: #0f172a;
+  background: #ffffff;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.page {
+  max-width: 760px;
+  margin: 32px auto;
+  padding: 40px 48px;
+  background: #fff;
+}
+.email-message {
+  margin-bottom: 32px;
+  padding: 16px 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #334155;
+  white-space: pre-wrap;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  margin-bottom: 32px;
+}
+.brand {
+  font-size: 20px;
+  font-weight: 600;
+  color: #0f172a;
+}
+.title {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #64748b;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.estimate-number {
+  font-size: 22px;
+  font-weight: 600;
+  color: #0f172a;
+  margin: 0;
+}
+.meta {
+  text-align: right;
+  font-size: 12px;
+  color: #475569;
+}
+.meta div { margin-top: 2px; }
+.parties {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  margin-bottom: 32px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.party-label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #64748b;
+  font-size: 10px;
+  margin-bottom: 6px;
+}
+.party-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: #0f172a;
+  margin-bottom: 4px;
+}
+.party-detail { white-space: pre-line; color: #475569; }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #64748b;
+  border-bottom: 1px solid #cbd5e1;
+  padding: 8px 6px;
+  font-weight: 600;
+}
+tbody td {
+  padding: 10px 6px;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: top;
+}
+.right { text-align: right; }
+.num { font-variant-numeric: tabular-nums; }
+.totals {
+  width: 280px;
+  margin-left: auto;
+  margin-top: 16px;
+}
+.totals .row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  font-size: 13px;
+  color: #475569;
+}
+.totals .row.grand {
+  border-top: 2px solid #0f172a;
+  margin-top: 6px;
+  padding-top: 10px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+}
+.notes, .footer {
+  margin-top: 32px;
+  padding: 16px;
+  background: #f8fafc;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  color: #334155;
+}
+.footer {
+  background: transparent;
+  padding: 0 4px;
+  text-align: center;
+  font-size: 11px;
+  color: #64748b;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 16px;
+  margin-top: 48px;
+}
+.status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.status.draft    { background: #f1f5f9; color: #475569; }
+.status.sent     { background: #e0f2fe; color: #075985; }
+.status.accepted { background: #dcfce7; color: #166534; }
+.status.declined { background: #fee2e2; color: #991b1b; }
+.status.void     { background: #fee2e2; color: #991b1b; }
+@page { size: A4; margin: 12mm; }
+@media print {
+  body { background: #fff; }
+  .page { margin: 0; padding: 0; max-width: none; box-shadow: none; }
+}
+`;
+
+function esc(s: string | null | undefined): string {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function fmtDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function fmtQty(q: number): string {
+  return Number.isInteger(q) ? String(q) : q.toFixed(2);
+}
+
+export function renderEstimateHtml(input: EstimateHtmlInput): string {
+  const { estimate, customer, lines } = input;
+  const issuer = documentIssuerFields(estimate, input);
+  const cur = estimate.currency;
+  // The lines read as billed; the discount comes off their subtotal, and the
+  // stored subtotal is already net of it.
+  const discountCents = estimate.discountCents ?? 0;
+  const discountRow =
+    discountCents > 0
+      ? `<div class="row"><span>${esc(
+          discountLabel({
+            discountPercent: estimate.discountPercent ?? 0,
+            discountAmountCents: estimate.discountAmountCents ?? 0,
+          }),
+        )}</span><span class="num">-${formatMoney(discountCents, cur)}</span></div>`
+      : "";
+  // A taxed line shows its tax beside its amount, which stays quantity × unit
+  // price, so the tax can be checked line by line against the totals. An
+  // estimate with no tax keeps the four columns.
+  const taxed = anyLineTaxed(lines);
+  const headCells = taxed
+    ? `<th style="width:43%">Description</th>
+          <th class="right" style="width:9%">Qty</th>
+          <th class="right" style="width:15%">Unit</th>
+          <th class="right" style="width:16%">Tax</th>
+          <th class="right" style="width:17%">Amount</th>`
+    : `<th style="width:55%">Description</th>
+          <th class="right" style="width:10%">Qty</th>
+          <th class="right" style="width:17%">Unit</th>
+          <th class="right" style="width:18%">Amount</th>`;
+  const lineRows = lines
+    .map((l) => {
+      const qty = fmtQty(l.quantity);
+      const unit = formatMoney(l.unitPriceCents, cur);
+      const amount = formatMoney(lineAmountCents(l), cur);
+      const taxCell = !taxed
+        ? ""
+        : l.taxPercent > 0
+          ? `<td class="right num">${formatMoney(l.lineTaxCents, cur)}<div style="color:#94a3b8;font-size:11px;margin-top:2px">${esc(lineTaxLabel(l))}</div></td>`
+          : `<td class="right" style="color:#94a3b8">—</td>`;
+      return `<tr>
+        <td>${esc(l.description)}</td>
+        <td class="right num">${qty}</td>
+        <td class="right num">${unit}</td>
+        ${taxCell}
+        <td class="right num">${amount}</td>
+      </tr>`;
+    })
+    .join("");
+
+  const notesBlock = estimate.notes ? `<div class="notes">${esc(estimate.notes)}</div>` : "";
+  // Per-document terms win; otherwise use the selected issuer's defaults.
+  const footerText = estimate.footer || issuer.defaultFooter || "";
+  const footerBlock = footerText ? `<div class="footer">${esc(footerText)}</div>` : "";
+
+  const numberDisplay = estimate.status === "draft" ? "DRAFT" : estimate.number || "DRAFT";
+  const statusClass = estimate.status;
+  const emailMessageBlock = input.emailMessage?.trim()
+    ? `<div class="email-message">${esc(input.emailMessage.trim())}</div>`
+    : "";
+
+  const billingAddress = customer.billingAddress
+    ? `<div class="party-detail">${esc(customer.billingAddress)}</div>`
+    : "";
+  const taxNumber = customer.taxNumber
+    ? `<div class="party-detail">Tax #: ${esc(customer.taxNumber)}</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Estimate ${esc(numberDisplay)}</title>
+  <style>${STYLES}</style>
+</head>
+<body>
+  <div class="page">
+    ${emailMessageBlock}
+    <div class="header">
+      <div>
+        <div class="brand">${esc(issuer.companyName || "")}</div>
+        <div style="margin-top:24px">
+          <div class="title">Estimate</div>
+          <h1 class="estimate-number">${esc(numberDisplay)}</h1>
+          <div style="margin-top:6px"><span class="status ${statusClass}">${esc(estimate.status)}</span></div>
+        </div>
+      </div>
+      <div class="meta">
+        <div><strong>Issued:</strong> ${fmtDate(estimate.issueDate)}</div>
+        <div><strong>Valid until:</strong> ${fmtDate(estimate.validUntil)}</div>
+        <div><strong>Currency:</strong> ${esc(estimate.currency)}</div>
+      </div>
+    </div>
+
+    <div class="parties">
+      <div>
+        <div class="party-label">Prepared for</div>
+        <div class="party-name">${esc(customer.name)}</div>
+        ${customer.email ? `<div class="party-detail">${esc(customer.email)}</div>` : ""}
+        ${billingAddress}
+        ${taxNumber}
+      </div>
+      <div>
+        <div class="party-label">From</div>
+        ${
+          issuer.defaultFromBlock
+            ? `<div class="party-detail">${esc(issuer.defaultFromBlock)}</div>`
+            : `<div class="party-name">${esc(issuer.companyName || "")}</div>`
+        }
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          ${headCells}
+        </tr>
+      </thead>
+      <tbody>${lineRows || `<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:24px">No line items</td></tr>`}</tbody>
+    </table>
+
+    <div class="totals">
+      <div class="row"><span>Subtotal</span><span class="num">${formatMoney(estimate.subtotalCents + discountCents, cur)}</span></div>
+      ${discountRow}
+      <div class="row"><span>Tax</span><span class="num">${formatMoney(estimate.taxCents, cur)}</span></div>
+      <div class="row grand"><span>Total</span><span class="num">${formatMoney(estimate.totalCents, cur)}</span></div>
+    </div>
+
+    ${notesBlock}
+    ${footerBlock}
+  </div>
+</body>
+</html>`;
+}
+
+/** Convenience wrapper that loads the company name + templates itself. */
+export async function renderEstimateHtmlForCompany(
+  companyId: string,
+  estimate: Estimate,
+  customer: Customer,
+  lines: EstimateLineItem[],
+  options: { emailMessage?: string } = {},
+): Promise<string> {
+  const [company, settings] = await Promise.all([
+    AppDataSource.getRepository(Company).findOneBy({ id: companyId }),
+    getFinanceSettings(companyId),
+  ]);
+  return renderEstimateHtml({
+    estimate,
+    customer,
+    lines,
+    companyName: company?.name ?? "",
+    defaultFromBlock: settings.defaultFromBlock,
+    defaultFooter: settings.defaultFooter,
+    emailMessage: options.emailMessage,
+  });
+}
+
+/** Render the exact scoped estimate already authorized by the caller. No lifecycle side effects. */
+export async function renderEstimatePdf(
+  companyId: string,
+  estimate: Estimate,
+): Promise<{ buffer: Buffer; filename: string } | null> {
+  if (estimate.companyId !== companyId) return null;
+  const customer = await AppDataSource.getRepository(Customer).findOneBy({
+    id: estimate.customerId,
+    companyId,
+  });
+  if (!customer) return null;
+  const lines = await AppDataSource.getRepository(EstimateLineItem).find({
+    where: { estimateId: estimate.id },
+    order: { sortOrder: "ASC" },
+  });
+  const html = await renderEstimateHtmlForCompany(companyId, estimate, customer, lines);
+  return {
+    buffer: await htmlToPdf(html),
+    filename: `${estimate.status === "draft" ? `DRAFT-${estimate.slug}` : estimate.number || estimate.slug}.pdf`,
+  };
+}

@@ -1,0 +1,3029 @@
+import React from "react";
+import { RunResumeButton } from "@/components/routines/RunResumeButton";
+import { isRunError, isRunPaused } from "@/lib/runStatus";
+import { Link, useNavigate, useOutletContext, useParams, useSearchParams } from "react-router-dom";
+import {
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  Ban,
+  BrainCircuit,
+  ChevronsUp,
+  ClipboardCheck,
+  Clock,
+  Copy,
+  Folder,
+  Globe,
+  History,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Timer,
+  Trash2,
+  Webhook,
+  Zap,
+} from "lucide-react";
+import {
+  AIModel,
+  api,
+  CatchUpPolicy,
+  Company,
+  Goal,
+  MemberBrowser,
+  Routine,
+  RoutineFolder,
+  RoutinePriority,
+  CommandChecksAvailability,
+  RoutineCheck,
+  RoutineCheckList,
+  RoutineTrigger,
+  RoutineTriggerList,
+  RoutineWithMeta,
+  Run,
+  RunLesson,
+  RunLog,
+  MAX_CHECKS_PER_ROUTINE,
+  Workstream,
+  WorkstreamStatus,
+} from "../lib/api";
+import { Breadcrumbs } from "../components/AppShell";
+import { StanddownBanner, StanddownControl } from "../components/StanddownBanner";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { Avatar, employeeAvatarUrl } from "../components/ui/Avatar";
+import { Badge } from "../components/ui/Badge";
+import { Button } from "../components/ui/Button";
+import { Card, CardBody } from "../components/ui/Card";
+import { Disclosure } from "../components/ui/Disclosure";
+import { EmptyState } from "../components/ui/EmptyState";
+import { FormError, FormSuccess } from "../components/ui/FormError";
+import { Input } from "../components/ui/Input";
+import { MarkdownEditor } from "../components/MarkdownEditor";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { Textarea } from "../components/ui/Textarea";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import { clsx } from "../components/ui/clsx";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { copyToClipboard } from "../lib/clipboard";
+import { errorMessage } from "../lib/errors";
+import {
+  RunLiveModal,
+  RunBrowserRecordingsPane,
+  RunChecksChip,
+  RunChecksStrip,
+  RunContinuationNotice,
+  followUpNeedsPolling,
+  mergeRunContinuationState,
+  runFollowUpLabel,
+  RunEffectsPane,
+  RunFailureNotice,
+  RunLogPane,
+  RunOutcomeChip,
+  RunPauseNotice,
+  RunReviewNotice,
+  RunStatusChip,
+  formatDuration,
+  overdueFor,
+  runLogNeedsPolling,
+  timeAgo,
+  timeUntil,
+  visibleBrowserRecordings,
+} from "../components/routines/RunViews";
+import { describeCronExpr, formatRunTime, resolveTimeZone } from "../lib/scheduleBuilder";
+import { ScheduleField } from "../components/ScheduleField";
+import {
+  DEFAULT_TIMEOUT_SEC,
+  describeRoutineAdvanced,
+  formatTimeout,
+} from "../lib/routineAdvancedSummary";
+import {
+  buildCheckSpec,
+  checkSpecDraft,
+  describeCheck,
+  type CheckSpecDraft,
+} from "../lib/routineChecks";
+import {
+  ROUTINE_PRIORITY_OPTIONS,
+  routinePriorityHelp,
+  routinePriorityOf,
+} from "../lib/routinePriority";
+import { RoutinePriorityChip } from "../components/routines/RoutinePriorityChip";
+import { RoutinesContext } from "./RoutinesLayout";
+import { useAskAi } from "../components/askAi/AskAiProvider";
+import { ResourceTagPicker } from "../components/TagPicker";
+import { EnabledToggle } from "./RevenueSignals";
+import { RecordHistory } from "../components/RecordHistory";
+
+/**
+ * One routine, in full: who runs it, when, on what brain, and how every past
+ * run went.
+ *
+ * Addressed by `:empSlug/:routineSlug` rather than a bare slug because a
+ * routine slug is only unique within its employee — two employees may both
+ * have a `daily-digest`.
+ */
+
+type Tab = "overview" | "brief" | "runs" | "settings";
+const TABS: Array<[Tab, string]> = [
+  ["overview", "Overview"],
+  ["brief", "Brief"],
+  ["runs", "Runs"],
+  ["settings", "Settings"],
+];
+
+export default function RoutineDetail({ company }: { company: Company }) {
+  const { empSlug, routineSlug } = useParams();
+  const { routines, folders, loading, loadError, refresh } = useOutletContext<RoutinesContext>();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [activeRun, setActiveRun] = React.useState<Run | null>(null);
+  const [startingRun, setStartingRun] = React.useState(false);
+  const dialog = useDialog();
+  const background = useBackgroundAction();
+  /**
+   * The header switch's value while a pause or resume is on its way. Tied to
+   * the routine it was flipped on: this page is not rebuilt when the Member
+   * moves to another routine.
+   */
+  const [enabledDraft, setEnabledDraft] = React.useState<{ id: string; enabled: boolean } | null>(
+    null,
+  );
+  // Ask AI docks beside every page now; with it open the routine has roughly
+  // a phone's width, and two-column tab layouts stop being two columns.
+  const askAiOpen = Boolean(useAskAi()?.open);
+
+  const routine =
+    routines.find((r) => r.employee?.slug === empSlug && r.slug === routineSlug) ?? null;
+
+  // A `?run=` deep link is a request to look at run history.
+  const deepLinkedRun = searchParams.get("run");
+  const tabParam = searchParams.get("tab") as Tab | null;
+  const tab: Tab =
+    tabParam && TABS.some(([t]) => t === tabParam) ? tabParam : deepLinkedRun ? "runs" : "overview";
+
+  function setTab(next: Tab) {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === "overview") p.delete("tab");
+        else p.set("tab", next);
+        // A stale `?run=` would drag us straight back to the runs tab, since a
+        // bare `run` param reads as "show me run history".
+        if (next !== "runs") p.delete("run");
+        return p;
+      },
+      { replace: true },
+    );
+  }
+
+  // Open one run in the runs tab. Both params move together: `tab` alone would
+  // land on the newest run, `run` alone would rely on the implicit tab switch.
+  function openRun(runId: string) {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        p.set("tab", "runs");
+        p.set("run", runId);
+        return p;
+      },
+      { replace: true },
+    );
+  }
+
+  async function triggerRun() {
+    if (!routine) return;
+    try {
+      const run = await api.post<Run>(`/api/companies/${company.id}/routines/${routine.id}/run`);
+      setActiveRun(run);
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t start the run" });
+    }
+  }
+
+  async function runNow() {
+    setStartingRun(true);
+    try {
+      await triggerRun();
+    } finally {
+      setStartingRun(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="p-6">
+        <Spinner />
+      </div>
+    );
+  }
+
+  if (!routine && loadError) return null;
+  if (!routine) {
+    return (
+      <div className="mx-auto max-w-3xl p-6">
+        <Breadcrumbs items={[{ label: "Routines", to: `/c/${company.slug}/routines` }]} />
+        <div className="mt-4">
+          <EmptyState
+            title="Routine not found"
+            description="It may have been deleted, or renamed to a different address."
+            action={
+              <Link to={`/c/${company.slug}/routines`}>
+                <Button variant="secondary">Back to routines</Button>
+              </Link>
+            }
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const emp = routine.employee;
+  const brokenSchedule = routine.enabled && routine.nextRunAt === null;
+  const compact = askAiOpen;
+  // Every routine write is admin-only on the server; Members see the state.
+  const canManage = company.role === "owner" || company.role === "admin";
+  const enabled = enabledDraft?.id === routine.id ? enabledDraft.enabled : routine.enabled;
+  const standdownTitle = routine.standdown
+    ? `${
+        routine.standdown.scope === "company"
+          ? "Company"
+          : routine.standdown.scope === "employee"
+            ? "AI Employee"
+            : "Routine"
+      } Standdown: ${routine.standdown.reason}`
+    : undefined;
+
+  /**
+   * Pause or resume in one click from the header — reversible, so no
+   * confirmation; the switch moves at once and snaps back, with the reason,
+   * if the server refuses.
+   */
+  function setRoutineEnabled(next: boolean) {
+    if (!routine) return;
+    const id = routine.id;
+    setEnabledDraft({ id, enabled: next });
+    const settle = () =>
+      setEnabledDraft((draft) => (draft?.id === id && draft.enabled === next ? null : draft));
+    background(() => api.patch(`/api/companies/${company.id}/routines/${id}`, { enabled: next }), {
+      title: next ? "Couldn’t resume the routine" : "Couldn’t pause the routine",
+      error: (err) => `${errorMessage(err)} The switch was put back.`,
+      onSuccess: () => void Promise.resolve(refresh()).finally(settle),
+      onError: settle,
+    });
+  }
+
+  return (
+    // The left column takes the page's scroll off `<main>` so Ask AI, docked
+    // beside the page, scrolls its own conversation instead of riding along.
+    <div className="relative flex h-full min-h-0 w-full">
+      <div className="page-shell min-w-0 flex-1 overflow-y-auto px-4 py-6 sm:p-6">
+        <Breadcrumbs
+          items={[
+            { label: "Routines", to: `/c/${company.slug}/routines` },
+            ...(emp
+              ? [{ label: emp.name, to: `/c/${company.slug}/routines?employee=${emp.slug}` }]
+              : []),
+            { label: routine.name },
+          ]}
+        />
+
+        <div className="mb-5 mt-3 flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-50">
+                {routine.name}
+              </h1>
+              {!enabled && <Badge icon={<Pause />}>paused</Badge>}
+              <RoutinePriorityChip priority={routine.priority} />
+
+              {routine.lastRun && (
+                <RunStatusChip
+                  status={routine.lastRun.status}
+                  errorKind={routine.lastRun.errorKind}
+                  pauseCount={routine.lastRun.pauseCount}
+                  size="xs"
+                />
+              )}
+              {routine.lastRun?.status !== "reviewed" && routine.lastRun?.outcomeVerdict && (
+                <RunOutcomeChip verdict={routine.lastRun.outcomeVerdict} size="xs" />
+              )}
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-slate-500 dark:text-slate-400">
+              <span title={routine.cronExpr}>{describeCronExpr(routine.cronExpr)}</span>
+              {routine.enabled && routine.nextRunAt && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  {overdueFor(routine.nextRunAt) ? (
+                    <span
+                      className="text-amber-600 dark:text-amber-400"
+                      title={new Date(routine.nextRunAt).toLocaleString()}
+                    >
+                      overdue by {overdueFor(routine.nextRunAt)}
+                    </span>
+                  ) : (
+                    <span title={new Date(routine.nextRunAt).toLocaleString()}>
+                      next {timeUntil(routine.nextRunAt)}
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+            {/* A quiet property row, not a labelled box: tags are for finding
+                the routine later, not something to fill in on every visit. */}
+            <div className="mt-2">
+              <ResourceTagPicker
+                companyId={company.id}
+                resourceType="routine"
+                resourceId={routine.id}
+                value={routine.tags ?? []}
+                onSaved={refresh}
+                variant="inline"
+              />
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-3">
+            {canManage && (
+              <label className="touch-target relative flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+                <EnabledToggle
+                  enabled={enabled}
+                  label={enabled ? "Pause this routine" : "Resume this routine"}
+                  onChange={setRoutineEnabled}
+                />
+                {enabled ? "Active" : "Paused"}
+              </label>
+            )}
+            {/* A Standdown refuses manual Runs too; say so instead of an error. */}
+            <Button
+              onClick={() => void runNow()}
+              loading={startingRun}
+              disabled={Boolean(routine.standdown)}
+              title={standdownTitle}
+            >
+              <Play size={14} /> Run now
+            </Button>
+          </div>
+        </div>
+
+        <StanddownBanner company={company} routineId={routine.id} className="mb-4" />
+
+        {brokenSchedule && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+            <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+            <div>
+              <div className="font-medium">This routine never fires.</div>
+              <div className="text-xs">
+                It&apos;s enabled, but no next run could be computed from{" "}
+                <code className="font-mono">{routine.cronExpr}</code>. Edit the schedule under
+                Settings, or run it manually.
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mb-5 flex gap-1 border-b border-slate-200 dark:border-slate-800">
+          {TABS.map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              className={
+                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition " +
+                (tab === key
+                  ? "border-indigo-600 text-indigo-700 dark:border-indigo-400 dark:text-indigo-300"
+                  : "border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200")
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "overview" && (
+          <OverviewTab
+            folders={folders}
+            company={company}
+            routine={routine}
+            compact={compact}
+            onSeeRuns={() => setTab("runs")}
+            onOpenRun={openRun}
+          />
+        )}
+        {tab === "brief" && (
+          <BriefTab
+            key={`${company.id}:${routine.id}`}
+            company={company}
+            routine={routine}
+            onSwitchedOn={() => void refresh()}
+          />
+        )}
+        {tab === "runs" && (
+          <RunsTab
+            company={company}
+            routine={routine}
+            compact={compact}
+            initialRunId={deepLinkedRun}
+            onRetry={triggerRun}
+          />
+        )}
+        {tab === "settings" && (
+          <SettingsTab
+            key={`${company.id}:${routine.id}`}
+            company={company}
+            routine={routine}
+            folders={folders}
+            onSaved={refresh}
+          />
+        )}
+
+        {activeRun && (
+          <RunLiveModal
+            key={activeRun.id}
+            company={company}
+            routine={routine}
+            run={activeRun}
+            onRetry={triggerRun}
+            onClose={() => {
+              setActiveRun(null);
+              refresh();
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ───────────────────────────── Overview ─────────────────────────────────
+
+function OverviewTab({
+  company,
+  routine,
+  folders,
+  compact,
+  onSeeRuns,
+  onOpenRun,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  folders: RoutineFolder[];
+  /** Ask AI is docked beside the page, so there is no room for two columns. */
+  compact: boolean;
+  onSeeRuns: () => void;
+  onOpenRun: (runId: string) => void;
+}) {
+  const [runs, setRuns] = React.useState<Run[] | null>(null);
+  const [model, setModel] = React.useState<AIModel | null | undefined>(undefined);
+  const emp = routine.employee;
+  /** The zone this routine's schedule is read in: its company's, or server time. */
+  const scheduleZone = resolveTimeZone(company.timezone);
+  const folder = routine.folderId ? (folders.find((f) => f.id === routine.folderId) ?? null) : null;
+
+  React.useEffect(() => {
+    api
+      .get<Run[]>(`/api/companies/${company.id}/routines/${routine.id}/runs`)
+      .then(setRuns)
+      .catch(() => setRuns([]));
+  }, [company.id, routine.id]);
+
+  // Resolve what "this routine's brain" actually means right now — the pin if
+  // it holds, otherwise whatever the employee has active (which is what the
+  // runner would fall back to).
+  React.useEffect(() => {
+    if (!emp) return;
+    api
+      .get<AIModel[]>(`/api/companies/${company.id}/employees/${emp.id}/models`)
+      .then((list) => {
+        const pinned = routine.modelId ? list.find((m) => m.id === routine.modelId) : null;
+        setModel(pinned ?? list.find((m) => m.isActive) ?? null);
+      })
+      .catch(() => setModel(null));
+  }, [company.id, emp, routine.modelId]);
+
+  const pinHolds = !!routine.modelId && model?.id === routine.modelId;
+  const recent = (runs ?? []).slice(0, 5);
+  // Only what the rows inside show, so the line never names something the
+  // person cannot find once they open it.
+  const moreDetailsSummary = describeRoutineAdvanced({
+    folderPath: folder?.path,
+    timeoutSec: routine.timeoutSec,
+    requiresApproval: routine.requiresApproval,
+    outcomeCheck: !!routine.acceptanceCriteria?.trim(),
+    priority: routinePriorityOf(routine.priority),
+    browserEnabledOverride: routine.browserEnabledOverride ?? null,
+    memberBrowser: !!routine.memberBrowserId,
+    catchUpPolicy: routine.catchUpPolicy ?? "once",
+    maxAttempts: routine.maxAttempts ?? 1,
+    retryBackoffSec: routine.retryBackoffSec,
+    webhookEnabled: routine.webhookEnabled,
+  });
+
+  return (
+    <div className={clsx("grid gap-4", !compact && "md:grid-cols-2")}>
+      <Card>
+        <CardBody className="flex flex-col gap-3">
+          <SectionLabel>Assigned to</SectionLabel>
+          {emp ? (
+            <Link
+              to={`/c/${company.slug}/employees/${emp.slug}`}
+              className="group flex items-center gap-3"
+            >
+              <Avatar
+                name={emp.name}
+                src={employeeAvatarUrl(company.id, emp.id, emp.avatarKey)}
+                kind="ai"
+                size="lg"
+              />
+              <div className="min-w-0">
+                <div className="truncate font-medium text-slate-900 group-hover:text-indigo-600 dark:text-slate-100 dark:group-hover:text-indigo-400">
+                  {emp.name}
+                </div>
+                <div className="truncate text-sm text-slate-500 dark:text-slate-400">
+                  {emp.role || "AI employee"}
+                </div>
+              </div>
+            </Link>
+          ) : (
+            <div className="text-sm text-slate-400 dark:text-slate-500">
+              The employee that owned this routine is gone.
+            </div>
+          )}
+          <div className="border-t border-slate-100 pt-3 dark:border-slate-800">
+            <Row icon={<BrainCircuit size={14} />} label="Runs on">
+              {model === undefined ? (
+                <span className="text-slate-400">…</span>
+              ) : model === null ? (
+                <span className="text-amber-600 dark:text-amber-400">
+                  No model connected — runs are skipped
+                </span>
+              ) : (
+                <span>
+                  {model.provider} · {model.model}{" "}
+                  <span className="text-xs text-slate-400 dark:text-slate-500">
+                    {pinHolds ? "(pinned)" : "(employee's active model)"}
+                  </span>
+                </span>
+              )}
+            </Row>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardBody className="flex flex-col gap-3">
+          <SectionLabel>Schedule</SectionLabel>
+          <Row icon={<Clock size={14} />} label="Fires">
+            <span title={routine.cronExpr}>{describeCronExpr(routine.cronExpr)}</span>
+          </Row>
+          <Row icon={<Clock size={14} />} label="Next run">
+            {!routine.enabled ? (
+              <span className="text-slate-400 dark:text-slate-500">Paused</span>
+            ) : routine.nextRunAt && overdueFor(routine.nextRunAt) ? (
+              <span
+                className="text-amber-600 dark:text-amber-400"
+                title={new Date(routine.nextRunAt).toLocaleString()}
+              >
+                Overdue by {overdueFor(routine.nextRunAt)}
+              </span>
+            ) : routine.nextRunAt ? (
+              // Read on the clock the schedule is: the company's zone, the way
+              // the Settings preview says it, not the browser's own with seconds.
+              <span title={`${formatRunTime(new Date(routine.nextRunAt), new Date(), scheduleZone)} (${scheduleZone ?? "server time"})`}>
+                {formatRunTime(new Date(routine.nextRunAt), new Date(), scheduleZone)} (
+                {timeUntil(routine.nextRunAt)})
+              </span>
+            ) : (
+              <span className="text-amber-600 dark:text-amber-400">Never</span>
+            )}
+          </Row>
+          <Row icon={<Clock size={14} />} label="Last run">
+            {routine.lastRunAt ? (
+              <span title={new Date(routine.lastRunAt).toLocaleString()}>
+                {timeAgo(routine.lastRunAt)}
+              </span>
+            ) : (
+              <span className="text-slate-400 dark:text-slate-500">Never</span>
+            )}
+          </Row>
+        </CardBody>
+      </Card>
+
+      {/* Where the routine is filed and how it is guarded are worth knowing but
+          rarely worth reading; the summary keeps anything unusual in view. */}
+      <Disclosure
+        variant="card"
+        title="More details"
+        summary={moreDetailsSummary}
+        className={compact ? undefined : "md:col-span-2"}
+      >
+        <div className="flex flex-col gap-3">
+          <Row icon={<Folder size={14} />} label="Filed in">
+            {folder ? (
+              <Link
+                to={`/c/${company.slug}/routines?folder=${encodeURIComponent(folder.slug)}`}
+                className="hover:text-indigo-600 dark:hover:text-indigo-400"
+              >
+                {folder.path}
+              </Link>
+            ) : (
+              <span className="text-slate-400 dark:text-slate-500">Unfiled</span>
+            )}
+          </Row>
+          <Row icon={<Timer size={14} />} label="Timeout">
+            {formatTimeout(routine.timeoutSec)}
+          </Row>
+          <Row icon={<ShieldCheck size={14} />} label="Approval">
+            {routine.requiresApproval
+              ? "Each scheduled run waits for a human"
+              : "Runs without asking"}
+          </Row>
+          <Row icon={<ClipboardCheck size={14} />} label="Outcome check">
+            {routine.acceptanceCriteria?.trim()
+              ? "Completed runs are graded against acceptance criteria"
+              : "Off — no acceptance criteria set"}
+          </Row>
+          <Row icon={<ChevronsUp size={14} />} label="Priority">
+            {routinePriorityOf(routine.priority) === "high"
+              ? "High — its Runs start before Normal ones waiting for the same AI Model"
+              : "Normal — its Runs wait in the order they were queued"}
+          </Row>
+          <Row icon={<Globe size={14} />} label="Browser">
+            {routine.browserEnabledOverride === true
+              ? "Forced on for this routine"
+              : routine.browserEnabledOverride === false
+                ? "Forced off for this routine"
+                : "Inherits the employee setting"}
+            {routine.memberBrowserId && " · runs in a connected browser"}
+          </Row>
+          <Row icon={<History size={14} />} label="Catch-up">
+            {routine.catchUpPolicy === "skip"
+              ? "Skips a catch-up that is already late"
+              : "Fires once after downtime"}
+          </Row>
+          <Row icon={<RefreshCw size={14} />} label="Retries">
+            {(routine.maxAttempts ?? 1) <= 1
+              ? routine.enabled && !routine.requiresApproval
+                ? "Interrupted scheduled Runs retry once after 1h"
+                : "Automatic recovery is off while paused or approval-gated"
+              : `Up to ${routine.maxAttempts} attempts, from ${formatTimeout(
+                  routine.retryBackoffSec ?? 60,
+                )}`}
+          </Row>
+          <Row icon={<Webhook size={14} />} label="Webhook">
+            {routine.webhookEnabled ? "Enabled" : "Off"}
+          </Row>
+        </div>
+      </Disclosure>
+
+      <LessonsCard company={company} routine={routine} compact={compact} />
+
+      <WorkstreamCard company={company} routine={routine} compact={compact} />
+
+      <Card className={compact ? undefined : "md:col-span-2"}>
+        <CardBody className="flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <SectionLabel>Recent runs</SectionLabel>
+            {(runs?.length ?? 0) > 0 && (
+              <button
+                onClick={onSeeRuns}
+                className="touch-target relative text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              >
+                See all
+              </button>
+            )}
+          </div>
+          {runs === null ? (
+            <Spinner />
+          ) : recent.length === 0 ? (
+            <div className="py-4 text-center text-sm text-slate-400 dark:text-slate-500">
+              This routine hasn&apos;t run yet.
+            </div>
+          ) : (
+            <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+              {recent.map((run) => (
+                <li key={run.id}>
+                  <button
+                    type="button"
+                    onClick={() => onOpenRun(run.id)}
+                    className="flex w-full items-center gap-3 rounded px-1 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800/60"
+                  >
+                    <RunStatusChip
+                      status={run.status}
+                      errorKind={run.errorKind}
+                      pauseCount={run.pauseCount}
+                      size="xs"
+                    />
+                    {run.status !== "reviewed" && run.outcomeVerdict && (
+                      <RunOutcomeChip
+                        verdict={run.outcomeVerdict}
+                        note={run.outcomeNote}
+                        size="xs"
+                      />
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-slate-600 dark:text-slate-300">
+                      {new Date(run.startedAt).toLocaleString()}
+                    </span>
+                    {run.exitCode !== null && (
+                      <span className="shrink-0 text-xs text-slate-400 dark:text-slate-500">
+                        exit {run.exitCode}
+                      </span>
+                    )}
+                    <span className="shrink-0 text-xs tabular-nums text-slate-400 dark:text-slate-500">
+                      {formatDuration(run.startedAt, run.finishedAt)}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardBody>
+      </Card>
+
+      <RecordHistory
+        companyId={company.id}
+        companySlug={company.slug}
+        targetType="routine"
+        targetId={routine.id}
+        noun="this routine"
+        className={compact ? undefined : "md:col-span-2"}
+        milestones={[{ label: "Routine created", at: routine.createdAt, covers: ["create"] }]}
+      />
+    </div>
+  );
+}
+
+/**
+ * Lessons — the takeaways graded Runs left behind (M52). The runner folds
+ * every undismissed lesson into the routine's future prompts, so an admin
+ * dismissing one here is telling future runs to stop hearing it. The section
+ * vanishes entirely while the routine has no lessons: an empty queue is not
+ * news.
+ */
+function LessonsCard({
+  company,
+  routine,
+  compact,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  compact: boolean;
+}) {
+  const [lessons, setLessons] = React.useState<RunLesson[] | null>(null);
+  const [dismissingId, setDismissingId] = React.useState<string | null>(null);
+  const dialog = useDialog();
+  const canManage = company.role === "owner" || company.role === "admin";
+
+  const reload = React.useCallback(() => {
+    api
+      .get<RunLesson[]>(`/api/companies/${company.id}/run-lessons/routine/${routine.id}`)
+      .then(setLessons)
+      .catch(() => setLessons([]));
+  }, [company.id, routine.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  // Lessons ride the routine's own live-sync kind, scoped like the runs list:
+  // a graded run writing a new lesson lands here without a manual refresh.
+  useLiveRefetch("routine", reload, routine.id);
+
+  async function dismiss(lesson: RunLesson) {
+    setDismissingId(lesson.id);
+    try {
+      await api.post(`/api/companies/${company.id}/run-lessons/${lesson.id}/dismiss`, {});
+      reload();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t dismiss the lesson" });
+    } finally {
+      setDismissingId(null);
+    }
+  }
+
+  if (!lessons || lessons.length === 0) return null;
+
+  return (
+    <Card className={compact ? undefined : "md:col-span-2"}>
+      <CardBody className="flex flex-col gap-3">
+        <SectionLabel>Lessons</SectionLabel>
+        <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+          {lessons.map((lesson) => (
+            <li key={lesson.id} className="flex items-start gap-3 py-2 first:pt-0 last:pb-0">
+              <div className="min-w-0 flex-1">
+                <div
+                  className={clsx(
+                    "text-sm",
+                    lesson.dismissedAt
+                      ? "text-slate-400 dark:text-slate-500"
+                      : "text-slate-800 dark:text-slate-200",
+                  )}
+                >
+                  {lesson.advice}
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  because: {lesson.cause}
+                </div>
+              </div>
+              <span
+                className="shrink-0 text-xs tabular-nums text-slate-400 dark:text-slate-500"
+                title={new Date(lesson.createdAt).toLocaleString()}
+              >
+                {new Date(lesson.createdAt).toLocaleDateString()}
+              </span>
+              {lesson.dismissedAt ? (
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                  Dismissed
+                </span>
+              ) : canManage ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  loading={dismissingId === lesson.id}
+                  onClick={() => void dismiss(lesson)}
+                >
+                  Dismiss
+                </Button>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * Workstream — the persistent state document for work this routine's Runs
+ * carry across sessions (M54). Only an ACTIVE workstream is news on the
+ * routine page — the card vanishes when there is none, like Lessons. Closing
+ * (admin) records done/abandoned plus a reason; the employee reads both.
+ */
+function WorkstreamCard({
+  company,
+  routine,
+  compact,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  compact: boolean;
+}) {
+  const [workstreams, setWorkstreams] = React.useState<Workstream[] | null>(null);
+  const [closing, setClosing] = React.useState(false);
+  const canManage = company.role === "owner" || company.role === "admin";
+
+  const reload = React.useCallback(() => {
+    api
+      .get<Workstream[]>(`/api/companies/${company.id}/workstreams`)
+      .then(setWorkstreams)
+      .catch(() => setWorkstreams([]));
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  // A run rewriting the state document, or another admin closing the stream,
+  // lands here without a manual refresh.
+  useLiveRefetch("workstream", reload);
+
+  // The list endpoint filters by employee, not routine — narrow client-side.
+  const active =
+    (workstreams ?? []).find((w) => w.routineId === routine.id && w.status === "active") ?? null;
+
+  if (!active) return null;
+
+  return (
+    <Card className={compact ? undefined : "md:col-span-2"}>
+      <CardBody className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-2">
+          <SectionLabel>Workstream</SectionLabel>
+          {canManage && (
+            <Button variant="ghost" size="sm" onClick={() => setClosing(true)}>
+              Close
+            </Button>
+          )}
+        </div>
+        <div>
+          <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+            {active.title}
+          </div>
+          {active.objective && (
+            <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              {active.objective}
+            </div>
+          )}
+        </div>
+        <div className="max-h-64 overflow-y-auto whitespace-pre-wrap rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2 font-mono text-xs leading-5 text-slate-700 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300">
+          {active.stateDoc.trim() || "The employee hasn't written the state document yet."}
+        </div>
+        <div className="text-xs text-slate-400 dark:text-slate-500">
+          last updated {new Date(active.updatedAt).toLocaleDateString()}
+        </div>
+        {closing && (
+          <CloseWorkstreamModal
+            company={company}
+            workstream={active}
+            onClose={() => setClosing(false)}
+            onClosed={() => {
+              setClosing(false);
+              reload();
+            }}
+          />
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function CloseWorkstreamModal({
+  company,
+  workstream,
+  onClose,
+  onClosed,
+}: {
+  company: Company;
+  workstream: Workstream;
+  onClose: () => void;
+  onClosed: () => void;
+}) {
+  const [status, setStatus] =
+    React.useState<Exclude<WorkstreamStatus, "active" | "archived">>("done");
+  const [reason, setReason] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmed = reason.trim();
+    if (!trimmed) {
+      setError("Give a reason — the employee reads it.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/api/companies/${company.id}/workstreams/${workstream.id}/close`, {
+        status,
+        reason: trimmed,
+      });
+      onClosed();
+    } catch (err) {
+      setError(errorMessage(err, "Could not close the workstream"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={`Close "${workstream.title}"?`}
+      description="The state document is kept for the record; future runs stop carrying it."
+      onSubmit={save}
+      footer={
+        <>
+          <Button variant="secondary" type="button" disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy}>
+            {busy ? "Closing…" : "Close workstream"}
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormError message={error} />
+        <div className="flex flex-col gap-1.5">
+          {(
+            [
+              ["done", "Done — the objective was reached"],
+              ["abandoned", "Abandoned — stop pursuing it"],
+            ] as const
+          ).map(([value, label]) => (
+            <label
+              key={value}
+              className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200"
+            >
+              <input
+                type="radio"
+                name="workstream-close-status"
+                checked={status === value}
+                onChange={() => setStatus(value)}
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+        <Textarea
+          label="Reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          className="min-h-[60px]"
+          placeholder="Why it's closing — the employee reads this."
+        />
+      </div>
+    </Modal>
+  );
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{children}</div>
+  );
+}
+
+function Row({
+  icon,
+  label,
+  children,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start gap-2 text-sm">
+      <span className="mt-0.5 shrink-0 text-slate-400 dark:text-slate-500">{icon}</span>
+      <span className="w-24 shrink-0 text-slate-500 dark:text-slate-400">{label}</span>
+      <span className="min-w-0 flex-1 text-slate-800 dark:text-slate-200">{children}</span>
+    </div>
+  );
+}
+
+/**
+ * The upper edge of each retry's jitter band, so the operator sees what
+ * "backoff 60s, 3 attempts" actually costs in wall-clock before saving. The
+ * real delay is uniform in [0, this), and the server caps it at 6 hours.
+ */
+function backoffPreview(baseSec: number, attempts: number): string {
+  const steps: string[] = [];
+  for (let i = 0; i < Math.max(0, attempts - 1) && i < 4; i += 1) {
+    steps.push(formatTimeout(Math.min(6 * 3600, baseSec * 2 ** i)));
+  }
+  return steps.length ? `up to ${steps.join(", then ")}` : "no retries";
+}
+
+// ─────────────────────────────── Brief ──────────────────────────────────
+
+/**
+ * The markdown brief the runner folds into the prompt every time the routine
+ * fires. Round-trips against `Routine.body` via `/routines/:rid/readme`.
+ *
+ * A routine created without its brief waits paused for one, and the first
+ * brief saved switches it on. The tab says so before the save, not after.
+ */
+function BriefTab({
+  company,
+  routine,
+  onSwitchedOn,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  onSwitchedOn: () => void;
+}) {
+  const [content, setContent] = React.useState<string | null>(null);
+  const [saved, setSaved] = React.useState<string | null>(null);
+  const [awaitingBrief, setAwaitingBrief] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = React.useState(0);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let active = true;
+    setLoadError(null);
+    api
+      .get<{ content: string; awaitingBrief: boolean }>(
+        `/api/companies/${company.id}/routines/${routine.id}/readme`,
+      )
+      .then((r) => {
+        if (!active) return;
+        setContent(r.content);
+        setSaved(r.content);
+        setAwaitingBrief(r.awaitingBrief);
+      })
+      .catch((err: unknown) => {
+        if (active) setLoadError(errorMessage(err, "Could not load the brief"));
+      });
+    return () => {
+      active = false;
+    };
+  }, [company.id, routine.id, loadAttempt]);
+
+  async function save() {
+    if (content === null || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api.put<{ ok: true; enabled: boolean }>(
+        `/api/companies/${company.id}/routines/${routine.id}/readme`,
+        { content },
+      );
+      setSaved(content);
+      if (awaitingBrief && result.enabled) {
+        setAwaitingBrief(false);
+        onSwitchedOn();
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loadError)
+    return (
+      <div className="flex flex-col items-start gap-3">
+        <FormError message={loadError} />
+        <Button variant="secondary" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+          Retry brief
+        </Button>
+      </div>
+    );
+  if (content === null) return <Spinner />;
+  const dirty = content !== saved;
+  // Switched on from the header in the meantime, it is no longer waiting.
+  const switchesOnWhenSaved = awaitingBrief && !routine.enabled;
+
+  return (
+    <Card>
+      <CardBody className="flex flex-col gap-3">
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          What this employee should actually do each time the routine fires. Folded into the prompt
+          on every run.
+        </p>
+        {switchesOnWhenSaved && (
+          <div className="flex items-start gap-2 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-900 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-100">
+            <Pause size={16} className="mt-0.5 shrink-0" />
+            <div>
+              <div className="font-medium">Paused until its brief is saved</div>
+              <div className="text-xs">
+                Replace the outline below with what the employee should do. Saving the brief
+                switches this routine on, and it runs on its schedule from then on.
+              </div>
+            </div>
+          </div>
+        )}
+        <MarkdownEditor
+          value={content}
+          onChange={setContent}
+          rows={18}
+          onSave={() => {
+            if (dirty) void save();
+          }}
+        />
+        <FormError message={error} />
+        <div className="flex items-center gap-2">
+          <Button onClick={save} loading={saving} disabled={!dirty}>
+            {saving ? "Saving…" : switchesOnWhenSaved ? "Save brief & switch on" : "Save brief"}
+          </Button>
+          {dirty && (
+            <span className="text-xs text-slate-400 dark:text-slate-500">Unsaved changes</span>
+          )}
+          <span className="ml-auto text-xs text-slate-400 dark:text-slate-500">⌘S to save</span>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+// ──────────────────────────────── Runs ──────────────────────────────────
+
+/**
+ * Full run history. Left rail lists recent runs newest-first; picking one
+ * loads its captured log. The server keeps the 50 most recent and caps each
+ * log at 256KB.
+ */
+function RunsTab({
+  company,
+  routine,
+  compact,
+  initialRunId,
+  onRetry,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  /** Ask AI is docked beside the page, so the run list stacks above the log. */
+  compact: boolean;
+  initialRunId: string | null;
+  onRetry: () => Promise<void>;
+}) {
+  const [runs, setRuns] = React.useState<Run[] | null>(null);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [log, setLog] = React.useState<RunLog | null>(null);
+  const [loadingLog, setLoadingLog] = React.useState(false);
+  const [logLoadError, setLogLoadError] = React.useState<string | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [starting, setStarting] = React.useState(false);
+  const [cancellingRetry, setCancellingRetry] = React.useState(false);
+  const dialog = useDialog();
+  const recordings = visibleBrowserRecordings(log?.browserRecordings);
+
+  const loadRuns = React.useCallback(async () => {
+    try {
+      const list = await api.get<Run[]>(`/api/companies/${company.id}/routines/${routine.id}/runs`);
+      setRuns(list);
+      setLoadError(null);
+      setActiveId((current) => {
+        // Keep the run the human is looking at selected across a live refetch;
+        // only fall back to the deep-linked or newest run on first load.
+        if (current && list.some((r) => r.id === current)) return current;
+        if (list.length === 0) return null;
+        return initialRunId && list.some((r) => r.id === initialRunId) ? initialRunId : list[0].id;
+      });
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the runs"));
+      setRuns([]);
+    }
+  }, [company.id, routine.id, initialRunId]);
+
+  React.useEffect(() => {
+    loadRuns();
+  }, [loadRuns]);
+
+  // A run flipping running → done, or a fresh run appearing, is the canonical
+  // "an AI employee did something" moment — reflect it without a refresh.
+  useLiveRefetch("run", loadRuns, routine.id);
+
+  React.useEffect(() => {
+    if (!activeId) {
+      setLog(null);
+      setLogLoadError(null);
+      return;
+    }
+    setLoadingLog(true);
+    setLog(null);
+    setLogLoadError(null);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let consecutiveErrors = 0;
+    async function loadLog() {
+      try {
+        const l = await api.get<RunLog>(`/api/companies/${company.id}/runs/${activeId}/log`);
+        if (cancelled) return;
+        consecutiveErrors = 0;
+        setLog(l);
+        // Either live list reads or log polling can observe a handoff first.
+        // Apply the latest received metadata to this exact selected Run.
+        setRuns(
+          (current) =>
+            current?.map((run) =>
+              run.id === activeId ? mergeRunContinuationState(run, l) : run,
+            ) ?? null,
+        );
+        setLogLoadError(null);
+        if (runLogNeedsPolling(l)) timer = setTimeout(loadLog, 1200);
+      } catch (err) {
+        if (cancelled) return;
+        consecutiveErrors += 1;
+        setLogLoadError(`${errorMessage(err, "Couldn’t load the log.")} Retrying…`);
+        const retryDelay = Math.min(10_000, 2500 * 2 ** Math.min(consecutiveErrors - 1, 2));
+        timer = setTimeout(loadLog, retryDelay);
+      } finally {
+        if (!cancelled) setLoadingLog(false);
+      }
+    }
+    void loadLog();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [company.id, activeId]);
+
+  async function runNow() {
+    setStarting(true);
+    try {
+      await onRetry();
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  if (loadError) return <FormError message={loadError} />;
+  if (runs === null) return <Spinner />;
+  if (runs.length === 0) {
+    return (
+      <EmptyState
+        title="No runs yet"
+        description="Hit Run now to trigger this routine, or wait for its schedule to fire."
+        action={
+          <Button onClick={() => void runNow()} loading={starting}>
+            <Play size={14} /> Run now
+          </Button>
+        }
+      />
+    );
+  }
+
+  const activeRun = runs.find((r) => r.id === activeId) ?? null;
+  // The Runs list is live-refetched; the selected log is a one-shot snapshot
+  // once terminal. Let the list own queue state so a dispatched retry cannot
+  // leave behind a stale Cancel action.
+  const pendingRetryAt = activeRun?.retryAt ?? null;
+
+  async function cancelActiveRetry() {
+    if (!activeRun || !pendingRetryAt) return;
+    setCancellingRetry(true);
+    try {
+      await api.post(`/api/companies/${company.id}/runs/${activeRun.id}/cancel-retry`, {});
+      setRuns(
+        (current) =>
+          current?.map((run) =>
+            run.id === activeRun.id ? { ...run, retryAt: null, continuationPending: false } : run,
+          ) ?? null,
+      );
+      setLog((current) =>
+        current ? { ...current, retryAt: null, continuationPending: false } : current,
+      );
+    } catch (err) {
+      void dialog.error(err, {
+        title: activeRun.continuationPending
+          ? "Couldn’t cancel the continuation"
+          : "Couldn’t cancel the retry",
+      });
+      await loadRuns();
+    } finally {
+      setCancellingRetry(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {activeRun && (
+        <RunPauseNotice
+          status={log?.status ?? activeRun.status}
+          pauseCount={log?.pauseCount ?? activeRun.pauseCount}
+          pausedAt={log?.pausedAt ?? activeRun.pausedAt}
+          pauseReason={log?.pauseReason ?? activeRun.pauseReason}
+        />
+      )}
+      <RunContinuationNotice
+        continuationPending={activeRun?.continuationPending}
+        continuationStopReason={activeRun?.continuationStopReason}
+        followUpRun={activeRun?.followUpRun}
+        onOpenRun={
+          activeRun?.followUpRun?.id !== activeId
+            ? (next) => {
+                setRuns((current) =>
+                  current?.some((run) => run.id === next.id) ? current : [next, ...(current ?? [])],
+                );
+                setActiveId(next.id);
+              }
+            : undefined
+        }
+      />
+      <RunFailureNotice reason={log?.failureReason ?? activeRun?.failureReason} />
+      <div
+        className={clsx("flex flex-col gap-3", !compact && "md:flex-row")}
+        style={{ minHeight: 460 }}
+      >
+        <aside
+          className={clsx(
+            "max-h-48 w-full shrink-0 overflow-y-auto rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-950",
+            !compact && "md:max-h-none md:w-64",
+          )}
+        >
+          <ul className="flex flex-col">
+            {runs.map((r) => (
+              <li key={r.id}>
+                <button
+                  onClick={() => setActiveId(r.id)}
+                  className={
+                    "flex w-full flex-col gap-0.5 border-b border-slate-100 px-3 py-2 text-left text-xs dark:border-slate-800 " +
+                    (r.id === activeId
+                      ? "bg-indigo-50 dark:bg-indigo-500/10"
+                      : "hover:bg-slate-50 dark:hover:bg-slate-800/60")
+                  }
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <RunStatusChip
+                      status={r.status}
+                      errorKind={r.errorKind}
+                      pauseCount={r.pauseCount}
+                      size="xs"
+                    />
+                    {r.followUpRun && (
+                      <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                        {runFollowUpLabel(r.followUpRun)}
+                      </span>
+                    )}
+                    {r.status !== "reviewed" && r.outcomeVerdict && (
+                      <RunOutcomeChip verdict={r.outcomeVerdict} note={r.outcomeNote} size="xs" />
+                    )}
+                    {r.status !== "reviewed" && r.checksVerdict && (
+                      <RunChecksChip verdict={r.checksVerdict} size="xs" />
+                    )}
+                    {r.exitCode !== null && (
+                      <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                        exit {r.exitCode}
+                      </span>
+                    )}
+                    {(r.attempt ?? 1) > 1 && (
+                      <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                        attempt {r.attempt}
+                      </span>
+                    )}
+                    {(r.continuationCount ?? 0) > 0 && (
+                      <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                        continuation {r.continuationCount}
+                      </span>
+                    )}
+                    {r.retryAt && (
+                      <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                        {r.continuationPending ? "Continuation scheduled" : "retry"}{" "}
+                        {timeUntil(r.retryAt)}
+                      </span>
+                    )}
+                    {(r.missedSlots ?? 0) > 0 && (
+                      <span
+                        className="text-[10px] text-amber-600 dark:text-amber-400"
+                        title="More scheduled occurrences this Run covers: missed while the server was unavailable, or due while it waited to start"
+                      >
+                        +{r.missedSlots} missed
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-slate-700 dark:text-slate-200">
+                    {new Date(r.startedAt).toLocaleString()}
+                  </div>
+                  <div className="text-slate-400 dark:text-slate-500">
+                    {r.status === "queued"
+                      ? isRunPaused(r)
+                        ? r.pauseReason === "outage"
+                          ? "Paused for its AI Model"
+                          : "Paused for a restart"
+                        : "Waiting to start"
+                      : formatDuration(r.startedAt, r.finishedAt)}
+                  </div>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </aside>
+        <div
+          className={
+            "grid min-w-0 flex-1 gap-3 " +
+            (recordings.length > 0 && !compact ? "xl:grid-cols-2" : "")
+          }
+        >
+          <RunLogPane
+            log={log}
+            loading={loadingLog}
+            placeholder={
+              logLoadError ??
+              ((log?.status ?? activeRun?.status) === "queued"
+                ? "Waiting to start. If a Standdown covers this Run, it resumes after the Standdown is lifted."
+                : "(empty log)")
+            }
+            className="h-full max-h-[60vh] min-h-[400px]"
+          />
+          {recordings.length > 0 && activeId && (
+            <RunBrowserRecordingsPane
+              companyId={company.id}
+              runId={activeId}
+              recordings={recordings}
+              className="min-h-[400px] max-h-[60vh]"
+            />
+          )}
+        </div>
+      </div>
+      {(log?.status ?? activeRun?.status) === "reviewed" && (
+        <RunReviewNotice companySlug={company.slug} />
+      )}
+      {/* What the server saw, under what the model said. Keyed on the run so
+          switching selection in the list re-reads both, and on the terminal
+          status so a run finishing while it is open picks up the Check results
+          that only exist once the loop has returned. */}
+      {activeId && (
+        <div className={clsx("grid min-w-0 gap-3", !compact && "xl:grid-cols-2")}>
+          <RunChecksStrip
+            companyId={company.id}
+            runId={activeId}
+            reloadKey={`${log?.status ?? ""}:${log?.checksVerdict ?? ""}`}
+            className="max-h-72"
+          />
+          <RunEffectsPane
+            companyId={company.id}
+            runId={activeId}
+            reloadKey={`${log?.status ?? ""}:${log?.checksVerdict ?? ""}`}
+            className="max-h-72"
+          />
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3 dark:border-slate-800">
+        <div className="text-xs text-slate-500 dark:text-slate-400">
+          {pendingRetryAt
+            ? activeRun?.continuationPending
+              ? `Unfinished work will continue from saved progress ${timeUntil(pendingRetryAt)}.`
+              : `Automatic recovery is scheduled ${timeUntil(pendingRetryAt)}. Cancel it before running manually to avoid two Runs.`
+            : activeRun?.status === "interrupted" || activeRun?.errorKind === "interrupted"
+              ? "This Run was interrupted. Review its recorded reason, log, and Effects before running it again; work already done may repeat."
+              : activeRun?.status === "failed"
+                ? "This Run did not complete its intended work. Review the reason before running it again."
+                : isRunError(activeRun?.status)
+                  ? "This Run encountered an error. Review the log before running it again."
+                  : "Showing the 50 most recent runs."}
+        </div>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {activeRun && (
+            <RunResumeButton
+              company={company}
+              routineName={routine.name}
+              run={activeRun}
+              onResumed={async (next) => {
+                setRuns((current) => [
+                  next,
+                  ...(current ?? []).filter((run) => run.id !== next.id),
+                ]);
+                setActiveId(next.id);
+                await loadRuns();
+              }}
+            />
+          )}
+          {pendingRetryAt && !activeRun?.followUpRun ? (
+            <Button variant="secondary" onClick={cancelActiveRetry} loading={cancellingRetry}>
+              <Ban size={14} />
+              {activeRun?.continuationPending ? "Cancel continuation" : "Cancel retry"}
+            </Button>
+          ) : !followUpNeedsPolling(activeRun?.followUpRun) ? (
+            <Button variant="secondary" onClick={() => void runNow()} loading={starting}>
+              <Play size={14} /> Run now
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ────────────────────────────── Settings ────────────────────────────────
+
+function SettingsTab({
+  company,
+  routine,
+  folders,
+  onSaved,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  folders: RoutineFolder[];
+  onSaved: () => Promise<void>;
+}) {
+  const navigate = useNavigate();
+  const dialog = useDialog();
+  const emp = routine.employee;
+
+  const [name, setName] = React.useState(routine.name);
+  const [cronExpr, setCronExpr] = React.useState(routine.cronExpr);
+  // Same re-seed discipline as the folder and goal pickers below: an AI
+  // Employee rescheduling this routine through `update_routine`, or another
+  // Member editing it, must not be silently undone by someone here saving an
+  // unrelated setting — `save()` always sends `cronExpr`.
+  React.useEffect(() => {
+    setCronExpr(routine.cronExpr);
+  }, [routine.id, routine.cronExpr]);
+  // "" is the unfiled choice — the routine sits in no folder at all.
+  const [folderId, setFolderId] = React.useState(routine.folderId ?? "");
+
+  // Re-seed when the routine reloads (a bulk move from the list, another
+  // Member filing it, the folder being deleted underneath us). Without this the
+  // picker held whatever it was mounted with, and saving an unrelated setting
+  // re-filed the routine — or 400'd on a folder id that no longer exists.
+  React.useEffect(() => {
+    const current = routine.folderId ?? "";
+    setFolderId(current && !folders.some((f) => f.id === current) ? "" : current);
+  }, [routine.id, routine.folderId, folders]);
+  // "" is the unlinked choice — the routine serves no goal.
+  const [goalId, setGoalId] = React.useState(routine.goalId ?? "");
+  const [goals, setGoals] = React.useState<Goal[]>([]);
+  // Same re-seed discipline as the folder picker: another Member linking the
+  // routine, or the goal being deleted underneath us (which unlinks it
+  // server-side), must not be undone by saving an unrelated setting.
+  React.useEffect(() => {
+    setGoalId(routine.goalId ?? "");
+  }, [routine.id, routine.goalId]);
+  const [timeoutSec, setTimeoutSec] = React.useState(routine.timeoutSec ?? DEFAULT_TIMEOUT_SEC);
+  const [requiresApproval, setRequiresApproval] = React.useState(routine.requiresApproval ?? false);
+  const [priority, setPriority] = React.useState<RoutinePriority>(
+    routinePriorityOf(routine.priority),
+  );
+  // Same re-seed discipline as the schedule: another owner moving this Routine
+  // up or down the queue must not be undone by a save of an unrelated setting.
+  React.useEffect(() => {
+    setPriority(routinePriorityOf(routine.priority));
+  }, [routine.id, routine.priority]);
+  // "" is the inherit choice — the routine follows the employee's active model.
+  const [modelId, setModelId] = React.useState(routine.modelId ?? "");
+  const [models, setModels] = React.useState<AIModel[] | null>(null);
+  // Tri-state: "inherit" reads as null, "on"/"off" force a boolean override.
+  const [catchUpPolicy, setCatchUpPolicy] = React.useState<CatchUpPolicy>(
+    routine.catchUpPolicy ?? "once",
+  );
+  const [maxAttempts, setMaxAttempts] = React.useState(routine.maxAttempts ?? 1);
+  const [retryBackoffSec, setRetryBackoffSec] = React.useState(routine.retryBackoffSec ?? 60);
+  const [retryOnTimeout, setRetryOnTimeout] = React.useState(routine.retryOnTimeout ?? false);
+  const [acceptanceCriteria, setAcceptanceCriteria] = React.useState(
+    routine.acceptanceCriteria ?? "",
+  );
+  const [browserOverride, setBrowserOverride] = React.useState<"inherit" | "on" | "off">(
+    routine.browserEnabledOverride === true
+      ? "on"
+      : routine.browserEnabledOverride === false
+        ? "off"
+        : "inherit",
+  );
+  const [memberBrowserId, setMemberBrowserId] = React.useState<string | null>(
+    routine.memberBrowserId ?? null,
+  );
+  const [memberBrowsers, setMemberBrowsers] = React.useState<MemberBrowser[]>([]);
+  const [webhookEnabled, setWebhookEnabled] = React.useState(routine.webhookEnabled);
+  const [webhookToken, setWebhookToken] = React.useState(routine.webhookToken);
+  const [regenerating, setRegenerating] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [webhookError, setWebhookError] = React.useState<string | null>(null);
+  const [webhookNotice, setWebhookNotice] = React.useState<string | null>(null);
+  // How many Checks and Triggers there are, reported by their cards for the
+  // Advanced summary. `null` until each has loaded.
+  const [checkCount, setCheckCount] = React.useState<number | null>(null);
+  const [triggerCount, setTriggerCount] = React.useState<number | null>(null);
+  const criteriaId = React.useId();
+
+  React.useEffect(() => {
+    if (!emp) return;
+    api
+      .get<AIModel[]>(`/api/companies/${company.id}/employees/${emp.id}/models`)
+      .then((list) => {
+        setModels(list);
+        // A pin can dangle if the model was removed out from under us. Show
+        // inherit, which is what the runner would fall back to anyway.
+        setModelId((cur) => (cur && !list.some((m) => m.id === cur) ? "" : cur));
+      })
+      .catch(() => setModels([]));
+  }, [company.id, emp]);
+
+  React.useEffect(() => {
+    api
+      .get<Goal[]>(`/api/companies/${company.id}/goals`)
+      .then((list) => {
+        setGoals(list);
+        // A link can dangle if the goal was deleted out from under us. Show
+        // "None", which is what the server holds by then anyway.
+        setGoalId((cur) => (cur && !list.some((g) => g.id === cur) ? "" : cur));
+      })
+      .catch(() => setGoals([]));
+  }, [company.id]);
+
+  React.useEffect(() => {
+    if (!emp) return;
+    api
+      .get<MemberBrowser[]>(`/api/companies/${company.id}/member-browsers/for-employee/${emp.id}`)
+      // Keep unavailable browsers in the picker so a legacy Routine does not
+      // render as if it silently switched back to Genosyn's browser. They stay
+      // disabled until their owner re-confirms unattended recording consent.
+      .then(setMemberBrowsers)
+      .catch(() => setMemberBrowsers([]));
+  }, [company.id, emp]);
+
+  async function toggleWebhook(next: boolean) {
+    setWebhookError(null);
+    setWebhookNotice(null);
+    try {
+      const updated = await api.post<Routine>(
+        `/api/companies/${company.id}/routines/${routine.id}/webhook`,
+        { enabled: next },
+      );
+      setWebhookEnabled(updated.webhookEnabled);
+      setWebhookToken(updated.webhookToken);
+    } catch (err) {
+      setWebhookError(errorMessage(err));
+    }
+  }
+
+  async function save() {
+    setSaving(true);
+    setError(null);
+    try {
+      // `enabled` is not sent: the switch at the top of the page owns it, and a
+      // Save here must never put back a state somebody has since changed.
+      await api.patch(`/api/companies/${company.id}/routines/${routine.id}`, {
+        name,
+        cronExpr,
+        timeoutSec,
+        requiresApproval,
+        priority,
+        folderId: folderId || null,
+        goalId: goalId || null,
+        modelId: modelId || null,
+        browserEnabledOverride:
+          browserOverride === "on" ? true : browserOverride === "off" ? false : null,
+        memberBrowserId,
+        catchUpPolicy,
+        maxAttempts,
+        retryBackoffSec,
+        retryOnTimeout,
+        acceptanceCriteria,
+      });
+      // The slug is stable across renames, so the address survives — but the
+      // list behind it has to reload before the header shows the new name.
+      await onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // The server computes `isActive` live, so this is the brain "Inherit" means.
+  const activeModel = (models ?? []).find((m) => m.isActive) ?? null;
+  const pinnedModelMissing =
+    models !== null && !!routine.modelId && !models.some((m) => m.id === routine.modelId);
+  const webhookUrl =
+    webhookEnabled && webhookToken
+      ? `${window.location.origin}/api/webhooks/r/${routine.id}/${webhookToken}`
+      : null;
+
+  const advancedSummary = describeRoutineAdvanced({
+    folderPath: folders.find((f) => f.id === folderId)?.path ?? null,
+    timeoutSec,
+    requiresApproval,
+    checks: checkCount,
+    priority,
+    modelPinned: modelId !== "",
+    browserEnabledOverride:
+      browserOverride === "on" ? true : browserOverride === "off" ? false : null,
+    memberBrowser: memberBrowserId !== null,
+    catchUpPolicy,
+    maxAttempts,
+    retryBackoffSec,
+    retryOnTimeout,
+    triggers: triggerCount,
+    webhookEnabled,
+  });
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Card>
+        <CardBody className="flex flex-col gap-4">
+          <SectionLabel>Basics</SectionLabel>
+          <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+
+          <ScheduleField value={cronExpr} onChange={setCronExpr} />
+
+          <div className="flex flex-col gap-1">
+            <Select label="Goal" value={goalId} onChange={(e) => setGoalId(e.target.value)}>
+              <option value="">None</option>
+              {[...goals]
+                .sort((a, b) => Number(a.status !== "active") - Number(b.status !== "active"))
+                .map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.status === "active" ? g.title : `${g.title} (${g.status})`}
+                  </option>
+                ))}
+            </Select>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              {goals.length === 0
+                ? "No goals yet — create one on the Goals page."
+                : "The objective this routine’s work serves."}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <label
+              htmlFor={criteriaId}
+              className="text-sm font-medium text-slate-700 dark:text-slate-300"
+            >
+              What counts as done
+            </label>
+            <textarea
+              id={criteriaId}
+              aria-describedby={`${criteriaId}-hint`}
+              value={acceptanceCriteria}
+              onChange={(e) => setAcceptanceCriteria(e.target.value)}
+              rows={4}
+              maxLength={4000}
+              placeholder={
+                'What must be true for a run to count — e.g. "The digest was posted to #general and covers every failed run since the last digest."'
+              }
+              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:border-indigo-400 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:placeholder:text-slate-500"
+            />
+            <div id={`${criteriaId}-hint`} className="text-xs text-slate-500 dark:text-slate-400">
+              The acceptance criteria, in plain language. They ride along in every run&apos;s brief,
+              and after a completed run a restricted checker grades the work against them; an
+              off-goal run notifies the company&apos;s owners and admins, plus this employee&apos;s
+              manager. Leave empty to switch the check off.
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      {/* Everything past the basics. The cards stay mounted while this is
+          closed: Checks and Triggers load their own rows, and the summary needs
+          their counts. Checks, Triggers and the Webhook save as you change
+          them; the rest rides the Save button below. */}
+      <Disclosure variant="row" title="Advanced" summary={advancedSummary} keepMounted>
+        <div className="flex flex-col gap-4">
+          <Card>
+            <CardBody className="flex flex-col gap-4">
+              <SectionLabel>Folder, timeout and approval</SectionLabel>
+              <div className="flex flex-col gap-1">
+                <Select
+                  label="Folder"
+                  value={folderId}
+                  onChange={(e) => setFolderId(e.target.value)}
+                >
+                  <option value="">Unfiled</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.path}
+                    </option>
+                  ))}
+                </Select>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {folders.length === 0
+                    ? "No folders yet — create one from the Routines sidebar."
+                    : "Where this routine lives. Use tags for what it’s about; a routine has one folder and any number of tags."}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Input
+                  label="Timeout (seconds)"
+                  type="number"
+                  min={10}
+                  max={21600}
+                  value={String(timeoutSec)}
+                  onChange={(e) => setTimeoutSec(Math.max(10, Number(e.target.value) || DEFAULT_TIMEOUT_SEC))}
+                />
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Stop after this long. The Run is marked <strong>Error</strong>, with a timeout
+                  reason.
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                  <input
+                    type="checkbox"
+                    checked={requiresApproval}
+                    onChange={(e) => setRequiresApproval(e.target.checked)}
+                  />
+                  Require approval before each scheduled run
+                </label>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Manual &quot;Run now&quot; still runs immediately — a human is already in the
+                  loop.
+                </div>
+              </div>
+            </CardBody>
+          </Card>
+
+          <ChecksCard company={company} routine={routine} onCount={setCheckCount} />
+
+          <Card>
+            <CardBody className="flex flex-col gap-4">
+              <SectionLabel>Execution</SectionLabel>
+              <div className="flex flex-col gap-1.5">
+                <span
+                  id={`${criteriaId}-priority`}
+                  className="text-sm font-medium text-slate-700 dark:text-slate-300"
+                >
+                  Priority
+                </span>
+                <div
+                  role="group"
+                  aria-labelledby={`${criteriaId}-priority`}
+                  aria-describedby={`${criteriaId}-priority-hint`}
+                  className="flex gap-1 rounded-md border border-slate-200 p-0.5 text-xs dark:border-slate-700"
+                >
+                  {ROUTINE_PRIORITY_OPTIONS.map(({ value, label }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      aria-pressed={priority === value}
+                      onClick={() => setPriority(value)}
+                      className={
+                        "flex flex-1 items-center justify-center gap-1 rounded px-2 py-1 transition " +
+                        (priority === value
+                          ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300"
+                          : "text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800")
+                      }
+                    >
+                      {value === "high" && <ChevronsUp size={12} aria-hidden="true" />}
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div
+                  id={`${criteriaId}-priority-hint`}
+                  className="text-xs text-slate-500 dark:text-slate-400"
+                >
+                  {routinePriorityHelp(priority)}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <Select
+                  label="Model"
+                  value={modelId}
+                  disabled={models === null}
+                  onChange={(e) => setModelId(e.target.value)}
+                >
+                  <option value="">
+                    {activeModel
+                      ? `Inherit — ${activeModel.provider} · ${activeModel.model}`
+                      : "Inherit the employee's active model"}
+                  </option>
+                  {(models ?? [])
+                    .filter((m) => m.id !== activeModel?.id)
+                    .map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.provider} · {m.model}
+                      </option>
+                    ))}
+                </Select>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {pinnedModelMissing
+                    ? "The model this routine was pinned to is gone. It now inherits the employee's active model."
+                    : "Inherit follows whichever model is active for the employee. Pinning applies to this routine's Runs only — employee Chat has its own per-message model picker."}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  Browser access
+                </span>
+                <div className="flex gap-1 rounded-md border border-slate-200 p-0.5 text-xs dark:border-slate-700">
+                  {(
+                    [
+                      ["inherit", "Inherit"],
+                      ["on", "Force on"],
+                      ["off", "Force off"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setBrowserOverride(value)}
+                      className={
+                        "flex-1 rounded px-2 py-1 transition " +
+                        (browserOverride === value
+                          ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300"
+                          : "text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800")
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Inherit uses the employee&apos;s Browser access setting. An override applies only
+                  to this routine&apos;s runs.
+                </div>
+              </div>
+
+              {memberBrowsers.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                    Which browser
+                  </span>
+                  <Select
+                    aria-label="Browser this routine runs in"
+                    value={memberBrowserId ?? ""}
+                    onChange={(e) => setMemberBrowserId(e.target.value || null)}
+                  >
+                    <option value="">Genosyn&apos;s browser</option>
+                    {memberBrowsers.map((browser) => (
+                      <option
+                        key={browser.id}
+                        value={browser.id}
+                        disabled={!browser.allowUnattended}
+                      >
+                        {browser.name}
+                        {browser.routineRecordingConsentRequired
+                          ? " (needs re-confirmation)"
+                          : !browser.allowUnattended
+                            ? " (unavailable for Routines)"
+                            : ""}
+                      </option>
+                    ))}
+                  </Select>
+                  {memberBrowserId &&
+                    memberBrowsers.some(
+                      (browser) =>
+                        browser.id === memberBrowserId && browser.routineRecordingConsentRequired,
+                    ) && (
+                      <div className="text-xs text-amber-700 dark:text-amber-300">
+                        Its owner needs to turn scheduled Routine use on again under the new
+                        recording notice in Settings → Browsers.
+                      </div>
+                    )}
+                  {memberBrowserId &&
+                    memberBrowsers.some(
+                      (browser) =>
+                        browser.id === memberBrowserId &&
+                        !browser.allowUnattended &&
+                        !browser.routineRecordingConsentRequired,
+                    ) && (
+                      <div className="text-xs text-amber-700 dark:text-amber-300">
+                        This browser is not available to scheduled Routines. Its owner can enable it
+                        in Settings → Browsers.
+                      </div>
+                    )}
+                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                    A routine fires on a schedule with nobody watching. If you point it at a browser
+                    on your own computer and that computer is asleep when the routine runs, the run
+                    fails rather than quietly using a different browser.
+                  </div>
+                </div>
+              )}
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardBody className="flex flex-col gap-4">
+              <SectionLabel>Reliability</SectionLabel>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                  After downtime
+                </span>
+                <div className="flex gap-1 rounded-md border border-slate-200 p-0.5 text-xs dark:border-slate-700">
+                  {(
+                    [
+                      ["once", "Run once"],
+                      ["skip", "Skip"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setCatchUpPolicy(value)}
+                      className={
+                        "flex-1 rounded px-2 py-1 transition " +
+                        (catchUpPolicy === value
+                          ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300"
+                          : "text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800")
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  A routine fires once after an outage, never once per missed slot. Skip suppresses
+                  that catch-up run when the slot is already more than a minute late — for work
+                  that&apos;s only useful on time.
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Input
+                  label="Attempts"
+                  type="number"
+                  min={1}
+                  max={5}
+                  value={String(maxAttempts)}
+                  onChange={(e) =>
+                    setMaxAttempts(Math.min(5, Math.max(1, Number(e.target.value) || 1)))
+                  }
+                />
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Counting the first. At 1, ordinary failure and Error retries are off. Saved
+                  unfinished work still continues automatically within the original time limit. An
+                  initial scheduled Run on an enabled routine without an approval gate receives one
+                  recovery attempt after an hour if a restart interrupts it. Retries re-run the
+                  whole brief and may repeat actions. Use Cancel retry on the Run if repeating its
+                  actions would be unsafe.
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Input
+                  label="Retry backoff (seconds)"
+                  type="number"
+                  min={10}
+                  max={21600}
+                  disabled={maxAttempts <= 1}
+                  value={String(retryBackoffSec)}
+                  onChange={(e) => setRetryBackoffSec(Math.max(10, Number(e.target.value) || 60))}
+                />
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {maxAttempts <= 1
+                    ? "Interrupted Runs use a fixed one-hour recovery delay while Attempts is 1."
+                    : `Doubles each attempt with jitter — roughly ${backoffPreview(retryBackoffSec, maxAttempts)}.`}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                  <input
+                    type="checkbox"
+                    disabled={maxAttempts <= 1}
+                    checked={retryOnTimeout}
+                    onChange={(e) => setRetryOnTimeout(e.target.checked)}
+                  />
+                  Retry runs that timed out
+                </label>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Off by default: a timed-out Run re-burns its full time budget on the retry.
+                </div>
+              </div>
+            </CardBody>
+          </Card>
+
+          <TriggersCard company={company} routine={routine} onCount={setTriggerCount} />
+
+          <Card>
+            <CardBody className="flex flex-col gap-2">
+              <SectionLabel>Webhook</SectionLabel>
+              <div className="flex items-center justify-between gap-2">
+                <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                  <input
+                    type="checkbox"
+                    checked={webhookEnabled}
+                    onChange={(e) => toggleWebhook(e.target.checked)}
+                  />
+                  Trigger via incoming webhook
+                </label>
+                {webhookEnabled && webhookToken && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    loading={regenerating}
+                    onClick={async () => {
+                      setRegenerating(true);
+                      try {
+                        await toggleWebhook(false);
+                        await toggleWebhook(true);
+                      } finally {
+                        setRegenerating(false);
+                      }
+                    }}
+                  >
+                    Regenerate token
+                  </Button>
+                )}
+              </div>
+              <FormError message={webhookError} />
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                External systems POST here to fire this routine. The URL itself is the credential —
+                keep it secret. This one saves immediately.
+              </div>
+              {webhookUrl && (
+                <div className="flex items-center gap-1">
+                  <code className="min-w-0 flex-1 truncate rounded bg-slate-50 px-2 py-1 font-mono text-[11px] text-slate-800 dark:bg-slate-800 dark:text-slate-100">
+                    {webhookUrl}
+                  </code>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={async () => {
+                      setWebhookNotice(null);
+                      const ok = await copyToClipboard(webhookUrl);
+                      if (!ok) {
+                        void dialog.error("Could not access the clipboard.", {
+                          title: "Couldn’t copy the webhook URL",
+                        });
+                        return;
+                      }
+                      setWebhookNotice("Webhook URL copied.");
+                    }}
+                  >
+                    <Copy size={12} />
+                  </Button>
+                </div>
+              )}
+              <FormSuccess message={webhookNotice} />
+            </CardBody>
+          </Card>
+        </div>
+      </Disclosure>
+
+      <FormError message={error} />
+
+      <div className="flex gap-2">
+        <Button onClick={save} loading={saving}>
+          {saving ? "Saving…" : "Save changes"}
+        </Button>
+      </div>
+
+      <Card>
+        <CardBody className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+              Stand this routine down
+            </div>
+            <div className="mt-0.5 max-w-xl text-xs text-slate-500 dark:text-slate-400">
+              A revocable stop, for when this routine is doing damage and pausing it is not enough:
+              a Run in flight is interrupted, its retries defer rather than pile up, and skipped
+              slots still advance the schedule so lifting it later produces no catch-up storm. Chat
+              with the employee keeps working — this covers the routine only. Pausing is the
+              ordinary switch at the top of this page; this one records who stopped the work and
+              why.
+            </div>
+          </div>
+          <StanddownControl
+            company={company}
+            scope="routine"
+            scopeId={routine.id}
+            label={routine.name}
+          />
+        </CardBody>
+      </Card>
+
+      <Card className="border-rose-200 dark:border-rose-500/30">
+        <CardBody className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+              Delete this routine
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              The schedule and its brief go away. Past Run logs and browser recordings are deleted
+              with it.
+            </div>
+          </div>
+          <Button
+            variant="danger"
+            loading={deleting}
+            onClick={async () => {
+              const ok = await dialog.confirm({
+                title: `Delete routine "${routine.name}"?`,
+                message:
+                  "The schedule and its brief will be removed, along with this routine's Run logs and browser recordings.",
+                confirmLabel: "Delete routine",
+                variant: "danger",
+              });
+              if (!ok) return;
+              setDeleting(true);
+              try {
+                await api.del(`/api/companies/${company.id}/routines/${routine.id}`);
+                await onSaved();
+                navigate(`/c/${company.slug}/routines`, { replace: true });
+              } catch (err) {
+                void dialog.error(err, { title: "Couldn’t delete the routine" });
+              } finally {
+                setDeleting(false);
+              }
+            }}
+          >
+            <Trash2 size={14} /> Delete
+          </Button>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+// ───────────────────────────── Triggers ─────────────────────────────────
+
+/**
+ * Event subscriptions that fire this routine (M54). Like the Webhook card,
+ * everything here saves immediately through its own endpoints rather than
+ * riding the Save button — a trigger is its own row, not a field on the
+ * routine. Reads are member-level; the toggle, delete, and add form are
+ * admin-only.
+ */
+function TriggersCard({
+  company,
+  routine,
+  onCount,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  /** Told how many Triggers there are each time the list loads, for the Advanced summary. */
+  onCount?: (count: number) => void;
+}) {
+  const [data, setData] = React.useState<RoutineTriggerList | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [rowError, setRowError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState<`${"toggle" | "remove"}:${string}` | null>(null);
+  const canManage = company.role === "owner" || company.role === "admin";
+
+  const reload = React.useCallback(async () => {
+    try {
+      setData(
+        await api.get<RoutineTriggerList>(
+          `/api/companies/${company.id}/routine-triggers/routine/${routine.id}`,
+        ),
+      );
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the triggers"));
+      setData({ kinds: [], triggers: [] });
+    }
+  }, [company.id, routine.id]);
+
+  React.useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  React.useEffect(() => {
+    if (data) onCount?.(data.triggers.length);
+  }, [data, onCount]);
+
+  // Trigger changes ride the routine's own live-sync kind, scoped by
+  // routineId — another admin's edit lands here without a manual refresh.
+  useLiveRefetch("routine", reload, routine.id);
+
+  async function toggle(trigger: RoutineTrigger, enabled: boolean) {
+    setBusy(`toggle:${trigger.id}`);
+    setRowError(null);
+    try {
+      await api.patch(`/api/companies/${company.id}/routine-triggers/${trigger.id}`, { enabled });
+      await reload();
+    } catch (err) {
+      setRowError(errorMessage(err, "Could not update the trigger"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove(trigger: RoutineTrigger) {
+    setBusy(`remove:${trigger.id}`);
+    setRowError(null);
+    try {
+      await api.del(`/api/companies/${company.id}/routine-triggers/${trigger.id}`);
+      await reload();
+    } catch (err) {
+      setRowError(errorMessage(err, "Could not delete the trigger"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardBody className="flex flex-col gap-3">
+        <SectionLabel>Triggers</SectionLabel>
+        <div className="text-xs text-slate-500 dark:text-slate-400">
+          Fires this routine when the chosen resource family changes anywhere in the company — an
+          approval first when the routine is gated.
+        </div>
+        {loadError ? (
+          <FormError message={loadError} />
+        ) : data === null ? (
+          <Spinner />
+        ) : (
+          <>
+            <FormError message={rowError} />
+            {data.triggers.length > 0 && (
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                {data.triggers.map((trigger) => (
+                  <li
+                    key={trigger.id}
+                    className="flex items-center gap-3 py-2 first:pt-0 last:pb-0"
+                  >
+                    <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-[11px] font-medium text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                      <Zap size={10} className="mr-1 inline-block" aria-hidden="true" />
+                      {trigger.kind}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm text-slate-600 dark:text-slate-300">
+                      at most every {Math.round(trigger.minIntervalSec / 60)}min
+                    </span>
+                    <span
+                      className="shrink-0 text-xs text-slate-400 dark:text-slate-500"
+                      title={
+                        trigger.lastFiredAt
+                          ? new Date(trigger.lastFiredAt).toLocaleString()
+                          : undefined
+                      }
+                    >
+                      {trigger.lastFiredAt
+                        ? `last fired ${timeAgo(trigger.lastFiredAt)}`
+                        : "never fired"}
+                    </span>
+                    {canManage && (
+                      <>
+                        <EnabledToggle
+                          enabled={trigger.enabled}
+                          label={`${trigger.enabled ? "Disable" : "Enable"} the ${trigger.kind} trigger`}
+                          disabled={busy !== null}
+                          onChange={(next) => void toggle(trigger, next)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void remove(trigger)}
+                          disabled={busy !== null}
+                          aria-busy={busy === `remove:${trigger.id}` || undefined}
+                          aria-label={`Delete the ${trigger.kind} trigger`}
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-red-600 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-red-400"
+                        >
+                          {busy === `remove:${trigger.id}` ? (
+                            <ButtonSpinner size={14} />
+                          ) : (
+                            <Trash2 size={14} />
+                          )}
+                        </button>
+                      </>
+                    )}
+                    {!canManage && !trigger.enabled && (
+                      <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                        off
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {data.triggers.length === 0 && !canManage && (
+              <div className="text-sm text-slate-400 dark:text-slate-500">
+                No triggers — this routine fires on its schedule only.
+              </div>
+            )}
+            {canManage && (
+              <AddTriggerForm
+                company={company}
+                routine={routine}
+                kinds={data.kinds}
+                onAdded={() => void reload()}
+              />
+            )}
+          </>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function AddTriggerForm({
+  company,
+  routine,
+  kinds,
+  onAdded,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  kinds: string[];
+  onAdded: () => void;
+}) {
+  const [kind, setKind] = React.useState("");
+  const [minutes, setMinutes] = React.useState(15);
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!kind) {
+      setError("Pick what to listen for.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await api.post(`/api/companies/${company.id}/routine-triggers`, {
+        routineId: routine.id,
+        kind,
+        minIntervalSec: minutes * 60,
+      });
+      setKind("");
+      setMinutes(15);
+      onAdded();
+    } catch (err) {
+      setError(errorMessage(err, "Could not add the trigger"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form
+      onSubmit={save}
+      className="flex flex-col gap-3 border-t border-slate-100 pt-3 dark:border-slate-800"
+    >
+      <FormError message={error} />
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="min-w-40 flex-1">
+          <Select label="When this changes" value={kind} onChange={(e) => setKind(e.target.value)}>
+            <option value="">Choose a resource family…</option>
+            {kinds.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div className="w-40">
+          <Input
+            label="At most every (min)"
+            type="number"
+            min={1}
+            max={10080}
+            value={String(minutes)}
+            onChange={(e) =>
+              setMinutes(Math.min(10080, Math.max(1, Math.round(Number(e.target.value) || 15))))
+            }
+          />
+        </div>
+        <Button type="submit" size="sm" loading={saving}>
+          {saving ? "Adding…" : "Add trigger"}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+// ────────────────────────────── Checks ──────────────────────────────────
+
+/**
+ * The **Checks** on this routine, the counterpart of its acceptance criteria.
+ *
+ * The two answer the same question from opposite sides. Acceptance criteria
+ * are the bar a model judges: prose, read by a restricted checker against a
+ * transcript the graded model wrote. A Check is the bar the server judges —
+ * a command that exited 0, or a write the effect ledger actually contains.
+ * Setting them side by side is what stops a Routine from being tuned against
+ * whichever bar is easier to satisfy.
+ *
+ * Like the Webhook and Triggers cards, everything here saves immediately
+ * through its own endpoints rather than riding the page's Save button: a Check
+ * is its own row, not a field on the routine. Reads are member-level and every
+ * mutation is admin-gated at the route — the graded party cannot author its
+ * own bar, which is the entire point of the primitive.
+ */
+function ChecksCard({
+  company,
+  routine,
+  onCount,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  /** Told how many Checks there are each time the list loads, for the Advanced summary. */
+  onCount?: (count: number) => void;
+}) {
+  const [data, setData] = React.useState<RoutineCheckList | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [rowError, setRowError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState<`${"toggle" | "remove" | "move"}:${string}` | null>(null);
+  const [editing, setEditing] = React.useState<RoutineCheck | "new" | null>(null);
+  const dialog = useDialog();
+  const canManage = company.role === "owner" || company.role === "admin";
+
+  const reload = React.useCallback(async () => {
+    try {
+      setData(
+        await api.get<RoutineCheckList>(
+          `/api/companies/${company.id}/routines/${routine.id}/checks`,
+        ),
+      );
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load the checks"));
+      setData({ checks: [], commandChecks: { available: false } });
+    }
+  }, [company.id, routine.id]);
+
+  React.useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  React.useEffect(() => {
+    if (data) onCount?.(data.checks.length);
+  }, [data, onCount]);
+
+  const checks = data?.checks ?? [];
+  const atLimit = checks.length >= MAX_CHECKS_PER_ROUTINE;
+
+  async function toggle(check: RoutineCheck, enabled: boolean) {
+    setBusy(`toggle:${check.id}`);
+    setRowError(null);
+    try {
+      await api.patch(`/api/companies/${company.id}/routines/${routine.id}/checks/${check.id}`, {
+        enabled,
+      });
+      await reload();
+    } catch (err) {
+      setRowError(errorMessage(err, "Could not update the check"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove(check: RoutineCheck) {
+    const ok = await dialog.confirm({
+      title: `Delete the check "${check.name}"?`,
+      message:
+        "Runs already graded against it keep their results — a result stays readable after its check is gone. Future Runs simply stop being asked.",
+      confirmLabel: "Delete check",
+      variant: "danger",
+    });
+    if (!ok) return;
+    setBusy(`remove:${check.id}`);
+    setRowError(null);
+    try {
+      await api.del(`/api/companies/${company.id}/routines/${routine.id}/checks/${check.id}`);
+      await reload();
+    } catch (err) {
+      setRowError(errorMessage(err, "Could not delete the check"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Moving one row is expressed as the whole new order, because that is what
+  // the server accepts: it refuses an order that does not list every check, so
+  // two admins reordering at once cannot interleave into a half-applied list.
+  async function move(index: number, delta: number) {
+    const next = [...checks];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setBusy(`move:${checks[index].id}`);
+    setRowError(null);
+    try {
+      await api.post(`/api/companies/${company.id}/routines/${routine.id}/checks/reorder`, {
+        orderedIds: next.map((c) => c.id),
+      });
+      await reload();
+    } catch (err) {
+      setRowError(errorMessage(err, "Could not reorder the checks"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardBody className="flex flex-col gap-3">
+        <SectionLabel>Checks</SectionLabel>
+        <div className="text-xs text-slate-500 dark:text-slate-400">
+          Machine-verifiable assertions a Run must pass before it can finish green. The acceptance
+          criteria under Basics are graded by a model reading a transcript; a Check is graded by the
+          server, which is why a Run cannot talk its way past one. A failed required Check earns up
+          to two remediation rounds inside the Run&apos;s own timeout, and then fails the Run. The
+          employee is shown its Checks in every brief — it should know the bar it is aimed at — and
+          no tool can create, edit, or delete one.
+        </div>
+        {loadError ? (
+          <FormError message={loadError} />
+        ) : data === null ? (
+          <Spinner />
+        ) : (
+          <>
+            <FormError message={rowError} />
+            {checks.length === 0 ? (
+              <div className="text-sm text-slate-400 dark:text-slate-500">
+                No checks — nothing about this routine&apos;s Runs is machine-verified.
+              </div>
+            ) : (
+              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                {checks.map((check, index) => (
+                  <li key={check.id} className="flex items-start gap-3 py-2 first:pt-0 last:pb-0">
+                    <span
+                      className={clsx(
+                        "mt-0.5 shrink-0 rounded-full px-2 py-0.5 font-mono text-[11px] font-medium",
+                        check.kind === "command"
+                          ? "bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-300"
+                          : "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200",
+                      )}
+                    >
+                      {check.kind}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={clsx(
+                            "text-sm font-medium",
+                            check.enabled
+                              ? "text-slate-800 dark:text-slate-100"
+                              : "text-slate-400 dark:text-slate-500",
+                          )}
+                        >
+                          {check.name}
+                        </span>
+                        {!check.required && <Badge>advisory</Badge>}
+                      </div>
+                      <div className="mt-0.5 break-words text-xs text-slate-500 dark:text-slate-400">
+                        {describeCheck(check)}
+                      </div>
+                    </div>
+                    {canManage && (
+                      <div className="flex shrink-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => void move(index, -1)}
+                          disabled={busy !== null || index === 0}
+                          aria-label={`Move "${check.name}" earlier`}
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-30 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                        >
+                          <ArrowUp size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void move(index, 1)}
+                          disabled={busy !== null || index === checks.length - 1}
+                          aria-label={`Move "${check.name}" later`}
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-30 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                        >
+                          <ArrowDown size={14} />
+                        </button>
+                        <EnabledToggle
+                          enabled={check.enabled}
+                          label={`${check.enabled ? "Disable" : "Enable"} the check "${check.name}"`}
+                          disabled={busy !== null}
+                          onChange={(next) => void toggle(check, next)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setEditing(check)}
+                          disabled={busy !== null}
+                          aria-label={`Edit the check "${check.name}"`}
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void remove(check)}
+                          disabled={busy !== null}
+                          aria-busy={busy === `remove:${check.id}` || undefined}
+                          aria-label={`Delete the check "${check.name}"`}
+                          className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-red-600 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-red-400"
+                        >
+                          {busy === `remove:${check.id}` ? (
+                            <ButtonSpinner size={14} />
+                          ) : (
+                            <Trash2 size={14} />
+                          )}
+                        </button>
+                      </div>
+                    )}
+                    {!canManage && !check.enabled && (
+                      <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                        off
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {canManage && (
+              <div className="flex items-center gap-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={atLimit}
+                  onClick={() => setEditing("new")}
+                >
+                  <Plus size={14} /> Add a check
+                </Button>
+                <span className="text-xs text-slate-400 dark:text-slate-500">
+                  {atLimit
+                    ? `At the limit of ${MAX_CHECKS_PER_ROUTINE}. Remove one before adding another.`
+                    : `${checks.length} of ${MAX_CHECKS_PER_ROUTINE}. They run in this order.`}
+                </span>
+              </div>
+            )}
+          </>
+        )}
+
+        {editing && data && (
+          <CheckEditor
+            company={company}
+            routine={routine}
+            check={editing === "new" ? null : editing}
+            commandChecks={data.commandChecks}
+            onClose={() => setEditing(null)}
+            onSaved={async () => {
+              setEditing(null);
+              await reload();
+            }}
+          />
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * Create or edit one Check.
+ *
+ * The `command` option is disabled — with the server's own reason shown beside
+ * it — wherever command execution is unavailable. Checks follow the configured
+ * execution mode, so on disabled installs one could never pass,
+ * and letting somebody author it would produce a Routine that fails forever
+ * for a reason nothing on screen explains.
+ */
+function CheckEditor({
+  company,
+  routine,
+  check,
+  commandChecks,
+  onClose,
+  onSaved,
+}: {
+  company: Company;
+  routine: RoutineWithMeta;
+  check: RoutineCheck | null;
+  commandChecks: CommandChecksAvailability;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [draft, setDraft] = React.useState<CheckSpecDraft>(() => checkSpecDraft(check));
+  const [name, setName] = React.useState(check?.name ?? "");
+  const [timeoutSec, setTimeoutSec] = React.useState(check?.timeoutSec ?? 120);
+  const [required, setRequired] = React.useState(check?.required ?? true);
+  const [enabled, setEnabled] = React.useState(check?.enabled ?? true);
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function save(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!name.trim()) {
+      setError("Give the check a name — it is what the Run report and the brief call it.");
+      return;
+    }
+    const built = buildCheckSpec(draft);
+    if (!built.ok) {
+      setError(built.error);
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const body = {
+        name: name.trim(),
+        kind: draft.kind,
+        spec: built.spec,
+        required,
+        enabled,
+        timeoutSec,
+      };
+      if (check) {
+        await api.patch(
+          `/api/companies/${company.id}/routines/${routine.id}/checks/${check.id}`,
+          body,
+        );
+      } else {
+        await api.post(`/api/companies/${company.id}/routines/${routine.id}/checks`, body);
+      }
+      await onSaved();
+    } catch (err) {
+      setError(errorMessage(err, "Could not save the check"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title={check ? `Edit "${check.name}"` : "Add a check"}>
+      <form onSubmit={save} className="flex flex-col gap-4">
+        <FormError message={error} />
+
+        <Input
+          label="Name"
+          value={name}
+          maxLength={80}
+          placeholder="The digest actually reached Slack"
+          onChange={(e) => setName(e.target.value)}
+        />
+
+        <div className="flex flex-col gap-1.5">
+          <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+            What decides it
+          </span>
+          <div className="flex gap-1 rounded-md border border-slate-200 p-0.5 text-xs dark:border-slate-700">
+            {(
+              [
+                ["effect", "Effect assertion"],
+                ["command", "Command"],
+              ] as const
+            ).map(([value, label]) => {
+              const blocked = value === "command" && !commandChecks.available;
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  disabled={blocked}
+                  onClick={() => setDraft({ ...draft, kind: value })}
+                  className={clsx(
+                    "flex-1 rounded px-2 py-1 transition",
+                    draft.kind === value
+                      ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300"
+                      : "text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800",
+                    blocked && "cursor-not-allowed opacity-40 hover:bg-transparent",
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          {!commandChecks.available && (
+            <div className="text-xs text-amber-700 dark:text-amber-300">
+              {commandChecks.reason ??
+                "Command checks are unavailable on this Genosyn installation."}
+            </div>
+          )}
+        </div>
+
+        {draft.kind === "effect" ? (
+          <div className="flex flex-col gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              Counts what the server recorded this Run changing — not what the transcript says it
+              did — and passes when the count falls inside the window.
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Input
+                label="Action"
+                value={draft.action}
+                maxLength={80}
+                placeholder="mail.send"
+                className="font-mono"
+                onChange={(e) => setDraft({ ...draft, action: e.target.value })}
+              />
+              <Input
+                label="Target type (optional)"
+                value={draft.targetType}
+                maxLength={40}
+                placeholder="mail_message"
+                className="font-mono"
+                onChange={(e) => setDraft({ ...draft, targetType: e.target.value })}
+              />
+              <Input
+                label="At least"
+                type="number"
+                min={0}
+                value={draft.min}
+                onChange={(e) => setDraft({ ...draft, min: e.target.value })}
+              />
+              <Input
+                label="At most (optional)"
+                type="number"
+                min={0}
+                value={draft.max}
+                placeholder="no ceiling"
+                onChange={(e) => setDraft({ ...draft, max: e.target.value })}
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              Runs in the employee&apos;s working directory using this installation&apos;s command
+              execution mode. It passes on exit 0.
+            </div>
+            <Input
+              label="Command"
+              value={draft.command}
+              maxLength={2000}
+              placeholder="npm test --silent"
+              className="font-mono"
+              onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+            />
+            <div className="flex flex-col gap-1">
+              <Input
+                label="Timeout (seconds)"
+                type="number"
+                min={1}
+                max={900}
+                value={String(timeoutSec)}
+                onChange={(e) =>
+                  setTimeoutSec(Math.min(900, Math.max(1, Number(e.target.value) || 120)))
+                }
+              />
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                Also clamped by whatever is left of the Run&apos;s own timeout, so checks can never
+                extend it.
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-1">
+          <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+            <input
+              type="checkbox"
+              checked={required}
+              onChange={(e) => setRequired(e.target.checked)}
+            />
+            Required
+          </label>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            A required check that does not hold fails the Run. An advisory one reports its result
+            and changes nothing — the way to watch a signal before letting it stop work.
+          </div>
+        </div>
+
+        <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enabled
+        </label>
+
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={saving}>
+            {saving ? "Saving…" : check ? "Save check" : "Add check"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

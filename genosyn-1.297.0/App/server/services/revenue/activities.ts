@@ -1,0 +1,762 @@
+import { Brackets, In, IsNull, type SelectQueryBuilder } from "typeorm";
+
+import { AppDataSource } from "../../db/datasource.js";
+import {
+  type CursorValue,
+  decodeCursor,
+  encodeCursor,
+  filterFingerprint,
+  type KeysetColumn,
+  keysetRows,
+  type PageInfo,
+  pageNote,
+} from "../listPaging.js";
+import {
+  ACTIVITY_BODY_CAP,
+  Activity,
+  type ActivityPriority,
+  type ActivityKind,
+  type ActivityTaskStatus,
+} from "../../db/entities/Activity.js";
+import { Contact } from "../../db/entities/Contact.js";
+import { Deal } from "../../db/entities/Deal.js";
+import { Partnership } from "../../db/entities/Partnership.js";
+import { touchLastActivity } from "./contacts.js";
+import { assertRevenueLinks } from "./integrity.js";
+
+/**
+ * The activity timeline.
+ *
+ * Mostly written by machines rather than people — mail sync produces the bulk
+ * of it, the deal service adds stage changes, sequences add their touches. Those
+ * machine rows are immutable evidence. Manually logged notes, calls, meetings,
+ * and tasks may be corrected through the narrow administration functions below.
+ * That is the point: a CRM whose history depends on humans remembering to log
+ * calls is a CRM with no history, so the useful default is that opening a
+ * Contact shows every conversation without anyone having typed anything.
+ *
+ * Writes here also move the denormalized `lastActivityAt` on the contact and
+ * deal, which is what the list views sort by.
+ */
+
+export type ActivityActor = {
+  userId?: string | null;
+  employeeId?: string | null;
+};
+
+export type ActivityInput = {
+  kind: ActivityKind;
+  subject?: string;
+  bodyText?: string;
+  occurredAt?: Date;
+  contactId?: string | null;
+  dealId?: string | null;
+  customerId?: string | null;
+  partnershipId?: string | null;
+  mailThreadId?: string | null;
+  mailMessageId?: string | null;
+  meetingId?: string | null;
+  meta?: Record<string, unknown> | null;
+  taskStatus?: ActivityTaskStatus | null;
+  dueAt?: Date | null;
+  completedAt?: Date | null;
+  assignedUserId?: string | null;
+  assignedEmployeeId?: string | null;
+  priority?: ActivityPriority | null;
+  reminderAt?: Date | null;
+  recurrenceRule?: string | null;
+};
+
+export type ActivityListOptions = {
+  q?: string;
+  contactId?: string;
+  dealId?: string;
+  customerId?: string;
+  partnershipId?: string;
+  kinds?: ActivityKind[];
+  from?: Date;
+  to?: Date;
+  actorUserId?: string;
+  actorEmployeeId?: string;
+  /** Also include activities on deals belonging to this contact. */
+  includeRelatedDeals?: boolean;
+  /** With `customerId`: also include activities on the account's contacts and deals. */
+  includeRelatedRecords?: boolean;
+  limit?: number;
+  offset?: number;
+};
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
+
+/** Body text is capped in the service, never by the column — see the entity. */
+function capBody(body: string | undefined): string {
+  if (!body) return "";
+  if (body.length <= ACTIVITY_BODY_CAP) return body;
+  return `${body.slice(0, ACTIVITY_BODY_CAP)}\n…[truncated]`;
+}
+
+function serializeMeta(meta: Record<string, unknown> | null | undefined): string | null {
+  if (!meta) return null;
+  try {
+    return JSON.stringify(meta);
+  } catch {
+    // Metadata comes from callers as varied as a customer's own database via a
+    // signal payload. A circular or unserializable value must not stop the
+    // activity being recorded — the timeline entry matters more than its detail.
+    return null;
+  }
+}
+
+/**
+ * Write one activity and move the denormalized recency markers.
+ *
+ * `occurredAt` defaults to now but is deliberately separate from `createdAt`:
+ * a backfilled email happened long before we learned about it, and the timeline
+ * sorts by when it happened.
+ */
+export async function recordActivity(
+  companyId: string,
+  input: ActivityInput,
+  actor: ActivityActor = {},
+): Promise<Activity> {
+  const occurredAt = input.occurredAt ?? new Date();
+  const repo = AppDataSource.getRepository(Activity);
+  const row = await repo.save(
+    repo.create({
+      companyId,
+      kind: input.kind,
+      subject: (input.subject ?? "").slice(0, 500),
+      bodyText: capBody(input.bodyText),
+      occurredAt,
+      contactId: input.contactId ?? null,
+      dealId: input.dealId ?? null,
+      customerId: input.customerId ?? null,
+      partnershipId: input.partnershipId ?? null,
+      mailThreadId: input.mailThreadId ?? null,
+      mailMessageId: input.mailMessageId ?? null,
+      meetingId: input.meetingId ?? null,
+      actorUserId: actor.userId ?? null,
+      actorEmployeeId: actor.employeeId ?? null,
+      metaJson: serializeMeta(input.meta),
+      taskStatus: input.kind === "task" ? (input.taskStatus ?? "open") : null,
+      dueAt: input.kind === "task" ? (input.dueAt ?? null) : null,
+      completedAt: input.kind === "task" ? (input.completedAt ?? null) : null,
+      assignedUserId: input.kind === "task" ? (input.assignedUserId ?? null) : null,
+      assignedEmployeeId: input.kind === "task" ? (input.assignedEmployeeId ?? null) : null,
+      priority: input.kind === "task" ? (input.priority ?? "normal") : null,
+      reminderAt: input.kind === "task" ? (input.reminderAt ?? null) : null,
+      recurrenceRule: input.kind === "task" ? (input.recurrenceRule ?? null) : null,
+    }),
+  );
+
+  if (input.contactId) await touchLastActivity(companyId, [input.contactId], occurredAt);
+  if (input.dealId) await touchDealActivity(companyId, [input.dealId], occurredAt);
+  if (input.partnershipId) {
+    await AppDataSource.getRepository(Partnership)
+      .createQueryBuilder()
+      .update(Partnership)
+      .set({ lastActivityAt: occurredAt })
+      .where("companyId = :companyId AND id = :id", {
+        companyId,
+        id: input.partnershipId,
+      })
+      .execute();
+  }
+  return row;
+}
+
+/**
+ * Record a mail-derived activity exactly once.
+ *
+ * Idempotent on `mailMessageId`, because the backfill re-walks threads it has
+ * already seen when Gmail expires a history cursor. Returns the existing row
+ * rather than a duplicate, so a re-import does not double every conversation.
+ */
+export async function recordMailActivity(
+  companyId: string,
+  input: ActivityInput & { mailMessageId: string },
+  actor: ActivityActor = {},
+): Promise<Activity | null> {
+  const existing = await AppDataSource.getRepository(Activity).findOneBy({
+    companyId,
+    mailMessageId: input.mailMessageId,
+  });
+  if (existing) return existing;
+  return recordActivity(companyId, input, actor);
+}
+
+/**
+ * Record a meeting-derived activity exactly once per (meeting, subject-row).
+ *
+ * The same call legitimately produces several rows — one per Contact whose
+ * timeline it belongs on — so the key is the pair, not the meeting alone.
+ * Without that, linking a call attended by three known Contacts would write
+ * one row and drop two, which is the opposite of the bug this guards against.
+ *
+ * Idempotency matters here for the same reason it does for mail: the linker is
+ * re-runnable by design (a Contact created after the call should be able to
+ * pick it up), and re-running must never double a timeline.
+ */
+export async function recordMeetingActivity(
+  companyId: string,
+  input: ActivityInput & { meetingId: string },
+  actor: ActivityActor = {},
+): Promise<Activity | null> {
+  // `IsNull()` rather than a bare null: TypeORM's object form treats a null
+  // property as "no condition", so passing it would match the first row for
+  // this meeting regardless of subject and silently collapse the three rows a
+  // three-Contact call is supposed to produce.
+  const existing = await AppDataSource.getRepository(Activity).findOneBy({
+    companyId,
+    meetingId: input.meetingId,
+    contactId: input.contactId ? input.contactId : IsNull(),
+    dealId: input.dealId ? input.dealId : IsNull(),
+    customerId: input.customerId ? input.customerId : IsNull(),
+  });
+  if (existing) {
+    // A re-link after the write-up is how the row gets the summary.
+    const bodyText = capBody(input.bodyText);
+    if (bodyText && bodyText !== existing.bodyText) {
+      existing.bodyText = bodyText;
+      return AppDataSource.getRepository(Activity).save(existing);
+    }
+    return existing;
+  }
+  return recordActivity(companyId, input, actor);
+}
+
+/**
+ * Bulk-record mail activities, skipping any message already on the timeline.
+ *
+ * One query to find what exists, then one save — an initial mailbox import can
+ * carry thousands of messages and must not issue two round-trips each.
+ */
+export async function recordMailActivities(
+  companyId: string,
+  inputs: Array<ActivityInput & { mailMessageId: string }>,
+): Promise<number> {
+  if (inputs.length === 0) return 0;
+  const repo = AppDataSource.getRepository(Activity);
+  const ids = [...new Set(inputs.map((i) => i.mailMessageId))];
+  const existing = await repo.find({
+    where: { companyId, mailMessageId: In(ids) },
+    select: { mailMessageId: true },
+  });
+  const seen = new Set(existing.map((e) => e.mailMessageId));
+
+  const fresh = inputs.filter((i) => !seen.has(i.mailMessageId));
+  if (fresh.length === 0) return 0;
+
+  const rows = fresh.map((input) =>
+    repo.create({
+      companyId,
+      kind: input.kind,
+      subject: (input.subject ?? "").slice(0, 500),
+      bodyText: capBody(input.bodyText),
+      occurredAt: input.occurredAt ?? new Date(),
+      contactId: input.contactId ?? null,
+      dealId: input.dealId ?? null,
+      customerId: input.customerId ?? null,
+      partnershipId: input.partnershipId ?? null,
+      mailThreadId: input.mailThreadId ?? null,
+      mailMessageId: input.mailMessageId,
+      meetingId: null,
+      metaJson: serializeMeta(input.meta),
+      taskStatus: null,
+      dueAt: null,
+      completedAt: null,
+      assignedUserId: null,
+      assignedEmployeeId: null,
+      priority: null,
+      reminderAt: null,
+      recurrenceRule: null,
+    }),
+  );
+  await repo.save(rows);
+
+  // Move recency markers once for the whole batch, using each contact's newest
+  // touched moment rather than one save per row.
+  const newestByContact = new Map<string, Date>();
+  for (const input of fresh) {
+    if (!input.contactId) continue;
+    const at = input.occurredAt ?? new Date();
+    const current = newestByContact.get(input.contactId);
+    if (!current || at > current) newestByContact.set(input.contactId, at);
+  }
+  for (const [contactId, at] of newestByContact) {
+    await touchLastActivity(companyId, [contactId], at);
+  }
+  return rows.length;
+}
+
+/**
+ * The activities `opts` match, as a factory of fresh, unordered query builders
+ * — the shared WHERE of the timeline and the export. The related records a
+ * contact's or an account's timeline reaches are looked up once, here, so an
+ * export reading many batches does not look them up again for each.
+ */
+async function activityListQuery(
+  companyId: string,
+  opts: Omit<ActivityListOptions, "limit" | "offset">,
+): Promise<() => SelectQueryBuilder<Activity>> {
+  let relatedDealIds: string[] = [];
+  let accountContactIds: string[] = [];
+  let accountDealIds: string[] = [];
+  if (opts.contactId && opts.includeRelatedDeals) {
+    const deals = await AppDataSource.getRepository(Deal).find({
+      where: { companyId, primaryContactId: opts.contactId },
+      select: { id: true },
+    });
+    relatedDealIds = deals.map((d) => d.id);
+  }
+  if (opts.customerId && opts.includeRelatedRecords) {
+    // `customerId` is stamped when an activity is written and never moved, so
+    // a contact or deal attached to the account later keeps its earlier
+    // history under its own id only. The account's timeline reaches it there.
+    const [contacts, deals] = await Promise.all([
+      AppDataSource.getRepository(Contact).find({
+        where: { companyId, customerId: opts.customerId },
+        select: { id: true },
+      }),
+      AppDataSource.getRepository(Deal).find({
+        where: { companyId, customerId: opts.customerId },
+        select: { id: true },
+      }),
+    ]);
+    accountContactIds = contacts.map((c) => c.id);
+    accountDealIds = deals.map((d) => d.id);
+  }
+
+  return () => {
+    const qb = AppDataSource.getRepository(Activity)
+      .createQueryBuilder("a")
+      .where("a.companyId = :companyId", { companyId });
+
+    if (opts.contactId && opts.includeRelatedDeals) {
+      qb.andWhere(
+        new Brackets((w) => {
+          w.where("a.contactId = :contactId", { contactId: opts.contactId });
+          if (relatedDealIds.length > 0) w.orWhere("a.dealId IN (:...ids)", { ids: relatedDealIds });
+        }),
+      );
+    } else if (opts.contactId) {
+      qb.andWhere("a.contactId = :contactId", { contactId: opts.contactId });
+    }
+
+    if (opts.dealId) qb.andWhere("a.dealId = :dealId", { dealId: opts.dealId });
+    if (opts.customerId && opts.includeRelatedRecords) {
+      qb.andWhere(
+        new Brackets((w) => {
+          w.where("a.customerId = :customerId", { customerId: opts.customerId });
+          if (accountContactIds.length > 0) {
+            w.orWhere("a.contactId IN (:...relatedContactIds)", {
+              relatedContactIds: accountContactIds,
+            });
+          }
+          if (accountDealIds.length > 0) {
+            w.orWhere("a.dealId IN (:...relatedDealIds)", { relatedDealIds: accountDealIds });
+          }
+        }),
+      );
+    } else if (opts.customerId) {
+      qb.andWhere("a.customerId = :customerId", { customerId: opts.customerId });
+    }
+    if (opts.partnershipId) {
+      qb.andWhere("a.partnershipId = :partnershipId", { partnershipId: opts.partnershipId });
+    }
+    if (opts.kinds && opts.kinds.length > 0) {
+      qb.andWhere("a.kind IN (:...kinds)", { kinds: opts.kinds });
+    }
+    if (opts.q?.trim()) {
+      qb.andWhere(
+        new Brackets((where) => {
+          where
+            .where("LOWER(a.subject) LIKE :activityQuery", {
+              activityQuery: `%${opts.q!.trim().toLowerCase()}%`,
+            })
+            .orWhere("LOWER(a.bodyText) LIKE :activityQuery", {
+              activityQuery: `%${opts.q!.trim().toLowerCase()}%`,
+            });
+        }),
+      );
+    }
+    if (opts.from) qb.andWhere("a.occurredAt >= :from", { from: opts.from });
+    if (opts.to) qb.andWhere("a.occurredAt <= :to", { to: opts.to });
+    if (opts.actorUserId) {
+      qb.andWhere("a.actorUserId = :actorUserId", { actorUserId: opts.actorUserId });
+    }
+    if (opts.actorEmployeeId) {
+      qb.andWhere("a.actorEmployeeId = :actorEmployeeId", {
+        actorEmployeeId: opts.actorEmployeeId,
+      });
+    }
+    return qb;
+  };
+}
+
+/**
+ * The timeline.
+ *
+ * With `includeRelatedDeals`, a contact's timeline also carries activities
+ * logged against their deals — which is what somebody opening a contact
+ * actually expects to see, since "we moved their deal to Proposal" is part of
+ * that relationship's history even though it was recorded against the deal.
+ */
+export async function listActivities(
+  companyId: string,
+  opts: ActivityListOptions = {},
+): Promise<{ rows: Activity[]; total: number }> {
+  const limit = Math.min(Math.max(opts.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT);
+  const offset = Math.max(opts.offset ?? 0, 0);
+
+  const qb = (await activityListQuery(companyId, opts))();
+
+  const total = await qb.clone().getCount();
+  const rows = await qb
+    .orderBy("a.occurredAt", "DESC")
+    .addOrderBy("a.createdAt", "DESC")
+    .addOrderBy("a.id", "DESC")
+    .skip(offset)
+    .take(limit)
+    .getMany();
+
+  return { rows, total };
+}
+
+export const MANUAL_ACTIVITY_KINDS = ["note", "call", "meeting", "task"] as const;
+
+function isManualActivity(activity: Activity): boolean {
+  return (MANUAL_ACTIVITY_KINDS as readonly string[]).includes(activity.kind);
+}
+
+export async function getActivity(companyId: string, id: string): Promise<Activity | null> {
+  return AppDataSource.getRepository(Activity).findOneBy({ companyId, id });
+}
+
+export type ActivityPatch = {
+  subject?: string;
+  bodyText?: string;
+  occurredAt?: Date;
+  contactId?: string | null;
+  dealId?: string | null;
+  customerId?: string | null;
+  partnershipId?: string | null;
+};
+
+/**
+ * Correct a manually logged fact. Machine-derived rows stay immutable because
+ * mail, stage and Signal history are evidence used by reporting and compliance.
+ */
+export async function updateManualActivity(
+  companyId: string,
+  id: string,
+  patch: ActivityPatch,
+): Promise<Activity | null> {
+  const repo = AppDataSource.getRepository(Activity);
+  const activity = await repo.findOneBy({ companyId, id });
+  if (!activity) return null;
+  if (!isManualActivity(activity)) {
+    throw new Error("Only manually logged notes, calls, meetings, and tasks can be edited");
+  }
+  await assertRevenueLinks(companyId, patch);
+  const previousLinks = activityLinks(activity);
+  if (patch.subject !== undefined) activity.subject = patch.subject.slice(0, 500);
+  if (patch.bodyText !== undefined) activity.bodyText = capBody(patch.bodyText);
+  if (patch.occurredAt !== undefined) activity.occurredAt = patch.occurredAt;
+  if (patch.contactId !== undefined) activity.contactId = patch.contactId;
+  if (patch.dealId !== undefined) activity.dealId = patch.dealId;
+  if (patch.customerId !== undefined) activity.customerId = patch.customerId;
+  if (patch.partnershipId !== undefined) activity.partnershipId = patch.partnershipId;
+  const saved = await repo.save(activity);
+  await refreshActivityRecency(companyId, [...previousLinks, ...activityLinks(saved)]);
+  return saved;
+}
+
+export async function deleteManualActivity(
+  companyId: string,
+  id: string,
+): Promise<Activity | null> {
+  const repo = AppDataSource.getRepository(Activity);
+  const activity = await repo.findOneBy({ companyId, id });
+  if (!activity) return null;
+  if (!isManualActivity(activity)) {
+    throw new Error("Only manually logged notes, calls, meetings, and tasks can be deleted");
+  }
+  const links = activityLinks(activity);
+  await repo.delete({ companyId, id });
+  await refreshActivityRecency(companyId, links);
+  return activity;
+}
+
+type RecencyLink =
+  | { type: "contact"; id: string }
+  | { type: "deal"; id: string }
+  | { type: "partnership"; id: string };
+
+function activityLinks(
+  activity: Pick<Activity, "contactId" | "dealId" | "partnershipId">,
+): RecencyLink[] {
+  return [
+    ...(activity.contactId ? [{ type: "contact" as const, id: activity.contactId }] : []),
+    ...(activity.dealId ? [{ type: "deal" as const, id: activity.dealId }] : []),
+    ...(activity.partnershipId
+      ? [{ type: "partnership" as const, id: activity.partnershipId }]
+      : []),
+  ];
+}
+
+async function refreshActivityRecency(companyId: string, links: RecencyLink[]): Promise<void> {
+  const unique = new Map(links.map((link) => [`${link.type}:${link.id}`, link]));
+  for (const link of unique.values()) {
+    const column =
+      link.type === "contact" ? "contactId" : link.type === "deal" ? "dealId" : "partnershipId";
+    const raw = await AppDataSource.getRepository(Activity)
+      .createQueryBuilder("activity")
+      .select("MAX(activity.occurredAt)", "latest")
+      .where("activity.companyId = :companyId", { companyId })
+      .andWhere(`activity.${column} = :resourceId`, { resourceId: link.id })
+      .getRawOne<{ latest: string | Date | null }>();
+    const latest = raw?.latest ? new Date(raw.latest) : null;
+    if (link.type === "contact") {
+      await AppDataSource.getRepository(Contact).update(
+        { companyId, id: link.id },
+        { lastActivityAt: latest },
+      );
+    } else if (link.type === "deal") {
+      await AppDataSource.getRepository(Deal).update(
+        { companyId, id: link.id },
+        { lastActivityAt: latest },
+      );
+    } else {
+      await AppDataSource.getRepository(Partnership).update(
+        { companyId, id: link.id },
+        { lastActivityAt: latest },
+      );
+    }
+  }
+}
+
+/** At most this many activities in one part of an export; a cursor carries on past it. */
+export const ACTIVITY_EXPORT_ROW_CAP = 10_000;
+
+/** Rows read per query while an export part fills. */
+const ACTIVITY_EXPORT_BATCH = 500;
+
+const ACTIVITY_EXPORT_SCOPE = "revenue.activities.export";
+
+/** The timeline's own order, newest first, as a keyset ending in the unique id. */
+const ACTIVITY_KEYS: KeysetColumn[] = [
+  { column: "a.occurredAt", direction: "DESC", type: "timestamp" },
+  { column: "a.createdAt", direction: "DESC", type: "timestamp" },
+  { column: "a.id", direction: "DESC", type: "string" },
+];
+
+const ACTIVITY_EXPORT_HEADER = [
+  "id",
+  "occurredAt",
+  "kind",
+  "subject",
+  "bodyText",
+  "contactId",
+  "dealId",
+  "customerId",
+  "partnershipId",
+  "actorUserId",
+  "actorEmployeeId",
+  "createdAt",
+];
+
+function csvCell(value: unknown): string {
+  const text =
+    value instanceof Date
+      ? value.toISOString()
+      : value === null || value === undefined
+        ? ""
+        : String(value);
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function activityCsvLine(row: Activity): string {
+  return [
+    row.id,
+    row.occurredAt,
+    row.kind,
+    row.subject,
+    row.bodyText,
+    row.contactId,
+    row.dealId,
+    row.customerId,
+    row.partnershipId,
+    row.actorUserId,
+    row.actorEmployeeId,
+    row.createdAt,
+  ]
+    .map(csvCell)
+    .join(",");
+}
+
+/** Characters a line takes inside a JSON string, newline included — how a tool result carries the CSV. */
+function jsonChars(line: string): number {
+  return JSON.stringify(line).length - 2 + 4;
+}
+
+/** One part of an activity export, and what follows it (`services/listPaging.ts`). */
+export type ActivityExport = PageInfo & {
+  csv: string;
+  exported: number;
+  /** `hasMore` under its older name, kept for existing callers. */
+  truncated: boolean;
+};
+
+/**
+ * The activity ledger as CSV, newest first, one part at a time.
+ *
+ * A part holds at most {@link ACTIVITY_EXPORT_ROW_CAP} activities, and with
+ * `maxChars` ends early rather than outgrow what its reader can hold — an AI
+ * Employee's tool result. While more follow it answers `hasMore` and a
+ * `nextCursor`: passed back as `cursor` with the same filters, the next part
+ * starts after the last activity this one holds. Every part starts with the
+ * header row, so each is a CSV on its own. The cursor names the last row
+ * rather than counting rows, so activities logged while an export is read
+ * never shift the next part. It used to stop at 10,000 rows with no way on.
+ */
+export async function exportActivitiesCsv(
+  companyId: string,
+  opts: Omit<ActivityListOptions, "limit" | "offset"> = {},
+  part: { cursor?: string; maxChars?: number } = {},
+): Promise<ActivityExport> {
+  const fingerprint = filterFingerprint(companyId, {
+    q: opts.q?.trim() ? opts.q.trim().toLowerCase() : undefined,
+    contactId: opts.contactId,
+    dealId: opts.dealId,
+    customerId: opts.customerId,
+    partnershipId: opts.partnershipId,
+    kinds: opts.kinds?.length ? [...new Set(opts.kinds)].sort() : undefined,
+    from: opts.from,
+    to: opts.to,
+    actorUserId: opts.actorUserId,
+    actorEmployeeId: opts.actorEmployeeId,
+    includeRelatedDeals: opts.contactId ? !!opts.includeRelatedDeals : undefined,
+    includeRelatedRecords: opts.customerId ? !!opts.includeRelatedRecords : undefined,
+  });
+  let after = part.cursor
+    ? decodeCursor(ACTIVITY_EXPORT_SCOPE, fingerprint, part.cursor)
+    : null;
+  const query = await activityListQuery(companyId, opts);
+  const total = await query().getCount();
+
+  const header = ACTIVITY_EXPORT_HEADER.map(csvCell).join(",");
+  const lines = [header];
+  let chars = jsonChars(header);
+  let exported = 0;
+  let lastKey: CursorValue[] | null = null;
+  let hasMore = false;
+  for (;;) {
+    const want = Math.min(ACTIVITY_EXPORT_BATCH, ACTIVITY_EXPORT_ROW_CAP - exported);
+    // The keyset alone, one row-value range the (companyId, occurredAt,
+    // createdAt, id) index starts at the cursor. A plain bound on occurredAt
+    // beside it led SQLite to skip-scan and sort every older activity, bodies
+    // included, for each batch: 270 ms a batch at 200,000 activities, 1.4 ms
+    // without it.
+    const batchQuery = query();
+    const batch = await keysetRows(batchQuery, {
+      keys: ACTIVITY_KEYS,
+      after,
+      limit: want,
+      prefix: "export",
+    });
+    let full = false;
+    for (const entry of batch.slice(0, want)) {
+      const line = activityCsvLine(entry.row);
+      // A part always holds at least one row, so the cursor always moves on.
+      if (part.maxChars !== undefined && exported > 0 && chars + jsonChars(line) > part.maxChars) {
+        full = true;
+        break;
+      }
+      lines.push(line);
+      chars += jsonChars(line);
+      exported += 1;
+      lastKey = entry.key;
+    }
+    // The batch reads one row past `want`; when it came back short, nothing
+    // is left past the rows it held.
+    if (full || (batch.length > want && exported >= ACTIVITY_EXPORT_ROW_CAP)) {
+      hasMore = true;
+      break;
+    }
+    if (batch.length <= want) break;
+    after = lastKey;
+  }
+
+  const nextCursor =
+    hasMore && lastKey ? encodeCursor(ACTIVITY_EXPORT_SCOPE, fingerprint, lastKey) : null;
+  const note = pageNote({ shown: exported, total, noun: "activities", hasMore: !!nextCursor });
+  return {
+    total,
+    hasMore: !!nextCursor,
+    nextCursor,
+    ...(note ? { note } : {}),
+    csv: lines.join("\r\n"),
+    exported,
+    truncated: !!nextCursor,
+  };
+}
+
+/** Move a deal's denormalized recency marker forward only. */
+export async function touchDealActivity(
+  companyId: string,
+  dealIds: string[],
+  when: Date,
+): Promise<void> {
+  const ids = [...new Set(dealIds.filter(Boolean))];
+  if (ids.length === 0) return;
+  await AppDataSource.getRepository(Deal)
+    .createQueryBuilder()
+    .update(Deal)
+    .set({ lastActivityAt: when })
+    .where("companyId = :companyId", { companyId })
+    .andWhere("id IN (:...ids)", { ids })
+    .andWhere(
+      new Brackets((w) => {
+        w.where("lastActivityAt IS NULL").orWhere("lastActivityAt < :when", { when });
+      }),
+    )
+    .execute();
+}
+
+/**
+ * Count activities per kind for a contact or deal — drives the little summary
+ * chips on the detail header ("14 emails · 2 meetings").
+ */
+export async function countActivitiesByKind(
+  companyId: string,
+  scope: { contactId?: string; dealId?: string },
+): Promise<Record<string, number>> {
+  const qb = AppDataSource.getRepository(Activity)
+    .createQueryBuilder("a")
+    .select("a.kind", "kind")
+    .addSelect("COUNT(*)", "count")
+    .where("a.companyId = :companyId", { companyId })
+    .groupBy("a.kind");
+
+  if (scope.contactId) qb.andWhere("a.contactId = :contactId", { contactId: scope.contactId });
+  if (scope.dealId) qb.andWhere("a.dealId = :dealId", { dealId: scope.dealId });
+
+  const rows = await qb.getRawMany<{ kind: string; count: string | number }>();
+  const out: Record<string, number> = {};
+  for (const row of rows) out[row.kind] = Number(row.count);
+  return out;
+}
+
+/** Contacts touched most recently — the "what's happening" feed on the index. */
+export async function recentlyActiveContacts(companyId: string, limit = 10): Promise<Contact[]> {
+  return AppDataSource.getRepository(Contact)
+    .createQueryBuilder("c")
+    .where("c.companyId = :companyId", { companyId })
+    .andWhere("c.archivedAt IS NULL")
+    .andWhere("c.lastActivityAt IS NOT NULL")
+    .orderBy("c.lastActivityAt", "DESC")
+    .take(Math.min(Math.max(limit, 1), MAX_LIMIT))
+    .getMany();
+}

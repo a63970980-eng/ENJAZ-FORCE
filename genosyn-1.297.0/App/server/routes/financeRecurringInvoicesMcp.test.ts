@@ -1,0 +1,860 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { AddressInfo } from "node:net";
+import { after, before, beforeEach, test } from "node:test";
+
+import express from "express";
+import type { Server } from "node:http";
+
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { AuditEvent } from "../db/entities/AuditEvent.js";
+import { Company } from "../db/entities/Company.js";
+import { Customer } from "../db/entities/Customer.js";
+import { EmailLog } from "../db/entities/EmailLog.js";
+import { EmployeeFinanceGrant } from "../db/entities/EmployeeFinanceGrant.js";
+import { Invoice } from "../db/entities/Invoice.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { LedgerEntry } from "../db/entities/LedgerEntry.js";
+import { Membership } from "../db/entities/Membership.js";
+import { RecurringInvoice } from "../db/entities/RecurringInvoice.js";
+import { RecurringInvoiceLineItem } from "../db/entities/RecurringInvoiceLineItem.js";
+import { User } from "../db/entities/User.js";
+import { STATIC_TOOLS } from "../mcp/toolManifest.js";
+import { errorHandler } from "../middleware/error.js";
+import { deadToolNames } from "../services/agent/tools/grantDead.js";
+import { issueMcpToken, revokeMcpToken } from "../services/mcpTokens.js";
+import {
+  generateInvoiceFromRecurring,
+  RECURRING_INVOICE_NAME_REQUIRED_ERROR,
+} from "../services/recurringInvoices.js";
+import { closeTestDb, initTestDb, insert, resetTestDb } from "../test/dbHarness.js";
+import { mcpInternalRouter } from "./mcpInternal.js";
+
+type ToolBody = Record<string, unknown> & { error?: string };
+
+let server: Server;
+let baseUrl = "";
+let token = "";
+let company: Company;
+let customer: Customer;
+let employee: AIEmployee;
+let grant: EmployeeFinanceGrant;
+
+before(async () => {
+  await initTestDb();
+  const app = express();
+  app.use(express.json());
+  app.use("/internal/mcp", mcpInternalRouter);
+  app.use(errorHandler);
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, resolve);
+  });
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+beforeEach(async () => {
+  if (token) revokeMcpToken(token);
+  await resetTestDb();
+  company = await insert(Company, {
+    name: "Acme",
+    slug: "acme",
+    ownerId: "owner-1",
+  });
+  employee = await insert(AIEmployee, {
+    companyId: company.id,
+    name: "Finance partner",
+    slug: "finance-partner",
+    role: "Finance partner",
+    soulBody: "",
+  });
+  grant = await insert(EmployeeFinanceGrant, {
+    companyId: company.id,
+    employeeId: employee.id,
+    accessLevel: "invoice",
+  });
+  customer = await insert(Customer, {
+    companyId: company.id,
+    name: "DreamIT Host",
+    slug: "dreamit-host",
+    email: "billing@dreamithost.example",
+    currency: "USD",
+  });
+  token = issueMcpToken(employee.id, company.id, { authority: "employee" });
+});
+
+after(async () => {
+  if (token) revokeMcpToken(token);
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  await closeTestDb();
+});
+
+async function callTool(
+  name: string,
+  body: Record<string, unknown> = {},
+): Promise<{ status: number; body: ToolBody }> {
+  const response = await fetch(`${baseUrl}/internal/mcp/tools/${name}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: (await response.json()) as ToolBody };
+}
+
+function annualSchedule(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    customerSlug: customer.slug,
+    name: "OneUptime Starter annual renewal",
+    cronExpr: "0 9 20 8 *",
+    frequency: "yearly",
+    daysUntilDue: 14,
+    autoSend: false,
+    currency: "USD",
+    notes: "Nine licences billed annually at $22 per user per month.",
+    lines: [
+      {
+        description: "OneUptime Starter — annual licence",
+        quantity: 9,
+        unitPriceCents: 26_400,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+async function createAnnualSchedule(
+  overrides: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const response = await callTool("create_recurring_invoice", annualSchedule(overrides));
+  assert.equal(response.status, 200, response.body.error);
+  return response.body.recurringInvoice as Record<string, unknown>;
+}
+
+test("create_recurring_invoice schedules annual billing without billing immediately", async () => {
+  const before = Date.now();
+  const payload = await createAnnualSchedule();
+
+  assert.match(String(payload.slug), /^ri-/);
+  assert.equal(payload.name, "OneUptime Starter annual renewal");
+  assert.equal(payload.cronExpr, "0 9 20 8 *");
+  assert.equal(payload.frequency, "yearly");
+  assert.equal(payload.intervalCount, 1);
+  assert.equal(payload.status, "active");
+  assert.equal(payload.autoSend, false);
+  assert.equal(payload.currency, "USD");
+  assert.ok(new Date(String(payload.nextRunAt)).getTime() > before);
+
+  const schedule = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(payload.id),
+    companyId: company.id,
+  });
+  assert.equal(schedule.customerId, customer.id);
+  assert.equal(schedule.createdById, null);
+  assert.equal(schedule.runsCreated, 0);
+  assert.equal(schedule.lastRunAt, null);
+  assert.equal(schedule.lastInvoiceSlug, "");
+  assert.equal(
+    await AppDataSource.getRepository(RecurringInvoiceLineItem).countBy({
+      recurringInvoiceId: schedule.id,
+    }),
+    1,
+  );
+
+  assert.equal(await AppDataSource.getRepository(Invoice).count(), 0);
+  assert.equal(await AppDataSource.getRepository(EmailLog).count(), 0);
+  assert.equal(await AppDataSource.getRepository(LedgerEntry).count(), 0);
+
+  const audit = await AppDataSource.getRepository(AuditEvent).findOneByOrFail({
+    companyId: company.id,
+    action: "finance.recurring_invoice.create",
+  });
+  assert.equal(audit.actorKind, "ai");
+  assert.equal(audit.actorEmployeeId, employee.id);
+  assert.equal(audit.targetType, "recurring_invoice");
+  assert.equal(audit.targetId, schedule.id);
+  assert.equal(
+    await AppDataSource.getRepository(JournalEntry).countBy({ employeeId: employee.id }),
+    1,
+  );
+
+  const automatic = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ name: "Automatic annual renewal", autoSend: true }),
+  );
+  assert.equal(automatic.status, 200, automatic.body.error);
+  assert.equal((automatic.body.recurringInvoice as Record<string, unknown>).autoSend, true);
+  assert.match(String(automatic.body.note), /Each run will issue.*post.*email/i);
+  assert.equal(await AppDataSource.getRepository(Invoice).count(), 0);
+  assert.equal(await AppDataSource.getRepository(EmailLog).count(), 0);
+  assert.equal(await AppDataSource.getRepository(LedgerEntry).count(), 0);
+});
+
+test("list_recurring_invoices and get_recurring_invoice return the saved schedule", async () => {
+  const created = await createAnnualSchedule();
+  const slug = String(created.slug);
+
+  const listed = await callTool("list_recurring_invoices");
+  assert.equal(listed.status, 200, listed.body.error);
+  const rows = listed.body.recurringInvoices as Array<Record<string, unknown>>;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.slug, slug);
+  assert.equal(rows[0]?.status, "active");
+  assert.equal((rows[0]?.customer as Record<string, unknown>)?.slug, customer.slug);
+
+  const fetched = await callTool("get_recurring_invoice", {
+    recurringInvoiceSlug: slug,
+  });
+  assert.equal(fetched.status, 200, fetched.body.error);
+  const schedule = fetched.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(schedule.slug, slug);
+  assert.equal((schedule.customer as Record<string, unknown>)?.slug, customer.slug);
+  const lines = schedule.lines as Array<Record<string, unknown>>;
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0]?.quantity, 9);
+  assert.equal(lines[0]?.unitPriceCents, 26_400);
+});
+
+test("recurring invoice reads stay inside the employee's company", async () => {
+  const otherCompany = await insert(Company, {
+    name: "Other Co",
+    slug: "other-co",
+    ownerId: "owner-2",
+  });
+  const otherCustomer = await insert(Customer, {
+    companyId: otherCompany.id,
+    name: "Other Customer",
+    slug: "other-customer",
+    email: "billing@other.example",
+    currency: "USD",
+  });
+  await insert(RecurringInvoice, {
+    companyId: otherCompany.id,
+    customerId: otherCustomer.id,
+    slug: "ri-other-company",
+    name: "Other schedule",
+    cronExpr: "0 9 1 * *",
+    frequency: "monthly",
+    intervalCount: 1,
+    status: "active",
+    daysUntilDue: 14,
+    autoSend: false,
+    currency: "USD",
+    notes: "",
+    footer: "",
+    runsCreated: 0,
+    lastInvoiceSlug: "",
+    maxRuns: null,
+    endsOn: null,
+    createdById: null,
+  });
+
+  const listed = await callTool("list_recurring_invoices");
+  assert.equal(listed.status, 200, listed.body.error);
+  assert.deepEqual(listed.body.recurringInvoices, []);
+
+  const fetched = await callTool("get_recurring_invoice", {
+    recurringInvoiceSlug: "ri-other-company",
+  });
+  assert.equal(fetched.status, 404);
+
+  const filtered = await callTool("list_recurring_invoices", {
+    customerSlug: otherCustomer.slug,
+  });
+  assert.equal(filtered.status, 404);
+});
+
+test("recurring invoice reads need read access and writes need Invoicing access", async () => {
+  const created = await createAnnualSchedule();
+  const recurringInvoiceSlug = String(created.slug);
+
+  grant.accessLevel = "read";
+  await AppDataSource.getRepository(EmployeeFinanceGrant).save(grant);
+
+  const listed = await callTool("list_recurring_invoices");
+  assert.equal(listed.status, 200, listed.body.error);
+  const fetched = await callTool("get_recurring_invoice", { recurringInvoiceSlug });
+  assert.equal(fetched.status, 200, fetched.body.error);
+
+  const createDenied = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ name: "Must not be created" }),
+  );
+  assert.equal(createDenied.status, 403);
+  assert.match(createDenied.body.error ?? "", /needs the "invoice" finance access level/);
+
+  const updateDenied = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "paused",
+  });
+  assert.equal(updateDenied.status, 403);
+  assert.match(updateDenied.body.error ?? "", /needs the "invoice" finance access level/);
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 1);
+
+  await AppDataSource.getRepository(EmployeeFinanceGrant).delete({ employeeId: employee.id });
+  const readDenied = await callTool("list_recurring_invoices");
+  assert.equal(readDenied.status, 403);
+  assert.match(readDenied.body.error ?? "", /do not have access to the finance system/);
+
+  const dead = await deadToolNames(employee.id);
+  for (const name of [
+    "list_recurring_invoices",
+    "get_recurring_invoice",
+    "create_recurring_invoice",
+    "update_recurring_invoice",
+  ]) {
+    assert.equal(dead.has(name), true, name);
+  }
+});
+
+test("create_recurring_invoice rejects invalid references, schedules, and values atomically", async () => {
+  const missingCustomer = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ customerSlug: "missing-customer" }),
+  );
+  assert.equal(missingCustomer.status, 404);
+  assert.match(missingCustomer.body.error ?? "", /not found/i);
+
+  const missingTaxRate = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({
+      lines: [
+        {
+          description: "Taxed annual licence",
+          quantity: 1,
+          unitPriceCents: 10_000,
+          taxRateId: randomUUID(),
+        },
+      ],
+    }),
+  );
+  assert.equal(missingTaxRate.status, 400);
+  assert.match(missingTaxRate.body.error ?? "", /Unknown tax rate/);
+
+  const invalidCron = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ cronExpr: "not a cron expression" }),
+  );
+  assert.equal(invalidCron.status, 400);
+
+  const mismatchedFrequency = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ frequency: "monthly" }),
+  );
+  assert.equal(mismatchedFrequency.status, 400);
+
+  const nonPositive = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({
+      lines: [{ description: "Free placeholder", quantity: 2, unitPriceCents: 0 }],
+    }),
+  );
+  assert.equal(nonPositive.status, 400);
+  assert.match(nonPositive.body.error ?? "", /more than zero|positive/i);
+
+  const invalidSortOrder = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({
+      lines: [
+        {
+          description: "Annual licence",
+          quantity: 1,
+          unitPriceCents: 10_000,
+          sortOrder: 200,
+        },
+      ],
+    }),
+  );
+  assert.equal(invalidSortOrder.status, 400);
+
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 0);
+  assert.equal(await AppDataSource.getRepository(RecurringInvoiceLineItem).count(), 0);
+  assert.equal(await AppDataSource.getRepository(AuditEvent).count(), 0);
+  assert.equal(await AppDataSource.getRepository(JournalEntry).count(), 0);
+});
+
+test("auto-send requires a customer email when it is created, enabled, moved, or resumed", async () => {
+  const customerWithoutEmail = await insert(Customer, {
+    companyId: company.id,
+    name: "No-email customer",
+    slug: "no-email-customer",
+    email: "",
+    currency: "USD",
+  });
+
+  const rejectedCreate = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ customerSlug: customerWithoutEmail.slug, autoSend: true }),
+  );
+  assert.equal(rejectedCreate.status, 400);
+  assert.match(rejectedCreate.body.error ?? "", /email address/i);
+
+  const draftSchedule = await createAnnualSchedule({
+    customerSlug: customerWithoutEmail.slug,
+    name: "Draft-only renewal",
+  });
+  const rejectedEnable = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: draftSchedule.slug,
+    autoSend: true,
+  });
+  assert.equal(rejectedEnable.status, 400);
+  assert.match(rejectedEnable.body.error ?? "", /email address/i);
+
+  const automatic = await createAnnualSchedule({ name: "Automatic renewal", autoSend: true });
+  const rejectedMove = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: automatic.slug,
+    customerSlug: customerWithoutEmail.slug,
+  });
+  assert.equal(rejectedMove.status, 400);
+  assert.match(rejectedMove.body.error ?? "", /email address/i);
+
+  const automaticRow = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(automatic.id),
+  });
+  automaticRow.customerId = customerWithoutEmail.id;
+  automaticRow.status = "paused";
+  automaticRow.nextRunAt = null;
+  await AppDataSource.getRepository(RecurringInvoice).save(automaticRow);
+  const rejectedResume = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: automatic.slug,
+    status: "active",
+  });
+  assert.equal(rejectedResume.status, 400);
+  assert.match(rejectedResume.body.error ?? "", /email address/i);
+});
+
+test("non-cadence edits preserve the next run and legacy schedules can still be paused", async () => {
+  const created = await createAnnualSchedule();
+  const recurringInvoiceSlug = String(created.slug);
+  const repo = AppDataSource.getRepository(RecurringInvoice);
+  const legacy = await repo.findOneByOrFail({ companyId: company.id, slug: recurringInvoiceSlug });
+  const preservedNextRunAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+  legacy.cronExpr = "0 9 1,15 * *";
+  legacy.frequency = "monthly";
+  legacy.nextRunAt = preservedNextRunAt;
+  await repo.save(legacy);
+
+  const edited = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    notes: "Keep the existing run date.",
+  });
+  assert.equal(edited.status, 200, edited.body.error);
+  assert.equal(
+    new Date(String((edited.body.recurringInvoice as Record<string, unknown>).nextRunAt)).getTime(),
+    preservedNextRunAt.getTime(),
+  );
+
+  const paused = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "paused",
+  });
+  assert.equal(paused.status, 200, paused.body.error);
+  assert.equal((paused.body.recurringInvoice as Record<string, unknown>).status, "paused");
+  assert.equal((paused.body.recurringInvoice as Record<string, unknown>).nextRunAt, null);
+});
+
+test("update_recurring_invoice pauses, resumes, and ends a schedule terminally", async () => {
+  const created = await createAnnualSchedule();
+  const recurringInvoiceSlug = String(created.slug);
+
+  const revised = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    name: "Revised annual renewal",
+    cronExpr: "30 8 3 9 *",
+    frequency: "yearly",
+    intervalCount: 2,
+    lines: [{ description: "Revised annual licence", quantity: 10, unitPriceCents: 30_000 }],
+  });
+  assert.equal(revised.status, 200, revised.body.error);
+  const revisedSchedule = revised.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(revisedSchedule.name, "Revised annual renewal");
+  assert.equal(revisedSchedule.cronExpr, "30 8 3 9 *");
+  assert.equal(revisedSchedule.intervalCount, 2);
+  const revisedLines = revisedSchedule.lines as Array<Record<string, unknown>>;
+  assert.equal(revisedLines.length, 1);
+  assert.equal(revisedLines[0]?.description, "Revised annual licence");
+  assert.equal(revisedLines[0]?.quantity, 10);
+
+  const paused = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "paused",
+  });
+  assert.equal(paused.status, 200, paused.body.error);
+  const pausedSchedule = paused.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(pausedSchedule.status, "paused");
+  assert.equal(pausedSchedule.nextRunAt, null);
+
+  const resumed = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "active",
+  });
+  assert.equal(resumed.status, 200, resumed.body.error);
+  const resumedSchedule = resumed.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(resumedSchedule.status, "active");
+  assert.ok(resumedSchedule.nextRunAt);
+
+  const ended = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "ended",
+  });
+  assert.equal(ended.status, 200, ended.body.error);
+  const endedSchedule = ended.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(endedSchedule.status, "ended");
+  assert.equal(endedSchedule.nextRunAt, null);
+
+  const reactivate = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug,
+    status: "active",
+  });
+  assert.equal(reactivate.status, 409);
+  assert.match(reactivate.body.error ?? "", /ended|terminal/i);
+
+  const persisted = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    companyId: company.id,
+    slug: recurringInvoiceSlug,
+  });
+  assert.equal(persisted.status, "ended");
+  assert.equal(persisted.nextRunAt, null);
+  assert.equal(
+    await AppDataSource.getRepository(AuditEvent).countBy({
+      companyId: company.id,
+      action: "finance.recurring_invoice.update",
+    }),
+    4,
+  );
+});
+
+// ─────────── A schedule is named after its customer unless named ───────────
+
+/** An annual schedule with no `name` key at all, plus any overrides. */
+function unnamedSchedule(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const { name: _name, ...rest } = annualSchedule();
+  return { ...rest, ...overrides };
+}
+
+test("create_recurring_invoice names a schedule after its customer when the name is left out", async () => {
+  const response = await callTool("create_recurring_invoice", unnamedSchedule());
+  assert.equal(response.status, 200, response.body.error);
+  const payload = response.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(payload.name, "DreamIT Host");
+
+  const schedule = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(payload.id),
+  });
+  assert.equal(schedule.name, "DreamIT Host");
+  assert.equal(schedule.customerId, customer.id);
+  const audit = await AppDataSource.getRepository(AuditEvent).findOneByOrFail({
+    companyId: company.id,
+    action: "finance.recurring_invoice.create",
+  });
+  assert.equal(audit.targetLabel, "DreamIT Host");
+  const journal = await AppDataSource.getRepository(JournalEntry).findOneByOrFail({
+    employeeId: employee.id,
+  });
+  assert.equal(journal.title, "Finance partner created recurring invoice DreamIT Host");
+  assert.equal(await AppDataSource.getRepository(Invoice).count(), 0);
+});
+
+test("create_recurring_invoice treats a blank name as left out and trims a given one", async () => {
+  for (const name of ["", "   ", "\n\t"]) {
+    const created = await createAnnualSchedule({ name });
+    assert.equal(created.name, "DreamIT Host", JSON.stringify(name));
+  }
+  const padded = await createAnnualSchedule({ name: "  OneUptime renewal  " });
+  assert.equal(padded.name, "OneUptime renewal");
+  const stored = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(padded.id),
+  });
+  assert.equal(stored.name, "OneUptime renewal");
+
+  const exact = "N".repeat(200);
+  assert.equal((await createAnnualSchedule({ name: exact })).name, exact);
+  const tooLong = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ name: "N".repeat(201) }),
+  );
+  assert.equal(tooLong.status, 400);
+  const notText = await callTool("create_recurring_invoice", annualSchedule({ name: 42 }));
+  assert.equal(notText.status, 400);
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 5);
+});
+
+test("create_recurring_invoice falls back to the domain and refuses a customer with nothing to use", async () => {
+  const domainOnly = await insert(Customer, {
+    companyId: company.id,
+    name: " ",
+    slug: "domain-only",
+    domain: "domain-only.example",
+    email: "ap@domain-only.example",
+    currency: "USD",
+  });
+  const fromDomain = await createAnnualSchedule({ customerSlug: domainOnly.slug, name: undefined });
+  assert.equal(fromDomain.name, "domain-only.example");
+
+  const anonymous = await insert(Customer, {
+    companyId: company.id,
+    name: "",
+    slug: "anonymous",
+    email: "",
+    currency: "USD",
+  });
+  const refused = await callTool(
+    "create_recurring_invoice",
+    unnamedSchedule({ customerSlug: anonymous.slug }),
+  );
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.error, RECURRING_INVOICE_NAME_REQUIRED_ERROR);
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 1);
+  assert.equal(await AppDataSource.getRepository(AuditEvent).count(), 1);
+  assert.equal(
+    await AppDataSource.getRepository(JournalEntry).countBy({ employeeId: employee.id }),
+    1,
+  );
+
+  const named = await createAnnualSchedule({ customerSlug: anonymous.slug, name: "Anonymous" });
+  assert.equal(named.name, "Anonymous");
+});
+
+test("create_recurring_invoice never names a schedule after another company's customer", async () => {
+  const otherCompany = await insert(Company, {
+    name: "Other Co",
+    slug: "other-co",
+    ownerId: "owner-2",
+  });
+  const foreign = await insert(Customer, {
+    companyId: otherCompany.id,
+    name: "Foreign Customer Ltd",
+    slug: "foreign-customer",
+    email: "billing@foreign.example",
+    currency: "USD",
+  });
+  for (const body of [
+    unnamedSchedule({ customerSlug: foreign.slug }),
+    unnamedSchedule({ customerSlug: foreign.slug, name: "" }),
+    annualSchedule({ customerSlug: foreign.slug }),
+  ]) {
+    const response = await callTool("create_recurring_invoice", body);
+    assert.equal(response.status, 404);
+    assert.match(response.body.error ?? "", /not found/i);
+  }
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 0);
+  assert.equal(await AppDataSource.getRepository(AuditEvent).count(), 0);
+  assert.equal(await AppDataSource.getRepository(JournalEntry).count(), 0);
+});
+
+test("an unnamed create needs Invoicing access at every level, like any create", async () => {
+  const expected = { none: 403, read: 403, invoice: 200, full: 200 } as const;
+  for (const level of ["none", "read", "invoice", "full"] as const) {
+    await AppDataSource.getRepository(EmployeeFinanceGrant).delete({ employeeId: employee.id });
+    if (level !== "none") {
+      await insert(EmployeeFinanceGrant, {
+        companyId: company.id,
+        employeeId: employee.id,
+        accessLevel: level,
+      });
+    }
+    const response = await callTool("create_recurring_invoice", unnamedSchedule());
+    assert.equal(response.status, expected[level], `${level}: ${response.body.error}`);
+    if (expected[level] === 200) {
+      const created = response.body.recurringInvoice as Record<string, unknown>;
+      assert.equal(created.name, "DreamIT Host");
+    }
+  }
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 2);
+});
+
+test("an unnamed create on a Member's behalf needs that Member's full Finance access", async () => {
+  const user = await insert(User, {
+    name: "Member",
+    email: "member@example.com",
+    passwordHash: "hash",
+    sessionVersion: 0,
+  });
+  const member = await insert(Membership, {
+    companyId: company.id,
+    userId: user.id,
+    role: "member",
+    financeAccess: "none",
+  });
+  revokeMcpToken(token);
+  token = issueMcpToken(employee.id, company.id, {
+    authority: "member",
+    requesterUserId: user.id,
+    requesterSessionVersion: 0,
+  });
+
+  for (const access of ["none", "read"] as const) {
+    member.financeAccess = access;
+    await AppDataSource.getRepository(Membership).save(member);
+    const response = await callTool("create_recurring_invoice", unnamedSchedule());
+    assert.equal(response.status, 403, access);
+  }
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 0);
+
+  member.financeAccess = "full";
+  await AppDataSource.getRepository(Membership).save(member);
+  const allowed = await callTool("create_recurring_invoice", unnamedSchedule());
+  assert.equal(allowed.status, 200, allowed.body.error);
+  assert.equal((allowed.body.recurringInvoice as Record<string, unknown>).name, "DreamIT Host");
+});
+
+test("update_recurring_invoice never renames a schedule when its customer moves", async () => {
+  const created = await createAnnualSchedule({ name: undefined });
+  assert.equal(created.name, "DreamIT Host");
+  const acme = await insert(Customer, {
+    companyId: company.id,
+    name: "Acme Corp",
+    slug: "acme-corp",
+    email: "billing@acme.example",
+    currency: "USD",
+  });
+  const moved = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: created.slug,
+    customerSlug: acme.slug,
+  });
+  assert.equal(moved.status, 200, moved.body.error);
+  const schedule = moved.body.recurringInvoice as Record<string, unknown>;
+  assert.equal((schedule.customer as Record<string, unknown>).slug, "acme-corp");
+  assert.equal(schedule.name, "DreamIT Host");
+
+  const renamed = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: created.slug,
+    name: "  Acme annual renewal  ",
+  });
+  assert.equal(renamed.status, 200, renamed.body.error);
+  const renamedSchedule = renamed.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(renamedSchedule.name, "Acme annual renewal");
+
+  for (const name of ["", "   "]) {
+    const blank = await callTool("update_recurring_invoice", {
+      recurringInvoiceSlug: created.slug,
+      name,
+    });
+    assert.equal(blank.status, 400, JSON.stringify(name));
+  }
+  const tooLong = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: created.slug,
+    name: "N".repeat(201),
+  });
+  assert.equal(tooLong.status, 400);
+  const stored = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(created.id),
+  });
+  assert.equal(stored.name, "Acme annual renewal");
+  assert.equal(stored.customerId, acme.id);
+});
+
+test("the tool manifest lets create_recurring_invoice leave the name out", () => {
+  type Schema = {
+    required: string[];
+    properties: Record<string, { maxLength?: number; minLength?: number; description?: string }>;
+  };
+  const create = STATIC_TOOLS.find((tool) => tool.name === "create_recurring_invoice");
+  const update = STATIC_TOOLS.find((tool) => tool.name === "update_recurring_invoice");
+  assert.ok(create && update);
+  const createSchema = create.inputSchema as unknown as Schema;
+  assert.deepEqual(
+    [...createSchema.required].sort(),
+    ["cronExpr", "customerSlug", "frequency", "lines"],
+  );
+  assert.equal(createSchema.properties.name.maxLength, 200);
+  assert.match(createSchema.properties.name.description ?? "", /after the customer/);
+  assert.match(create.description, /`name` is optional and defaults to the customer's name/);
+  const updateSchema = update.inputSchema as unknown as Schema;
+  assert.deepEqual(updateSchema.required, ["recurringInvoiceSlug"]);
+  assert.equal(updateSchema.properties.name.minLength, 1);
+  assert.equal(updateSchema.properties.name.maxLength, 200);
+  assert.match(updateSchema.properties.customerSlug.description ?? "", /keeps its name/);
+});
+
+test("create_recurring_invoice and update_recurring_invoice carry a discount onto every run", async () => {
+  const created = await createAnnualSchedule({ discountPercent: 10 });
+  assert.equal(created.discountPercent, 10);
+  assert.equal(created.discountAmountCents, 0);
+
+  // Sending one kind replaces the other, as it does on an invoice.
+  const replaced = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: created.slug,
+    discountAmountCents: 20_000,
+  });
+  assert.equal(replaced.status, 200, replaced.body.error);
+  const schedule = replaced.body.recurringInvoice as Record<string, unknown>;
+  assert.equal(schedule.discountPercent, 0);
+  assert.equal(schedule.discountAmountCents, 20_000);
+
+  const both = await callTool(
+    "create_recurring_invoice",
+    annualSchedule({ discountPercent: 5, discountAmountCents: 100 }),
+  );
+  assert.equal(both.status, 400);
+  assert.match(String(both.body.error), /percentage or an amount/);
+  const bothEdit = await callTool("update_recurring_invoice", {
+    recurringInvoiceSlug: created.slug,
+    discountPercent: 5,
+    discountAmountCents: 100,
+  });
+  assert.equal(bothEdit.status, 400);
+
+  assert.equal(await AppDataSource.getRepository(RecurringInvoice).count(), 1);
+  const stored = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(created.id),
+  });
+  assert.equal(stored.discountPercent, 0);
+  assert.equal(stored.discountAmountCents, 20_000);
+});
+
+test("the tool manifest offers a discount when creating and updating a schedule", () => {
+  type Schema = { properties: Record<string, { type?: string; maximum?: number }> };
+  for (const name of ["create_recurring_invoice", "update_recurring_invoice"]) {
+    const tool = STATIC_TOOLS.find((candidate) => candidate.name === name);
+    assert.ok(tool, name);
+    const schema = tool.inputSchema as unknown as Schema;
+    assert.equal(schema.properties.discountPercent?.maximum, 100, name);
+    assert.equal(schema.properties.discountAmountCents?.type, "integer", name);
+  }
+});
+
+test("list_invoices lists the invoices one schedule created, and each row names its schedule", async () => {
+  const created = await createAnnualSchedule();
+  const schedule = await AppDataSource.getRepository(RecurringInvoice).findOneByOrFail({
+    id: String(created.id),
+  });
+  const { invoice: generated } = await generateInvoiceFromRecurring(schedule, null);
+  const byHand = await insert(Invoice, {
+    companyId: company.id,
+    customerId: customer.id,
+    slug: "draft-byhand",
+    issueDate: new Date(),
+    dueDate: new Date(),
+  });
+
+  const filtered = await callTool("list_invoices", { recurringInvoiceSlug: schedule.slug });
+  assert.equal(filtered.status, 200, filtered.body.error);
+  const rows = filtered.body.invoices as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    rows.map((row) => row.id),
+    [generated.id],
+  );
+  assert.deepEqual(rows[0].recurringInvoice, { name: schedule.name, slug: schedule.slug });
+
+  const all = (await callTool("list_invoices")).body.invoices as Array<Record<string, unknown>>;
+  assert.equal(all.length, 2);
+  assert.equal(all.find((row) => row.id === byHand.id)?.recurringInvoice, null);
+
+  const missing = await callTool("list_invoices", { recurringInvoiceSlug: "ri-missing" });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.body.error, 'Recurring invoice "ri-missing" not found');
+});
+
+test("the tool manifest lets list_invoices filter to one recurring invoice", () => {
+  type Schema = { properties: Record<string, { type?: string }> };
+  const tool = STATIC_TOOLS.find((candidate) => candidate.name === "list_invoices");
+  assert.ok(tool);
+  const schema = tool.inputSchema as unknown as Schema;
+  assert.equal(schema.properties.recurringInvoiceSlug?.type, "string");
+  assert.match(tool.description, /recurringInvoiceSlug/);
+});

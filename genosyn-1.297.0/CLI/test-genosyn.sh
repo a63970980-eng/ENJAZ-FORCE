@@ -1,0 +1,1497 @@
+#!/usr/bin/env bash
+# Tests for the pure helpers in `genosyn`. No docker, no network.
+#
+#   ./CLI/test-genosyn.sh
+#
+# Sources `genosyn` rather than invoking it, so the helpers are testable
+# without running a command. The source guard at the bottom of `genosyn` is
+# what makes that safe.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./genosyn
+source "${HERE}/genosyn"
+
+pass=0
+fail=0
+
+check() {
+  local label="$1" actual="$2" expected="$3"
+  if [ "${actual}" = "${expected}" ]; then
+    pass=$((pass + 1))
+    printf '  ok   %s\n' "${label}"
+  else
+    fail=$((fail + 1))
+    printf '  FAIL %s\n         expected: %s\n         actual:   %s\n' \
+      "${label}" "${expected}" "${actual}"
+  fi
+}
+
+echo "image_repo — tag stripping"
+check "tagged ghcr ref" \
+  "$(image_repo 'ghcr.io/genosyn/app:latest')" 'ghcr.io/genosyn/app'
+check "tagged ghcr ref, semver" \
+  "$(image_repo 'ghcr.io/genosyn/app:1.10.0')" 'ghcr.io/genosyn/app'
+check "untagged ghcr ref" \
+  "$(image_repo 'ghcr.io/genosyn/app')" 'ghcr.io/genosyn/app'
+check "bare name, tagged" \
+  "$(image_repo 'app:latest')" 'app'
+check "bare name, untagged" \
+  "$(image_repo 'app')" 'app'
+
+echo "image_repo — registry ports (the colon that is not a tag)"
+check "tagged ported ref" \
+  "$(image_repo 'localhost:5000/app:1.10.0')" 'localhost:5000/app'
+# The regression. Naive ${IMAGE%:*} yields 'localhost' here, whose glob then
+# matches every image from that registry.
+check "untagged ported ref" \
+  "$(image_repo 'localhost:5000/app')" 'localhost:5000/app'
+check "untagged ported ref, nested path" \
+  "$(image_repo 'registry:5000/team/app')" 'registry:5000/team/app'
+check "tagged ported ref, nested path" \
+  "$(image_repo 'registry:5000/team/app:2.0')" 'registry:5000/team/app'
+
+echo "image_repo — digests"
+check "digest ref" \
+  "$(image_repo 'ghcr.io/genosyn/app@sha256:abc123')" 'ghcr.io/genosyn/app'
+check "tag + digest ref" \
+  "$(image_repo 'ghcr.io/genosyn/app:1.10.0@sha256:abc123')" 'ghcr.io/genosyn/app'
+check "ported digest ref" \
+  "$(image_repo 'localhost:5000/app@sha256:abc123')" 'localhost:5000/app'
+check "bare name digest ref" \
+  "$(image_repo 'app@sha256:abc123')" 'app'
+
+# What prune actually asks: "is this image one of ours?" Same-repo refs must
+# match regardless of how they're written; anything else must not -- especially
+# a bystander image that merely shares a registry host.
+echo "prune repo matching — same repo matches, bystanders do not"
+same_repo() {
+  [ "$(image_repo "$1")" = "$(image_repo "$2")" ] && echo yes || echo no
+}
+check "ours, different tag" \
+  "$(same_repo 'ghcr.io/genosyn/app:latest' 'ghcr.io/genosyn/app:1.9.0')" 'yes'
+check "ours, by digest" \
+  "$(same_repo 'ghcr.io/genosyn/app:latest' 'ghcr.io/genosyn/app@sha256:abc')" 'yes'
+check "sibling image is not ours" \
+  "$(same_repo 'ghcr.io/genosyn/app:latest' 'ghcr.io/genosyn/home:latest')" 'no'
+check "unrelated registry is not ours" \
+  "$(same_repo 'ghcr.io/genosyn/app:latest' 'docker.io/library/postgres:16')" 'no'
+check "ported: ours matches ours" \
+  "$(same_repo 'localhost:5000/app' 'localhost:5000/app:1.10.0')" 'yes'
+# The data-loss case: pruning an untagged ported ref must not sweep up an
+# unrelated image that happens to live on the same host:port.
+check "ported: bystander on same registry is not ours" \
+  "$(same_repo 'localhost:5000/app' 'localhost:5000/postgres:16')" 'no'
+check "ported: bystander under another path is not ours" \
+  "$(same_repo 'registry:5000/team/app' 'registry:5000/other/db:1')" 'no'
+
+echo "user security commands — bootstrap and recovery invariants"
+check "master-admin bootstrap requires verified email" \
+  "$(grep -Fc "Verify this account's email before granting master-admin access." "${HERE}/genosyn")" '1'
+check "master-admin bootstrap rotates existing sessions" \
+  "$(grep -Fc '"isMasterAdmin" = TRUE, "sessionVersion" = "sessionVersion" + 1' "${HERE}/genosyn")" '1'
+check "password recovery revokes API keys for both database drivers" \
+  "$(grep -Fc 'UPDATE api_keys SET "revokedAt"' "${HERE}/genosyn")" '2'
+check "password recovery rotates sessions for both database drivers" \
+  "$(grep -Fc '"sessionVersion" = "sessionVersion" + 1 WHERE id' "${HERE}/genosyn")" '4'
+check "user help advertises safe bootstrap command" \
+  "$(cmd_user_help | grep -Fc 'grant-master-admin <email>')" '1'
+
+echo "auto-update schedule — enable, refresh, disable"
+test_root="$(mktemp -d -t genosyn-cli-test.XXXXXX)"
+trap 'rm -rf "${test_root}"' EXIT
+mkdir -p "${test_root}/bin" "${test_root}/state"
+mock_crontab="${test_root}/crontab"
+export MOCK_CRONTAB_FILE="${mock_crontab}"
+
+cat >"${test_root}/bin/crontab" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -l)
+    [ -f "${MOCK_CRONTAB_FILE}" ] || exit 1
+    cat "${MOCK_CRONTAB_FILE}"
+    ;;
+  -)
+    cat >"${MOCK_CRONTAB_FILE}"
+    ;;
+  -r)
+    rm -f "${MOCK_CRONTAB_FILE}"
+    ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "${test_root}/bin/crontab"
+# The wrapper below captures this PATH, and the test runs it. Whatever it ends
+# up starting must not reach the real Docker daemon, the network, or sudo --
+# not even when the code under test is broken.
+for tool in docker curl wget sudo; do
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"${test_root}/bin/${tool}"
+  chmod +x "${test_root}/bin/${tool}"
+done
+
+original_path="${PATH}"
+PATH="${test_root}/bin:${PATH}"
+AUTO_UPDATE_DIR="${test_root}/state"
+NAME="genosyn-test"
+PORT="9000"
+VOLUME="genosyn-test-data"
+IMAGE="ghcr.io/genosyn/app:latest"
+UPGRADE_BACKUP_DIR="${test_root}/backups"
+printf '%s\n' '5 2 * * * /usr/local/bin/backup' >"${mock_crontab}"
+
+enable_auto_update 1
+check "enable adds one cron entry" \
+  "$(grep -Fc '# genosyn-auto-update:genosyn-test' "${mock_crontab}")" '1'
+check "wrapper captures the custom port" \
+  "$(grep -Fxc 'export GENOSYN_PORT=9000' "$(auto_update_wrapper_path)")" '1'
+check "wrapper captures the backup directory" \
+  "$(grep -Fxc "export GENOSYN_BACKUP_DIR=${test_root}/backups" "$(auto_update_wrapper_path)")" '1'
+check "wrapper runs the safe upgrade command" \
+  "$(grep -Fxc '  "${cli_path}" upgrade' "$(auto_update_wrapper_path)")" '1'
+# The command is only as safe as the CLI it runs: the schedule's own copy,
+# which starts as exactly the CLI that scheduled it.
+check "the upgrade command runs the schedule's own CLI copy" \
+  "$(grep -Fxc "cli_path=$(printf '%q' "${test_root}/state/auto-update-genosyn-test.cli")" "$(auto_update_wrapper_path)")" '1'
+check "the schedule's copy starts as the CLI that scheduled it" \
+  "$(file_sha256 "$(auto_update_cli_path)")" "$(file_sha256 "${HERE}/genosyn")"
+check "wrapper tells the copy where its schedule lives" \
+  "$(grep -Fxc "export GENOSYN_STATE_DIR=$(printf '%q' "${test_root}/state")" "$(auto_update_wrapper_path)")" '1'
+
+# Run the wrapper the way cron does -- a bare environment -- with a recorder
+# standing in for the copy, to see exactly what a nightly run executes.
+cat >"$(auto_update_cli_path)" <<'EOF' || true
+#!/usr/bin/env bash
+printf 'ran %s %s on port %s\n' "$0" "$*" "${GENOSYN_PORT}"
+EOF
+env -i HOME="${test_root}" PATH=/usr/bin:/bin "$(auto_update_wrapper_path)" </dev/null || true
+check "a cron run executes only 'upgrade', from the copy, with the captured settings" \
+  "$(tail -1 "$(auto_update_log_path)")" \
+  "ran ${test_root}/state/auto-update-genosyn-test.cli upgrade on port 9000"
+
+# Enabling again refreshes the wrapper and schedule instead of duplicating it.
+enable_auto_update 1
+check "re-enable remains idempotent" \
+  "$(grep -Fc '# genosyn-auto-update:genosyn-test' "${mock_crontab}")" '1'
+check "re-enabling resets the schedule's copy to the CLI that enabled it" \
+  "$(file_sha256 "$(auto_update_cli_path)")" "$(file_sha256 "${HERE}/genosyn")"
+
+disable_auto_update 1
+check "disable removes only the Genosyn cron entry" \
+  "$(cat "${mock_crontab}")" '5 2 * * * /usr/local/bin/backup'
+check "disable removes the generated wrapper" \
+  "$([ ! -e "$(auto_update_wrapper_path)" ] && echo yes || echo no)" 'yes'
+check "disable removes the schedule's CLI copy" \
+  "$([ ! -e "$(auto_update_cli_path)" ] && echo yes || echo no)" 'yes'
+check "disable records the operator opt-out" \
+  "$([ -e "$(auto_update_disabled_path)" ] && echo yes || echo no)" 'yes'
+
+ensure_auto_update_default
+check "manual upgrade respects the operator opt-out" \
+  "$(grep -Fc '# genosyn-auto-update:genosyn-test' "${mock_crontab}")" '0'
+
+rm -f "$(auto_update_disabled_path)"
+ensure_auto_update_default
+check "existing installs adopt the default-on schedule" \
+  "$(grep -Fc '# genosyn-auto-update:genosyn-test' "${mock_crontab}")" '1'
+
+PATH="${original_path}"
+rm -rf "${test_root}"
+trap - EXIT
+
+# The install this exists for: the installer left /usr/local/bin/genosyn
+# owned by root, the schedule was set up by an older CLI, and cron has no
+# passwordless sudo -- so every nightly run used to repeat the outdated CLI.
+echo "automatic updates — replace their own CLI without sudo"
+test_root="$(mktemp -d -t genosyn-cli-cron-test.XXXXXX)"
+trap 'chmod -R u+w "${test_root}" 2>/dev/null; rm -rf "${test_root}"' EXIT
+cron_home="${test_root}/home"
+cron_bin="${test_root}/bin"
+cron_state="${cron_home}/.genosyn"
+cron_wrapper="${cron_state}/auto-update-genosyn.sh"
+cron_copy="${cron_state}/auto-update-genosyn.cli"
+cron_log="${cron_state}/auto-update-genosyn.log"
+cron_path="${cron_bin}:/usr/bin:/bin:/usr/sbin:/sbin"
+mkdir -p "${cron_bin}" "${cron_state}" "${test_root}/usr-local/bin"
+
+installed="${test_root}/usr-local/bin/genosyn"
+cp "${HERE}/genosyn" "${installed}"
+chmod 0555 "${installed}" "${test_root}/usr-local/bin"
+
+# What genosyn.com serves next: a newer CLI that says when it runs.
+published="${test_root}/published-genosyn"
+sed 's/^CLI_VERSION=.*/CLI_VERSION="9.9.9"; echo "CLI ${CLI_VERSION} is running"/' \
+  "${HERE}/genosyn" >"${published}"
+
+cat >"${cron_bin}/crontab" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -l) [ -f "${MOCK_CRONTAB_FILE}" ] || exit 1; cat "${MOCK_CRONTAB_FILE}" ;;
+  -) cat >"${MOCK_CRONTAB_FILE}" ;;
+  -r) rm -f "${MOCK_CRONTAB_FILE}" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"${cron_bin}/curl" <<'EOF'
+#!/usr/bin/env bash
+dest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) dest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "${MOCK_CURL_SOURCE}" "${dest}"
+EOF
+# No passwordless sudo, as on the reported install. Any call is recorded.
+cat >"${cron_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_SUDO_LOG}"
+exit 1
+EOF
+# A running container already on the newest image.
+cat >"${cron_bin}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_DOCKER_LOG}"
+case "${1:-}" in
+  ps) printf '%s\n' genosyn ;;
+  inspect) printf '%s\n' sha256:current ;;
+  image) case "$*" in *'{{.Id}}'*) printf '%s\n' sha256:current ;; esac ;;
+esac
+exit 0
+EOF
+chmod +x "${cron_bin}/crontab" "${cron_bin}/curl" "${cron_bin}/sudo" "${cron_bin}/docker"
+
+# The wrapper CLI 0.3.0 through 0.7.0 wrote: it runs the installed CLI.
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -uo pipefail'
+  printf 'export PATH=%q\n' "${cron_path}"
+  printf 'export GENOSYN_PORT=%q\n' 9100
+  printf 'export GENOSYN_NAME=%q\n' genosyn
+  printf 'export GENOSYN_VOLUME=%q\n' genosyn-data
+  printf 'export GENOSYN_IMAGE=%q\n' ghcr.io/genosyn/app:latest
+  # 0.6.0 and 0.7.0 also exported GENOSYN_SANDBOX, which the CLI now ignores.
+  printf 'export GENOSYN_SANDBOX=%q\n' 0
+  printf 'export GENOSYN_CLI_URL=%q\n' https://genosyn.invalid/genosyn
+  printf 'export GENOSYN_BACKUP_DIR=%q\n' "${cron_state}/backups"
+  printf 'log_path=%q\n' "${cron_log}"
+  printf 'cli_path=%q\n' "${installed}"
+  cat <<'EOF'
+mkdir -p "$(dirname "${log_path}")"
+{
+  printf '\n[%s] Starting automatic Genosyn update\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "${cli_path}" upgrade
+} >>"${log_path}" 2>&1
+EOF
+} >"${cron_wrapper}"
+chmod 0700 "${cron_wrapper}"
+printf '17 3 * * * %q # genosyn-auto-update:genosyn\n' "${cron_wrapper}" >"${test_root}/crontab"
+cron_entry="$(cat "${test_root}/crontab")"
+
+# Commands an operator runs by hand, with the installed CLI. Their shell has
+# no GENOSYN_PORT, so the default port would leak in if anything re-captured.
+run_installed() {
+  HOME="${cron_home}" PATH="${cron_path}" \
+  MOCK_CRONTAB_FILE="${test_root}/crontab" \
+    bash -c 'source "$1"; shift; "$@"' _ "${installed}" "$@" </dev/null 2>&1
+}
+
+# A nightly run: cron's bare environment, then whatever the wrapper exports.
+run_cron() {
+  env -i HOME="${cron_home}" PATH=/usr/bin:/bin \
+    MOCK_CRONTAB_FILE="${test_root}/crontab" \
+    MOCK_CURL_SOURCE="$1" \
+    MOCK_SUDO_LOG="${test_root}/sudo.log" \
+    MOCK_DOCKER_LOG="${test_root}/docker.log" \
+    "${cron_wrapper}" </dev/null
+}
+
+# Only what the latest run appended to the log.
+last_cron_run() {
+  awk '/Starting automatic Genosyn update/ { run = "" } { run = run $0 "\n" } END { printf "%s", run }' "${cron_log}"
+}
+
+check "status says an older schedule cannot replace its own CLI yet" \
+  "$(run_installed cmd_auto_update status | grep -Fc "Run 'genosyn upgrade' once")" '1'
+
+# `genosyn upgrade` by hand keeps the schedule and moves it onto a copy.
+run_installed ensure_auto_update_default >/dev/null || true
+check "an upgrade run by hand points the older schedule at its own copy" \
+  "$(grep -Fxc "cli_path=$(printf '%q' "${cron_copy}")" "${cron_wrapper}")" '1'
+check "the older schedule keeps the port it captured" \
+  "$(grep -Fxc 'export GENOSYN_PORT=9100' "${cron_wrapper}")" '1'
+check "the copy starts as the installed CLI" \
+  "$(file_sha256 "${cron_copy}")" "$(file_sha256 "${installed}")"
+check "the cron entry itself is unchanged" "$(cat "${test_root}/crontab")" "${cron_entry}"
+
+: >"${test_root}/docker.log"
+run_cron "${published}" || true
+check "the nightly run updates its own copy to the published CLI" \
+  "$(file_sha256 "${cron_copy}")" "$(file_sha256 "${published}")"
+check "the nightly run continues with the latest CLI" \
+  "$(last_cron_run | grep -Fc 'CLI 9.9.9 is running')" '1'
+check "the nightly run never asks for sudo" \
+  "$(cat "${test_root}/sudo.log" 2>/dev/null)" ''
+check "the nightly run has nothing it cannot update" \
+  "$(last_cron_run | grep -Fc 'Cannot update' || true)" '0'
+check "the root-owned installed CLI is left alone" \
+  "$(file_sha256 "${installed}")" "$(file_sha256 "${HERE}/genosyn")"
+check "the nightly run still upgrades Genosyn" \
+  "$(grep -Fxc 'pull ghcr.io/genosyn/app:latest' "${test_root}/docker.log")" '1'
+check "the copy rewrites the older wrapper in the current format" \
+  "$(grep -Fxc "export GENOSYN_STATE_DIR=$(printf '%q' "${cron_state}")" "${cron_wrapper}")" '1'
+check "the rewritten wrapper keeps every setting the older one captured" \
+  "$(grep -Fx -e 'export GENOSYN_PORT=9100' \
+    -e 'export GENOSYN_CLI_URL=https://genosyn.invalid/genosyn' \
+    -e "export PATH=$(printf '%q' "${cron_path}")" "${cron_wrapper}" | wc -l | tr -d ' ')" '3'
+check "status names the copy and the version it runs" \
+  "$(run_installed cmd_auto_update status | grep -Fxc "CLI      ${cron_copy} (9.9.9)")" '1'
+
+wrapper_before="$(file_sha256 "${cron_wrapper}")"
+run_cron "${published}" || true
+check "a current wrapper is not rewritten" \
+  "$(file_sha256 "${cron_wrapper}")" "${wrapper_before}"
+check "an up-to-date copy is kept" \
+  "$(last_cron_run | grep -Fc 'CLI is already up to date.')" '1'
+
+# A download that would not run must not become what every later run starts.
+printf '%s\n' '#!/usr/bin/env bash' 'CLI_VERSION="9.9.10"' 'if then' >"${test_root}/broken-genosyn"
+: >"${test_root}/docker.log"
+run_cron "${test_root}/broken-genosyn" || true
+check "a download that does not parse leaves the copy alone" \
+  "$(file_sha256 "${cron_copy}")" "$(file_sha256 "${published}")"
+check "a rejected download is reported" \
+  "$(last_cron_run | grep -Fc 'not a working genosyn CLI')" '1'
+check "a rejected download does not stop the upgrade" \
+  "$(grep -Fxc 'pull ghcr.io/genosyn/app:latest' "${test_root}/docker.log")" '1'
+
+# A replacement that cannot be written in full must leave the copy as it was,
+# and must not claim an update: here nothing can be created beside the copy.
+sed 's/^CLI_VERSION=.*/CLI_VERSION="9.9.11"/' "${HERE}/genosyn" >"${test_root}/published-next"
+cat >"${cron_bin}/mktemp" <<EOF
+#!/usr/bin/env bash
+case "\$*" in *"${cron_state}"*) exit 1 ;; esac
+exec /usr/bin/mktemp "\$@"
+EOF
+chmod +x "${cron_bin}/mktemp"
+: >"${test_root}/docker.log"
+run_cron "${test_root}/published-next" || true
+rm -f "${cron_bin}/mktemp"
+check "a copy that cannot be replaced in full is kept as it was" \
+  "$(file_sha256 "${cron_copy}")" "$(file_sha256 "${published}")"
+check "a failed replacement does not claim an update" \
+  "$(last_cron_run | grep -Fc 'CLI updated.' || true)" '0'
+check "a failed replacement says so" \
+  "$(last_cron_run | grep -Fc 'Could not replace')" '1'
+check "a failed replacement does not stop the upgrade" \
+  "$(grep -Fxc 'pull ghcr.io/genosyn/app:latest' "${test_root}/docker.log")" '1'
+
+rm -f "${cron_copy}"
+run_installed ensure_auto_update_default >/dev/null || true
+check "the next upgrade restores a deleted copy" \
+  "$(file_sha256 "${cron_copy}")" "$(file_sha256 "${installed}")"
+
+# Cron runs what the state directory holds, so nobody else may change it.
+open_home="${test_root}/open-home"
+mkdir -p "${open_home}"
+mkdir -m 0777 "${open_home}/.genosyn"
+HOME="${open_home}" PATH="${cron_path}" MOCK_CRONTAB_FILE="${test_root}/open-crontab" \
+  bash -c 'source "$1"; enable_auto_update 1' _ "${HERE}/genosyn" </dev/null >/dev/null 2>&1
+check "the state directory loses group and other write access" \
+  "$(stat -c '%a' "${open_home}/.genosyn" 2>/dev/null || stat -f '%Lp' "${open_home}/.genosyn")" '755'
+
+# Seen as another uid, the home directory holding the state directory belongs
+# to someone else -- the sudo-kept-HOME case a root crontab must refuse.
+mkdir -p "${test_root}/other-uid" "${test_root}/foreign-home"
+# Run as root, the suite would own that home itself; hand it to a third uid.
+if [ "$(id -u)" = "0" ]; then chown 4243 "${test_root}/foreign-home"; fi
+cat >"${test_root}/other-uid/id" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-u" ]; then echo 4242; else exec /usr/bin/id "$@"; fi
+EOF
+chmod +x "${test_root}/other-uid/id"
+foreign_rc=0
+foreign_output="$(
+  HOME="${test_root}/foreign-home" PATH="${test_root}/other-uid:${cron_path}" \
+  MOCK_CRONTAB_FILE="${test_root}/foreign-crontab" \
+    bash -c 'source "$1"; enable_auto_update' _ "${HERE}/genosyn" </dev/null 2>&1
+)" || foreign_rc=$?
+check "a state directory inside another user's directory is refused" "${foreign_rc}" '1'
+check "the refusal says why" \
+  "$(printf '%s' "${foreign_output}" | grep -Fc 'another user can change it')" '1'
+check "a refused schedule installs nothing for cron to run" \
+  "$(ls -A "${test_root}/foreign-home/.genosyn"; cat "${test_root}/foreign-crontab" 2>/dev/null)" ''
+
+chmod -R u+w "${test_root}"
+rm -rf "${test_root}"
+trap - EXIT
+
+echo "upgrade safety — backup by default and automatic rollback"
+test_root="$(mktemp -d -t genosyn-cli-upgrade-test.XXXXXX)"
+trap 'rm -rf "${test_root}"' EXIT
+UPGRADE_BACKUP_DIR="${test_root}/backups"
+NAME="genosyn-test"
+
+generated_backup="$(upgrade_backup_path)"
+case "$(basename "${generated_backup}")" in
+  genosyn-pre-upgrade-genosyn-test-*.tar.gz) backup_name_ok=yes ;;
+  *) backup_name_ok=no ;;
+esac
+check "pre-upgrade backup uses a dated instance-specific name" \
+  "${backup_name_ok}" 'yes'
+check "pre-upgrade backup directory is private" \
+  "$(stat -c '%a' "${UPGRADE_BACKUP_DIR}" 2>/dev/null || stat -f '%Lp' "${UPGRADE_BACKUP_DIR}")" '700'
+
+rollback_log="${test_root}/rollback.log"
+docker() {
+  printf 'docker %s\n' "$*" >>"${rollback_log}"
+  return 0
+}
+container_exists() { return 0; }
+restore_volume_from() {
+  printf 'restore %s\n' "$1" >>"${rollback_log}"
+  return 0
+}
+wait_for_ready() {
+  printf 'wait-ready\n' >>"${rollback_log}"
+  return 0
+}
+
+rollback_upgrade \
+  "genosyn-test-upgrade-rollback" \
+  "${test_root}/backups/pre-upgrade.tar.gz" >/dev/null 2>&1
+check "rollback removes failed container, restores data, and restarts old container" \
+  "$(cat "${rollback_log}")" \
+  "$(printf '%s\n' \
+    'docker logs --tail 50 genosyn-test' \
+    'docker rm -f genosyn-test' \
+    "restore ${test_root}/backups/pre-upgrade.tar.gz" \
+    'docker rename genosyn-test-upgrade-rollback genosyn-test' \
+    'docker start genosyn-test' \
+    'wait-ready')"
+
+: >"${rollback_log}"
+rollback_upgrade "genosyn-test-upgrade-rollback" "" >/dev/null 2>&1
+check "rollback without a backup restarts the old container without restoring data" \
+  "$(cat "${rollback_log}")" \
+  "$(printf '%s\n' \
+    'docker logs --tail 50 genosyn-test' \
+    'docker rm -f genosyn-test' \
+    'docker rename genosyn-test-upgrade-rollback genosyn-test' \
+    'docker start genosyn-test' \
+    'wait-ready')"
+
+upgrade_log="${test_root}/upgrade.log"
+docker() {
+  case "${1:-} ${2:-}" in
+    'inspect --format') printf '%s\n' 'sha256:old' ;;
+    'image inspect') printf '%s\n' 'sha256:new' ;;
+    *) printf 'docker %s\n' "$*" >>"${upgrade_log}" ;;
+  esac
+  return 0
+}
+require_docker() { return 0; }
+container_exists() { return 0; }
+container_running() { return 0; }
+container_named_exists() { return 1; }
+ensure_auto_update_default() { return 0; }
+image_version_label() { return 0; }
+upgrade_backup_path() { printf '%s\n' "${test_root}/backups/pre-upgrade.tar.gz"; }
+backup_volume_to() {
+  printf 'backup-volume %s %s\n' "$1" "${2:-0}" >>"${upgrade_log}"
+  return 0
+}
+backup_running_volume_to() {
+  printf 'backup-running %s %s\n' "$1" "${2:-0}" >>"${upgrade_log}"
+  return "${MOCK_LIVE_BACKUP_RC:-0}"
+}
+volume_backup_size_kb() { printf '%s\n' "${MOCK_VOLUME_KB:-2048}"; }
+sqlite_snapshot_size_kb() { printf '%s\n' "${MOCK_SNAPSHOT_KB:-0}"; }
+container_tmp_free_kb() { printf '%s\n' "${MOCK_TMP_FREE_KB:-99999999}"; }
+free_space_kb() {
+  # Clearing Docker's build cache leaves MOCK_FREE_AFTER_RECLAIM_KB free, when set.
+  if [ -n "${MOCK_FREE_AFTER_RECLAIM_KB:-}" ] && grep -Fq 'docker builder prune' "${upgrade_log}"; then
+    printf '%s\n' "${MOCK_FREE_AFTER_RECLAIM_KB}"
+  else
+    printf '%s\n' "${MOCK_FREE_KB:-99999999}"
+  fi
+}
+run_container_with_image() {
+  printf 'run-container %s\n' "$1" >>"${upgrade_log}"
+  return 0
+}
+wait_for_upgrade_ready() { return 0; }
+print_post_install() { return 0; }
+
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "upgrade takes one verified data backup by default" \
+  "$(grep -Ec 'backup-(volume|running) ' "${upgrade_log}" || true)" '1'
+check "a running Genosyn is backed up while it keeps running" \
+  "$(grep -E 'backup-(volume|running) ' "${upgrade_log}")" \
+  "backup-running ${test_root}/backups/pre-upgrade.tar.gz 1"
+check "before its Routine Runs pause or it stops, so the backup costs no downtime" \
+  "$(grep -E 'backup-running|pauseRoutines.js --|docker stop' "${upgrade_log}" | cut -d' ' -f1-3)" \
+  "$(printf '%s\n' "backup-running ${test_root}/backups/pre-upgrade.tar.gz 1" \
+    'docker exec -w' 'docker stop genosyn-test')"
+check "with room to spare, it leaves Docker's build cache and untagged images alone" \
+  "$(grep -Ec 'docker builder prune|docker image prune --force$' "${upgrade_log}" || true)" '0'
+check "once upgraded, it removes only Genosyn's images that earlier upgrades left behind" \
+  "$(grep -F 'docker image prune' "${upgrade_log}")" \
+  'docker image prune --force --filter label=org.opencontainers.image.source=https://github.com/Genosyn/genosyn'
+
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade --backup >/dev/null 2>&1
+check "--backup, now the default, still takes one" \
+  "$(grep -Ec 'backup-(volume|running) ' "${upgrade_log}" || true)" '1'
+
+for flag in --no-backup --skip-backup; do
+  : >"${upgrade_log}"
+  cmd_upgrade --no-self-upgrade "${flag}" >/dev/null 2>&1
+  check "${flag} skips the data backup" \
+    "$(grep -Ec 'backup-(volume|running) ' "${upgrade_log}" || true)" '0'
+  check "${flag} still upgrades" \
+    "$(grep -Fc 'run-container ' "${upgrade_log}" || true)" '1'
+done
+
+: >"${upgrade_log}"
+no_room_rc=0
+# A 5 GiB volume with 3 GiB free: `die` ends only the command substitution.
+no_room_output="$(MOCK_VOLUME_KB=5242880 MOCK_FREE_KB=3145728; cmd_upgrade --no-self-upgrade 2>&1 >/dev/null)" || no_room_rc=$?
+check "an upgrade with no room for its backup stops" "${no_room_rc}" "1"
+check "before pausing, stopping or replacing anything" \
+  "$(grep -Ec 'pauseRoutines|docker stop|backup-(volume|running)|run-container' "${upgrade_log}" || true)" '0'
+case "${no_room_output}" in
+  *"Not enough free space"*"--no-backup"*) no_room_said=yes ;;
+  *) no_room_said=no ;;
+esac
+check "and says how to go on" "${no_room_said}" "yes"
+check "it first clears Docker's build cache and untagged images no container uses" \
+  "$(grep -E 'docker (image|builder) prune' "${upgrade_log}")" \
+  "$(printf '%s\n' 'docker image prune --force' 'docker builder prune --all --force')"
+check "and never a tagged image, a container, or a volume" \
+  "$(grep -Ec 'docker (volume|container|system|network|rm|rmi) |docker image (rm|prune .*(-a|--all))' "${upgrade_log}" || true)" '0'
+
+: >"${upgrade_log}"
+# The same 3 GiB free, and 9 GiB once Docker's build cache is cleared.
+reclaim_output="$(MOCK_VOLUME_KB=5242880 MOCK_FREE_KB=3145728 MOCK_FREE_AFTER_RECLAIM_KB=9437184; cmd_upgrade --no-self-upgrade 2>/dev/null)" || true
+check "when that makes room, the upgrade goes on with its backup" \
+  "$(grep -Ec 'backup-running |run-container ' "${upgrade_log}" || true)" '2'
+case "${reclaim_output}" in
+  *"Freed 6.0GB"*) reclaim_said=yes ;;
+  *) reclaim_said=no ;;
+esac
+check "and says how much it freed" "${reclaim_said}" "yes"
+
+: >"${upgrade_log}"
+snapshot_rc=0
+# A 2 GiB volume whose 2 GiB database is snapshotted too: 5 GiB with the spare
+# gigabyte, and only 4.5 GiB free.
+snapshot_output="$(MOCK_VOLUME_KB=2097152 MOCK_SNAPSHOT_KB=2097152 MOCK_FREE_KB=4718592; cmd_upgrade --no-self-upgrade 2>&1 >/dev/null)" || snapshot_rc=$?
+check "a running Genosyn's database snapshot counts toward the room the backup needs" \
+  "${snapshot_rc}:$(grep -Ec 'backup-running|docker stop' "${upgrade_log}" || true)" '1:0'
+case "${snapshot_output}" in
+  *"Not enough free space for the upgrade backup"*"up to 4.0GB and 4.5GB is free"*) snapshot_said=yes ;;
+  *) snapshot_said=no ;;
+esac
+check "and the shortfall says so" "${snapshot_said}" "yes"
+
+: >"${upgrade_log}"
+tmp_rc=0
+tmp_output="$(MOCK_SNAPSHOT_KB=2097152 MOCK_TMP_FREE_KB=2097152; cmd_upgrade --no-self-upgrade 2>&1 >/dev/null)" || tmp_rc=$?
+check "the container needs room for the snapshot as well" \
+  "${tmp_rc}:$(grep -Ec 'backup-running|docker stop' "${upgrade_log}" || true)" '1:0'
+case "${tmp_output}" in
+  *"Not enough free space for the database snapshot"*) tmp_said=yes ;;
+  *) tmp_said=no ;;
+esac
+check "and says it is the snapshot that does not fit" "${tmp_said}" "yes"
+
+: >"${upgrade_log}"
+live_failed_rc=0
+live_failed_output="$(MOCK_LIVE_BACKUP_RC=1; cmd_upgrade --no-self-upgrade 2>&1 >/dev/null)" || live_failed_rc=$?
+check "a live backup that fails stops the upgrade" "${live_failed_rc}" "1"
+check "with Genosyn left running: nothing paused, stopped or replaced" \
+  "$(grep -Ec 'pauseRoutines.js --|docker stop|run-container' "${upgrade_log}" || true)" '0'
+case "${live_failed_output}" in
+  *"still running"*"genosyn stop"*"--no-backup"*) live_failed_said=yes ;;
+  *) live_failed_said=no ;;
+esac
+check "and says how to go on" "${live_failed_said}" "yes"
+
+: >"${upgrade_log}"
+container_running() { return 1; }
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "a stopped Genosyn is archived as it lies" \
+  "$(grep -E 'backup-(volume|running) ' "${upgrade_log}")" \
+  "backup-volume ${test_root}/backups/pre-upgrade.tar.gz 1"
+check "and nothing is stopped for it" \
+  "$(grep -Ec 'docker stop|pauseRoutines.js --' "${upgrade_log}" || true)" '0'
+container_running() { return 0; }
+
+echo "upgrade backups — one kept per install"
+NAME="genosyn-test"
+mkdir -p "${UPGRADE_BACKUP_DIR}"
+older="${UPGRADE_BACKUP_DIR}/genosyn-pre-upgrade-genosyn-test-20261020-091500-4242.tar.gz"
+neighbour="${UPGRADE_BACKUP_DIR}/genosyn-pre-upgrade-genosyn-test-2-20261020-091500-4242.tar.gz"
+unrelated="${UPGRADE_BACKUP_DIR}/genosyn-backup-20261020-091500.tar.gz"
+: >"${older}"; : >"${neighbour}"; : >"${unrelated}"
+prune_pre_upgrade_backups >/dev/null 2>&1
+check "the previous upgrade backup for this install is removed" \
+  "$([ -e "${older}" ] && echo kept || echo removed)" 'removed'
+check "another install's upgrade backup is left alone" \
+  "$([ -e "${neighbour}" ] && echo kept || echo removed)" 'kept'
+check "a manual backup in the same directory is left alone" \
+  "$([ -e "${unrelated}" ] && echo kept || echo removed)" 'kept'
+rm -f "${neighbour}" "${unrelated}"
+
+echo "live backups — snapshot, stream, clean up"
+live_log="${test_root}/live.log"
+live_backup() {
+  # $1 = what the snapshot step prints (the database's path, or nothing),
+  # $2 = its exit status, $3 = tar's exit status.
+  : >"${live_log}"
+  rm -f "${test_root}/live.tar.gz"
+  (
+    # shellcheck source=./genosyn
+    source "${HERE}/genosyn"
+    NAME="genosyn-test"
+    docker() {
+      printf '%s\n' "$*" >>"${live_log}"
+      case "$*" in
+        *" node") cat >/dev/null; printf '%s' "${MOCK_DB}"; return "${MOCK_SNAPSHOT_RC}" ;;
+        *" tar --create "*) printf 'archive-bytes'; return "${MOCK_TAR_RC}" ;;
+      esac
+      return 0
+    }
+    archive_valid() { [ -s "$1" ]; }
+    rc=0
+    MOCK_DB="$1" MOCK_SNAPSHOT_RC="$2" MOCK_TAR_RC="$3" \
+      backup_running_volume_to "${test_root}/live.tar.gz" 1 2>/dev/null || rc=$?
+    echo "rc=${rc}" >>"${live_log}"
+  )
+}
+stage_cleanups() { grep -Fc 'exec -u 0 genosyn-test rm -rf /tmp/genosyn-upgrade-backup' "${live_log}" || true; }
+
+live_backup app.sqlite 0 0
+check "the database is snapshotted inside the running container" \
+  "$(grep -F ' node' "${live_log}")" \
+  'exec -i -w /app -e GENOSYN_SNAPSHOT_DIR=/tmp/genosyn-upgrade-backup genosyn-test node'
+check "and the archive streams the volume with the snapshot in place of the live database" \
+  "$(grep -F 'tar --create' "${live_log}")" \
+  'exec -u 0 genosyn-test tar --create --gzip --file=- --checkpoint=1000 --checkpoint-action=echo=genosyn-progress %{}T --directory=/app/data --anchored --ignore-failed-read --warning=no-file-changed --warning=no-file-removed --warning=no-file-ignored --exclude=./Backup --exclude=./app.sqlite --exclude=./app.sqlite-wal --exclude=./app.sqlite-shm --exclude=./app.sqlite-journal . --directory=/tmp/genosyn-upgrade-backup app.sqlite'
+check "into a private file on the host" \
+  "$(cat "${test_root}/live.tar.gz"):$(stat -c '%a' "${test_root}/live.tar.gz" 2>/dev/null || stat -f '%Lp' "${test_root}/live.tar.gz")" \
+  'archive-bytes:600'
+check "and the snapshot is cleared before and after" "$(stage_cleanups):$(tail -1 "${live_log}")" '2:rc=0'
+
+live_backup app.sqlite 0 1
+check "a file that changed while it was read still makes a backup" "$(tail -1 "${live_log}")" 'rc=0'
+
+live_backup app.sqlite 0 2
+check "a tar error does not, and the snapshot is still cleared" \
+  "$(stage_cleanups):$(tail -1 "${live_log}")" '2:rc=1'
+
+live_backup "" 1 0
+check "a snapshot that fails stops before the archive, and is cleared" \
+  "$(grep -Fc 'tar --create' "${live_log}" || true):$(stage_cleanups):$(tail -1 "${live_log}")" '0:2:rc=1'
+
+live_backup "" 0 0
+check "a volume with no SQLite database (Postgres) is archived as it is" \
+  "$(grep -F 'tar --create' "${live_log}" | sed 's/.* --exclude=/--exclude=/')" \
+  '--exclude=./Backup .'
+
+echo "progress — a bar on a terminal, the same lines as ever elsewhere"
+progress_screen="${test_root}/progress.screen"
+# Reports progress the way GNU tar's checkpoints do, with an error among the
+# reports, writes an archive to stdout, and exits with $1.
+progress_reporter() {
+  printf 'tar: %s 1024 (1.0KiB, 1.0KiB/s)\n' "${PROGRESS_MARK}" >&2
+  printf 'tar: ./locked: Cannot open: Permission denied\n' >&2
+  printf 'tar: %s 1050 (1.0KiB, 1.0KiB/s)\n' "${PROGRESS_MARK}" >&2
+  printf 'tar: %s 2048 (2.0KiB, 2.0KiB/s)\n' "${PROGRESS_MARK}" >&2
+  printf 'archive-bytes'
+  return "$1"
+}
+# What a terminal is sent to redraw the progress line as $1.
+redraw() { printf '\r\033[K%s' "$1"; }
+# $1 cells of $2.
+cells() { local s; printf -v s '%*s' "$1" ''; printf '%s' "${s// /$2}"; }
+# Run with_progress as if stderr were a terminal, keeping what it is sent.
+on_terminal() {
+  (
+    progress_tty() { return 0; }
+    C_INDIGO="" C_DIM="" C_RESET=""
+    with_progress "$@" >/dev/null 2>"${progress_screen}"
+  )
+}
+
+progress_rc=0
+progress_out="$(with_progress "Archiving the volume" 4096 progress_reporter 3 2>"${progress_screen}")" || progress_rc=$?
+check "with_progress hands the command's stdout through" "${progress_out}" 'archive-bytes'
+check "and returns the command's status" "${progress_rc}" '3'
+check "off a terminal, the progress reports are dropped and every other line passes through" \
+  "$(cat "${progress_screen}")" 'tar: ./locked: Cannot open: Permission denied'
+
+on_terminal "Archiving the volume" 4096 progress_reporter 0
+bar25="  $(cells 7 █)$(cells 23 ░)  25%  1.0KB of 4.0KB"
+bar50="  $(cells 15 █)$(cells 15 ░)  50%  2.0KB of 4.0KB"
+expected="$(redraw '  Archiving the volume…')$(redraw "${bar25}")"
+expected+="$(redraw 'tar: ./locked: Cannot open: Permission denied')"$'\n'"${bar25}"
+expected+="$(redraw "${bar50}")$(redraw '')"
+check "on a terminal, the line says what is happening, then shows the bar, redrawn as the percentage moves, around other lines, and is cleared at the end" \
+  "$(cat "${progress_screen}")" "${expected}"
+
+on_terminal "Archiving the volume" "" progress_reporter 0
+expected="$(redraw '  Archiving the volume…')$(redraw '  Archiving the volume… 1.0KB')"
+expected+="$(redraw 'tar: ./locked: Cannot open: Permission denied')"$'\n''  Archiving the volume… 1.0KB'
+expected+="$(redraw '  Archiving the volume… 2.0KB')$(redraw '')"
+check "without a total, it counts the bytes done" "$(cat "${progress_screen}")" "${expected}"
+
+on_terminal "Archiving the volume" 1024 progress_reporter 0
+check "a volume that grows past its measured size fills the bar and stops there" \
+  "$(cat "${progress_screen}")" \
+  "$(redraw '  Archiving the volume…')$(redraw "  $(cells 30 █) 100%  1.0KB of 1.0KB")$(redraw 'tar: ./locked: Cannot open: Permission denied')"$'\n'"  $(cells 30 █) 100%  1.0KB of 1.0KB$(redraw '')"
+
+on_terminal "Snapshotting the database" "" true
+check "a step that reports nothing says what it is doing until it ends" \
+  "$(cat "${progress_screen}")" "$(redraw '  Snapshotting the database…')$(redraw '')"
+
+echo "live backups — the progress bar's total"
+live_screen="${test_root}/live.screen"
+live_progress() {
+  # $1 = yes to draw as on a terminal. Logs docker to live_log and keeps what
+  # the terminal is sent in live_screen.
+  local tty="$1"
+  : >"${live_log}"
+  rm -f "${test_root}/live.tar.gz"
+  (
+    # shellcheck source=./genosyn
+    source "${HERE}/genosyn"
+    NAME="genosyn-test"
+    C_INDIGO="" C_DIM="" C_RESET=""
+    if [ "${tty}" = "yes" ]; then progress_tty() { return 0; }; fi
+    docker() {
+      printf '%s\n' "$*" >>"${live_log}"
+      case "$*" in
+        *" node") cat >/dev/null; printf 'app.sqlite' ;;
+        *" tar --create --file=/dev/null "*) printf 'Total bytes written: 20480000 (20MiB, 1.0GiB/s)\n' >&2 ;;
+        *" tar --create "*)
+          printf 'tar: %s 10240000 (9.8MiB, 9.8MiB/s)\n' "${PROGRESS_MARK}" >&2
+          printf 'archive-bytes'
+          printf 'tar: %s 20480000 (20MiB, 9.8MiB/s)\n' "${PROGRESS_MARK}" >&2
+          ;;
+      esac
+      return 0
+    }
+    archive_valid() { [ -s "$1" ]; }
+    rc=0
+    backup_running_volume_to "${test_root}/live.tar.gz" 1 2>"${live_screen}" || rc=$?
+    echo "rc=${rc}" >>"${live_log}"
+  )
+}
+
+live_progress yes
+check "on a terminal, a dry run into /dev/null measures the same archive first, in the C locale" \
+  "$(grep -F -- '--file=/dev/null' "${live_log}")" \
+  'exec -u 0 -e LC_ALL=C genosyn-test tar --create --file=/dev/null --totals --directory=/app/data --anchored --ignore-failed-read --warning=no-file-changed --warning=no-file-removed --warning=no-file-ignored --exclude=./Backup --exclude=./app.sqlite --exclude=./app.sqlite-wal --exclude=./app.sqlite-shm --exclude=./app.sqlite-journal . --directory=/tmp/genosyn-upgrade-backup app.sqlite'
+check "so tar reports about a thousand times over it" \
+  "$(grep -F -- '--file=- ' "${live_log}" | grep -o -- '--checkpoint=[0-9]*')" '--checkpoint=3'
+check "which the terminal shows as a bar, never as tar's own lines" \
+  "$(grep -Fc " 50%  9.8MB of 19.5MB" "${live_screen}" || true):$(grep -Fc "${PROGRESS_MARK}" "${live_screen}" || true)" '1:0'
+check "after a line saying the database is being snapshotted" \
+  "$(grep -Fc 'Snapshotting the database…' "${live_screen}" || true)" '1'
+check "and the backup still succeeds" \
+  "$(cat "${test_root}/live.tar.gz"):$(tail -1 "${live_log}")" 'archive-bytes:rc=0'
+
+live_progress no
+check "elsewhere, nothing measures the archive first" \
+  "$(grep -Fc -- '--file=/dev/null' "${live_log}" || true)" '0'
+check "tar reports every ~10MB" \
+  "$(grep -o -- '--checkpoint=[0-9]*' "${live_log}")" '--checkpoint=1000'
+check "and nothing is drawn" "$(cat "${live_screen}"):$(tail -1 "${live_log}")" ':rc=0'
+
+echo "volume archives — the App's Backup/ folder"
+volume_log="${test_root}/volume.log"
+(
+  # The real helper, not the rollback test's stand-in, with only docker faked.
+  # shellcheck source=./genosyn
+  source "${HERE}/genosyn"
+  docker() { printf '%s\n' "$*" >>"${volume_log}"; return 0; }
+  restore_volume_from "${test_root}/backups/pre-upgrade.tar.gz"
+)
+check "a restore keeps the App's Backup/ archives" \
+  "$(grep -Fc '! -name Backup' "${volume_log}" || true)" '1'
+
+echo "volume archives — what BusyBox tar has read, as the progress"
+volume_screen="${test_root}/volume.screen"
+mkdir -p "${test_root}/backups"
+volume_progress() {
+  # $1 = yes to draw as on a terminal. Logs docker to volume_log and keeps what
+  # the terminal is sent in volume_screen.
+  local tty="$1"
+  : >"${volume_log}"
+  rm -f "${test_root}/backups/stopped.tar.gz"
+  (
+    # shellcheck source=./genosyn
+    source "${HERE}/genosyn"
+    VOLUME="genosyn-test-data"
+    C_INDIGO="" C_DIM="" C_RESET=""
+    if [ "${tty}" = "yes" ]; then progress_tty() { return 0; }; fi
+    docker() {
+      printf '%s\n' "$*" >>"${volume_log}"
+      case "$*" in
+        *"du -sb"*) printf '4096\n' ;;
+        *"tar -czf"*)
+          # The archive goes to the directory mounted at /backup, named by the
+          # script's first argument; the progress mark is its last.
+          local args=("$@")
+          printf '%s 2048\n' "${args[$# - 1]}" >&2
+          printf 'archive' >"${args[5]%:/backup}/${args[$# - 5]}"
+          printf '%s 4096\n' "${args[$# - 1]}" >&2
+          ;;
+      esac
+      return 0
+    }
+    archive_valid() { [ -s "$1" ]; }
+    rc=0
+    backup_volume_to "${test_root}/backups/stopped.tar.gz" 1 2>"${volume_screen}" || rc=$?
+    echo "rc=${rc}" >>"${volume_log}"
+  )
+}
+
+volume_progress yes
+check "on a terminal, the volume is measured first, leaving out the App's Backup/ folder" \
+  "$(grep -F 'du -sb' "${volume_log}" | awk '{ print $NF }')" '1'
+check "while tar archives, the shell beside it reports what tar has read from /proc" \
+  "$(grep -Fc 'sed -n "s/^rchar: /$5 /p" "/proc/$pid/io"' "${volume_log}" || true)" '1'
+check "with the progress mark" \
+  "$(grep -F 'wait "$pid"' "${volume_log}" | awk '{ print $(NF - 1), $NF }')" "1 ${PROGRESS_MARK}"
+check "which the terminal shows as a bar, never as the reports themselves" \
+  "$(grep -Fc " 50%  2.0KB of 4.0KB" "${volume_screen}" || true):$(grep -Fc "${PROGRESS_MARK}" "${volume_screen}" || true)" '1:0'
+check "and the archive is still written and checked" \
+  "$(cat "${test_root}/backups/stopped.tar.gz"):$(tail -1 "${volume_log}")" 'archive:rc=0'
+
+volume_progress no
+check "elsewhere, the volume is not measured and nothing is drawn" \
+  "$(grep -Fc 'du -sb' "${volume_log}" || true):$(cat "${volume_screen}"):$(tail -1 "${volume_log}")" '0::rc=0'
+
+echo "archive checks — how far tar has read the archive, as the progress"
+check_log="${test_root}/check.log"
+check_screen="${test_root}/check.screen"
+check_archive="${test_root}/backups/check.tar.gz"
+printf '%4096s' '' >"${check_archive}"
+archive_check() {
+  # $1 = yes to draw as on a terminal, $2 = what tar exits with, $3 = the
+  # archive. Logs docker to check_log and keeps what the terminal is sent in
+  # check_screen.
+  local tty="$1" tar_rc="$2" archive="$3"
+  : >"${check_log}"
+  (
+    # shellcheck source=./genosyn
+    source "${HERE}/genosyn"
+    C_INDIGO="" C_DIM="" C_RESET=""
+    if [ "${tty}" = "yes" ]; then progress_tty() { return 0; }; fi
+    docker() {
+      printf '%s\n' "$*" >>"${check_log}"
+      # The shell beside tar reports its position in the archive, with the
+      # mark it is given as its last argument.
+      local args=("$@")
+      printf '%s 2048\n' "${args[$# - 1]}" >&2
+      printf '%s 4096\n' "${args[$# - 1]}" >&2
+      return "${tar_rc}"
+    }
+    rc=0
+    archive_valid "${archive}" 2>"${check_screen}" || rc=$?
+    echo "rc=${rc}" >>"${check_log}"
+  )
+}
+
+archive_check yes 0 "${check_archive}"
+check "the archive's folder is mounted read-only and tar lists it" \
+  "$(head -1 "${check_log}")" \
+  "run --rm -v ${test_root}/backups:/backup:ro alpine:3.20 sh -c tar -tzf \"/backup/\$1\" >/dev/null &"
+check "while the shell beside it reads its position in the archive from /proc" \
+  "$(grep -Fc '"${fd%/fd/*}/fdinfo/${fd##*/}"' "${check_log}" || true):$(grep -F 'wait "$pid"' "${check_log}")" \
+  "1:wait \"\$pid\" sh check.tar.gz ${PROGRESS_MARK}"
+check "which a terminal shows as a bar of the archive's size" \
+  "$(cat "${check_screen}")" \
+  "$(redraw '  Verifying the backup…')$(redraw "  $(cells 15 █)$(cells 15 ░)  50%  2.0KB of 4.0KB")$(redraw "  $(cells 30 █) 100%  4.0KB of 4.0KB")$(redraw '')"
+check "and an archive tar reads end to end is valid" "$(tail -1 "${check_log}")" 'rc=0'
+
+archive_check no 1 "${check_archive}"
+check "one it cannot read is not, and elsewhere nothing is drawn" \
+  "$(tail -1 "${check_log}"):$(cat "${check_screen}")" 'rc=1:'
+
+: >"${test_root}/backups/empty.tar.gz"
+archive_check yes 0 "${test_root}/backups/empty.tar.gz"
+check "an empty archive is not valid, and tar is never started" \
+  "$(cat "${check_log}")" 'rc=1'
+
+echo "upgrade pauses running Routine Runs so they continue afterwards"
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "upgrade pauses Routine Runs before it stops the container" \
+  "$(grep -E 'pauseRoutines|drainRoutines|docker stop' "${upgrade_log}")" \
+  "$(printf '%s\n' \
+    'docker exec genosyn-test test -f /app/dist/server/admin/pauseRoutines.js' \
+    'docker exec -w /app genosyn-test node dist/server/admin/pauseRoutines.js --finish-minutes 0 --grace-seconds 90' \
+    'docker stop genosyn-test')"
+
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade --drain-minutes 15 >/dev/null 2>&1
+check "--drain-minutes lets running Routine Runs finish before the rest pause" \
+  "$(grep -F -- '--finish-minutes' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/pauseRoutines.js --finish-minutes 15 --grace-seconds 90'
+
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade --now >/dev/null 2>&1
+check "--now pauses at once, without time to save progress" \
+  "$(grep -F -- '--finish-minutes' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/pauseRoutines.js --finish-minutes 0 --grace-seconds 0'
+check "--now still upgrades" \
+  "$(grep -Fc 'docker stop genosyn-test' "${upgrade_log}" || true)" '1'
+
+: >"${upgrade_log}"
+GENOSYN_TEST_GRACE_BEFORE="${PAUSE_GRACE_SECONDS}"
+PAUSE_GRACE_SECONDS=30
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "GENOSYN_PAUSE_GRACE_SECONDS sets how long each Run gets to save its progress" \
+  "$(grep -F -- '--grace-seconds' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/pauseRoutines.js --finish-minutes 0 --grace-seconds 30'
+
+: >"${upgrade_log}"
+PAUSE_GRACE_SECONDS="soon"
+DRAIN_MINUTES="an hour"
+bad_env_output="$(cmd_upgrade --no-self-upgrade 2>&1 >/dev/null || true)"
+check "unreadable pause settings fall back to the defaults" \
+  "$(grep -F -- '--grace-seconds' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/pauseRoutines.js --finish-minutes 0 --grace-seconds 90'
+case "${bad_env_output}" in
+  *"GENOSYN_PAUSE_GRACE_SECONDS must be a whole number"*"GENOSYN_DRAIN_MINUTES"*|*"GENOSYN_DRAIN_MINUTES must be a whole number"*"GENOSYN_PAUSE_GRACE_SECONDS"*) bad_env_warned=yes ;;
+  *) bad_env_warned=no ;;
+esac
+check "and say so" "${bad_env_warned}" "yes"
+PAUSE_GRACE_SECONDS="${GENOSYN_TEST_GRACE_BEFORE}"
+DRAIN_MINUTES=0
+
+bad_drain_rc=0
+(cmd_upgrade --no-self-upgrade --drain-minutes soon >/dev/null 2>&1) || bad_drain_rc=$?
+check "--drain-minutes refuses anything but whole minutes" "${bad_drain_rc}" "1"
+
+docker() {
+  case "${1:-} ${2:-}" in
+    'inspect --format') printf '%s\n' 'sha256:old' ;;
+    'image inspect') printf '%s\n' 'sha256:new' ;;
+    *)
+      printf 'docker %s\n' "$*" >>"${upgrade_log}"
+      # An image from before pausing still has its drain script.
+      [ "${1:-} ${3:-} ${5:-}" != "exec test /app/dist/server/admin/pauseRoutines.js" ] || return 1
+      ;;
+  esac
+  return 0
+}
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "an image from before pausing holds its queue, so the upgraded one resumes what is cut off" \
+  "$(grep -F 'drainRoutines.js --' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/drainRoutines.js --minutes 0'
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade --drain-minutes 20 >/dev/null 2>&1
+check "and still lets Runs finish first when asked" \
+  "$(grep -F 'drainRoutines.js --' "${upgrade_log}")" \
+  'docker exec -w /app genosyn-test node dist/server/admin/drainRoutines.js --minutes 20'
+
+docker() {
+  case "${1:-} ${2:-}" in
+    'inspect --format') printf '%s\n' 'sha256:old' ;;
+    'image inspect') printf '%s\n' 'sha256:new' ;;
+    *)
+      printf 'docker %s\n' "$*" >>"${upgrade_log}"
+      # An image from before draining has no script at all.
+      [ "${1:-} ${3:-}" != "exec test" ] || return 1
+      ;;
+  esac
+  return 0
+}
+: >"${upgrade_log}"
+cmd_upgrade --no-self-upgrade >/dev/null 2>&1
+check "an image without either script restarts as before" \
+  "$(grep -Ec 'pauseRoutines.js --|drainRoutines.js --' "${upgrade_log}" || true)" '0'
+check "an image without either script still upgrades" \
+  "$(grep -Fc 'docker stop genosyn-test' "${upgrade_log}" || true)" '1'
+
+docker() {
+  case "${1:-} ${2:-}" in
+    'inspect --format') printf '%s\n' 'sha256:old' ;;
+    'image inspect') printf '%s\n' 'sha256:new' ;;
+    *)
+      printf 'docker %s\n' "$*" >>"${upgrade_log}"
+      # Runs were still going when the pause ran out of time.
+      [ "${1:-} ${2:-} ${6:-}" != "exec -w dist/server/admin/pauseRoutines.js" ] || return 3
+      ;;
+  esac
+  return 0
+}
+: >"${upgrade_log}"
+pause_output="$(cmd_upgrade --no-self-upgrade 2>&1 >/dev/null || true)"
+check "Runs that did not pause in time are reported and the upgrade goes on" \
+  "$(grep -Fc 'docker stop genosyn-test' "${upgrade_log}" || true)" '1'
+case "${pause_output}" in
+  *"did not pause in time"*"resume from their last saved line"*) pause_warned=yes ;;
+  *) pause_warned=no ;;
+esac
+check "the warning says they resume after the restart" "${pause_warned}" "yes"
+
+docker() {
+  case "${1:-} ${2:-}" in
+    'inspect --format') printf '%s\n' 'sha256:old' ;;
+    'image inspect') printf '%s\n' 'sha256:new' ;;
+    *)
+      printf 'docker %s\n' "$*" >>"${upgrade_log}"
+      [ "${1:-} ${2:-} ${6:-}" != "exec -w dist/server/admin/pauseRoutines.js" ] || return 1
+      ;;
+  esac
+  return 0
+}
+: >"${upgrade_log}"
+pause_failed_output="$(cmd_upgrade --no-self-upgrade 2>&1 >/dev/null || true)"
+check "a pause that fails outright does not block the upgrade" \
+  "$(grep -Fc 'docker stop genosyn-test' "${upgrade_log}" || true)" '1'
+case "${pause_failed_output}" in
+  *"Could not pause running Routine Runs; upgrading anyway"*) pause_failure_warned=yes ;;
+  *) pause_failure_warned=no ;;
+esac
+check "and says so" "${pause_failure_warned}" "yes"
+
+install_log="${test_root}/install.log"
+require_docker() { return 0; }
+container_exists() { return 0; }
+disable_auto_update() {
+  printf 'disable-auto-update\n' >>"${install_log}"
+  return 0
+}
+cmd_upgrade() {
+  printf 'safe-upgrade %s\n' "$*" >>"${install_log}"
+  return 0
+}
+
+cmd_install \
+  --no-auto-update \
+  --port 9100 \
+  --name existing-genosyn \
+  --volume existing-data \
+  --image ghcr.io/genosyn/app:latest >/dev/null 2>&1
+check "re-running the installer delegates to the safe upgrade path" \
+  "$(cat "${install_log}")" \
+  "$(printf '%s\n' \
+    'disable-auto-update' \
+    'safe-upgrade --port 9100 --name existing-genosyn --volume existing-data --image ghcr.io/genosyn/app:latest')"
+
+rm -rf "${test_root}"
+trap - EXIT
+
+echo "display and common flag helpers"
+check "human size: bytes" "$(human_size 1023)" "1023B"
+check "human size: kibibytes" "$(human_size 1536)" "1.5KB"
+check "human size: mebibytes" "$(human_size 1048576)" "1.0MB"
+check "human size: tebibytes" "$(human_size 1099511627776)" "1.0TB"
+
+NAME="prod/us west"
+AUTO_UPDATE_DIR="/tmp/genosyn state"
+check "unsafe container characters are sanitized in state keys" \
+  "$(auto_update_key)" "prod_us_west"
+check "the sanitized key is used in the wrapper path" \
+  "$(auto_update_wrapper_path)" "/tmp/genosyn state/auto-update-prod_us_west.sh"
+check "the sanitized key is used in the schedule's CLI copy path" \
+  "$(auto_update_cli_path)" "/tmp/genosyn state/auto-update-prod_us_west.cli"
+
+PORT=8471
+NAME=genosyn
+VOLUME=genosyn-data
+IMAGE=ghcr.io/genosyn/app:latest
+parse_common_flags \
+  --port 9001 \
+  --name=custom \
+  --volume custom-data \
+  --image=registry:5000/team/app:2 \
+  --tail 50 \
+  positional
+check "common flags parse the space form" "${PORT}" "9001"
+check "common flags parse the equals form" "${NAME}" "custom"
+check "common flags carry registry ports intact" "${IMAGE}" "registry:5000/team/app:2"
+check "common flags leave command-specific args in order" \
+  "$(printf '%s|' "${REMAINING[@]}")" "--tail|50|positional|"
+
+missing_value_rc=0
+missing_value_output="$(
+  bash -c 'source "$1"; parse_common_flags --port' _ "${HERE}/genosyn" 2>&1
+)" || missing_value_rc=$?
+check "a common flag without a value fails" "${missing_value_rc}" "1"
+check "a common flag without a value explains itself" \
+  "${missing_value_output}" "✗ Missing value for --port"
+
+for disabled in 0 false FALSE no NO off OFF; do
+  if auto_update_requested "${disabled}"; then disabled_result=yes; else disabled_result=no; fi
+  check "auto-update opt-out ${disabled}" "${disabled_result}" "no"
+done
+if auto_update_requested yes; then enabled_result=yes; else enabled_result=no; fi
+check "auto-update defaults all other values on" "${enabled_result}" "yes"
+
+echo "vLLM configuration helpers"
+test_root="$(mktemp -d -t genosyn-cli-vllm-test.XXXXXX)"
+trap 'rm -rf "${test_root}"' EXIT
+VLLM_DIR="${test_root}/vllm"
+mkdir -p "${VLLM_DIR}"
+vllm_write_default_env
+check "default vLLM model is the documented Qwen model" \
+  "$(vllm_env_get VLLM_MODEL "${VLLM_DIR}/.env")" \
+  "Qwen/Qwen2.5-Coder-32B-Instruct"
+check "default vLLM endpoint is unauthenticated" \
+  "$(vllm_env_get VLLM_API_KEY "${VLLM_DIR}/.env")" ""
+
+vllm_env_set VLLM_PORT 9000 "${VLLM_DIR}/.env"
+vllm_env_set VLLM_API_KEY 'secret=with=equals' "${VLLM_DIR}/.env"
+check "env upsert replaces a value" \
+  "$(vllm_env_get VLLM_PORT "${VLLM_DIR}/.env")" "9000"
+check "env values may contain equals signs" \
+  "$(vllm_env_get VLLM_API_KEY "${VLLM_DIR}/.env")" "secret=with=equals"
+printf '%s\n' 'VLLM_PORT=1' 'KEEP=this' 'VLLM_PORT=2' >"${VLLM_DIR}/duplicates.env"
+vllm_env_set VLLM_PORT 8001 "${VLLM_DIR}/duplicates.env"
+check "env upsert collapses duplicate keys" \
+  "$(grep -Ec '^VLLM_PORT=' "${VLLM_DIR}/duplicates.env")" "1"
+check "env upsert preserves unrelated lines" \
+  "$(grep -Fxc 'KEEP=this' "${VLLM_DIR}/duplicates.env")" "1"
+check "missing env keys read as empty" \
+  "$(vllm_env_get UNKNOWN "${VLLM_DIR}/.env")" ""
+
+vllm_write_compose
+check "generated compose keeps model interpolation for runtime" \
+  "$(grep -Fxc '      --model ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}' "${VLLM_DIR}/docker-compose.yml")" \
+  "1"
+check "generated compose exposes the OpenAI-compatible port" \
+  "$(grep -Fxc '      - "${VLLM_PORT:-8000}:8000"' "${VLLM_DIR}/docker-compose.yml")" \
+  "1"
+check "generated compose reserves every NVIDIA GPU" \
+  "$(grep -Fxc '              capabilities: [gpu]' "${VLLM_DIR}/docker-compose.yml")" \
+  "1"
+
+echo "container command construction"
+command_log="${test_root}/commands.log"
+mkdir -p "${test_root}/bin"
+cat >"${test_root}/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf 'docker' >>"${MOCK_DOCKER_LOG}"
+printf ' <%s>' "$@" >>"${MOCK_DOCKER_LOG}"
+printf '\n' >>"${MOCK_DOCKER_LOG}"
+EOF
+chmod +x "${test_root}/bin/docker"
+PATH="${test_root}/bin:${PATH}" \
+MOCK_DOCKER_LOG="${command_log}" \
+GENOSYN_NAME="company-one" \
+GENOSYN_PORT="9123" \
+GENOSYN_VOLUME="company-one-data" \
+bash -c 'source "$1"; run_container_with_image "$2"' \
+  _ "${HERE}/genosyn" "registry:5000/genosyn/app:test"
+check "run container binds the selected name, port, volume, and image" \
+  "$(cat "${command_log}")" \
+  "docker <run> <-d> <--name> <company-one> <--restart> <unless-stopped> <-p> <9123:8471> <-v> <company-one-data:/app/data> <registry:5000/genosyn/app:test>"
+
+# GENOSYN_SANDBOX is retired. A value still exported by an operator's shell, or
+# by an auto-update wrapper an older CLI wrote, must change nothing: one plain
+# `docker run`, under Docker's standard security profile.
+: >"${command_log}"
+PATH="${test_root}/bin:${PATH}" \
+MOCK_DOCKER_LOG="${command_log}" \
+GENOSYN_SANDBOX="1" \
+bash -c 'source "$1"; run_container_with_image "$2"' \
+  _ "${HERE}/genosyn" "registry:5000/genosyn/app:test"
+check "a leftover GENOSYN_SANDBOX=1 still calls docker run exactly once" \
+  "$(grep -Fc 'docker <run>' "${command_log}" || true)" '1'
+check "a leftover GENOSYN_SANDBOX=1 never passes --security-opt" \
+  "$(grep -Fc -e '--security-opt' "${command_log}" || true)" '0'
+
+: >"${command_log}"
+PATH="${test_root}/bin:${PATH}" \
+MOCK_DOCKER_LOG="${command_log}" \
+GENOSYN_NAME="company-one" \
+bash -c 'source "$1"; require_docker() { return 0; }; container_exists() { return 0; }; cmd_logs --tail 25 -f' \
+  _ "${HERE}/genosyn"
+check "logs preserves follow and tail flags" \
+  "$(cat "${command_log}")" \
+  "docker <logs> <-f> <--tail> <25> <company-one>"
+
+echo "bootstrap installer smoke tests"
+mkdir -p "${test_root}/bin" "${test_root}/home"
+cat >"${test_root}/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  info) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+cat >"${test_root}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+dest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) dest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "${MOCK_CURL_SOURCE}" "${dest}"
+EOF
+chmod +x "${test_root}/bin/docker" "${test_root}/bin/curl"
+
+installer_rc=0
+installer_output="$(
+  PATH="${test_root}/bin:${PATH}" \
+  HOME="${test_root}/home" \
+  MOCK_CURL_SOURCE="${HERE}/genosyn" \
+  GENOSYN_CLI_PREFIX="${test_root}/prefix" \
+  GENOSYN_SKIP_RUN=1 \
+  bash "${HERE}/install.sh" 2>&1
+)" || installer_rc=$?
+check "installer succeeds with a valid downloaded CLI" "${installer_rc}" "0"
+check "installer writes an executable CLI" \
+  "$([ -x "${test_root}/prefix/bin/genosyn" ] && echo yes || echo no)" "yes"
+check "installer preserves the downloaded CLI exactly" \
+  "$(file_sha256 "${test_root}/prefix/bin/genosyn")" \
+  "$(file_sha256 "${HERE}/genosyn")"
+check "skip-run stops before Docker installation" \
+  "$(printf '%s' "${installer_output}" | grep -Fc "CLI installed. Run 'genosyn install'")" "1"
+
+printf '%s\n' '<html>not a script</html>' >"${test_root}/invalid-download"
+invalid_rc=0
+invalid_output="$(
+  PATH="${test_root}/bin:${PATH}" \
+  HOME="${test_root}/home" \
+  MOCK_CURL_SOURCE="${test_root}/invalid-download" \
+  GENOSYN_CLI_PREFIX="${test_root}/invalid-prefix" \
+  GENOSYN_SKIP_RUN=1 \
+  bash "${HERE}/install.sh" 2>&1
+)" || invalid_rc=$?
+check "installer rejects a non-script download" "${invalid_rc}" "1"
+check "installer explains a non-script download" \
+  "$(printf '%s' "${invalid_output}" | grep -Fc 'Downloaded file does not look like a shell script')" \
+  "1"
+
+
+echo "bootstrap installer — docker bootstrap"
+
+# A PATH sandbox: only the host tools the installer legitimately needs, so the
+# mocks decide whether docker, sudo, brew, or sg exist at all.
+sysbin="${test_root}/sysbin"
+mkdir -p "${sysbin}"
+for tool in bash sh env mktemp mkdir rm ln cp mv chmod install dirname head grep \
+  sed cut tr id sleep cat printf test uname; do
+  tool_path="$(command -v "${tool}" 2>/dev/null)"
+  [ -n "${tool_path}" ] && ln -sf "${tool_path}" "${sysbin}/${tool}"
+done
+
+# A stand-in for the downloaded CLI: the installer only checks the shebang, and
+# this way the handoff is observable without pulling an image.
+cat >"${test_root}/fake-cli" <<'EOF'
+#!/usr/bin/env bash
+echo "CLI-INSTALL-RAN $*"
+EOF
+
+# curl that serves the CLI and the Docker convenience script from local files.
+cat >"${test_root}/mock-curl" <<'EOF'
+#!/usr/bin/env bash
+url=""; dest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) dest="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "${url}" in
+  *get.docker.com*) cp "${MOCK_GET_DOCKER_SOURCE}" "${dest}" ;;
+  *) cp "${MOCK_CURL_SOURCE}" "${dest}" ;;
+esac
+EOF
+
+# sudo that records what it was asked to elevate, then runs it with the
+# daemon reachable — that is what root access buys on a fresh install.
+cat >"${test_root}/mock-sudo" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"${MOCK_SUDO_LOG}"
+MOCK_DOCKER_OK=1 exec "$@"
+EOF
+
+# docker whose socket only answers when MOCK_DOCKER_OK is set.
+cat >"${test_root}/mock-docker-gated" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  info) [ "${MOCK_DOCKER_OK:-0}" = "1" ] && exit 0 || exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+
+# The Docker convenience script, which drops a working docker onto PATH.
+cat >"${test_root}/mock-get-docker" <<'GETDOCKER_EOF'
+#!/bin/sh
+echo "get-docker ran"
+cat >"${MOCK_DOCKER_BIN_DIR}/docker" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "${MOCK_DOCKER_BIN_DIR}/docker"
+GETDOCKER_EOF
+
+cat >"${test_root}/mock-sg" <<'EOF'
+#!/usr/bin/env bash
+# sg <group> -c <command>
+echo "$*" >>"${MOCK_SG_LOG}"
+MOCK_DOCKER_OK=1 bash -c "$3"
+EOF
+
+cat >"${test_root}/mock-uname" <<'EOF'
+#!/usr/bin/env bash
+echo "${MOCK_UNAME_S}"
+EOF
+
+cat >"${test_root}/mock-noop" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+# Pin an unprivileged identity so these cases exercise the sudo and docker-group
+# paths whether the suite itself runs as root (containers, CI) or not.
+cat >"${test_root}/mock-id" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -un) echo tester ;;
+  *) echo 1000 ;;
+esac
+EOF
+
+chmod +x "${test_root}/fake-cli" "${test_root}/mock-curl" "${test_root}/mock-sudo" \
+  "${test_root}/mock-docker-gated" "${test_root}/mock-get-docker" \
+  "${test_root}/mock-sg" "${test_root}/mock-uname" "${test_root}/mock-noop" \
+  "${test_root}/mock-id"
+
+new_case_bin() {
+  # new_case_bin <name> — a mock dir that shadows the PATH sandbox.
+  local dir="${test_root}/$1"
+  rm -rf "${dir}"
+  mkdir -p "${dir}"
+  cp "${test_root}/mock-curl" "${dir}/curl"
+  cp "${test_root}/mock-id" "${dir}/id"
+  echo "${dir}"
+}
+
+# --- opting out of the Docker install ---
+
+optout_bin="$(new_case_bin case-optout)"
+cp "${test_root}/mock-uname" "${optout_bin}/uname"
+optout_rc=0
+optout_output="$(
+  PATH="${optout_bin}:${sysbin}" \
+  HOME="${test_root}/home" \
+  MOCK_UNAME_S=Linux \
+  MOCK_CURL_SOURCE="${test_root}/fake-cli" \
+  GENOSYN_CLI_PREFIX="${test_root}/optout-prefix" \
+  GENOSYN_INSTALL_DOCKER=0 \
+  GENOSYN_DOCKER_WAIT=0 \
+  bash "${HERE}/install.sh" 2>&1
+)" || optout_rc=$?
+check "GENOSYN_INSTALL_DOCKER=0 refuses to install Docker" "${optout_rc}" "1"
+check "the opt-out points at the Docker docs" \
+  "$(printf '%s' "${optout_output}" | grep -Fc 'Docker is not installed. Get it at')" "1"
+check "the CLI is installed even when Docker setup fails" \
+  "$([ -x "${test_root}/optout-prefix/bin/genosyn" ] && echo yes || echo no)" "yes"
+
+# --- installing Docker on Linux ---
+
+linux_bin="$(new_case_bin case-linux)"
+cp "${test_root}/mock-uname" "${linux_bin}/uname"
+cp "${test_root}/mock-sudo" "${linux_bin}/sudo"
+cp "${test_root}/mock-noop" "${linux_bin}/systemctl"
+linux_sudo_log="${test_root}/linux-sudo.log"
+: >"${linux_sudo_log}"
+linux_rc=0
+linux_output="$(
+  PATH="${linux_bin}:${sysbin}" \
+  HOME="${test_root}/home" \
+  MOCK_UNAME_S=Linux \
+  MOCK_CURL_SOURCE="${test_root}/fake-cli" \
+  MOCK_GET_DOCKER_SOURCE="${test_root}/mock-get-docker" \
+  MOCK_DOCKER_BIN_DIR="${linux_bin}" \
+  MOCK_SUDO_LOG="${linux_sudo_log}" \
+  GENOSYN_CLI_PREFIX="${test_root}/linux-prefix" \
+  GENOSYN_DOCKER_WAIT=0 \
+  bash "${HERE}/install.sh" 2>&1
+)" || linux_rc=$?
+check "a Linux host without Docker installs it" "${linux_rc}" "0"
+check "the convenience script is fetched" \
+  "$(printf '%s' "${linux_output}" | grep -Fc 'Installing Docker via https://get.docker.com')" "1"
+check "the convenience script runs with root" \
+  "$(grep -c 'sh /' "${linux_sudo_log}" || true)" "1"
+check "the installed Docker is reported" \
+  "$(printf '%s' "${linux_output}" | grep -Fc 'Docker installed.')" "1"
+check "the handoff runs once Docker is up" \
+  "$(printf '%s' "${linux_output}" | grep -Fc 'CLI-INSTALL-RAN install')" "1"
+
+# --- a daemon the user is not yet allowed to talk to ---
+
+group_bin="$(new_case_bin case-group)"
+cp "${test_root}/mock-uname" "${group_bin}/uname"
+cp "${test_root}/mock-sudo" "${group_bin}/sudo"
+cp "${test_root}/mock-sg" "${group_bin}/sg"
+cp "${test_root}/mock-docker-gated" "${group_bin}/docker"
+# Present so a daemon restart would be visible if the installer reached for one.
+cp "${test_root}/mock-noop" "${group_bin}/systemctl"
+cp "${test_root}/mock-noop" "${group_bin}/usermod"
+cp "${test_root}/mock-noop" "${group_bin}/groupadd"
+group_sudo_log="${test_root}/group-sudo.log"
+group_sg_log="${test_root}/group-sg.log"
+: >"${group_sudo_log}"
+: >"${group_sg_log}"
+group_rc=0
+group_output="$(
+  PATH="${group_bin}:${sysbin}" \
+  HOME="${test_root}/home" \
+  MOCK_UNAME_S=Linux \
+  MOCK_CURL_SOURCE="${test_root}/fake-cli" \
+  MOCK_SUDO_LOG="${group_sudo_log}" \
+  MOCK_SG_LOG="${group_sg_log}" \
+  GENOSYN_CLI_PREFIX="${test_root}/group-prefix" \
+  GENOSYN_DOCKER_WAIT=0 \
+  bash "${HERE}/install.sh" 2>&1
+)" || group_rc=$?
+check "a socket the user cannot reach is repaired" "${group_rc}" "0"
+check "the user is added to the docker group" \
+  "$(grep -Fc 'usermod -aG docker' "${group_sudo_log}" || true)" "1"
+check "the daemon is not restarted to fix a permission problem" \
+  "$(printf '%s' "${group_output}" | grep -Fc 'Starting the Docker daemon')" "0"
+check "the rest of the run borrows the new group" \
+  "$(grep -Fc 'docker -c' "${group_sg_log}" || true)" "2"
+check "the handoff runs under the new group" \
+  "$(printf '%s' "${group_output}" | grep -Fc 'CLI-INSTALL-RAN install')" "1"
+
+# --- macOS without Homebrew ---
+
+mac_bin="$(new_case_bin case-mac)"
+cp "${test_root}/mock-uname" "${mac_bin}/uname"
+mac_rc=0
+mac_output="$(
+  PATH="${mac_bin}:${sysbin}" \
+  HOME="${test_root}/home" \
+  MOCK_UNAME_S=Darwin \
+  MOCK_CURL_SOURCE="${test_root}/fake-cli" \
+  GENOSYN_CLI_PREFIX="${test_root}/mac-prefix" \
+  GENOSYN_DOCKER_WAIT=0 \
+  bash "${HERE}/install.sh" 2>&1
+)" || mac_rc=$?
+check "macOS without Homebrew stops with instructions" "${mac_rc}" "1"
+check "macOS without Homebrew names Docker Desktop" \
+  "$(printf '%s' "${mac_output}" | grep -Fc 'Homebrew isn'"'"'t available')" "1"
+
+rm -rf "${test_root}"
+trap - EXIT
+
+printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
+[ "${fail}" -eq 0 ]

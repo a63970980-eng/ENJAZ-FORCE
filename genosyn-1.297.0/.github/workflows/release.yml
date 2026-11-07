@@ -1,0 +1,103 @@
+name: Release
+
+# When a merge lands on the `release` branch, read the repo-root VERSION file
+# and publish a `v<version>` GitHub release with auto-generated notes. If the
+# tag/release already exists, the workflow is a no-op — bump VERSION to ship.
+# The resulting `v*.*.*` tag also triggers docker.yml to publish semver-tagged
+# images.
+
+on:
+  push:
+    branches: [release]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Tag and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Needed for the final step to call `gh workflow run docker.yml`.
+      # Without this we can create the GitHub release but can't dispatch the
+      # docker.yml run for the new tag (HTTP 403 from the dispatch API).
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Read VERSION
+        id: version
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "::error::VERSION file not found at repo root"
+            exit 1
+          fi
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::VERSION file is empty"
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::VERSION must be semver (got: $VERSION)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $TAG already exists — bump VERSION to ship a new release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
+
+      # Tag pushes from GITHUB_TOKEN don't fire workflow triggers (GitHub's
+      # recursion guard), so `docker.yml`'s `tags: v*.*.*` rule never sees the
+      # tag we just created. workflow_dispatch is an explicit exception, so we
+      # kick off docker.yml against the new tag ref to publish semver-tagged
+      # images.
+      - name: Trigger image build for new tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh workflow run docker.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG"
+
+      # Same recursion-guard workaround for the Helm chart: chart.yml's
+      # `tags: v*.*.*` trigger never sees a tag created by GITHUB_TOKEN, so
+      # dispatch it explicitly to package + push the chart for this release.
+      - name: Trigger Helm chart publish for new tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh workflow run chart.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG"

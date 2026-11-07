@@ -1,0 +1,1262 @@
+import { ParallelWorkerResult } from "../db/entities/ParallelWorkerResult.js";
+import { Router } from "express";
+import { z } from "zod";
+import cron from "node-cron";
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Company } from "../db/entities/Company.js";
+import { Routine } from "../db/entities/Routine.js";
+import { RoutineChatMessage } from "../db/entities/RoutineChatMessage.js";
+import {
+  ROUTINE_ACCESS_LEVELS,
+  type RoutineAccessLevel,
+} from "../db/entities/EmployeeRoutineGrant.js";
+import { Run } from "../db/entities/Run.js";
+import { Approval } from "../db/entities/Approval.js";
+import { BrowserSession } from "../db/entities/BrowserSession.js";
+import crypto from "node:crypto";
+import { validateBody, validateParams, validateQuery } from "../middleware/validate.js";
+import {
+  requireAuth,
+  requireBrowserSession,
+  requireCompanyMember,
+  requireCompanyRoleForMutations,
+  onRoutePaths,
+  usesBearerCredential,
+} from "../middleware/auth.js";
+import { toSlug } from "../lib/slug.js";
+import {
+  awaitingRoutineBrief,
+  startingRoutineBrief,
+  writeRoutineBrief,
+} from "../services/routineBrief.js";
+import { MAX_ROUTINE_BRIEF_LENGTH } from "../../shared/routineBrief.js";
+import { DEFAULT_ROUTINE_PRIORITY, ROUTINE_PRIORITIES } from "../../shared/routinePriority.js";
+import { getGoal } from "../services/goals.js";
+import { isModelAttached } from "../services/models.js";
+import { nextRunFor, registerRoutine } from "../services/cron.js";
+import {
+  startManualRoutineRun,
+  getLiveRunSnapshot,
+  RUN_LOG_MAX_BYTES,
+} from "../services/runner.js";
+import { ManualRoutineStartError } from "../services/routineManualStart.js";
+import { activeStanddownFor, serializeStanddown, StanddownError } from "../services/standdowns.js";
+import { cancelPendingRetry } from "../services/runRecovery.js";
+import { resumeRoutineRun, RunManualResumeError } from "../services/runManualResume.js";
+import { readRunDiagnostics } from "../services/runDiagnostics.js";
+import {
+  loadRunFollowUps,
+  publicRun,
+  runContinuationView,
+} from "../services/runContinuationView.js";
+import { pageRunHistory, routineRunsQuerySchema, runHistoryQuery } from "../services/runHistory.js";
+import { ListQueryError } from "../services/listPaging.js";
+import { recordAudit } from "../services/audit.js";
+import { mayWatchBrowserRecording } from "../services/browserRecordingAccess.js";
+import { getOwnedMemberBrowser } from "../services/memberBrowsers.js";
+import { revokeDisabledBrowserSessionsForEmployee } from "../services/browserAccess.js";
+import {
+  deleteBrowserRecordingsForRunIds,
+  getBrowserRecordingFile,
+  getBrowserRecordingLiveFrame,
+  listBrowserRecordingsForRun,
+  markBrowserRecordingRoutineDeleting,
+  type BrowserRecordingInfo,
+} from "../services/browserRecordings.js";
+import {
+  deleteTagAssignments,
+  replaceResourceTags,
+  tagsByResourceIds,
+  tagsForResource,
+  validateCompanyTagIds,
+} from "../services/tags.js";
+import { resolveFolderForCompany, RoutineFolderError } from "../services/routineFolders.js";
+import { emitResourceChange } from "../services/resourceEvents.js";
+import { getRoutineActivity, ROUTINE_ACTIVITY_MAX_WINDOW_MS } from "../services/routineActivity.js";
+import {
+  RoutineAccessNotFoundError,
+  getRoutineAccessRow,
+  listRoutineAccess,
+  setRoutineAccess,
+} from "../services/routineAccess.js";
+
+const activityParamsSchema = z.object({ cid: z.string().uuid() });
+const activityQuerySchema = z
+  .object({
+    from: z.string().datetime({ offset: true }),
+    to: z.string().datetime({ offset: true }),
+  })
+  .strict()
+  .superRefine((query, ctx) => {
+    const length = Date.parse(query.to) - Date.parse(query.from);
+    if (!Number.isFinite(length) || length <= 0 || length > ROUTINE_ACTIVITY_MAX_WINDOW_MS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Choose a calendar day spanning no more than 26 hours, with from before to",
+      });
+    }
+  });
+
+export const routinesRouter = Router({ mergeParams: true });
+routinesRouter.use(requireAuth);
+routinesRouter.use(
+  onRoutePaths([/^\/routines\/activity\/?$/], validateParams(activityParamsSchema)),
+);
+routinesRouter.use(requireCompanyMember);
+routinesRouter.use(
+  onRoutePaths(
+    ["/routines", "/runs", /^\/employees\/[^/]+\/routines(?:\/|$)/],
+    requireCompanyRoleForMutations("admin"),
+  ),
+);
+
+async function loadEmp(cid: string, eid: string) {
+  return AppDataSource.getRepository(AIEmployee).findOneBy({ id: eid, companyId: cid });
+}
+async function loadCo(cid: string) {
+  return AppDataSource.getRepository(Company).findOneBy({ id: cid });
+}
+
+async function uniqueSlug(employeeId: string, base: string): Promise<string> {
+  const repo = AppDataSource.getRepository(Routine);
+  let slug = base || "routine";
+  let n = 1;
+  while (await repo.findOneBy({ employeeId, slug })) {
+    n += 1;
+    slug = `${base}-${n}`;
+  }
+  return slug;
+}
+
+/** A Routine may only be pinned to a model attached to its own employee. */
+async function employeeOwnsModel(employeeId: string, modelId: string): Promise<boolean> {
+  return isModelAttached(employeeId, modelId);
+}
+
+async function findRoutineByName(
+  employeeId: string,
+  name: string,
+  excludeId?: string,
+): Promise<Routine | null> {
+  const qb = AppDataSource.getRepository(Routine)
+    .createQueryBuilder("r")
+    .where("r.employeeId = :employeeId", { employeeId })
+    .andWhere("LOWER(r.name) = LOWER(:name)", { name: name.trim() });
+  if (excludeId) qb.andWhere("r.id != :excludeId", { excludeId });
+  return qb.getOne();
+}
+
+/**
+ * The employee fields the Routines section needs to answer "who is this
+ * assigned to?" — enough for an avatar, a name, and a link to the employee.
+ * Deliberately narrow: the full row carries the Soul body and browser
+ * allowlist, neither of which a routine list has any business shipping.
+ */
+type EmployeeSummary = Pick<AIEmployee, "id" | "name" | "slug" | "role" | "avatarKey">;
+
+function employeeSummary(emp: AIEmployee): EmployeeSummary {
+  return { id: emp.id, name: emp.name, slug: emp.slug, role: emp.role, avatarKey: emp.avatarKey };
+}
+
+/**
+ * Newest Run per routine, in one query. `Routine.lastRunAt` already records
+ * *when* a routine last fired, but not how it went — the Routines list wants
+ * the outcome so a failing routine is visible without opening it.
+ *
+ * The correlated MAX subquery is portable across the sqlite and postgres
+ * drivers (a window function or DISTINCT ON would not be) and rides the
+ * `["routineId", "startedAt"]` index that Run already declares for exactly
+ * this access pattern. Two runs of one routine sharing a startedAt timestamp
+ * would both come back; the Map below keeps the first and drops the tie.
+ */
+async function lastRunByRoutine(
+  companyId: string,
+  routineIds: string[],
+): Promise<Map<string, ReturnType<typeof publicRun>>> {
+  if (routineIds.length === 0) return new Map();
+  const runs = await AppDataSource.getRepository(Run)
+    .createQueryBuilder("run")
+    .select([
+      "run.id",
+      "run.routineId",
+      "run.status",
+      "run.errorKind",
+      "run.failureReason",
+      "run.startedAt",
+      "run.finishedAt",
+      "run.exitCode",
+      "run.attempt",
+      "run.retryAt",
+      "run.checkpointJson",
+      "run.continuationCount",
+      "run.continuationStopReason",
+      "run.missedSlots",
+      "run.outcomeVerdict",
+      "run.pausedAt",
+      "run.pauseCount",
+      "run.pauseReason",
+    ])
+    .where("run.routineId IN (:...routineIds)", { routineIds })
+    .andWhere(
+      "run.startedAt = (SELECT MAX(r2.startedAt) FROM runs r2 WHERE r2.routineId = run.routineId)",
+    )
+    .getMany();
+  const byRoutine = new Map<string, ReturnType<typeof publicRun>>();
+  const followUps = await loadRunFollowUps(companyId, runs);
+  for (const run of runs)
+    if (!byRoutine.has(run.routineId))
+      byRoutine.set(run.routineId, publicRun(run, followUps.get(run.id)));
+  return byRoutine;
+}
+
+/**
+ * Every routine in the company, with its employee and last run attached.
+ *
+ * Routines used to be reachable only through the employee that owns them, so
+ * "what is scheduled around here?" meant opening each employee in turn. This
+ * backs the top-level Routines section. `body` is omitted — the list renders
+ * names and schedules, and the briefs are fetched per routine via
+ * `/routines/:rid/readme`.
+ */
+routinesRouter.get("/routines", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const employees = await AppDataSource.getRepository(AIEmployee).findBy({ companyId: cid });
+  if (employees.length === 0) return res.json([]);
+  const byId = new Map(employees.map((e) => [e.id, e]));
+
+  const routines = await AppDataSource.getRepository(Routine).find({
+    where: { employeeId: In([...byId.keys()]) },
+  });
+  const lastRuns = await lastRunByRoutine(
+    cid,
+    routines.map((r) => r.id),
+  );
+  const tags = await tagsByResourceIds(
+    cid,
+    "routine",
+    routines.map((r) => r.id),
+  );
+
+  // Group by employee, then by name, so the list reads like a roster rather
+  // than insertion order.
+  const rows = routines.map(({ body: _body, ...routine }) => {
+    const emp = byId.get(routine.employeeId);
+    // Use the same cached scope resolution as dispatch, including company
+    // and employee stops, without adding a database query for every row.
+    const standdown = activeStanddownFor(cid, {
+      employeeId: routine.employeeId,
+      routineId: routine.id,
+    });
+    return {
+      ...routine,
+      employee: emp ? employeeSummary(emp) : null,
+      lastRun: lastRuns.get(routine.id) ?? null,
+      standdown: standdown ? serializeStanddown(standdown) : null,
+      tags: tags.get(routine.id) ?? [],
+    };
+  });
+  rows.sort(
+    (a, b) =>
+      (a.employee?.name ?? "").localeCompare(b.employee?.name ?? "") ||
+      a.name.localeCompare(b.name),
+  );
+  res.json(rows);
+});
+
+routinesRouter.get("/routines/activity", validateQuery(activityQuerySchema), async (req, res) => {
+  const { cid } = req.params as z.infer<typeof activityParamsSchema>;
+  const { from, to } = req.query as z.infer<typeof activityQuerySchema>;
+  res.json(await getRoutineActivity({ companyId: cid, from: new Date(from), to: new Date(to) }));
+});
+
+// ----- AI access -----
+//
+// Routines → AI access: whether each AI Employee may change Routines at all
+// (run < write; no row means write). Enforced at the MCP seam — see
+// `services/routineAccess.ts`. Registered before `/routines/:rid`, which would
+// otherwise answer `GET /routines/ai-access` as a Routine lookup. Reading the
+// roster is open to every Member; changing a level is owner/admin through the
+// `requireCompanyRoleForMutations("admin")` guard this router already applies
+// to every `/routines` path.
+
+const aiAccessListParamsSchema = z.object({ cid: z.string().uuid() }).strict();
+const aiAccessEmployeeParamsSchema = z
+  .object({ cid: z.string().uuid(), employeeId: z.string().uuid() })
+  .strict();
+const aiAccessBodySchema = z
+  .object({
+    accessLevel: z.enum(ROUTINE_ACCESS_LEVELS as [RoutineAccessLevel, ...RoutineAccessLevel[]]),
+  })
+  .strict();
+
+routinesRouter.get(
+  "/routines/ai-access",
+  validateParams(aiAccessListParamsSchema),
+  async (req, res, next) => {
+    try {
+      const { cid } = req.params as z.infer<typeof aiAccessListParamsSchema>;
+      res.json({ rows: await listRoutineAccess(cid) });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
+ * PUT because the caller states the level an employee should hold; every
+ * employee already holds one, so there is nothing to create or revoke.
+ * Audited only when the level actually moves.
+ */
+routinesRouter.put(
+  "/routines/ai-access/:employeeId",
+  validateParams(aiAccessEmployeeParamsSchema),
+  validateBody(aiAccessBodySchema),
+  async (req, res, next) => {
+    try {
+      const { cid, employeeId } = req.params as z.infer<typeof aiAccessEmployeeParamsSchema>;
+      const body = req.body as z.infer<typeof aiAccessBodySchema>;
+      let change;
+      try {
+        change = await setRoutineAccess(cid, employeeId, body.accessLevel);
+      } catch (err) {
+        if (err instanceof RoutineAccessNotFoundError) {
+          return res.status(404).json({ error: "Employee not found" });
+        }
+        throw err;
+      }
+      if (change.changed) {
+        await recordAudit({
+          companyId: cid,
+          actorUserId: req.userId ?? null,
+          action: "routine.ai_access.update",
+          targetType: "employee",
+          targetId: change.employee.id,
+          targetLabel: change.employee.name,
+          metadata: { accessLevel: change.accessLevel, previousAccessLevel: change.previous },
+        });
+      }
+      res.json({ row: await getRoutineAccessRow(cid, change.employee.id) });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+routinesRouter.get("/employees/:eid/routines", async (req, res) => {
+  const emp = await loadEmp((req.params as Record<string, string>).cid, req.params.eid);
+  if (!emp) return res.status(404).json({ error: "Employee not found" });
+  const routines = await AppDataSource.getRepository(Routine).find({
+    where: { employeeId: emp.id },
+  });
+  const tags = await tagsByResourceIds(
+    (req.params as Record<string, string>).cid,
+    "routine",
+    routines.map((r) => r.id),
+  );
+  res.json(routines.map((routine) => ({ ...routine, tags: tags.get(routine.id) ?? [] })));
+});
+
+// node-cron validates and cron-parser schedules, and the two do not agree —
+// node-cron accepts expressions like "5-1 9 * * *" that cron-parser throws on,
+// which used to produce a routine that saved with a 200 and then never fired.
+// Both checks, so what we accept is exactly what we can schedule.
+const cronExprSchema = z
+  .string()
+  .refine((v) => cron.validate(v), "Invalid cron expression")
+  .refine((v) => nextRunFor(v) !== null, "That cron expression cannot be scheduled");
+
+// Where the Routine's Runs wait while their AI Model is busy: a High Routine's
+// waiting Runs start before Normal ones (`shared/routinePriority.ts`). Like
+// every Routine setting it is written by owners and admins; no AI Employee
+// tool can raise its own work ahead of everyone else's.
+const routinePrioritySchema = z
+  .enum(ROUTINE_PRIORITIES)
+  .describe(
+    "Where this Routine's Runs wait while their AI Model is busy. `high` Runs start before " +
+      "`normal` ones; Runs paused for a restart and continuations of unfinished work still go " +
+      "first, and a `normal` Run that has waited a day counts as `high` from then on. " +
+      "Changing it reorders Runs already waiting.",
+  );
+
+const createSchema = z.object({
+  name: z.string().min(1).max(80),
+  cronExpr: cronExprSchema,
+  // What each Run should do. With one the Routine starts on its schedule;
+  // without (or blank) it starts paused, so nothing runs before there is one.
+  brief: z.string().max(MAX_ROUTINE_BRIEF_LENGTH).optional(),
+  tagIds: z.array(z.string().uuid()).max(20).optional(),
+  // Which folder to file the new routine in. Omitted or null leaves it
+  // unfiled, which is where every routine created before folders shipped sits.
+  folderId: z.string().uuid().nullable().optional(),
+  priority: routinePrioritySchema.optional(),
+});
+
+routinesRouter.post("/employees/:eid/routines", validateBody(createSchema), async (req, res) => {
+  const emp = await loadEmp((req.params as Record<string, string>).cid, req.params.eid);
+  if (!emp) return res.status(404).json({ error: "Employee not found" });
+  const co = await loadCo((req.params as Record<string, string>).cid);
+  if (!co) return res.status(404).json({ error: "Company not found" });
+  const body = req.body as z.infer<typeof createSchema>;
+  if (await findRoutineByName(emp.id, body.name)) {
+    return res
+      .status(409)
+      .json({ error: "A routine with that name already exists for this employee" });
+  }
+  try {
+    await validateCompanyTagIds(co.id, body.tagIds ?? []);
+    await resolveFolderForCompany(co.id, body.folderId ?? null);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({ error: message });
+  }
+  const slug = await uniqueSlug(emp.id, toSlug(body.name));
+  const repo = AppDataSource.getRepository(Routine);
+  // Paused with the starter outline unless a brief came with it, so one left
+  // unfinished never runs that outline on its schedule; the first brief saved
+  // switches it on (`writeRoutineBrief`).
+  const start = startingRoutineBrief({
+    name: body.name,
+    cronExpr: body.cronExpr,
+    brief: body.brief,
+  });
+  const r = repo.create({
+    employeeId: emp.id,
+    name: body.name,
+    slug,
+    cronExpr: body.cronExpr,
+    enabled: start.enabled,
+    lastRunAt: null,
+    folderId: body.folderId ?? null,
+    body: start.body,
+    priority: body.priority ?? DEFAULT_ROUTINE_PRIORITY,
+  });
+  registerRoutine(r, co.timezone);
+  await repo.save(r);
+  const tags = await replaceResourceTags(co.id, "routine", r.id, body.tagIds ?? []);
+  await recordAudit({
+    companyId: co.id,
+    actorUserId: req.userId ?? null,
+    action: "routine.create",
+    targetType: "routine",
+    targetId: r.id,
+    targetLabel: r.name,
+    metadata: { employeeId: emp.id, cronExpr: r.cronExpr, priority: r.priority },
+  });
+  res.json({ ...r, tags });
+});
+
+async function loadRoutine(cid: string, rid: string) {
+  const r = await AppDataSource.getRepository(Routine).findOneBy({ id: rid });
+  if (!r) return null;
+  const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: r.employeeId,
+    companyId: cid,
+  });
+  if (!emp) return null;
+  const co = await loadCo(cid);
+  if (!co) return null;
+  return { routine: r, emp, co };
+}
+
+// Strict, because stripping unknown keys made an edit this route cannot apply
+// look saved: `{ "body": "..." }` answered 200 and left the brief as it was.
+// The brief is edited through `PUT /routines/:rid/readme`. A key not listed
+// here is a 400 that names it, and nothing is written.
+const patchSchema = z
+  .object({
+    name: z.string().min(1).max(80).optional(),
+    cronExpr: cronExprSchema.optional(),
+    enabled: z.boolean().optional(),
+    timeoutSec: z
+      .number()
+      .int()
+      .min(10)
+      .max(6 * 60 * 60)
+      .optional(),
+    requiresApproval: z.boolean().optional(),
+    // Null inherits the employee's active model; a string pins one of the
+    // employee's own models to this routine. Ownership is checked below.
+    modelId: z.string().uuid().nullable().optional(),
+    // Three-valued: null inherits the employee's `browserEnabled`; explicit
+    // boolean overrides for this routine only.
+    browserEnabledOverride: z.boolean().nullable().optional(),
+    memberBrowserId: z.string().uuid().nullable().optional(),
+    // Reliability. Defaults catch up once after downtime and disable ordinary
+    // failure/timeout retries. A future initial scheduled Run on an enabled,
+    // ungated routine marked interrupted is the safety exception: one durable
+    // recovery attempt is due an hour later. Higher configured limits bound
+    // interruptions later in the retry chain.
+    catchUpPolicy: z.enum(["once", "skip"]).optional(),
+    maxAttempts: z.number().int().min(1).max(5).optional(),
+    retryBackoffSec: z
+      .number()
+      .int()
+      .min(10)
+      .max(6 * 60 * 60)
+      .optional(),
+    retryOnTimeout: z.boolean().optional(),
+    // The Routine's definition of done. Empty string clears it, which also
+    // switches the post-Run outcome check off for future Runs.
+    acceptanceCriteria: z.string().max(4_000).optional(),
+    // Tags aren't a Routine column — they're assignments in the shared catalog,
+    // so the create route already accepts these. Editing them here keeps the
+    // routine's own endpoint symmetric instead of forcing a second call to the
+    // generic PUT /tags/resources/routine/:rid. Passing the array replaces the
+    // whole set; omitting it leaves existing assignments untouched.
+    tagIds: z.array(z.string().uuid()).max(20).optional(),
+    // Re-file this routine. Null unfiles it; a uuid must name a folder in the
+    // same company as the owning employee. See `POST /routines/move` for the
+    // bulk version the Routines list uses.
+    folderId: z.string().uuid().nullable().optional(),
+    // The Goal this routine's work serves (M51). Null clears the link; a uuid
+    // must name a goal in the same company as the owning employee.
+    goalId: z.string().uuid().nullable().optional(),
+    // The queue reads it when it orders, so Runs already waiting move at once.
+    priority: routinePrioritySchema.optional(),
+  })
+  .strict();
+
+routinesRouter.patch("/routines/:rid", validateBody(patchSchema), async (req, res) => {
+  const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  const body = req.body as z.infer<typeof patchSchema>;
+  const r = found.routine;
+  // Validate tag ownership before mutating the routine so a bad tag id fails
+  // the whole request rather than leaving a half-applied edit.
+  if (body.tagIds !== undefined) {
+    try {
+      await validateCompanyTagIds(found.co.id, body.tagIds);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return res.status(400).json({ error: message });
+    }
+  }
+  if (body.folderId !== undefined) {
+    try {
+      await resolveFolderForCompany(found.co.id, body.folderId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return res.status(400).json({ error: message });
+    }
+    r.folderId = body.folderId;
+  }
+  if (body.goalId !== undefined) {
+    if (body.goalId !== null && !(await getGoal(found.co.id, body.goalId))) {
+      return res.status(400).json({ error: "Goal not found in this company" });
+    }
+    r.goalId = body.goalId;
+  }
+  if (body.name !== undefined) {
+    if (await findRoutineByName(r.employeeId, body.name, r.id)) {
+      return res
+        .status(409)
+        .json({ error: "A routine with that name already exists for this employee" });
+    }
+    r.name = body.name;
+  }
+  if (body.cronExpr !== undefined) r.cronExpr = body.cronExpr;
+  if (body.enabled !== undefined) r.enabled = body.enabled;
+  if (body.timeoutSec !== undefined) r.timeoutSec = body.timeoutSec;
+  if (body.requiresApproval !== undefined) r.requiresApproval = body.requiresApproval;
+  if (body.modelId !== undefined) {
+    // A routine may only pin a model attached to its own employee — a
+    // company model an admin has not given this employee stays out of reach.
+    if (body.modelId !== null && !(await employeeOwnsModel(r.employeeId, body.modelId))) {
+      return res.status(400).json({ error: "That AI Model is not attached to this employee" });
+    }
+    r.modelId = body.modelId;
+  }
+  if (body.browserEnabledOverride !== undefined) {
+    r.browserEnabledOverride = body.browserEnabledOverride;
+  }
+  if (body.memberBrowserId !== undefined) {
+    // The requester must own the browser and have opted it into unattended
+    // use. Checked here rather than only at spawn time so the person editing
+    // the routine finds out now, not at 3am when the run fails.
+    if (body.memberBrowserId !== null) {
+      const browser = await getOwnedMemberBrowser(found.co.id, req.userId!, body.memberBrowserId);
+      if (!browser) {
+        return res.status(404).json({ error: "That browser is not one of yours" });
+      }
+      if (!browser.allowUnattended || !browser.routineRecordingConsentAt) {
+        return res.status(400).json({
+          error: `"${browser.name}" is not available to scheduled Routines. Turn on unattended use for it first.`,
+        });
+      }
+    }
+    r.memberBrowserId = body.memberBrowserId;
+  }
+  if (body.catchUpPolicy !== undefined) r.catchUpPolicy = body.catchUpPolicy;
+  if (body.maxAttempts !== undefined) r.maxAttempts = body.maxAttempts;
+  if (body.retryBackoffSec !== undefined) r.retryBackoffSec = body.retryBackoffSec;
+  if (body.retryOnTimeout !== undefined) r.retryOnTimeout = body.retryOnTimeout;
+  if (body.acceptanceCriteria !== undefined) r.acceptanceCriteria = body.acceptanceCriteria;
+  if (body.priority !== undefined) r.priority = body.priority;
+  // Only re-derive the pending fire time when the schedule itself changed —
+  // renaming a routine or nudging its timeout shouldn't throw away the slot it
+  // was already waiting on.
+  if (body.cronExpr !== undefined || body.enabled !== undefined) {
+    registerRoutine(r, found.co.timezone);
+  }
+  await AppDataSource.getRepository(Routine).save(r);
+  if (body.browserEnabledOverride !== undefined) {
+    await revokeDisabledBrowserSessionsForEmployee(r.employeeId);
+  }
+  const tags =
+    body.tagIds !== undefined
+      ? await replaceResourceTags(found.co.id, "routine", r.id, body.tagIds)
+      : await tagsForResource(found.co.id, "routine", r.id);
+  await recordAudit({
+    companyId: found.co.id,
+    actorUserId: req.userId ?? null,
+    action: "routine.update",
+    targetType: "routine",
+    targetId: r.id,
+    targetLabel: r.name,
+    metadata: { changes: body },
+  });
+  res.json({ ...r, tags });
+});
+
+/**
+ * Move a batch of routines into one folder (or out of all of them, with a null
+ * `folderId`). The bulk form exists because filing an existing library is the
+ * whole reason folders are here: doing it one PATCH at a time across eighty
+ * routines is the tedium that stops people organizing at all.
+ *
+ * Every id is checked against the company before anything is written, so a
+ * single foreign routine fails the request instead of half-applying it.
+ */
+const moveSchema = z.object({
+  routineIds: z.array(z.string().uuid()).min(1).max(200),
+  folderId: z.string().uuid().nullable(),
+});
+
+routinesRouter.post("/routines/move", validateBody(moveSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof moveSchema>;
+  const co = await loadCo(cid);
+  if (!co) return res.status(404).json({ error: "Company not found" });
+  try {
+    await resolveFolderForCompany(co.id, body.folderId);
+  } catch (err) {
+    if (!(err instanceof RoutineFolderError)) throw err;
+    return res.status(400).json({ error: err.message });
+  }
+
+  const employeeIds = (
+    await AppDataSource.getRepository(AIEmployee).find({
+      where: { companyId: cid },
+      select: { id: true },
+    })
+  ).map((e) => e.id);
+  const routineIds = [...new Set(body.routineIds)];
+  const routines = employeeIds.length
+    ? await AppDataSource.getRepository(Routine).find({
+        where: { id: In(routineIds), employeeId: In(employeeIds) },
+      })
+    : [];
+  if (routines.length !== routineIds.length) {
+    return res.status(404).json({ error: "One or more routines are not in this company" });
+  }
+
+  // A targeted column update, then an explicit live-sync frame.
+  //
+  // Neither half is optional. `save()` on the loaded entities would write back
+  // every column that differs from the row as it stands at save time, so a
+  // `nextRunAt` the cron heartbeat advanced between the read and the write
+  // would be silently reverted — a routine re-firing or skipping a slot
+  // because somebody filed it. `update()` touches only `folderId`, but it
+  // broadcasts just the partial it was handed, which carries no `employeeId`
+  // for the subscriber to hop to the company on, so on its own it tells no
+  // other browser anything. See ROADMAP M31.
+  await AppDataSource.getRepository(Routine).update(
+    { id: In(routineIds) },
+    { folderId: body.folderId },
+  );
+  emitResourceChange(co.id, "routine");
+  await recordAudit({
+    companyId: co.id,
+    actorUserId: req.userId ?? null,
+    action: "routine.move",
+    targetType: "routine_folder",
+    targetId: body.folderId,
+    targetLabel: `${routines.length} routine${routines.length === 1 ? "" : "s"}`,
+    metadata: { routineIds, folderId: body.folderId },
+  });
+  // The folder row above is the batch; each Routine also gets its own row so
+  // its History shows who filed it — but only when it actually changed folder.
+  for (const r of routines) {
+    if (r.folderId === body.folderId) continue;
+    await recordAudit({
+      companyId: co.id,
+      actorUserId: req.userId ?? null,
+      action: "routine.move",
+      targetType: "routine",
+      targetId: r.id,
+      targetLabel: r.name,
+      metadata: { fields: ["folderId"], folderId: body.folderId },
+    });
+  }
+  res.json({ ok: true, moved: routines.length, folderId: body.folderId });
+});
+
+routinesRouter.delete("/routines/:rid", async (req, res) => {
+  const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  markBrowserRecordingRoutineDeleting(found.routine.id);
+  const runs = await AppDataSource.getRepository(Run).find({
+    where: { routineId: found.routine.id },
+    select: { id: true },
+  });
+  await AppDataSource.getRepository(Approval).delete({ routineId: found.routine.id });
+  // The routine's Ask AI conversation goes with it — it is about this routine
+  // and nothing else, so leaving it behind leaves rows nobody can ever reach.
+  await AppDataSource.getRepository(RoutineChatMessage).delete({ routineId: found.routine.id });
+  await deleteBrowserRecordingsForRunIds(runs.map((run) => run.id));
+  if (runs.length) {
+    await AppDataSource.getRepository(ParallelWorkerResult).delete({
+      parentRunId: In(runs.map((run) => run.id)),
+    });
+  }
+  await AppDataSource.getRepository(Run).delete({ routineId: found.routine.id });
+  await deleteTagAssignments("routine", found.routine.id);
+  await AppDataSource.getRepository(Routine).delete({ id: found.routine.id });
+  await recordAudit({
+    companyId: found.co.id,
+    actorUserId: req.userId ?? null,
+    action: "routine.delete",
+    targetType: "routine",
+    targetId: found.routine.id,
+    targetLabel: found.routine.name,
+    metadata: { employeeId: found.emp.id },
+  });
+  res.json({ ok: true });
+});
+
+/**
+ * One routine, with its employee attached. The Routines detail page resolves a
+ * routine from `/routines/:empSlug/:routineSlug`, so it needs the employee to
+ * render "assigned to" and to load that employee's models for the pin picker.
+ * `body` rides along here (unlike the list) — the detail page shows the brief.
+ */
+routinesRouter.get("/routines/:rid", async (req, res) => {
+  const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  const lastRuns = await lastRunByRoutine(found.co.id, [found.routine.id]);
+  const tags = await tagsForResource(found.co.id, "routine", found.routine.id);
+  const standdown = activeStanddownFor(found.co.id, {
+    employeeId: found.emp.id,
+    routineId: found.routine.id,
+  });
+  res.json({
+    ...found.routine,
+    employee: employeeSummary(found.emp),
+    lastRun: lastRuns.get(found.routine.id) ?? null,
+    standdown: standdown ? serializeStanddown(standdown) : null,
+    tags,
+  });
+});
+
+routinesRouter.get("/routines/:rid/readme", async (req, res, next) => {
+  try {
+    const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    // `awaitingBrief` lets the editor say, before the save, that saving will
+    // switch the Routine on.
+    res.json({
+      content: found.routine.body,
+      awaitingBrief: awaitingRoutineBrief(found.routine),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const readmeSchema = z.object({ content: z.string() });
+
+routinesRouter.put("/routines/:rid/readme", validateBody(readmeSchema), async (req, res, next) => {
+  try {
+    const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    const r = found.routine;
+    const switchedOn = writeRoutineBrief(
+      r,
+      (req.body as z.infer<typeof readmeSchema>).content,
+      found.co.timezone,
+    );
+    await AppDataSource.getRepository(Routine).save(r);
+    await recordAudit({
+      companyId: found.co.id,
+      actorUserId: req.userId ?? null,
+      action: "routine.update",
+      targetType: "routine",
+      targetId: r.id,
+      targetLabel: r.name,
+      // A Routine's first brief also switches it on (`writeRoutineBrief`).
+      metadata: { fields: switchedOn ? ["body", "enabled"] : ["body"] },
+    });
+    res.json({ ok: true, enabled: r.enabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Turn webhook on (generates a fresh 48-hex token) or off (clears the token).
+ * Regenerating a token is accomplished by calling this twice: once with
+ * `enabled=false`, then again with `enabled=true`.
+ */
+const webhookSchema = z.object({ enabled: z.boolean() });
+routinesRouter.post("/routines/:rid/webhook", validateBody(webhookSchema), async (req, res) => {
+  const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  const body = req.body as z.infer<typeof webhookSchema>;
+  const r = found.routine;
+  r.webhookEnabled = body.enabled;
+  r.webhookToken = body.enabled ? crypto.randomBytes(24).toString("hex") : null;
+  await AppDataSource.getRepository(Routine).save(r);
+  await recordAudit({
+    companyId: found.co.id,
+    actorUserId: req.userId ?? null,
+    action: body.enabled ? "routine.webhook.enable" : "routine.webhook.disable",
+    targetType: "routine",
+    targetId: r.id,
+    targetLabel: r.name,
+  });
+  res.json(r);
+});
+
+routinesRouter.post("/routines/:rid/run", async (req, res, next) => {
+  try {
+    const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    await recordAudit({
+      companyId: found.co.id,
+      actorUserId: req.userId ?? null,
+      action: "routine.run.manual",
+      targetType: "routine",
+      targetId: found.routine.id,
+      targetLabel: found.routine.name,
+    });
+    // A repeated request opens the accepted Run; losing an HTTP response must
+    // not silently enqueue another occurrence of the same Routine.
+    const run = await startManualRoutineRun(found.routine, found.co.id);
+    res.json(publicRun(run));
+  } catch (err) {
+    if (err instanceof StanddownError) return res.status(409).json({ error: err.message });
+    if (err instanceof ManualRoutineStartError)
+      return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+/** What a Run carries in a Routine's history: no transcript, which /runs/:runId/log reads. */
+const ROUTINE_RUN_COLUMNS = [
+  "run.id",
+  "run.routineId",
+  "run.startedAt",
+  "run.finishedAt",
+  "run.status",
+  "run.errorKind",
+  "run.failureReason",
+  "run.exitCode",
+  "run.createdAt",
+  "run.triggerKind",
+  "run.attempt",
+  "run.retryAt",
+  "run.checkpointJson",
+  "run.continuationCount",
+  "run.continuationStopReason",
+  "run.missedSlots",
+  "run.outcomeVerdict",
+  "run.outcomeNote",
+  "run.checksVerdict",
+  "run.checkRemediations",
+  "run.tokensIn",
+  "run.tokensOut",
+  "run.pausedAt",
+  "run.pauseCount",
+  "run.pauseReason",
+];
+
+/**
+ * List recent runs for a routine, newest-first. Returns lightweight metadata
+ * (sans the captured `logContent`) so the history timeline renders fast;
+ * log text is fetched lazily via /runs/:runId/log.
+ *
+ * Without limit or cursor: the newest 50, queued and running included, as a
+ * plain array — the timeline on the Routine's page. With either: one page of
+ * its finished Runs with a total and the cursor to the next, the list the
+ * `list_runs` AI tool reads (`services/runHistory.ts`), so a cursor from one
+ * continues the other. The status and start-date filters apply to both.
+ */
+routinesRouter.get(
+  "/routines/:rid/runs",
+  validateQuery(routineRunsQuerySchema),
+  async (req, res, next) => {
+    const found = await loadRoutine((req.params as Record<string, string>).cid, req.params.rid);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    const { limit, cursor, ...query } = req.query as unknown as z.infer<
+      typeof routineRunsQuerySchema
+    >;
+    const filter = { routineIds: [found.routine.id], ...query };
+    const present = async (runs: Run[]) => {
+      const followUps = await loadRunFollowUps(found.co.id, runs);
+      return runs.map((run) => publicRun(run, followUps.get(run.id)));
+    };
+    try {
+      if (limit !== undefined || cursor !== undefined) {
+        const { rows, ...info } = await pageRunHistory(
+          found.co.id,
+          filter,
+          { limit, cursor },
+          present,
+          { columns: ROUTINE_RUN_COLUMNS },
+        );
+        return res.json({ ...info, runs: rows });
+      }
+      const runs = await runHistoryQuery(filter, {
+        columns: ROUTINE_RUN_COLUMNS,
+        finishedOnly: false,
+      })
+        .orderBy("run.startedAt", "DESC")
+        .addOrderBy("run.id", "DESC")
+        .take(50)
+        .getMany();
+      res.json(await present(runs));
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+const runRecordingParamsSchema = z
+  .object({
+    cid: z.string().uuid(),
+    runId: z.string().uuid(),
+  })
+  .strict();
+const recordingFileParamsSchema = runRecordingParamsSchema
+  .extend({ sessionId: z.string().uuid() })
+  .strict();
+const recordingFileQuerySchema = z
+  .object({ disposition: z.enum(["inline", "attachment"]).default("inline") })
+  .strict();
+const recordingLiveQuerySchema = z.object({}).strict();
+
+async function loadCompanyRun(companyId: string, runId: string): Promise<Run | null> {
+  const run = await AppDataSource.getRepository(Run).findOneBy({ id: runId });
+  if (!run) return null;
+  return (await loadRoutine(companyId, run.routineId)) ? run : null;
+}
+
+/**
+ * Who may watch one browser recording.
+ *
+ * A **Member browser** is a human's own computer, so its recording stays with
+ * that exact owner whatever their company role. Genosyn's own Browser is
+ * company equipment: its recordings are for the company's owners and admins,
+ * and nobody else. A recording shows the whole viewport, sign-in screens
+ * included, so there is no wider audience to fall back to.
+ */
+function canReadBrowserRecording(
+  req: Parameters<typeof requireBrowserSession>[0],
+  session: BrowserSession,
+): Promise<boolean> {
+  return mayWatchBrowserRecording({ userId: req.userId, role: req.companyRole }, session);
+}
+
+async function recordingsVisibleToRequester(
+  req: Parameters<typeof requireBrowserSession>[0],
+  run: Run,
+): Promise<BrowserRecordingInfo[]> {
+  if (usesBearerCredential(req)) return [];
+  const [recordings, sessions] = await Promise.all([
+    listBrowserRecordingsForRun(run.id),
+    AppDataSource.getRepository(BrowserSession).findBy({ runId: run.id }),
+  ]);
+  const byId = new Map(sessions.map((session) => [session.id, session]));
+  const visible: BrowserRecordingInfo[] = [];
+  for (const recording of recordings) {
+    const session = byId.get(recording.id);
+    if (session?.companyId === req.params.cid && (await canReadBrowserRecording(req, session))) {
+      visible.push(recording);
+    }
+  }
+  return visible;
+}
+
+/** Shared authorization for saved video bytes and each live frame request. */
+async function recordingVisibleToRequester(
+  req: Parameters<typeof requireBrowserSession>[0],
+): Promise<{ run: Run; session: BrowserSession } | null> {
+  const run = await loadCompanyRun(req.params.cid, req.params.runId);
+  if (!run) return null;
+  const session = await AppDataSource.getRepository(BrowserSession).findOneBy({
+    id: req.params.sessionId,
+    runId: run.id,
+    companyId: req.params.cid,
+  });
+  if (!session || !(await canReadBrowserRecording(req, session))) return null;
+  return { run, session };
+}
+
+/** Metadata-only collection; video bytes are served from the item route below. */
+routinesRouter.get(
+  "/runs/:runId/browser-recordings",
+  requireBrowserSession,
+  validateParams(runRecordingParamsSchema),
+  async (req, res) => {
+    const run = await loadCompanyRun(req.params.cid, req.params.runId);
+    if (!run) return res.status(404).json({ error: "Not found" });
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json(await recordingsVisibleToRequester(req, run));
+  },
+);
+
+/** One current frame, with browser-session authorization checked on every poll. */
+routinesRouter.get(
+  "/runs/:runId/browser-recordings/:sessionId/live",
+  requireBrowserSession,
+  validateParams(recordingFileParamsSchema),
+  async (req, res) => {
+    const query = recordingLiveQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      return res.status(400).json({ error: "ValidationError", issues: query.error.issues });
+    }
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    const visible = await recordingVisibleToRequester(req);
+    const live = visible ? getBrowserRecordingLiveFrame(visible.session, visible.run) : null;
+    if (!live) return res.status(404).json({ error: "Not found" });
+    if (!live.frame) return res.status(204).end();
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Length", live.frame.length);
+    // end() avoids Express generating an ETag or converting a frame to 304.
+    return res.end(live.frame);
+  },
+);
+
+/**
+ * Seekable inline stream or download. Express sendFile implements byte-range
+ * requests, which lets the video element seek without loading the whole MP4.
+ */
+routinesRouter.get(
+  "/runs/:runId/browser-recordings/:sessionId",
+  requireBrowserSession,
+  validateParams(recordingFileParamsSchema),
+  async (req, res, next) => {
+    const query = recordingFileQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      return res.status(400).json({ error: "ValidationError", issues: query.error.issues });
+    }
+    const visible = await recordingVisibleToRequester(req);
+    if (!visible) return res.status(404).json({ error: "Not found" });
+    const recording = await getBrowserRecordingFile(visible.session);
+    if (!recording) return res.status(404).json({ error: "Not found" });
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Type", recording.info.mimeType);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader(
+      "Content-Disposition",
+      `${query.data.disposition}; filename="${recording.info.filename}"`,
+    );
+    return res.sendFile(recording.path, (error) => {
+      if (!error) return;
+      if (!res.headersSent) {
+        // sendFile preserves headers set before it discovers an unsatisfiable
+        // Range. Clear the media-only values before the API error middleware
+        // writes its JSON response; keep Content-Range so clients learn the
+        // current file size and can recover their seek request.
+        res.removeHeader("Content-Disposition");
+        res.removeHeader("Content-Type");
+        res.removeHeader("Content-Length");
+        if (typeof error === "object" && "status" in error && error.status === 416) {
+          res.status(416).json({ error: "Range Not Satisfiable" });
+          return;
+        }
+      }
+      next(error);
+    });
+  },
+);
+
+/**
+ * Return the captured log for a single run. While a run is still executing
+ * we serve the live in-memory buffer so the UI can tail output; once the
+ * row is finalized we fall back to the persisted `logContent`. The runner
+ * hard-caps the stored content at {@link RUN_LOG_MAX_BYTES}, so the
+ * endpoint never has to worry about runaway sizes. Status fields ride
+ * along so callers can poll a single endpoint to drive a live-log modal.
+ */
+routinesRouter.get("/runs/:runId/log", async (req, res, next) => {
+  try {
+    const run = await AppDataSource.getRepository(Run).findOneBy({ id: req.params.runId });
+    if (!run) return res.status(404).json({ error: "Not found" });
+    // Confirm the caller has access to the parent routine (company scope).
+    const found = await loadRoutine((req.params as Record<string, string>).cid, run.routineId);
+    if (!found) return res.status(404).json({ error: "Not found" });
+
+    const live = getLiveRunSnapshot(run.id);
+    const content = live ? live.content : (run.logContent ?? "");
+    const size = live ? live.size : Buffer.byteLength(content, "utf8");
+    const truncated = live ? live.truncated : size >= RUN_LOG_MAX_BYTES;
+    const browserRecordings = await recordingsVisibleToRequester(req, run);
+    const followUps = await loadRunFollowUps(found.co.id, [run]);
+
+    res.json({
+      content,
+      truncated,
+      size,
+      live: live !== null,
+      status: run.status,
+      errorKind: run.errorKind,
+      failureReason: run.failureReason,
+      diagnostics: readRunDiagnostics(run),
+      exitCode: run.exitCode,
+      queuedAt: run.createdAt,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      // So the live-log modal can say "retrying in 2m" without a second request.
+      retryAt: run.retryAt,
+      ...runContinuationView(run, followUps.get(run.id)),
+      attempt: run.attempt,
+      // The outcome check lands shortly after a completed run finalizes; polling
+      // this endpoint picks the verdict up without a second request.
+      outcomeVerdict: run.outcomeVerdict,
+      outcomeNote: run.outcomeNote,
+      checksVerdict: run.checksVerdict,
+      checkRemediations: run.checkRemediations,
+      // True while a verdict is still owed — the routine declares acceptance
+      // criteria and this completed run has not been graded yet. The live-log
+      // modal polls on this rather than guessing how long a check takes.
+      awaitingOutcome:
+        run.status === "completed" &&
+        run.outcomeVerdict === null &&
+        found.routine.acceptanceCriteria.trim().length > 0,
+      tokensIn: run.tokensIn,
+      tokensOut: run.tokensOut,
+      // A Run paused for a restart waits `queued` with its transcript; the
+      // modal says so rather than calling it pending.
+      pausedAt: run.pausedAt,
+      pauseCount: run.pauseCount,
+      pauseReason: run.pauseReason ?? null,
+      browserRecordings,
+    });
+  } catch (err) {
+    // Express 4 does not forward rejected async reads to the error handler.
+    next(err);
+  }
+});
+
+/**
+ * Acknowledge a failed/timed-out run so it drops off the Home "Failed
+ * routines" panel and the System Health "Failed routine runs" check. The run
+ * row is left intact — this only stamps `dismissedAt` so the alert stops
+ * nagging every member. Idempotent: re-dismissing a dismissed run is a no-op.
+ */
+routinesRouter.post("/runs/:runId/dismiss", async (req, res) => {
+  const runRepo = AppDataSource.getRepository(Run);
+  const run = await runRepo.findOneBy({ id: req.params.runId });
+  if (!run) return res.status(404).json({ error: "Not found" });
+  // Company-scope the run through its owning routine.
+  const found = await loadRoutine((req.params as Record<string, string>).cid, run.routineId);
+  if (!found) return res.status(404).json({ error: "Not found" });
+  if (!["failed", "error", "timeout", "interrupted"].includes(run.status)) {
+    return res
+      .status(409)
+      .json({ error: "Only Runs that failed or ended with an Error can be dismissed" });
+  }
+  if (!run.dismissedAt) {
+    run.dismissedAt = new Date();
+    await runRepo.save(run);
+    await recordAudit({
+      companyId: found.co.id,
+      actorUserId: req.userId ?? null,
+      action: "routine.run.dismiss",
+      targetType: "run",
+      targetId: run.id,
+      targetLabel: found.routine.name,
+      metadata: { routineId: found.routine.id, status: run.status },
+    });
+  }
+  res.json(publicRun(run));
+});
+
+const cancelRetrySchema = z.object({}).strict();
+
+const resumeRunParamsSchema = z.object({ cid: z.string().uuid(), runId: z.string().uuid() });
+const resumeRunSchema = z.object({ acknowledgeNewAllowance: z.literal(true) }).strict();
+
+/** Explicitly authorize a fresh, bounded allowance for saved unfinished work. */
+routinesRouter.post(
+  "/runs/:runId/resume",
+  requireBrowserSession,
+  validateParams(resumeRunParamsSchema),
+  validateBody(resumeRunSchema),
+  async (req, res, next) => {
+    try {
+      const run = await resumeRoutineRun({
+        companyId: req.params.cid,
+        sourceRunId: req.params.runId,
+        userId: req.userId!,
+        acknowledgeNewAllowance: true,
+      });
+      res.json(publicRun(run));
+    } catch (error) {
+      if (error instanceof RunManualResumeError)
+        return res.status(error.status).json({ error: error.message });
+      if (error instanceof StanddownError) return res.status(409).json({ error: error.message });
+      next(error);
+    }
+  },
+);
+
+/**
+ * Cancel a pending automatic retry without disabling the whole routine —
+ * the escape hatch for a failure a human has decided to fix by hand. Clearing
+ * `retryAt` also un-suppresses the run in the Home failed-routines panel,
+ * since it is now a failure nobody is going to re-attempt.
+ */
+routinesRouter.post(
+  "/runs/:runId/cancel-retry",
+  validateBody(cancelRetrySchema),
+  async (req, res) => {
+    const runRepo = AppDataSource.getRepository(Run);
+    const run = await runRepo.findOneBy({ id: req.params.runId });
+    if (!run) return res.status(404).json({ error: "Not found" });
+    const found = await loadRoutine((req.params as Record<string, string>).cid, run.routineId);
+    if (!found) return res.status(404).json({ error: "Not found" });
+    const outcome = await cancelPendingRetry(run.id);
+    if (outcome === "none") {
+      return res.status(409).json({ error: "This run has no retry scheduled" });
+    }
+    if (outcome === "dispatching") {
+      return res.status(409).json({ error: "This retry is already starting" });
+    }
+    if (outcome === "changed") {
+      return res.status(409).json({ error: "The retry changed; refresh and try again" });
+    }
+    await recordAudit({
+      companyId: found.co.id,
+      actorUserId: req.userId ?? null,
+      action: "routine.run.cancelRetry",
+      targetType: "run",
+      targetId: run.id,
+      targetLabel: found.routine.name,
+      metadata: { routineId: found.routine.id, attempt: run.attempt },
+    });
+    // Cancelling a hand-off's continuation also returns it to Failed.
+    const cancelled = await runRepo.findOneBy({ id: run.id });
+    res.json(publicRun(cancelled ?? { ...run, retryAt: null }));
+  },
+);

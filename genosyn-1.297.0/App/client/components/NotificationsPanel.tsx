@@ -1,0 +1,603 @@
+import React from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  AlertTriangle,
+  AtSign,
+  Bell,
+  BellRing,
+  Briefcase,
+  CheckCircle2,
+  ClipboardCheck,
+  FolderLock,
+  GitBranch,
+  GitPullRequest,
+  Hourglass,
+  Landmark,
+  LifeBuoy,
+  Lightbulb,
+  Mail,
+  MessageCircleQuestion,
+  PiggyBank,
+  ScrollText,
+  ShieldAlert,
+  ShieldCheck,
+  Star,
+  Target,
+  Users,
+  CloudOff,
+  Cloud,
+} from "lucide-react";
+import { api, Company, Notification, NotificationKind } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { Avatar, employeeAvatarUrl, memberAvatarUrl } from "./ui/Avatar";
+import { useCompanySocketSubscription } from "./CompanySocket";
+import { useBackgroundAction } from "./ui/Dialog";
+import { useNavigationGuard } from "./NavigationGuard";
+import { companyNotificationLink } from "../../shared/notificationLink";
+
+/**
+ * Opens the bell from elsewhere on the page — Home's "Unread notifications"
+ * tile and its "All notifications" link — with focus on the first row.
+ */
+export const OPEN_NOTIFICATIONS_EVENT = "genosyn:open-notifications";
+
+export function openNotifications(): void {
+  window.dispatchEvent(new Event(OPEN_NOTIFICATIONS_EVENT));
+}
+
+/**
+ * Bell + popover panel mounted in the top bar. Reads the per-user feed
+ * exposed at `/api/companies/:cid/notifications` and patches state in
+ * place when the server pushes `notification.new` / `notification.read`
+ * frames over the shared company WebSocket. The 15-second poll is kept
+ * as a backstop in case the socket missed a frame during reconnect.
+ */
+export function NotificationsPanel({ company, meId }: { company: Company; meId: string }) {
+  const navigate = useNavigate();
+  const navigationGuard = useNavigationGuard();
+  const background = useBackgroundAction();
+  const [open, setOpen] = React.useState(false);
+  const [count, setCount] = React.useState(0);
+  const [items, setItems] = React.useState<Notification[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const bellRef = React.useRef<HTMLButtonElement>(null);
+  const panelRef = React.useRef<HTMLDivElement>(null);
+  const panelId = React.useId();
+  // Set when the page opened the bell, so focus follows it into the list
+  // once this opening's list has arrived.
+  const focusFirstRow = React.useRef(false);
+  const listedSinceOpen = React.useRef(false);
+
+  React.useEffect(() => {
+    const onOpen = () => {
+      focusFirstRow.current = true;
+      listedSinceOpen.current = false;
+      setOpen(true);
+    };
+    window.addEventListener(OPEN_NOTIFICATIONS_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_NOTIFICATIONS_EVENT, onOpen);
+  }, []);
+
+  // Esc closes it and hands focus back to the bell, as the account and theme
+  // menus do.
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      setOpen(false);
+      bellRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  React.useEffect(() => {
+    if (!open || !focusFirstRow.current || !listedSinceOpen.current || loading) return;
+    focusFirstRow.current = false;
+    const first = panelRef.current?.querySelector<HTMLElement>("li button");
+    (first ?? panelRef.current)?.focus();
+  }, [open, loading, items]);
+
+  const refreshCount = React.useCallback(async () => {
+    try {
+      const r = await api.get<{ count: number }>(
+        `/api/companies/${company.id}/notifications/unread-count`,
+      );
+      setCount(r.count);
+    } catch {
+      // Stale count is preferable to interrupting the user — the panel will
+      // recompute the next time it is opened.
+    }
+  }, [company.id]);
+
+  const refreshList = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api.get<{ notifications: Notification[] }>(
+        `/api/companies/${company.id}/notifications?limit=30`,
+      );
+      setItems(r.notifications);
+    } finally {
+      listedSinceOpen.current = true;
+      setLoading(false);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    refreshCount();
+    const interval = window.setInterval(refreshCount, 15_000);
+    const onFocus = () => refreshCount();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refreshCount]);
+
+  React.useEffect(() => {
+    if (open) refreshList();
+  }, [open, refreshList]);
+
+  // Patch state in place from live WS frames. The hub broadcasts to every
+  // socket in the company room, so each client filters on `userId` to
+  // ignore frames that target a different teammate.
+  useCompanySocketSubscription((ev) => {
+    if (ev.type === "notification.new") {
+      if (ev.userId !== meId) return;
+      setItems((rows) => {
+        if (rows.some((r) => r.id === ev.notification.id)) return rows;
+        return [ev.notification, ...rows].slice(0, 50);
+      });
+      setCount((c) => c + 1);
+    } else if (ev.type === "notification.read") {
+      if (ev.userId !== meId) return;
+      const ids = new Set(ev.notificationIds);
+      const now = new Date().toISOString();
+      setItems((rows) => rows.map((r) => (ids.has(r.id) && !r.readAt ? { ...r, readAt: now } : r)));
+      // Server is authoritative on the unread count. Re-poll after a read
+      // frame so we don't double-decrement under StrictMode's twice-invoked
+      // setter or miss a frame that read more rows than we currently hold.
+      refreshCount();
+    }
+  });
+
+  function handleClick(n: Notification) {
+    setOpen(false);
+    if (!n.readAt) {
+      setItems((rows) =>
+        rows.map((r) => (r.id === n.id ? { ...r, readAt: new Date().toISOString() } : r)),
+      );
+      setCount((c) => Math.max(0, c - 1));
+      background(
+        () =>
+          api.post(`/api/companies/${company.id}/notifications/mark-read`, {
+            notificationId: n.id,
+          }),
+        {
+          title: "Couldn’t mark the notification read",
+          error: (error) => `${errorMessage(error)} It will be reconciled on refresh.`,
+          onError: () => {
+            void refreshCount();
+            void refreshList();
+          },
+        },
+      );
+    }
+    const href = companyNotificationLink(company.slug, n.link);
+    if (href && !navigationGuard.request(href)) navigate(href);
+  }
+
+  function handleMarkAll() {
+    const now = new Date().toISOString();
+    setItems((rows) => rows.map((r) => (r.readAt ? r : { ...r, readAt: now })));
+    setCount(0);
+    background(() => api.post(`/api/companies/${company.id}/notifications/mark-all-read`), {
+      title: "Couldn’t mark notifications read",
+      error: (error) => `${errorMessage(error)} The list has been refreshed.`,
+      onError: () => {
+        void refreshCount();
+        void refreshList();
+      },
+    });
+  }
+
+  return (
+    <div className="relative">
+      <button
+        ref={bellRef}
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="relative flex h-8 w-8 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+        title={count > 0 ? `${count} unread` : "Notifications"}
+        aria-label="Notifications"
+        aria-expanded={open}
+        aria-controls={open ? panelId : undefined}
+      >
+        <Bell size={16} />
+        {count > 0 && (
+          <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-[1rem] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white tabular-nums">
+            {count > 99 ? "99+" : count}
+          </span>
+        )}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          {/* Anchored to the bell from sm up; pinned to the viewport edges on
+              phones, where a 22rem panel would run off-screen. */}
+          <div
+            ref={panelRef}
+            id={panelId}
+            role="region"
+            aria-label="Notifications"
+            tabIndex={-1}
+            className="fixed left-3 right-3 top-16 z-20 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg outline-none sm:absolute sm:left-auto sm:right-0 sm:top-full sm:mt-2 sm:w-[22rem] dark:border-slate-700 dark:bg-slate-900"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  Notifications
+                </span>
+                {count > 0 && (
+                  <span className="rounded-full bg-rose-100 px-1.5 text-xs font-semibold text-rose-700 dark:bg-rose-500/15 dark:text-rose-200">
+                    {count}
+                  </span>
+                )}
+              </div>
+              {items.some((i) => !i.readAt) && (
+                <button
+                  onClick={handleMarkAll}
+                  className="text-xs text-indigo-600 hover:underline dark:text-indigo-400"
+                >
+                  Mark all read
+                </button>
+              )}
+            </div>
+            <div className="max-h-[26rem] overflow-y-auto">
+              {loading && items.length === 0 ? (
+                <div className="px-4 py-8 text-center text-xs text-slate-400 dark:text-slate-500">
+                  Loading…
+                </div>
+              ) : items.length === 0 ? (
+                <EmptyState />
+              ) : (
+                <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {items.map((n) => (
+                    <li key={n.id}>
+                      <NotificationRow
+                        notification={n}
+                        company={company}
+                        onClick={() => handleClick(n)}
+                      />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
+      <CheckCircle2 size={20} className="text-emerald-500 dark:text-emerald-400" />
+      <div className="text-sm font-medium text-slate-700 dark:text-slate-200">
+        You&apos;re all caught up
+      </div>
+      <div className="text-xs text-slate-500 dark:text-slate-400">
+        New mentions, reviews, and approvals show up here.
+      </div>
+    </div>
+  );
+}
+
+function NotificationRow({
+  notification: n,
+  company,
+  onClick,
+}: {
+  notification: Notification;
+  company: Company;
+  onClick: () => void;
+}) {
+  const unread = !n.readAt;
+  const tone = KIND_TONE[n.kind] ?? KIND_TONE.mention;
+
+  // Prefer the actor avatar; fall back to a kind-tinted icon square so the
+  // row isn't visually empty when the actor has no picture / is "system".
+  const actor = n.actor;
+  const avatarSrc = actor
+    ? actor.kind === "user" && actor.id
+      ? memberAvatarUrl(company.id, actor.id, actor.avatarKey)
+      : actor.kind === "ai" && actor.id
+        ? employeeAvatarUrl(company.id, actor.id, actor.avatarKey)
+        : null
+    : null;
+
+  return (
+    <button
+      onClick={onClick}
+      className={
+        "flex w-full items-start gap-3 px-4 py-3 text-left transition-colors " +
+        (unread
+          ? "bg-indigo-50/40 hover:bg-indigo-50 dark:bg-indigo-500/[0.06] dark:hover:bg-indigo-500/10"
+          : "hover:bg-slate-50 dark:hover:bg-slate-800/60")
+      }
+    >
+      <div className="relative">
+        {actor ? (
+          <Avatar
+            name={actor.name}
+            src={avatarSrc}
+            kind={actor.kind === "ai" ? "ai" : "human"}
+            size="md"
+          />
+        ) : (
+          <div className={"flex h-8 w-8 items-center justify-center rounded-full " + tone.iconBg}>
+            <KindIcon kind={n.kind} className={tone.iconFg} />
+          </div>
+        )}
+        <span
+          className={
+            "absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full ring-2 ring-white dark:ring-slate-900 " +
+            tone.iconBg
+          }
+        >
+          <KindIcon kind={n.kind} size={10} className={tone.iconFg} />
+        </span>
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <div className="min-w-0 flex-1 truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+            {n.title}
+          </div>
+          {unread && (
+            <span
+              className="mt-1 h-2 w-2 shrink-0 rounded-full bg-indigo-500"
+              aria-label="Unread"
+            />
+          )}
+        </div>
+        {n.body && (
+          <div className="mt-0.5 line-clamp-2 text-xs text-slate-500 dark:text-slate-400">
+            {n.body}
+          </div>
+        )}
+        <div className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+          {formatRelative(n.createdAt)}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function KindIcon({
+  kind,
+  size = 14,
+  className,
+}: {
+  kind: NotificationKind;
+  size?: number;
+  className?: string;
+}) {
+  switch (kind) {
+    case "mention":
+      return <AtSign size={size} className={className} />;
+    case "todo_review_requested":
+      return <ClipboardCheck size={size} className={className} />;
+    case "approval_pending":
+      return <ShieldCheck size={size} className={className} />;
+    case "decision_pending":
+      return <GitBranch size={size} className={className} />;
+    case "finance_review_ready":
+      return <Landmark size={size} className={className} />;
+    case "todo_needs_attention":
+      return <AlertTriangle size={size} className={className} />;
+    case "mail_handover":
+      return <Mail size={size} className={className} />;
+    case "revenue_follow_up":
+      return <BellRing size={size} className={className} />;
+    case "run_failed":
+      return <AlertTriangle size={size} className={className} />;
+    case "run_off_goal":
+      return <Target size={size} className={className} />;
+    case "approval_stale":
+      return <Hourglass size={size} className={className} />;
+    case "decision_stale":
+      return <Hourglass size={size} className={className} />;
+    case "handoff_overdue":
+      return <Hourglass size={size} className={className} />;
+    case "goal_achieved":
+      return <Target size={size} className={className} />;
+    case "goal_missed":
+      return <Target size={size} className={className} />;
+    case "goal_confirmation_pending":
+      return <Target size={size} className={className} />;
+    case "revision_pending":
+      return <GitPullRequest size={size} className={className} />;
+    case "revision_stale":
+      return <GitPullRequest size={size} className={className} />;
+    case "autonomy_revoked":
+      return <ShieldAlert size={size} className={className} />;
+    case "budget_exhausted":
+      return <PiggyBank size={size} className={className} />;
+    case "initiative_pending":
+      return <Lightbulb size={size} className={className} />;
+    case "board_letter_ready":
+      return <ScrollText size={size} className={className} />;
+    case "recruiting_application":
+      return <Briefcase size={size} className={className} />;
+    case "recruiting_strong_match":
+      return <Star size={size} className={className} />;
+    case "data_room_question":
+      return <MessageCircleQuestion size={size} className={className} />;
+    case "data_room_visit":
+      return <FolderLock size={size} className={className} />;
+    case "support_ticket_assigned":
+    case "support_customer_replied":
+      return <LifeBuoy size={size} className={className} />;
+    case "support_sla_breached":
+      return <Hourglass size={size} className={className} />;
+    case "support_low_rating":
+      return <Star size={size} className={className} />;
+    case "group_discussion":
+      return <Users size={size} className={className} />;
+    case "model_unavailable":
+      return <CloudOff size={size} className={className} />;
+    case "model_available":
+      return <Cloud size={size} className={className} />;
+  }
+}
+
+const KIND_TONE: Record<NotificationKind, { iconBg: string; iconFg: string }> = {
+  mention: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  todo_review_requested: {
+    iconBg: "bg-violet-100 dark:bg-violet-500/15",
+    iconFg: "text-violet-600 dark:text-violet-300",
+  },
+  approval_pending: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  decision_pending: {
+    iconBg: "bg-violet-100 dark:bg-violet-500/15",
+    iconFg: "text-violet-600 dark:text-violet-300",
+  },
+  finance_review_ready: {
+    iconBg: "bg-emerald-100 dark:bg-emerald-500/15",
+    iconFg: "text-emerald-600 dark:text-emerald-300",
+  },
+  todo_needs_attention: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  mail_handover: {
+    iconBg: "bg-sky-100 dark:bg-sky-500/15",
+    iconFg: "text-sky-600 dark:text-sky-300",
+  },
+  revenue_follow_up: {
+    iconBg: "bg-sky-100 dark:bg-sky-500/15",
+    iconFg: "text-sky-600 dark:text-sky-300",
+  },
+  run_failed: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  run_off_goal: {
+    iconBg: "bg-orange-100 dark:bg-orange-500/15",
+    iconFg: "text-orange-600 dark:text-orange-300",
+  },
+  approval_stale: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  decision_stale: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  handoff_overdue: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  goal_achieved: {
+    iconBg: "bg-emerald-100 dark:bg-emerald-500/15",
+    iconFg: "text-emerald-600 dark:text-emerald-300",
+  },
+  goal_missed: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  goal_confirmation_pending: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  revision_pending: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  revision_stale: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  autonomy_revoked: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  budget_exhausted: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  initiative_pending: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  board_letter_ready: {
+    iconBg: "bg-violet-100 dark:bg-violet-500/15",
+    iconFg: "text-violet-600 dark:text-violet-300",
+  },
+  recruiting_application: {
+    iconBg: "bg-cyan-100 dark:bg-cyan-500/15",
+    iconFg: "text-cyan-600 dark:text-cyan-300",
+  },
+  recruiting_strong_match: {
+    iconBg: "bg-emerald-100 dark:bg-emerald-500/15",
+    iconFg: "text-emerald-600 dark:text-emerald-300",
+  },
+  data_room_question: {
+    iconBg: "bg-indigo-100 dark:bg-indigo-500/15",
+    iconFg: "text-indigo-600 dark:text-indigo-300",
+  },
+  data_room_visit: {
+    iconBg: "bg-slate-100 dark:bg-slate-700/40",
+    iconFg: "text-slate-600 dark:text-slate-300",
+  },
+  support_ticket_assigned: {
+    iconBg: "bg-sky-100 dark:bg-sky-500/15",
+    iconFg: "text-sky-600 dark:text-sky-300",
+  },
+  support_customer_replied: {
+    iconBg: "bg-sky-100 dark:bg-sky-500/15",
+    iconFg: "text-sky-600 dark:text-sky-300",
+  },
+  support_sla_breached: {
+    iconBg: "bg-rose-100 dark:bg-rose-500/15",
+    iconFg: "text-rose-600 dark:text-rose-300",
+  },
+  support_low_rating: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  group_discussion: {
+    iconBg: "bg-indigo-100 dark:bg-indigo-500/15",
+    iconFg: "text-indigo-600 dark:text-indigo-300",
+  },
+  model_unavailable: {
+    iconBg: "bg-amber-100 dark:bg-amber-500/15",
+    iconFg: "text-amber-600 dark:text-amber-300",
+  },
+  model_available: {
+    iconBg: "bg-emerald-100 dark:bg-emerald-500/15",
+    iconFg: "text-emerald-600 dark:text-emerald-300",
+  },
+};
+
+function formatRelative(iso: string): string {
+  const d = new Date(iso);
+  const diff = Date.now() - d.getTime();
+  const sec = Math.round(diff / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  return d.toLocaleDateString();
+}

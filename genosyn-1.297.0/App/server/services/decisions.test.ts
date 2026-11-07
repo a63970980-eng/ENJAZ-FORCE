@@ -1,0 +1,975 @@
+import assert from "node:assert/strict";
+import { after, before, beforeEach, describe, test } from "node:test";
+
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Company } from "../db/entities/Company.js";
+import { Conversation } from "../db/entities/Conversation.js";
+import { Decision } from "../db/entities/Decision.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { MailThread } from "../db/entities/MailThread.js";
+import { Membership } from "../db/entities/Membership.js";
+import { Notification } from "../db/entities/Notification.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run } from "../db/entities/Run.js";
+import { User } from "../db/entities/User.js";
+import { closeTestDb, initTestDb, insert, resetTestDb, testCompanyId } from "../test/dbHarness.js";
+import {
+  cancelDecision,
+  canDecide,
+  createDecision,
+  decideDecision,
+  decisionLine,
+  listDecisions,
+  listPendingDecisions,
+  normalizeDecisionOptions,
+  parseDecisionOptions,
+  restoreDecision,
+} from "./decisions.js";
+
+before(initTestDb);
+after(closeTestDb);
+beforeEach(resetTestDb);
+
+/** A company with one employee and one owner, wired well enough to notify. */
+async function scenario(): Promise<{
+  companyId: string;
+  companySlug: string;
+  employeeId: string;
+  ownerId: string;
+  memberId: string;
+}> {
+  const companyId = testCompanyId();
+  const companySlug = `acme-${companyId.slice(3, 11)}`;
+  const owner = await insert(User, {
+    email: `owner-${companyId}@example.test`,
+    passwordHash: "x",
+    name: "Ada Owner",
+  });
+  const member = await insert(User, {
+    email: `member-${companyId}@example.test`,
+    passwordHash: "x",
+    name: "Mo Member",
+  });
+  await insert(Company, {
+    id: companyId,
+    name: "Acme",
+    slug: companySlug,
+    ownerId: owner.id,
+  });
+  const employee = await insert(AIEmployee, {
+    companyId,
+    name: "Rey",
+    slug: `rey-${companyId.slice(3, 11)}`,
+    role: "Support",
+    soulBody: "",
+  });
+  await insert(Membership, { companyId, userId: owner.id, role: "owner" });
+  await insert(Membership, { companyId, userId: member.id, role: "member" });
+  return {
+    companyId,
+    companySlug,
+    employeeId: employee.id,
+    ownerId: owner.id,
+    memberId: member.id,
+  };
+}
+
+async function stack(companyId: string, employeeId: string, overrides: Partial<Decision> = {}) {
+  const { decision } = await createDecision({
+    companyId,
+    employeeId,
+    title: "Send the pricing reply to Acme?",
+    body: "Hi there — here is the quote you asked for.",
+    options: [{ label: "Send it", tone: "primary" }, { label: "Hold for now" }],
+    ...overrides,
+  });
+  return decision;
+}
+
+describe("decision options", () => {
+  test("labels become stable ids, and duplicates never collide", () => {
+    const options = normalizeDecisionOptions([
+      { label: "Send it" },
+      { label: "Send it" },
+      { label: "Hold" },
+    ]);
+    assert.deepEqual(
+      options.map((o) => o.id),
+      ["send-it", "send-it-2", "hold"],
+    );
+  });
+
+  test("blank labels are dropped and the list is capped at six", () => {
+    const options = normalizeDecisionOptions([
+      { label: "   " },
+      ...Array.from({ length: 9 }, (_, i) => ({ label: `Option ${i}` })),
+    ]);
+    assert.equal(options.length, 6);
+    assert.equal(options[0].label, "Option 0");
+  });
+
+  test("credential material in an option label is redacted before storage", () => {
+    const [option] = normalizeDecisionOptions([{ label: "Use Authorization: Bearer sk-live-123" }]);
+    assert.ok(!option.label.includes("sk-live-123"), option.label);
+  });
+
+  test("a corrupt options blob yields no buttons rather than throwing", () => {
+    assert.deepEqual(parseDecisionOptions("not json"), []);
+    assert.deepEqual(parseDecisionOptions('{"not":"an array"}'), []);
+  });
+});
+
+describe("raising a decision", () => {
+  test("stores the human judgment rationale first, with evidence and credentials redacted", async () => {
+    const { companyId, employeeId } = await scenario();
+    const { decision } = await createDecision({
+      companyId,
+      employeeId,
+      title: "Choose a binding three-year supplier contract",
+      humanDecisionReason:
+        "  The three-year commitment exceeds delegated authority; the supplier supplied token=secret123.  ",
+      body: "The verified offers are attached; Authorization: Bearer private123",
+      options: [{ label: "Choose supplier A" }, { label: "Keep the current supplier" }],
+    });
+    assert.match(decision.body, /^## Why this needs a human decision\nThe three-year commitment/);
+    assert.match(decision.body, /The verified offers are attached/);
+    assert.ok(!decision.body.includes("secret123"));
+    assert.ok(!decision.body.includes("private123"));
+  });
+
+  test("rejects a blank rationale before creating a Decision or notifying anybody", async () => {
+    const { companyId, employeeId } = await scenario();
+    await assert.rejects(
+      createDecision({
+        companyId,
+        employeeId,
+        title: "Update the Contact name?",
+        humanDecisionReason: "                    ",
+        options: [{ label: "Update it" }],
+      }),
+      /major stakes/,
+    );
+    assert.equal(await AppDataSource.getRepository(Decision).countBy({ companyId }), 0);
+    assert.equal(await AppDataSource.getRepository(Notification).countBy({ companyId }), 0);
+  });
+
+  test("keeps the rationale visible within the existing body ceiling", async () => {
+    const { companyId, employeeId } = await scenario();
+    const { decision } = await createDecision({
+      companyId,
+      employeeId,
+      title: "Choose a strategic market",
+      humanDecisionReason: "Changing market focus would redirect the company's annual strategy.",
+      body: "Evidence. ".repeat(3_000),
+      options: [{ label: "Focus on enterprise" }, { label: "Keep the current strategy" }],
+    });
+    assert.match(decision.body, /^## Why this needs a human decision/);
+    assert.equal(decision.body.length, 20_000);
+  });
+
+  test("scrubs the title and body, and pages the owners", async () => {
+    const { companyId, companySlug, employeeId, ownerId, memberId } = await scenario();
+    const { decision } = await createDecision({
+      companyId,
+      employeeId,
+      title: "Post this with token=hunter2?",
+      body: "The draft says api_key: abcdef123456",
+      options: [{ label: "Post it" }],
+    });
+
+    assert.ok(!decision.title.includes("hunter2"), decision.title);
+    assert.ok(!decision.body.includes("abcdef123456"), decision.body);
+
+    const notifications = await AppDataSource.getRepository(Notification).find({
+      where: { companyId },
+    });
+    // Owners and admins are paged; a plain member is not, though they may still
+    // answer it from the stack.
+    assert.deepEqual(
+      notifications.map((n) => n.userId),
+      [ownerId],
+    );
+    assert.equal(notifications[0].kind, "decision_pending");
+    assert.equal(notifications[0].entityId, decision.id);
+    assert.equal(notifications[0].link, `/c/${companySlug}/decisions#decision-${decision.id}`);
+    assert.notEqual(notifications[0].userId, memberId);
+  });
+
+  test("an assignee is paged instead of the owners", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    await createDecision({
+      companyId,
+      employeeId,
+      title: "Which vendor?",
+      options: [{ label: "Vendor A" }, { label: "Vendor B" }],
+      assigneeUserId: memberId,
+    });
+    const notifications = await AppDataSource.getRepository(Notification).find({
+      where: { companyId },
+    });
+    assert.deepEqual(
+      notifications.map((n) => n.userId),
+      [memberId],
+    );
+  });
+
+  test("refuses a decision with no answerable option", async () => {
+    const { companyId, employeeId } = await scenario();
+    await assert.rejects(
+      () =>
+        createDecision({
+          companyId,
+          employeeId,
+          title: "What now?",
+          options: [{ label: "  " }],
+        }),
+      /at least one option/,
+    );
+  });
+});
+
+describe("the short lines a Decision opens on", () => {
+  test("decisionLine keeps one redacted line within its limit, and blank is null", () => {
+    assert.equal(decisionLine("  Acme renews\n\nFriday.  ", 200), "Acme renews Friday.");
+    assert.equal(decisionLine("   ", 200), null);
+    assert.equal(decisionLine(null, 200), null);
+    assert.equal(decisionLine(undefined, 200), null);
+    const long = decisionLine("word ".repeat(80), 160) ?? "";
+    assert.ok(long.length <= 160 && long.endsWith("…"), long);
+    assert.doesNotMatch(
+      decisionLine("Use token=abc123supersecret today", 200) ?? "",
+      /abc123supersecret/,
+    );
+  });
+
+  test("createDecision stores the summary and recommendation; the DTO and the stack return them", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const { decision } = await createDecision({
+      companyId,
+      employeeId,
+      title: "Sign Acme's renewal?",
+      summary: "Acme will sign for three years\nat 10% off.",
+      recommendation: "Sign it: three years beats the discount.",
+      options: [{ label: "Sign it", tone: "primary" }],
+    });
+    assert.equal(decision.summary, "Acme will sign for three years at 10% off.");
+    assert.equal(decision.recommendation, "Sign it: three years beats the discount.");
+    const [listed] = await listDecisions({ companyId, status: "pending" });
+    assert.equal(listed.summary, "Acme will sign for three years at 10% off.");
+    assert.equal(listed.recommendation, "Sign it: three years beats the discount.");
+    assert.equal(listed.pickupReport, null);
+    const { decisions } = await listPendingDecisions({
+      companyId,
+      limit: 5,
+      viewer: { userId: ownerId, role: "owner" },
+    });
+    assert.equal(decisions[0].summary, "Acme will sign for three years at 10% off.");
+    const [bell] = await AppDataSource.getRepository(Notification).find({ where: { companyId } });
+    assert.equal(bell.body, "Acme will sign for three years at 10% off.");
+  });
+
+  test("an older-style Decision has no lines, and its bell says what to do", async () => {
+    const { companyId, employeeId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    assert.equal(decision.summary, null);
+    assert.equal(decision.recommendation, null);
+    const [listed] = await listDecisions({ companyId, status: "pending" });
+    assert.equal(listed.summary, null);
+    const [bell] = await AppDataSource.getRepository(Notification).find({ where: { companyId } });
+    assert.equal(bell.body, "Pick an option in the Decision stack so they can carry on.");
+  });
+
+  test("a recorded pickup report reaches the stack beside the full log", async () => {
+    const { companyId, employeeId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    await AppDataSource.getRepository(Decision).update(
+      { id: decision.id },
+      {
+        status: "decided",
+        pickupStatus: "done",
+        pickupSummary: "Opened the deal.\n\nSent the reply.",
+        pickupReport: "Sent the reply.",
+      },
+    );
+    const [listed] = await listDecisions({ companyId, status: "decided" });
+    assert.equal(listed.pickupReport, "Sent the reply.");
+    assert.equal(listed.pickupSummary, "Opened the deal.\n\nSent the reply.");
+  });
+});
+
+describe("answering a decision", () => {
+  test("records the chosen option and journals it for the employee", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+
+    const result = await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+      optionId: "send-it",
+      note: "Drop the discount line.",
+    });
+
+    assert.equal(result.outcome, "decided");
+    assert.equal(result.outcome === "decided" && result.decision.chosenOptionId, "send-it");
+    assert.equal(result.outcome === "decided" && result.decision.chosenOptionLabel, "Send it");
+    assert.equal(result.outcome === "decided" && result.decision.note, "Drop the discount line.");
+
+    // The employee learns the answer through its journal, which is injected
+    // into its next prompt — that is the whole delivery mechanism.
+    const entries = await AppDataSource.getRepository(JournalEntry).find({
+      where: { employeeId },
+    });
+    assert.equal(entries.length, 1);
+    assert.match(entries[0].title, /Ada Owner decided .*: Send it/);
+    assert.match(entries[0].body, /Drop the discount line\./);
+  });
+
+  test("an ordinary member can answer an unassigned decision", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    const result = await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: memberId,
+      role: "member",
+      optionId: "hold-for-now",
+    });
+    assert.equal(result.outcome, "decided");
+  });
+
+  test("an assigned decision is refused to another member but open to an admin", async () => {
+    const { companyId, employeeId, memberId, ownerId } = await scenario();
+    const other = await insert(User, {
+      email: `other-${companyId}@example.test`,
+      passwordHash: "x",
+      name: "Other",
+    });
+    const decision = await stack(companyId, employeeId, {});
+    await AppDataSource.getRepository(Decision).update(
+      { id: decision.id },
+      { assigneeUserId: memberId },
+    );
+    const assigned = (await AppDataSource.getRepository(Decision).findOneBy({ id: decision.id }))!;
+
+    assert.equal(canDecide(assigned, other.id, "member"), false);
+    assert.equal(canDecide(assigned, memberId, "member"), true);
+    // An owner can still unblock the employee when the assignee is away.
+    assert.equal(canDecide(assigned, ownerId, "owner"), true);
+
+    const refused = await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: other.id,
+      role: "member",
+      optionId: "send-it",
+    });
+    assert.equal(refused.outcome, "forbidden");
+  });
+
+  test("an option the employee never offered is refused", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    const result = await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+      optionId: "wire-the-money",
+    });
+    assert.equal(result.outcome, "unknown_option");
+    const row = (await AppDataSource.getRepository(Decision).findOneBy({ id: decision.id }))!;
+    assert.equal(row.status, "pending");
+  });
+
+  test("twenty concurrent answers produce exactly one decision", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        decideDecision({
+          companyId,
+          decisionId: decision.id,
+          userId: ownerId,
+          role: "owner",
+          optionId: i % 2 === 0 ? "send-it" : "hold-for-now",
+        }),
+      ),
+    );
+
+    assert.equal(results.filter((r) => r.outcome === "decided").length, 1);
+    assert.equal(results.filter((r) => r.outcome === "conflict").length, 19);
+    const journal = await AppDataSource.getRepository(JournalEntry).find({ where: { employeeId } });
+    assert.equal(journal.length, 1, "the employee must be told once, not twenty times");
+  });
+
+  test("a decision from another company is invisible", async () => {
+    const a = await scenario();
+    const b = await scenario();
+    const decision = await stack(a.companyId, a.employeeId);
+    const result = await decideDecision({
+      companyId: b.companyId,
+      decisionId: decision.id,
+      userId: b.ownerId,
+      role: "owner",
+      optionId: "send-it",
+    });
+    assert.equal(result.outcome, "not_found");
+  });
+
+  test("a retired deadline on a pending Decision does not prevent an answer", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    await AppDataSource.getRepository(Decision).update(decision.id, {
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+    const result = await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+      optionId: "send-it",
+    });
+    assert.equal(result.outcome, "decided");
+    assert.equal(result.outcome === "decided" && result.decision.status, "decided");
+  });
+});
+
+describe("retracting a decision", () => {
+  test("an employee can cancel its own question but not another's", async () => {
+    const { companyId, employeeId } = await scenario();
+    const other = await insert(AIEmployee, {
+      companyId,
+      name: "Kay",
+      slug: `kay-${companyId.slice(3, 11)}`,
+      role: "Ops",
+      soulBody: "",
+    });
+    const decision = await stack(companyId, employeeId);
+
+    const wrong = await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      employeeId: other.id,
+    });
+    assert.equal(wrong.outcome, "not_found");
+
+    const right = await cancelDecision({ companyId, decisionId: decision.id, employeeId });
+    assert.equal(right.outcome, "cancelled");
+    // An employee retracting its own question does not journal at itself.
+    const journal = await AppDataSource.getRepository(JournalEntry).find({ where: { employeeId } });
+    assert.equal(journal.length, 0);
+  });
+
+  test("a human dismissal tells the employee nobody chose", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    const result = await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+      reason: "We already sent it manually.",
+    });
+    assert.equal(result.outcome, "cancelled");
+    const journal = await AppDataSource.getRepository(JournalEntry).find({ where: { employeeId } });
+    assert.equal(journal.length, 1);
+    assert.match(journal[0].title, /dismissed the decision/);
+  });
+
+  test("a Member cannot dismiss a decision assigned to somebody else", async () => {
+    const { companyId, employeeId, ownerId, memberId } = await scenario();
+    const decision = await stack(companyId, employeeId, { assigneeUserId: ownerId });
+
+    const blocked = await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: memberId,
+      role: "member",
+    });
+    assert.equal(blocked.outcome, "forbidden");
+
+    const owner = await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+    });
+    assert.equal(owner.outcome, "cancelled");
+  });
+});
+
+describe("restoring a dismissed decision", () => {
+  test("clears terminal and routing fields, makes the row visible, and re-pages once", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const routedTo = await insert(AIEmployee, {
+      companyId,
+      name: "Kai",
+      slug: `kai-${companyId.slice(3, 11)}`,
+      role: "Operations",
+      soulBody: "",
+    });
+    const decision = await stack(companyId, employeeId);
+    await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+      reason: "Handled another way.",
+    });
+    await AppDataSource.getRepository(Decision).update(decision.id, {
+      chosenOptionId: "send-it",
+      chosenOptionLabel: "Send it",
+      decidedByEmployeeId: routedTo.id,
+      routedToEmployeeId: routedTo.id,
+      routedAt: new Date(),
+      snoozedUntil: new Date(Date.now() + 60_000),
+    });
+
+    const result = await restoreDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+    });
+
+    assert.equal(result.outcome, "restored");
+    const restored = await AppDataSource.getRepository(Decision).findOneByOrFail({
+      id: decision.id,
+    });
+    assert.equal(restored.status, "pending");
+    assert.equal(restored.chosenOptionId, null);
+    assert.equal(restored.chosenOptionLabel, null);
+    assert.equal(restored.note, null);
+    assert.equal(restored.decidedByUserId, null);
+    assert.equal(restored.decidedByEmployeeId, null);
+    assert.equal(restored.decidedAt, null);
+    assert.equal(restored.routedToEmployeeId, null);
+    assert.equal(restored.routedAt, null);
+    assert.equal(restored.snoozedUntil, null);
+    assert.deepEqual(
+      (await listDecisions({ companyId })).map((row) => row.id),
+      [decision.id],
+    );
+
+    const notifications = await AppDataSource.getRepository(Notification).find({
+      where: { companyId, entityId: decision.id },
+      order: { createdAt: "ASC" },
+    });
+    assert.equal(notifications.length, 2);
+    assert.equal(
+      notifications.filter((notification) => notification.readAt !== null).length,
+      1,
+      "the original page was cleared by the dismissal",
+    );
+    assert.equal(
+      notifications.filter((notification) => notification.readAt === null).length,
+      1,
+      "restoring sends a fresh unread page",
+    );
+    const journal = await AppDataSource.getRepository(JournalEntry).find({
+      where: { employeeId },
+    });
+    assert.equal(journal.length, 2);
+    assert.equal(journal.filter((entry) => /restored the decision/.test(entry.title)).length, 1);
+  });
+
+  test("a concurrent restore has one winner and every other caller conflicts", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    await cancelDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () =>
+        restoreDecision({
+          companyId,
+          decisionId: decision.id,
+          userId: ownerId,
+          role: "owner",
+        }),
+      ),
+    );
+
+    assert.equal(results.filter((result) => result.outcome === "restored").length, 1);
+    assert.equal(results.filter((result) => result.outcome === "conflict").length, 11);
+    const notifications = await AppDataSource.getRepository(Notification).find({
+      where: { companyId, entityId: decision.id },
+    });
+    assert.equal(notifications.filter((notification) => notification.readAt === null).length, 1);
+  });
+
+  test("an AI Employee retraction is final", async () => {
+    const { companyId, employeeId, ownerId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    await cancelDecision({ companyId, decisionId: decision.id, employeeId });
+
+    const result = await restoreDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: ownerId,
+      role: "owner",
+    });
+    assert.equal(result.outcome, "not_restorable");
+  });
+
+  test("enforces the assignee and company boundary", async () => {
+    const first = await scenario();
+    const second = await scenario();
+    const decision = await stack(first.companyId, first.employeeId, {
+      assigneeUserId: first.ownerId,
+    });
+    await cancelDecision({
+      companyId: first.companyId,
+      decisionId: decision.id,
+      userId: first.ownerId,
+      role: "owner",
+    });
+
+    const forbidden = await restoreDecision({
+      companyId: first.companyId,
+      decisionId: decision.id,
+      userId: first.memberId,
+      role: "member",
+    });
+    assert.equal(forbidden.outcome, "forbidden");
+
+    const hidden = await restoreDecision({
+      companyId: second.companyId,
+      decisionId: decision.id,
+      userId: second.ownerId,
+      role: "owner",
+    });
+    assert.equal(hidden.outcome, "not_found");
+  });
+});
+
+describe("the stack itself", () => {
+  test("orders by urgency, then by how long it has waited", async () => {
+    const { companyId, employeeId } = await scenario();
+    const normal = await stack(companyId, employeeId, { title: "Normal one" });
+    const urgent = await stack(companyId, employeeId, { title: "Urgent one", urgency: "high" });
+    const low = await stack(companyId, employeeId, { title: "Low one", urgency: "low" });
+    // Force a deterministic age order; CreateDateColumn resolution can tie.
+    const repo = AppDataSource.getRepository(Decision);
+    await repo.update({ id: normal.id }, { createdAt: new Date(Date.now() - 30_000) });
+    await repo.update({ id: urgent.id }, { createdAt: new Date(Date.now() - 10_000) });
+    await repo.update({ id: low.id }, { createdAt: new Date(Date.now() - 20_000) });
+
+    const { decisions, total } = await listPendingDecisions({ companyId, limit: 10 });
+    assert.equal(total, 3);
+    assert.deepEqual(
+      decisions.map((d) => d.title),
+      ["Urgent one", "Normal one", "Low one"],
+    );
+    assert.equal(decisions[0].employee?.name, "Rey");
+  });
+
+  test("a retired deadline cannot remove a pending Decision from the list", async () => {
+    const { companyId, employeeId } = await scenario();
+    await stack(companyId, employeeId, { title: "Still live" });
+    const legacy = await stack(companyId, employeeId, {
+      title: "Legacy deadline",
+    });
+    await AppDataSource.getRepository(Decision).update(legacy.id, {
+      expiresAt: new Date(Date.now() - 1_000),
+    });
+
+    const { decisions, total } = await listPendingDecisions({ companyId, limit: 10 });
+    assert.equal(total, 2);
+    assert.deepEqual(
+      new Set(decisions.map((d) => d.title)),
+      new Set(["Still live", "Legacy deadline"]),
+    );
+    assert.ok(decisions.every((decision) => decision.expiresAt === null));
+  });
+
+  test("the count reports the whole stack even when the slice is smaller", async () => {
+    const { companyId, employeeId } = await scenario();
+    for (let i = 0; i < 7; i += 1) {
+      await stack(companyId, employeeId, { title: `Question ${i}` });
+    }
+    const { decisions, total } = await listPendingDecisions({ companyId, limit: 5 });
+    assert.equal(decisions.length, 5);
+    assert.equal(total, 7);
+  });
+
+  test("a Member's Home slice excludes Decisions assigned to somebody else", async () => {
+    const { companyId, employeeId, ownerId, memberId } = await scenario();
+    await stack(companyId, employeeId, { title: "Open to anyone" });
+    await stack(companyId, employeeId, {
+      title: "For this Member",
+      assigneeUserId: memberId,
+    });
+    await stack(companyId, employeeId, {
+      title: "For the owner",
+      assigneeUserId: ownerId,
+    });
+
+    const memberStack = await listPendingDecisions({
+      companyId,
+      limit: 10,
+      viewer: { userId: memberId, role: "member" },
+    });
+    assert.equal(memberStack.total, 2);
+    assert.deepEqual(
+      memberStack.decisions.map((decision) => decision.title),
+      ["Open to anyone", "For this Member"],
+    );
+
+    const ownerStack = await listPendingDecisions({
+      companyId,
+      limit: 10,
+      viewer: { userId: ownerId, role: "owner" },
+    });
+    assert.equal(ownerStack.total, 3);
+  });
+
+  test("one company's stack never contains another's", async () => {
+    const a = await scenario();
+    const b = await scenario();
+    await stack(a.companyId, a.employeeId, { title: "Theirs" });
+    const { decisions, total } = await listPendingDecisions({ companyId: b.companyId, limit: 10 });
+    assert.equal(total, 0);
+    assert.deepEqual(decisions, []);
+  });
+});
+
+/**
+ * Provenance — "where did this come from?".
+ *
+ * The stack renders a link per row, so what matters is that the resolved
+ * `source` names the right surface and degrades honestly when the thing it
+ * points at has been deleted. A row that silently claims to be a chat because
+ * its routine is gone would be worse than one that admits the routine is gone.
+ */
+describe("decision provenance", () => {
+  test("a routine-raised row resolves the routine, its run, and the employee slug", async () => {
+    const { companyId, employeeId } = await scenario();
+    const routine = await insert(Routine, {
+      employeeId,
+      name: "Nightly outreach",
+      slug: "nightly-outreach",
+      cronExpr: "0 2 * * *",
+      body: "",
+    });
+    const run = await insert(Run, {
+      routineId: routine.id,
+      startedAt: new Date(),
+      status: "completed",
+      triggerKind: "schedule",
+    });
+    await stack(companyId, employeeId, { routineId: routine.id, runId: run.id });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "routine");
+    assert.equal(dto.source.routine?.name, "Nightly outreach");
+    assert.equal(dto.source.routine?.slug, "nightly-outreach");
+    assert.ok(dto.source.routine?.employeeSlug, "the link needs the routine owner's slug");
+    assert.equal(dto.source.run?.id, run.id);
+    assert.equal(dto.source.run?.triggerKind, "schedule");
+  });
+
+  test("a mail-raised row resolves the thread it is about", async () => {
+    const { companyId, employeeId } = await scenario();
+    const thread = await insert(MailThread, {
+      companyId,
+      accountId: "acct-1",
+      gmailThreadId: `g-${companyId.slice(0, 8)}`,
+      subject: "Pricing for Acme",
+      lastMessageAt: new Date(),
+    });
+    await stack(companyId, employeeId, { mailThreadId: thread.id });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "mail");
+    assert.equal(dto.source.mailThread?.subject, "Pricing for Acme");
+    assert.equal(dto.source.mailThread?.id, thread.id);
+  });
+
+  test("a chat-raised row resolves the conversation", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const conversation = await insert(Conversation, {
+      employeeId,
+      ownerUserId: memberId,
+      title: "Acme renewal",
+      source: "web",
+    });
+    await stack(companyId, employeeId, { conversationId: conversation.id });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "chat");
+    assert.equal(dto.source.conversation?.title, "Acme renewal");
+  });
+
+  test("a row with no recorded surface is `unknown`, not mislabelled", async () => {
+    const { companyId, employeeId } = await scenario();
+    await stack(companyId, employeeId);
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "unknown");
+    assert.equal(dto.source.routine, null);
+    assert.equal(dto.source.conversation, null);
+  });
+
+  test("a deleted routine still reads as a routine, with nothing to link to", async () => {
+    const { companyId, employeeId } = await scenario();
+    const routine = await insert(Routine, {
+      employeeId,
+      name: "Gone",
+      slug: "gone",
+      cronExpr: "0 2 * * *",
+      body: "",
+    });
+    await stack(companyId, employeeId, { routineId: routine.id });
+    await AppDataSource.getRepository(Routine).delete({ id: routine.id });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "routine");
+    assert.equal(dto.source.routine, null);
+  });
+
+  test("a routine beats an email beats a chat when a row carries more than one", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const routine = await insert(Routine, {
+      employeeId,
+      name: "Sweep",
+      slug: "sweep",
+      cronExpr: "0 2 * * *",
+      body: "",
+    });
+    const conversation = await insert(Conversation, {
+      employeeId,
+      ownerUserId: memberId,
+      title: "Chat",
+      source: "web",
+    });
+    const thread = await insert(MailThread, {
+      companyId,
+      accountId: "acct-2",
+      gmailThreadId: `gg-${companyId.slice(0, 8)}`,
+      subject: "Thread",
+      lastMessageAt: new Date(),
+    });
+    await stack(companyId, employeeId, {
+      routineId: routine.id,
+      conversationId: conversation.id,
+      mailThreadId: thread.id,
+    });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.source.kind, "routine");
+    // The other two are still resolved — the row links to all of them.
+    assert.equal(dto.source.mailThread?.subject, "Thread");
+    assert.equal(dto.source.conversation?.title, "Chat");
+  });
+
+  test("who answered is resolved for display, not left as a bare id", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const decision = await stack(companyId, employeeId);
+    await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId: memberId,
+      role: "member",
+      optionId: "send-it",
+    });
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.decidedBy?.id, memberId);
+    assert.equal(dto.decidedBy?.name, "Mo Member");
+  });
+
+  test("hydrating a mixed stack issues no per-row lookups it cannot batch", async () => {
+    const { companyId, employeeId } = await scenario();
+    const routine = await insert(Routine, {
+      employeeId,
+      name: "Sweep",
+      slug: "sweep-many",
+      cronExpr: "0 2 * * *",
+      body: "",
+    });
+    for (let i = 0; i < 12; i += 1) {
+      await stack(companyId, employeeId, {
+        title: `Question ${i}`,
+        ...(i % 2 === 0 ? { routineId: routine.id } : {}),
+      });
+    }
+    const rows = await listDecisions({ companyId });
+    assert.equal(rows.length, 12);
+    assert.equal(rows.filter((r) => r.source.kind === "routine").length, 6);
+    assert.equal(rows.filter((r) => r.source.kind === "unknown").length, 6);
+  });
+});
+
+/**
+ * The read-path sweep for pickups that died with their process. A row stuck on
+ * `running` renders a spinner nobody can clear, so the rule is: once a session
+ * has been quiet longer than the chat seam's own hard timeout, it is dead.
+ */
+describe("stale pickup reconciliation", () => {
+  async function decidedRow(companyId: string, employeeId: string, userId: string) {
+    const decision = await stack(companyId, employeeId);
+    await decideDecision({
+      companyId,
+      decisionId: decision.id,
+      userId,
+      role: "member",
+      optionId: "send-it",
+    });
+    return decision;
+  }
+
+  test("a pickup abandoned by a crash is failed, with an explanation", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const decision = await decidedRow(companyId, employeeId, memberId);
+    await AppDataSource.getRepository(Decision).update(
+      { id: decision.id },
+      {
+        pickupStatus: "running",
+        pickupStartedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      },
+    );
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.pickupStatus, "failed");
+    assert.match(dto.pickupSummary ?? "", /journal/);
+    assert.ok(dto.pickupFinishedAt);
+  });
+
+  test("a session still inside its budget is left alone", async () => {
+    const { companyId, employeeId, memberId } = await scenario();
+    const decision = await decidedRow(companyId, employeeId, memberId);
+    await AppDataSource.getRepository(Decision).update(
+      { id: decision.id },
+      { pickupStatus: "running", pickupStartedAt: new Date(Date.now() - 60_000) },
+    );
+
+    const [dto] = await listDecisions({ companyId });
+    assert.equal(dto.pickupStatus, "running");
+  });
+
+  test("the sweep never reaches another company's rows", async () => {
+    const a = await scenario();
+    const b = await scenario();
+    const decision = await decidedRow(a.companyId, a.employeeId, a.memberId);
+    await AppDataSource.getRepository(Decision).update(
+      { id: decision.id },
+      {
+        pickupStatus: "running",
+        pickupStartedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+      },
+    );
+
+    await listDecisions({ companyId: b.companyId });
+    const row = await AppDataSource.getRepository(Decision).findOneByOrFail({ id: decision.id });
+    assert.equal(row.pickupStatus, "running");
+  });
+});

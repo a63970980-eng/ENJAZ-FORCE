@@ -1,0 +1,541 @@
+import { IsNull } from "typeorm";
+import { AppDataSource } from "../../db/datasource.js";
+import { AIEmployee } from "../../db/entities/AIEmployee.js";
+import { Project } from "../../db/entities/Project.js";
+import { Todo } from "../../db/entities/Todo.js";
+import { Base } from "../../db/entities/Base.js";
+import { BaseTable } from "../../db/entities/BaseTable.js";
+import { BaseField } from "../../db/entities/BaseField.js";
+import { JournalEntry } from "../../db/entities/JournalEntry.js";
+import { IntegrationConnection } from "../../db/entities/IntegrationConnection.js";
+import { ChannelMessage } from "../../db/entities/ChannelMessage.js";
+import { Channel } from "../../db/entities/Channel.js";
+import { createBaseRecordRow, findBaseField, unknownBaseFieldMessage, UUID_RE } from "../bases.js";
+import { findChannelBySlugOrId } from "../workspaceChat.js";
+import { broadcastToCompany } from "../realtime.js";
+import { safeFetchBuffer } from "../../lib/outboundUrl.js";
+import { assertSafeIntegrationConfig } from "../integrationOutboundConfig.js";
+import { chatWithEmployee } from "../chat.js";
+import { recordAudit } from "../audit.js";
+import { addTodoLink } from "../todoLinks.js";
+import { insertTodo } from "../todos.js";
+import { toSlug } from "../../lib/slug.js";
+import { decryptConnectionConfig, persistConnectionConfigIfCurrent } from "../integrations.js";
+import { assertIntegrationAllowed, getProvider } from "../../integrations/index.js";
+import { unrestrictedCapabilityGate } from "../connectionCapabilities.js";
+import { makeAdSpendLedger } from "../adSpend.js";
+import type { IntegrationConfig, IntegrationRuntimeContext } from "../../integrations/types.js";
+import { executePipelineCode } from "./codeRuntime.js";
+import { isModelAvailable } from "../modelAvailability.js";
+import { resolveChatModel } from "../models.js";
+import {
+  PipelineNodeKind,
+  NodeContext,
+  NodeResult,
+  PipelineStepWaitsForModel,
+} from "./types.js";
+
+/**
+ * Per-node-type runtime. Each handler receives a `NodeContext` whose `config`
+ * already has its template tokens resolved. Returns `outputs` (folded into
+ * the run env so downstream nodes can reference them via `{{<id>.<path>}}`)
+ * and an optional `branch` to select an outgoing edge by handle.
+ *
+ * Errors thrown here mark the run failed; the executor catches and writes
+ * the message to the run log + `errorMessage` column.
+ */
+
+type Handler = (ctx: NodeContext) => Promise<NodeResult>;
+
+/** Whether this Run's trigger carries words from outside: anything but a schedule, a click or a Todo. */
+function startedByOutsideWords(ctx: NodeContext): boolean {
+  const { kind, payload } = ctx.env.trigger;
+  if (kind === "manual" || kind === "schedule") return false;
+  return !(kind === "event" && (payload as { event?: unknown } | null)?.event === "todo.created");
+}
+
+export const HANDLERS: Partial<Record<PipelineNodeKind, Handler>> = {
+  // ───── Triggers ────────────────────────────────────────────────────────
+  // Trigger nodes are entry points; they don't run as steps. They appear in
+  // env.trigger.payload directly.
+  "trigger.manual": async () => ({ outputs: {} }),
+  "trigger.webhook": async () => ({ outputs: {} }),
+  "trigger.schedule": async () => ({ outputs: {} }),
+  "trigger.emailReceived": async () => ({ outputs: {} }),
+  "trigger.todoCreated": async () => ({ outputs: {} }),
+
+  // ───── Genosyn actions ────────────────────────────────────────────────
+  "action.sendMessage": async (ctx) => {
+    const channelIdOrSlug = String(ctx.config.channelIdOrSlug ?? "").trim();
+    const content = String(ctx.config.content ?? "").trim();
+    if (!channelIdOrSlug) throw new Error("channelIdOrSlug is required");
+    if (!content) throw new Error("content is required");
+    const channel = await findChannelBySlugOrId(ctx.companyId, channelIdOrSlug);
+    if (!channel) throw new Error(`Channel "${channelIdOrSlug}" not found`);
+    // A group chat is a conversation between people; a pipeline posting into
+    // one would also read to its AI Employees as a question to discuss.
+    if (channel.kind === "group") throw new Error("A pipeline cannot post into a group chat");
+    const msgRepo = AppDataSource.getRepository(ChannelMessage);
+    const channelRepo = AppDataSource.getRepository(Channel);
+    const saved = await msgRepo.save(
+      msgRepo.create({
+        channelId: channel.id,
+        authorKind: "system",
+        authorUserId: null,
+        authorEmployeeId: null,
+        content,
+        parentMessageId: null,
+        editedAt: null,
+        deletedAt: null,
+      }),
+    );
+    await channelRepo.update({ id: channel.id }, { lastMessageAt: saved.createdAt });
+    broadcastToCompany(ctx.companyId, {
+      type: "message.new",
+      channelId: channel.id,
+      // Lightweight summary; the workspace UI re-fetches if it cares.
+      message: {
+        id: saved.id,
+        channelId: channel.id,
+        authorKind: "system",
+        author: { kind: "system", id: null, name: `pipeline:${ctx.pipelineName}` },
+        content,
+        parentMessageId: null,
+        editedAt: null,
+        deletedAt: null,
+        createdAt: saved.createdAt.toISOString(),
+        attachments: [],
+        reactions: [],
+        discussionId: null,
+        discussionRole: null,
+      },
+    });
+    ctx.log(`posted message to #${channel.slug ?? channel.id}: ${truncate(content, 120)}`);
+    return { outputs: { messageId: saved.id, channelId: channel.id } };
+  },
+
+  /**
+   * Deliberately bypasses `Project.accessMode` — a pipeline runs as the
+   * company, not as a person, so there is no principal to check. The gate is
+   * upstream, on whoever wired this step to this project: a Member with
+   * access, or an AI employee whose own project access was checked when it
+   * saved the graph (`services/pipelines/authoring.ts`). Without this note the
+   * missing check reads as the bug the access feature just fixed everywhere
+   * else.
+   */
+  "action.createTodo": async (ctx) => {
+    const projectSlug = String(ctx.config.projectSlug ?? "").trim();
+    const title = String(ctx.config.title ?? "").trim();
+    if (!projectSlug) throw new Error("projectSlug is required");
+    if (!title) throw new Error("title is required");
+    const project = await AppDataSource.getRepository(Project).findOneBy({
+      companyId: ctx.companyId,
+      slug: projectSlug,
+    });
+    if (!project) throw new Error(`Project "${projectSlug}" not found`);
+    const priority = String(ctx.config.priority ?? "none") as Todo["priority"];
+    const description = String(ctx.config.description ?? "");
+    // A template can pull in anything, an email's body included, so no Member
+    // wrote this. And a Run an email or a webhook started has outside words to pull
+    // in, so what it files is held to preparing until a person says otherwise.
+    const todo = await insertTodo({
+      project,
+      title,
+      description,
+      status: "todo",
+      priority,
+      untrustedText: true,
+      ceilingJson: startedByOutsideWords(ctx)
+        ? JSON.stringify({ proactiveReview: true, mailDeliveryMode: "review" })
+        : null,
+    });
+    // A step can say where the Todo came from, usually the email that started
+    // the Pipeline: `{{trigger.message.threadId}}`. A value that names nothing
+    // in this company links nothing; the Todo still stands.
+    const linkMailThreadId = String(ctx.config.linkMailThreadId ?? "").trim();
+    if (linkMailThreadId) {
+      await addTodoLink({
+        companyId: ctx.companyId,
+        todoId: todo.id,
+        kind: "mail_thread",
+        targetId: linkMailThreadId,
+        isSource: true,
+      }).catch((err) => {
+        ctx.log(`could not link the email thread: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+    void import("./events.js")
+      .then(({ dispatchTodoCreated }) =>
+        dispatchTodoCreated(ctx.companyId, todo.id, {
+          depth: ctx.eventContext?.depth ?? 0,
+          visitedPipelineIds: [
+            ...new Set([...(ctx.eventContext?.visitedPipelineIds ?? []), ctx.pipelineId]),
+          ],
+        }),
+      )
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error(`[pipelines] task event failed for ${todo.id}:`, err);
+      });
+    ctx.log(`created todo ${project.key}-${todo.number}: ${title}`);
+    if (todo.ceilingJson) {
+      ctx.log("its words may be from outside, so it's held to preparing and starts no other Pipeline");
+    }
+    return {
+      outputs: {
+        todoId: todo.id,
+        projectId: project.id,
+        number: todo.number,
+        title,
+      },
+    };
+  },
+
+  "action.createProject": async (ctx) => {
+    const name = String(ctx.config.name ?? "").trim();
+    if (!name) throw new Error("name is required");
+    const repo = AppDataSource.getRepository(Project);
+    const existing = await repo
+      .createQueryBuilder("p")
+      .where("p.companyId = :companyId", { companyId: ctx.companyId })
+      .andWhere("LOWER(p.name) = LOWER(:name)", { name })
+      .getOne();
+    if (existing) {
+      ctx.log(`project "${name}" already exists, skipping`);
+      return { outputs: { projectId: existing.id, slug: existing.slug, skipped: true } };
+    }
+    const baseSlug = toSlug(name) || "project";
+    let slug = baseSlug;
+    let n = 1;
+    while (await repo.findOneBy({ companyId: ctx.companyId, slug })) {
+      n += 1;
+      slug = `${baseSlug}-${n}`;
+    }
+    const description = String(ctx.config.description ?? "");
+    const key =
+      name
+        .toUpperCase()
+        .replace(/[^A-Z0-9 ]/g, "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((w) => w[0])
+        .join("")
+        .slice(0, 4) || "PRJ";
+    const project = repo.create({
+      companyId: ctx.companyId,
+      name,
+      slug,
+      description,
+      key,
+      createdById: null,
+      todoCounter: 0,
+    });
+    await repo.save(project);
+    ctx.log(`created project "${name}" (${slug})`);
+    return { outputs: { projectId: project.id, slug, key } };
+  },
+
+  "action.createBaseRecord": async (ctx) => {
+    const baseSlug = String(ctx.config.baseSlug ?? "").trim();
+    const tableSlug = String(ctx.config.tableSlug ?? "").trim();
+    if (!baseSlug) throw new Error("baseSlug is required");
+    if (!tableSlug) throw new Error("tableSlug is required");
+    const base = await AppDataSource.getRepository(Base).findOneBy({
+      companyId: ctx.companyId,
+      slug: baseSlug,
+    });
+    if (!base) throw new Error(`Base "${baseSlug}" not found`);
+    const table = await AppDataSource.getRepository(BaseTable).findOneBy({
+      baseId: base.id,
+      slug: tableSlug,
+      archivedAt: IsNull(),
+    });
+    if (!table) throw new Error(`Table "${tableSlug}" not found in base "${baseSlug}"`);
+    const input = parseObject(ctx.config.data, "data");
+    // Authors write field names; cells are stored under field ids. Same order
+    // as the code SDK loads them, so both paths pick the same field when two
+    // share a name.
+    const fields = await AppDataSource.getRepository(BaseField).find({
+      where: { tableId: table.id },
+      order: { sortOrder: "ASC", createdAt: "ASC" },
+    });
+    const data: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(input)) {
+      if (value === null || value === undefined || value === "") continue;
+      const field = findBaseField(fields, key);
+      if (field) {
+        data[field.id] = value;
+        continue;
+      }
+      // A name matching nothing is a typo the author can fix, so say so. A
+      // field id matching nothing is a column somebody deleted after this step
+      // was saved: there is no author mistake to report, and failing the run
+      // would punish the pipeline for an unrelated schema edit.
+      if (UUID_RE.test(key)) {
+        ctx.log(`skipped "${key}": no such field in ${baseSlug}/${tableSlug}`);
+        continue;
+      }
+      throw new Error(`${unknownBaseFieldMessage(fields, key)} (in ${baseSlug}/${tableSlug})`);
+    }
+    const saved = await createBaseRecordRow(table.id, data);
+    ctx.log(`added record to ${baseSlug}/${tableSlug}: ${saved.id}`);
+    return {
+      outputs: {
+        recordId: saved.id,
+        tableId: table.id,
+        baseId: base.id,
+        data: input,
+      },
+    };
+  },
+
+  "action.askEmployee": async (ctx) => {
+    const employeeSlug = String(ctx.config.employeeSlug ?? "").trim();
+    const message = String(ctx.config.message ?? "").trim();
+    if (!employeeSlug) throw new Error("employeeSlug is required");
+    if (!message) throw new Error("message is required");
+    const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+      companyId: ctx.companyId,
+      slug: employeeSlug,
+    });
+    if (!emp) throw new Error(`Employee "${employeeSlug}" not found`);
+    // An AI Model that is unavailable is not an answer: the run pauses at this
+    // step and asks again when the model is back, instead of handing the next
+    // step the model's error as if it were the reply.
+    const model = await resolveChatModel(emp.id).catch(() => null);
+    if (model && !modelTakesWork(model)) throw new PipelineStepWaitsForModel(emp, model);
+    ctx.log(`asking ${emp.slug}: ${truncate(message, 120)}`);
+    const result = await chatWithEmployee(ctx.companyId, emp.id, message, [], {
+      toolAuthority: "employee",
+    });
+    if (result.status === "error" && result.unavailable) {
+      throw new PipelineStepWaitsForModel(emp, model);
+    }
+    ctx.log(`reply (${result.status}): ${truncate(result.reply, 200)}`);
+    return {
+      outputs: { reply: result.reply, status: result.status, employeeId: emp.id },
+    };
+  },
+
+  "action.journalNote": async (ctx) => {
+    const employeeSlug = String(ctx.config.employeeSlug ?? "").trim();
+    const title = String(ctx.config.title ?? "").trim();
+    const body = String(ctx.config.body ?? "");
+    if (!employeeSlug) throw new Error("employeeSlug is required");
+    if (!title) throw new Error("title is required");
+    const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+      companyId: ctx.companyId,
+      slug: employeeSlug,
+    });
+    if (!emp) throw new Error(`Employee "${employeeSlug}" not found`);
+    const repo = AppDataSource.getRepository(JournalEntry);
+    const saved = await repo.save(
+      repo.create({
+        employeeId: emp.id,
+        kind: "note",
+        title,
+        body,
+        runId: null,
+        routineId: null,
+        authorUserId: null,
+      }),
+    );
+    ctx.log(`journal note for ${emp.slug}: ${title}`);
+    return { outputs: { journalEntryId: saved.id } };
+  },
+
+  // ───── Logic / IO ──────────────────────────────────────────────────────
+  "logic.http": async (ctx) => {
+    const method = String(ctx.config.method ?? "GET").toUpperCase();
+    const url = String(ctx.config.url ?? "").trim();
+    if (!url) throw new Error("url is required");
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error("url must start with http:// or https://");
+    }
+    const headers = parseObject(ctx.config.headers, "headers") as Record<string, string>;
+    const bodyRaw = ctx.config.body;
+    const init: RequestInit = { method, headers: headers as HeadersInit };
+    if (method !== "GET" && method !== "HEAD" && bodyRaw !== undefined && bodyRaw !== "") {
+      init.body = typeof bodyRaw === "string" ? bodyRaw : JSON.stringify(bodyRaw);
+      if (!Object.keys(headers).some((k) => k.toLowerCase() === "content-type")) {
+        (init.headers as Record<string, string>)["content-type"] =
+          typeof bodyRaw === "string" ? "text/plain" : "application/json";
+      }
+    }
+    ctx.log(`${method} ${url}`);
+    const res = await safeFetchBuffer(url, init, { maxBytes: 2 * 1024 * 1024 });
+    const text = res.body.toString("utf8");
+    let body: unknown = text;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      /* keep as text */
+    }
+    ctx.log(`→ ${res.status} (${text.length} bytes)`);
+    return { outputs: { status: res.status, body } };
+  },
+
+  "logic.set": async (ctx) => {
+    const values = parseObject(ctx.config.values, "values");
+    return { outputs: values };
+  },
+
+  "logic.branch": async (ctx) => {
+    const left = ctx.config.left;
+    const right = ctx.config.right;
+    const op = String(ctx.config.operator ?? "eq");
+    let pass: boolean;
+    switch (op) {
+      case "eq":
+        pass = String(left ?? "") === String(right ?? "");
+        break;
+      case "ne":
+        pass = String(left ?? "") !== String(right ?? "");
+        break;
+      case "contains":
+        pass = String(left ?? "").includes(String(right ?? ""));
+        break;
+      case "gt":
+        pass = Number(left) > Number(right);
+        break;
+      case "lt":
+        pass = Number(left) < Number(right);
+        break;
+      case "truthy":
+        pass = Boolean(left);
+        break;
+      default:
+        throw new Error(`Unknown branch operator: ${op}`);
+    }
+    ctx.log(`branch ${op}: ${pass ? "true" : "false"}`);
+    return { outputs: { matched: pass }, branch: pass ? "true" : "false" };
+  },
+
+  "logic.delay": async (ctx) => {
+    const raw = Number(ctx.config.seconds ?? 0);
+    const seconds = Math.max(0, Math.min(60, Number.isFinite(raw) ? raw : 0));
+    if (seconds > 0) {
+      await new Promise((r) => setTimeout(r, seconds * 1000));
+    }
+    ctx.log(`delayed ${seconds}s`);
+    return { outputs: { seconds } };
+  },
+
+  "logic.code": async (ctx) => {
+    // The source runs verbatim: read it from the raw node config, not the
+    // template-resolved copy, so `{{` inside JavaScript is never rewritten.
+    // Pipeline data reaches the code through the input/steps globals instead.
+    const code = String(ctx.node.config?.code ?? "").trim();
+    if (!code) throw new Error("code is required");
+    const outputs = await executePipelineCode({
+      code,
+      timeoutSeconds: ctx.config.timeoutSeconds,
+      companyId: ctx.companyId,
+      env: ctx.env,
+      log: ctx.log,
+    });
+    return { outputs };
+  },
+
+  // ───── Integrations ────────────────────────────────────────────────────
+  "integration.invoke": async (ctx) => {
+    const connectionId = String(ctx.config.connectionId ?? "").trim();
+    const toolName = String(ctx.config.toolName ?? "").trim();
+    if (!connectionId) throw new Error("connectionId is required");
+    if (!toolName) throw new Error("toolName is required");
+    const conn = await AppDataSource.getRepository(IntegrationConnection).findOneBy({
+      id: connectionId,
+      companyId: ctx.companyId,
+    });
+    if (!conn) throw new Error(`Connection ${connectionId} not found`);
+    assertIntegrationAllowed(conn.provider);
+    const provider = getProvider(conn.provider);
+    if (!provider) throw new Error(`Unknown provider: ${conn.provider}`);
+    const tool = provider.tools.find((t) => t.name === toolName);
+    if (!tool) throw new Error(`Unknown tool: ${toolName}`);
+
+    const credentialSnapshot = conn.encryptedConfig;
+    const cfg = decryptConnectionConfig(conn);
+    await assertSafeIntegrationConfig({ provider, authMode: conn.authMode, config: cfg });
+    let refreshed: IntegrationConfig | null = null;
+    const runtimeCtx: IntegrationRuntimeContext = {
+      authMode: conn.authMode,
+      config: cfg,
+      setConfig(next) {
+        refreshed = next;
+      },
+      // A Run has no principal: it is the company acting, so there is no
+      // employee here to authorize and no employee grant to consult. What
+      // makes that safe is the check on the *author*. A human authoring in
+      // the builder is owner/admin; an AI employee authoring through the MCP
+      // tools must already hold the Connection grant AND the strongest
+      // capability the Connection can be asked for
+      // (`assertUnrestrictedConnectionUse`, called from
+      // `services/pipelines/authoring.ts`), so nothing this gate waves
+      // through exceeds what the author could already do directly.
+      //
+      // Opt in explicitly rather than leaving this undefined: providers deny
+      // when no gate is supplied, which is what stops a future context
+      // builder un-gating a tool by simply forgetting about it.
+      assertCapability: unrestrictedCapabilityGate(),
+      // Bind the ads ledger so deterministic no-AI budget rules ("pause
+      // everything at the monthly cap") can run through a pipeline. Hard
+      // caps and the approval gate inside the ads providers still apply —
+      // this is the same ledger the employee path uses, with no employee.
+      adSpend: makeAdSpendLedger({ connection: conn }),
+    };
+    const args = parseObject(ctx.config.args, "args");
+    ctx.log(`integration ${conn.provider}.${toolName} ${JSON.stringify(args).slice(0, 200)}`);
+    const result = await provider.invokeTool(toolName, args, runtimeCtx);
+    if (refreshed) {
+      await persistConnectionConfigIfCurrent({
+        connectionId: conn.id,
+        companyId: conn.companyId,
+        previousEncryptedConfig: credentialSnapshot,
+        config: refreshed,
+        healthy: true,
+      });
+    }
+    await recordAudit({
+      companyId: ctx.companyId,
+      actorKind: "system",
+      action: "pipeline.integration.invoke",
+      targetType: "connection",
+      targetId: conn.id,
+      targetLabel: conn.label,
+      metadata: { toolName, pipelineId: ctx.pipelineId, runId: ctx.runId },
+    });
+    ctx.log(`← ok`);
+    return { outputs: { result } };
+  },
+};
+
+function parseObject(raw: unknown, fieldName: string): Record<string, unknown> {
+  if (raw === null || raw === undefined || raw === "") return {};
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  throw new Error(`${fieldName} must be a JSON object`);
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+function modelTakesWork(model: Parameters<typeof isModelAvailable>[0]): boolean {
+  try {
+    return isModelAvailable(model);
+  } catch {
+    return true;
+  }
+}

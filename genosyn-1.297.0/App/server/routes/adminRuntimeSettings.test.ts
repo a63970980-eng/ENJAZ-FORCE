@@ -1,0 +1,562 @@
+import { persistTestSession } from "../test/userSession.js";
+import assert from "node:assert/strict";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { after, before, beforeEach, describe, test } from "node:test";
+
+import express from "express";
+
+import { AppDataSource } from "../db/datasource.js";
+import { AppSetting } from "../db/entities/AppSetting.js";
+import { User } from "../db/entities/User.js";
+import { errorHandler } from "../middleware/error.js";
+import {
+  RUNTIME_SETTINGS_DEFAULTS,
+  RUNTIME_SETTING_KEYS,
+  getBankingSettings,
+  getMailSettings,
+  getRuntimeOauthSettings,
+  getWebSettings,
+  resetRuntimeSettingsCacheForTests,
+} from "../services/runtimeSettings.js";
+import { closeTestDb, initTestDb, insert, resetTestDb } from "../test/dbHarness.js";
+import { adminRouter } from "./admin.js";
+
+/**
+ * Admin → Runtime.
+ *
+ * The endpoints behind the page that replaced the operational half of
+ * `config.ts`. Two things matter beyond the happy path: a full-group replace
+ * (so a stale form cannot silently revert a field it never showed), and a hard
+ * refusal of out-of-range values — these rows drive fetch budgets and poll
+ * intervals, so a mistyped number is a production incident, not a typo.
+ */
+
+let server: Server;
+let baseUrl = "";
+let actingUserId: string | null = null;
+
+before(async () => {
+  await initTestDb();
+  const app = express();
+  app.use(express.json());
+  app.use(async (req, _res, next) => {
+    (req as unknown as { session: unknown }).session = actingUserId
+      ? { userId: actingUserId, sessionVersion: 0 }
+      : null;
+    await persistTestSession(req);
+    next();
+  });
+  app.use("/api/admin", adminRouter);
+  app.use(errorHandler);
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, "127.0.0.1", resolve);
+  });
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+after(async () => {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  await closeTestDb();
+});
+
+beforeEach(async () => {
+  await resetTestDb();
+  resetRuntimeSettingsCacheForTests();
+  const operator = await insert(User, {
+    email: "op@example.com",
+    name: "Operator",
+    passwordHash: "x",
+    sessionVersion: 0,
+    isMasterAdmin: true,
+    emailVerifiedAt: new Date(),
+  });
+  actingUserId = operator.id;
+});
+
+async function call<T = Record<string, unknown>>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<{ status: number; body: T }> {
+  const response = await fetch(`${baseUrl}/api/admin${path}`, {
+    method,
+    headers: body === undefined ? {} : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  return { status: response.status, body: (text ? JSON.parse(text) : {}) as T };
+}
+
+type Snapshot = {
+  web: typeof RUNTIME_SETTINGS_DEFAULTS.web;
+  mail: typeof RUNTIME_SETTINGS_DEFAULTS.mail;
+  oauth: typeof RUNTIME_SETTINGS_DEFAULTS.oauth;
+  meetings: typeof RUNTIME_SETTINGS_DEFAULTS.meetings;
+  browser: typeof RUNTIME_SETTINGS_DEFAULTS.browser;
+  agent: typeof RUNTIME_SETTINGS_DEFAULTS.agent;
+  network: typeof RUNTIME_SETTINGS_DEFAULTS.network;
+  banking: typeof RUNTIME_SETTINGS_DEFAULTS.banking;
+  emailVerification: typeof RUNTIME_SETTINGS_DEFAULTS.emailVerification;
+  modelAvailability: typeof RUNTIME_SETTINGS_DEFAULTS.modelAvailability;
+  overridden: Record<string, boolean>;
+};
+
+describe("GET /api/admin/runtime-settings", () => {
+  test("a fresh install reports the shipped defaults, nothing overridden", async () => {
+    const { status, body } = await call<Snapshot>("GET", "/runtime-settings");
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.web, RUNTIME_SETTINGS_DEFAULTS.web);
+    assert.deepEqual(body.mail, RUNTIME_SETTINGS_DEFAULTS.mail);
+    assert.deepEqual(body.oauth, RUNTIME_SETTINGS_DEFAULTS.oauth);
+    assert.deepEqual(body.meetings, RUNTIME_SETTINGS_DEFAULTS.meetings);
+    assert.deepEqual(body.browser, RUNTIME_SETTINGS_DEFAULTS.browser);
+    assert.deepEqual(body.agent, RUNTIME_SETTINGS_DEFAULTS.agent);
+    assert.deepEqual(body.overridden, {
+      web: false,
+      mail: false,
+      oauth: false,
+      meetings: false,
+      browser: false,
+      agent: false,
+      containment: false,
+      network: false,
+      banking: false,
+      emailVerification: false,
+      modelAvailability: false,
+    });
+    assert.deepEqual(body.banking, RUNTIME_SETTINGS_DEFAULTS.banking);
+    assert.deepEqual(body.emailVerification, RUNTIME_SETTINGS_DEFAULTS.emailVerification);
+    assert.deepEqual(body.modelAvailability, RUNTIME_SETTINGS_DEFAULTS.modelAvailability);
+  });
+
+  test("only a signed-in master admin can read it", async () => {
+    actingUserId = null;
+    assert.equal((await call("GET", "/runtime-settings")).status, 401);
+  });
+});
+
+describe("PUT /api/admin/runtime-settings/:group", () => {
+  test("hosted sign-in settings normalize and reach the readers", async () => {
+    const expected = {
+      hostedSignInEnabled: false,
+      hostedSignInUrl: "https://customer-sign-in.example.com",
+    };
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/oauth", {
+      ...expected,
+      hostedSignInUrl: " https://CUSTOMER-sign-in.example.com/ ",
+    });
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.oauth, expected);
+    assert.equal(body.overridden.oauth, true);
+    assert.deepEqual(getRuntimeOauthSettings(), expected);
+    const stored = await AppDataSource.getRepository(AppSetting).findOneBy({
+      key: RUNTIME_SETTING_KEYS.oauth,
+    });
+    assert.deepEqual(JSON.parse(stored!.value), expected);
+  });
+
+  test("invalid service addresses are rejected without replacing saved settings", async () => {
+    const settings = {
+      ...RUNTIME_SETTINGS_DEFAULTS.oauth,
+      hostedSignInUrl: "https://customer-sign-in.example.com",
+    };
+    assert.equal((await call("PUT", "/runtime-settings/oauth", settings)).status, 200);
+
+    for (const hostedSignInUrl of [
+      "http://connect.example.com",
+      "https://connect.example.com/callback",
+      "https://connect.example.com?value=1",
+      "https://connect.example.com#fragment",
+      "https://user:secret@connect.example.com",
+      "",
+      null,
+      123,
+      "x".repeat(2049),
+    ]) {
+      const { status, body } = await call<{ error: string }>("PUT", "/runtime-settings/oauth", {
+        ...settings,
+        hostedSignInUrl,
+      });
+      assert.equal(status, 400);
+      assert.match(body.error, /Invalid runtime settings/);
+      assert.deepEqual(getRuntimeOauthSettings(), settings);
+    }
+    const stored = await AppDataSource.getRepository(AppSetting).findOneBy({
+      key: RUNTIME_SETTING_KEYS.oauth,
+    });
+    assert.deepEqual(JSON.parse(stored!.value), settings);
+  });
+
+  test("a form from before hosting moved to Connect still saves, without the retired fields", async () => {
+    // An admin page loaded before the upgrade still posts the hosting fields.
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/oauth", {
+      hostedSignInEnabled: true,
+      hostedSignInUrl: "https://connect.genosyn.com",
+      hostSignIn: true,
+      signInHostUrl: "https://connect.example.com",
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(body.oauth, RUNTIME_SETTINGS_DEFAULTS.oauth);
+    const stored = await AppDataSource.getRepository(AppSetting).findOneByOrFail({
+      key: RUNTIME_SETTING_KEYS.oauth,
+    });
+    assert.deepEqual(JSON.parse(stored.value), RUNTIME_SETTINGS_DEFAULTS.oauth);
+  });
+
+  test("old complete Gmail API bodies persist and return only canonical fields", async () => {
+    for (const gmailSignInHostUrl of [undefined, " https://HOST.example.com/ "]) {
+      const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/oauth", {
+        gmailSignInEnabled: false,
+        gmailSignInUrl: " https://LEGACY.example.com/ ",
+        hostGmailSignIn: true,
+        gmailSignInHostUrl,
+      });
+      const expected = {
+        hostedSignInEnabled: false,
+        hostedSignInUrl: "https://legacy.example.com",
+      };
+      assert.equal(status, 200);
+      assert.deepEqual(body.oauth, expected);
+      const stored = await AppDataSource.getRepository(AppSetting).findOneByOrFail({
+        key: RUNTIME_SETTING_KEYS.oauth,
+      });
+      assert.deepEqual(JSON.parse(stored.value), expected);
+    }
+  });
+
+  test("explicit canonical API fields take precedence over conflicting legacy values", async () => {
+    const expected = {
+      hostedSignInEnabled: false,
+      hostedSignInUrl: "https://current.example.com",
+    };
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/oauth", {
+      gmailSignInEnabled: true,
+      gmailSignInUrl: "http://unsafe.example.com",
+      ...expected,
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(body.oauth, expected);
+  });
+
+  test("legacy aliases cannot bypass validation of selected canonical settings", async () => {
+    const legacy = {
+      gmailSignInEnabled: true,
+      gmailSignInUrl: "https://legacy.example.com",
+    };
+    for (const invalid of [
+      { hostedSignInEnabled: "false" },
+      { hostedSignInUrl: "http://unsafe.example.com" },
+      { gmailSignInUrl: "http://unsafe.example.com" },
+    ]) {
+      assert.equal((await call("PUT", "/runtime-settings/oauth", { ...legacy, ...invalid })).status, 400);
+    }
+    assert.equal(await AppDataSource.getRepository(AppSetting).countBy({ key: RUNTIME_SETTING_KEYS.oauth }), 0);
+  });
+
+  test("OAuth updates reject incomplete bodies and unknown names", async () => {
+    for (const invalid of [
+      { hostedSignInEnabled: false },
+      { gmailSignInEnabled: false },
+      { ...RUNTIME_SETTINGS_DEFAULTS.oauth, hostSignin: true },
+      { ...RUNTIME_SETTINGS_DEFAULTS.oauth, connectUrl: "https://connect.example.com" },
+    ]) {
+      assert.equal((await call("PUT", "/runtime-settings/oauth", invalid)).status, 400);
+    }
+  });
+
+  test("a save persists, is reflected in the snapshot, and reaches the readers", async () => {
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/web", {
+      enabled: false,
+      searchProvider: "disabled",
+      maxSearchResults: 3,
+      maxDocumentBytes: 1024 * 1024,
+      maxTextChars: 5_000,
+    });
+
+    assert.equal(status, 200);
+    assert.equal(body.web.enabled, false);
+    assert.equal(body.overridden.web, true);
+    // The other groups are untouched.
+    assert.equal(body.overridden.mail, false);
+    assert.deepEqual(body.mail, RUNTIME_SETTINGS_DEFAULTS.mail);
+    // And the in-process readers see it without waiting for a refresh.
+    assert.equal(getWebSettings().enabled, false);
+    assert.equal(getWebSettings().maxSearchResults, 3);
+
+    const row = await AppDataSource.getRepository(AppSetting).findOneBy({
+      key: RUNTIME_SETTING_KEYS.web,
+    });
+    assert.equal(JSON.parse(row!.value).maxTextChars, 5_000);
+  });
+
+  test("an out-of-range value is a 400 and writes nothing", async () => {
+    const { status, body } = await call<{ error: string }>("PUT", "/runtime-settings/mail", {
+      syncIntervalSec: 1,
+      backfillThreadsPerPass: 200,
+      backfillPassSeconds: 25,
+      backfillDays: 0,
+    });
+
+    assert.equal(status, 400);
+    assert.match(body.error, /Invalid runtime settings/);
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({
+        key: RUNTIME_SETTING_KEYS.mail,
+      }),
+      null,
+    );
+    assert.deepEqual(getMailSettings(), RUNTIME_SETTINGS_DEFAULTS.mail);
+  });
+
+  test("a partial body is refused — the write replaces the whole group", async () => {
+    const { status } = await call("PUT", "/runtime-settings/web", { enabled: false });
+
+    assert.equal(status, 400);
+    assert.equal(getWebSettings().enabled, true);
+  });
+
+  test("an unknown group is a 400 rather than a new settings key", async () => {
+    const { status } = await call("PUT", "/runtime-settings/smtp", { host: "x" });
+
+    assert.equal(status, 400);
+    assert.deepEqual(await AppDataSource.getRepository(AppSetting).find(), []);
+  });
+
+  test("the agent group round-trips its nested tool discovery block", async () => {
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/agent", {
+      maxConcurrentTurnsPerCompany: 5,
+      taintPolicy: "off",
+      memberBrowsersEnabled: false,
+      toolDiscovery: { enabled: false, minCatalogueSize: 12 },
+    });
+
+    assert.equal(status, 200);
+    assert.deepEqual(body.agent, {
+      maxConcurrentTurnsPerCompany: 5,
+      taintPolicy: "off",
+      memberBrowsersEnabled: false,
+      toolDiscovery: { enabled: false, minCatalogueSize: 12 },
+    });
+  });
+
+  test("the network allowlist round-trips normalized, and an empty list still saves", async () => {
+    const saved = await call<Snapshot>("PUT", "/runtime-settings/network", {
+      privateHostAllowlist: ["GIT.Internal.", "git.internal", "10.0.0.5"],
+    });
+
+    assert.equal(saved.status, 200);
+    // Stored the way `privateHostAllowed()` compares, and deduped.
+    assert.deepEqual(saved.body.network.privateHostAllowlist, ["git.internal", "10.0.0.5"]);
+    assert.equal(saved.body.overridden.network, true);
+
+    const stored = await AppDataSource.getRepository(AppSetting).findOneBy({
+      key: RUNTIME_SETTING_KEYS.network,
+    });
+    assert.deepEqual(JSON.parse(stored!.value).privateHostAllowlist, ["git.internal", "10.0.0.5"]);
+
+    // An empty list is a legitimate save, not a reset: the row stays.
+    const emptied = await call<Snapshot>("PUT", "/runtime-settings/network", {
+      privateHostAllowlist: [],
+    });
+    assert.deepEqual(emptied.body.network.privateHostAllowlist, []);
+    assert.equal(emptied.body.overridden.network, true);
+  });
+
+  test("the network allowlist refuses a body that is not a list of hosts", async () => {
+    for (const body of [
+      { privateHostAllowlist: "git.internal" },
+      { privateHostAllowlist: [42] },
+      { privateHostAllowlist: [""] },
+      { privateHostAllowlist: [`${"a".repeat(254)}.internal`] },
+    ]) {
+      const { status } = await call("PUT", "/runtime-settings/network", body);
+      assert.equal(status, 400, JSON.stringify(body).slice(0, 60));
+    }
+
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({
+        key: RUNTIME_SETTING_KEYS.network,
+      }),
+      null,
+    );
+  });
+
+  test("the network allowlist refuses a list past the cap", async () => {
+    const { status } = await call("PUT", "/runtime-settings/network", {
+      privateHostAllowlist: Array.from(
+        { length: 101 },
+        (_value, index) => `host-${index}.internal`,
+      ),
+    });
+
+    // Truncating silently would leave the operator believing a host is exempt
+    // when it is not, so the whole write is refused instead.
+    assert.equal(status, 400);
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({
+        key: RUNTIME_SETTING_KEYS.network,
+      }),
+      null,
+    );
+  });
+
+  test('the browser group accepts "auto" and an explicit boolean for headless', async () => {
+    assert.equal(
+      (
+        await call<Snapshot>("PUT", "/runtime-settings/browser", {
+          ...RUNTIME_SETTINGS_DEFAULTS.browser,
+          headless: true,
+        })
+      ).body.browser.headless,
+      true,
+    );
+    assert.equal(
+      (
+        await call<Snapshot>("PUT", "/runtime-settings/browser", {
+          ...RUNTIME_SETTINGS_DEFAULTS.browser,
+          headless: "auto",
+        })
+      ).body.browser.headless,
+      "auto",
+    );
+    assert.equal(
+      (
+        await call("PUT", "/runtime-settings/browser", {
+          ...RUNTIME_SETTINGS_DEFAULTS.browser,
+          headless: "sometimes",
+        })
+      ).status,
+      400,
+    );
+  });
+
+  test("the browser group needs a recording window, so a stale form cannot reset it", async () => {
+    const { recordingRetentionDays: _omitted, ...withoutWindow } = RUNTIME_SETTINGS_DEFAULTS.browser;
+    assert.equal((await call("PUT", "/runtime-settings/browser", withoutWindow)).status, 400);
+    for (const bad of [-1, 1.5, 3651]) {
+      assert.equal(
+        (
+          await call("PUT", "/runtime-settings/browser", {
+            ...RUNTIME_SETTINGS_DEFAULTS.browser,
+            recordingRetentionDays: bad,
+          })
+        ).status,
+        400,
+      );
+    }
+    assert.equal(
+      (
+        await call<Snapshot>("PUT", "/runtime-settings/browser", {
+          ...RUNTIME_SETTINGS_DEFAULTS.browser,
+          recordingRetentionDays: 0,
+        })
+      ).body.browser.recordingRetentionDays,
+      0,
+    );
+  });
+});
+
+describe("the bank sync group", () => {
+  test("saves the switch and the interval, and the background sync reads them at once", async () => {
+    const { status, body } = await call<Snapshot>("PUT", "/runtime-settings/banking", {
+      syncEnabled: false,
+      syncIntervalMinutes: 60,
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(body.banking, { syncEnabled: false, syncIntervalMinutes: 60 });
+    assert.equal(body.overridden.banking, true);
+    assert.deepEqual(getBankingSettings(), { syncEnabled: false, syncIntervalMinutes: 60 });
+
+    const reset = await call<Snapshot>("DELETE", "/runtime-settings/banking");
+    assert.equal(reset.status, 200);
+    assert.deepEqual(reset.body.banking, RUNTIME_SETTINGS_DEFAULTS.banking);
+    assert.deepEqual(getBankingSettings(), RUNTIME_SETTINGS_DEFAULTS.banking);
+  });
+
+  test("refuses an interval under five minutes or over a day, and a partial body", async () => {
+    for (const body of [
+      { syncEnabled: true, syncIntervalMinutes: 4 },
+      { syncEnabled: true, syncIntervalMinutes: 1_441 },
+      { syncEnabled: true, syncIntervalMinutes: 7.5 },
+      { syncEnabled: "yes", syncIntervalMinutes: 30 },
+      { syncIntervalMinutes: 30 },
+      { syncEnabled: true },
+    ]) {
+      const { status } = await call("PUT", "/runtime-settings/banking", body);
+      assert.equal(status, 400, JSON.stringify(body));
+    }
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({ key: RUNTIME_SETTING_KEYS.banking }),
+      null,
+    );
+  });
+
+  test("only a master admin can change it", async () => {
+    actingUserId = (
+      await insert(User, {
+        email: "plain@example.com",
+        name: "Plain",
+        passwordHash: "x",
+        sessionVersion: 0,
+      })
+    ).id;
+    const { status } = await call("PUT", "/runtime-settings/banking", {
+      syncEnabled: false,
+      syncIntervalMinutes: 60,
+    });
+    assert.equal(status, 403);
+    assert.deepEqual(getBankingSettings(), RUNTIME_SETTINGS_DEFAULTS.banking);
+  });
+});
+
+describe("DELETE /api/admin/runtime-settings/:group", () => {
+  test("a reset drops the row and returns the group to the defaults", async () => {
+    await call("PUT", "/runtime-settings/meetings", {
+      enabled: false,
+      syncIntervalSeconds: 900,
+      transcriptionModel: "whisper-large-v3",
+      maxRecordingBytes: 1024 * 1024,
+    });
+
+    const { status, body } = await call<Snapshot>("DELETE", "/runtime-settings/meetings");
+
+    assert.equal(status, 200);
+    assert.equal(body.overridden.meetings, false);
+    assert.deepEqual(body.meetings, RUNTIME_SETTINGS_DEFAULTS.meetings);
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({
+        key: RUNTIME_SETTING_KEYS.meetings,
+      }),
+      null,
+    );
+  });
+
+  test("resetting the network allowlist drops every host it was exempting", async () => {
+    await call("PUT", "/runtime-settings/network", {
+      privateHostAllowlist: ["git.internal"],
+    });
+
+    const { status, body } = await call<Snapshot>("DELETE", "/runtime-settings/network");
+
+    assert.equal(status, 200);
+    assert.equal(body.overridden.network, false);
+    assert.deepEqual(body.network, RUNTIME_SETTINGS_DEFAULTS.network);
+    assert.equal(
+      await AppDataSource.getRepository(AppSetting).findOneBy({
+        key: RUNTIME_SETTING_KEYS.network,
+      }),
+      null,
+    );
+  });
+
+  test("resetting a group that was never saved is harmless", async () => {
+    const { status, body } = await call<Snapshot>("DELETE", "/runtime-settings/browser");
+    assert.equal(status, 200);
+    assert.deepEqual(body.browser, RUNTIME_SETTINGS_DEFAULTS.browser);
+  });
+});

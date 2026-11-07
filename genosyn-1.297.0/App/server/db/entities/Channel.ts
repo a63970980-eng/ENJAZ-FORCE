@@ -1,0 +1,84 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  Index,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from "typeorm";
+
+/**
+ * A Slack-style group chat scoped to a {@link Company}. `kind` splits into:
+ *
+ *  - `public`  — every member of the company can see + join it.
+ *  - `private` — visible only to explicit {@link ChannelMember} rows.
+ *  - `dm`      — 1:1 conversation between two members (human or AI). Name is
+ *                rendered from the members, not `name`/`slug`, so those fields
+ *                stay blank.
+ *  - `group`   — a group chat: a private conversation between a Member, the
+ *                AI Employees they brought in, and any other Members. Visible
+ *                only to its {@link ChannelMember} rows, like `private`. Every
+ *                Member message in it is worked out by the AI Employees as a
+ *                group discussion (`services/groupDiscussions.ts`). `name` is
+ *                optional — the sidebar falls back to the members — and
+ *                `slug` stays null, so a group chat never collides with a
+ *                channel's name.
+ *
+ * `slug` is unique within (companyId, kind='public'|'private') and null for
+ * DMs and group chats. We keep the soft-delete pattern from conversations:
+ * `archivedAt` hides the channel from default listings without losing history.
+ */
+export type ChannelKind = "public" | "private" | "dm" | "group";
+
+@Entity("channels")
+@Index(["companyId", "slug"], { unique: true, where: '"slug" IS NOT NULL' })
+export class Channel {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Index()
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  @Column({ type: "varchar" })
+  kind!: ChannelKind;
+
+  @Column({ type: "varchar", nullable: true })
+  name!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  slug!: string | null;
+
+  @Column({ type: "varchar", default: "" })
+  topic!: string;
+
+  /**
+   * Secret carried in a Slack-compatible incoming-webhook URL. Null disables
+   * delivery. DMs never receive a token: webhooks are channel integrations,
+   * not a way to impersonate either side of a private conversation.
+   */
+  @Column({ type: "varchar", nullable: true })
+  webhookToken!: string | null;
+
+  /** userId of the human that created the channel. Null for system channels. */
+  @Column({ type: "varchar", nullable: true })
+  createdByUserId!: string | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  archivedAt!: Date | null;
+
+  /**
+   * Mirrors the most recent message's createdAt so the sidebar can sort DMs
+   * and channels by recent activity without a subquery. Updated by the chat
+   * service on every send.
+   */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  lastMessageAt!: Date | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}

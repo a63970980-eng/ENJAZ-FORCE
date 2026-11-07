@@ -1,0 +1,991 @@
+import { In, IsNull, LessThanOrEqual, MoreThan } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run } from "../db/entities/Run.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Approval } from "../db/entities/Approval.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { startRoutineRun, type StartRunOptions } from "./runner.js";
+import { notifyApprovalPending } from "./notifications.js";
+import { withSchedulerLease } from "./schedulerLeases.js";
+import { dispatchQueuedRoutineRuns, resumeRoutineQueue, stopRoutineQueue } from "./routineQueue.js";
+import {
+  anyRetryAt,
+  claimRetryDispatch,
+  findDueRetries,
+  reconcileOrphanedRuns,
+  settleRetryDispatchClaim,
+} from "./runRecovery.js";
+import {
+  ORPHAN_GRACE_MS,
+  STALE_SLOT_MS,
+  automaticRetryLimit,
+  countMissedSlots,
+  isSlotStale,
+  nextRunFor,
+  shouldRetry,
+} from "./cronMath.js";
+import { timeZoneLookup } from "./companyTimeZone.js";
+import { dispatchDueFollowUpReminders } from "./revenue/followUpReminders.js";
+import {
+  dispatchDueTldrs,
+  reconcileStaleTldrs,
+  resetTldrSchedulesAfterRestore,
+  sweepTldrSchedules,
+} from "./tldrs.js";
+import { releaseInterruptedTldrQuestionActions } from "./tldrQuestionActions.js";
+import {
+  dispatchDueBoardLetters,
+  reconcileStaleBoardLetters,
+  rescheduleBoardLetters,
+} from "./boardLetters.js";
+import {
+  retireStaleStandingClaims,
+  sweepPendingStandingQuestions,
+} from "./tldrStandingQuestions.js";
+import { sweepStalledWork } from "./escalations.js";
+import { releaseDueDecisionSnoozes } from "./decisionSnoozes.js";
+import { sweepGoals } from "./goals.js";
+import { sweepRoutedDecisions } from "./decisionRouting.js";
+import { sweepAutonomyPromotions } from "./autonomy.js";
+import { workBlockedForRoutine } from "./standdowns.js";
+import { sweepUngradedRuns } from "./runGrading.js";
+import { dispatchDueWakeups } from "./wakeups.js";
+import { dispatchTodoPickups } from "./todoPickups.js";
+import { continuationEligibility, readRunCheckpoint } from "./runContinuation.js";
+import { notifyRunFailure } from "./runAlerts.js";
+
+/**
+ * Heartbeat-based routine scheduler.
+ *
+ * Instead of holding one in-memory `node-cron` timer per routine, we persist
+ * the next due time on each `Routine` row (`nextRunAt`) and poll every
+ * {@link HEARTBEAT_INTERVAL_MS}. Each pass runs three ordered phases:
+ *
+ *   1. **Reconcile** — clear crash debris (see `services/runRecovery.ts`).
+ *   2. **Schedule** — advance and fire due routines, oldest slot first.
+ *   3. **Retry** — start attempts that earlier failures scheduled.
+ *
+ * Catch-up after downtime is **fire-at-most-once**: if the server was down
+ * across many scheduled ticks, the routine fires once on the next heartbeat
+ * (not N times). This is implemented by advancing `nextRunAt` from *now*
+ * rather than from the stale `nextRunAt`, so we skip past all missed slots.
+ * How many slots that skipped is counted onto the catch-up Run
+ * (`Run.missedSlots`), and a routine set to `catchUpPolicy: "skip"` declines
+ * the catch-up entirely rather than doing yesterday's work today.
+ */
+
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+let heartbeat: NodeJS.Timeout | null = null;
+let ticking: Promise<void> | null = null;
+let cronGeneration = 0;
+let pendingQueueResume = false;
+
+class RoutineSchedulerStoppedError extends Error {}
+/**
+ * Set by {@link bootCron} so the first pass of a fresh process (and the pass
+ * after a backup restore) knows it may treat every `running` row as debris on
+ * sqlite, where this process is the only thing that could have written one.
+ */
+let pendingBootReconcile = true;
+
+/**
+ * Ceiling on scheduled runs dispatched per pass, oldest slot first. A restart
+ * with a large overdue set drains at roughly this rate per heartbeat instead
+ * of firing every routine in the same millisecond; undispatched rows keep
+ * their stale `nextRunAt` and are picked up next pass.
+ */
+const MAX_DISPATCH_PER_TICK = 10;
+
+/** Ceiling on retries per pass, separate so neither phase can starve the other. */
+const MAX_RETRIES_PER_TICK = 5;
+
+/** How far out to push a retry after a setup failure or overlap. */
+const BUSY_RETRY_MS = 60 * 1000;
+
+/**
+ * Bound on slot enumeration for the missed-occurrence count. The number is
+ * only ever a record, so a saturated count reads as "1000+" and costs nothing.
+ */
+const MISSED_SLOT_CAP = 1000;
+
+// The arithmetic lives in `cronMath.ts` (it needs no database, and
+// `companyTimeZone.ts` reschedules with it without pulling in the runner);
+// every module that reads a schedule still imports it from here.
+export { nextRunFor };
+
+/**
+ * Mutate a routine's `nextRunAt` based on its current cron/enabled state.
+ * Callers save the row afterward. When disabled or when the expression is
+ * unparseable we clear `nextRunAt` so the heartbeat ignores the row.
+ *
+ * `timeZone` is the zone of the company the Routine's employee works in —
+ * `company.timezone`, with "" meaning server time. It is required rather than
+ * defaulted so that a caller who has not thought about it fails to compile
+ * instead of scheduling a company's first run on the wrong clock; a caller that
+ * holds only an id reaches it with `companyTimeZone()` / `employeeTimeZone()`.
+ */
+export function registerRoutine(routine: Routine, timeZone: string): void {
+  if (!routine.enabled) {
+    routine.nextRunAt = null;
+    return;
+  }
+  routine.nextRunAt = nextRunFor(routine.cronExpr, new Date(), timeZone);
+}
+
+/**
+ * A terminal verdict does not release runtime/assessment cleanup ownership.
+ * Keep retries behind that claim as well as recent legacy running rows.
+ * Exported for its query-plan test.
+ */
+export async function findInFlightRun(
+  routine: Routine,
+  now: Date = new Date(),
+): Promise<Run | null> {
+  const inFlightSince = new Date(
+    now.getTime() - (Math.max(1, routine.timeoutSec) * 1000 + ORPHAN_GRACE_MS),
+  );
+  return AppDataSource.getRepository(Run).findOne({
+    where: [
+      {
+        routineId: routine.id,
+        status: "running",
+        startedAt: MoreThan(inFlightSince),
+      },
+      {
+        routineId: routine.id,
+        // A claim is never empty, so `> ''` finds the claimed Runs through the
+        // claim index, where `IS NOT NULL` walked the Routine's whole history.
+        queueActiveEmployeeId: MoreThan(""),
+      },
+    ],
+  });
+}
+
+/** Internal dispatch seam, exported for scheduler safety tests. */
+export async function tickRoutine(
+  routineId: string,
+  meta: { missedSlots: number },
+  assertLeaseHeld: () => void,
+): Promise<void> {
+  // Re-fetch each tick so edits (including flipping requiresApproval or
+  // disabling the routine) take effect without restarting the process.
+  const repo = AppDataSource.getRepository(Routine);
+  const fresh = await repo.findOneBy({ id: routineId });
+  if (!fresh || !fresh.enabled) return;
+  // A continuation owns the unfinished occurrence even between its chunks.
+  // Natural schedule ticks must not restart the same work while its durable
+  // dispatch claim is waiting, including while another scheduler prepares it.
+  if (await hasPendingContinuation(fresh.id)) return;
+  if (fresh.requiresApproval) {
+    const emp = await AppDataSource.getRepository(AIEmployee).findOneBy({
+      id: fresh.employeeId,
+    });
+    if (!emp) return;
+    const approvalRepo = AppDataSource.getRepository(Approval);
+    const pending = approvalRepo.create({
+      companyId: emp.companyId,
+      routineId: fresh.id,
+      employeeId: emp.id,
+      status: "pending",
+    });
+    assertLeaseHeld();
+    await approvalRepo.save(pending);
+    void notifyApprovalPending(pending).catch((e) => {
+      // eslint-disable-next-line no-console
+      console.error("[cron] notify approval pending failed:", e);
+    });
+    await AppDataSource.getRepository(JournalEntry).save(
+      AppDataSource.getRepository(JournalEntry).create({
+        employeeId: emp.id,
+        kind: "system",
+        title: `Approval requested for routine "${fresh.name}"`,
+        body: "Cron tick was gated; waiting for a human to approve or reject.",
+        routineId: fresh.id,
+        runId: null,
+        authorUserId: null,
+      }),
+    );
+    return;
+  }
+  if (await foldIntoWaitingRun(fresh, meta.missedSlots, assertLeaseHeld)) return;
+  // Persist each occurrence and dispatch it independently, even while another
+  // Routine is running. Per-Run claims prevent duplicate starts across replicas.
+  const { completion } = await startRoutineRun(fresh, {
+    triggerKind: "schedule",
+    missedSlots: meta.missedSlots,
+    beforeRunPersist: async () => {
+      assertLeaseHeld();
+      const current = await repo.findOneBy({ id: fresh.id });
+      if (
+        !current?.enabled ||
+        current.requiresApproval ||
+        current.employeeId !== fresh.employeeId
+      ) {
+        throw new RetryDispatchIneligibleError("This Routine changed before its Run could start.");
+      }
+      if ((await workBlockedForRoutine(current)).blocked) {
+        throw new RetryDispatchIneligibleError(
+          "This Routine was stood down before its Run could start.",
+        );
+      }
+      if (await hasPendingContinuation(fresh.id)) {
+        throw new RetryDispatchIneligibleError("This Routine already has unfinished work.");
+      }
+      Object.assign(fresh, current);
+    },
+  });
+  // The heartbeat only waits until the durable Run row exists. The agent work
+  // continues independently, just as it did when this whole function was
+  // detached, but the retry phase below can now see the row and avoid overlap.
+  void completion.catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[cron] routine ${fresh.id} failed after starting:`, err);
+  });
+}
+
+/**
+ * Let this Routine's scheduled Run that is still waiting to start also cover a
+ * newly due occurrence. A busy local AI Model can hold a Run in the queue past
+ * the Routine's next slot; a second Run queued behind it would only repeat the
+ * same work. The waiting Run instead records the occurrence the way a catch-up
+ * Run records slots missed during downtime, so its brief covers the whole
+ * period and a saturated model never accumulates a backlog of one Routine.
+ */
+async function foldIntoWaitingRun(
+  routine: Routine,
+  missedSlots: number,
+  assertLeaseHeld: () => void,
+): Promise<boolean> {
+  const repo = AppDataSource.getRepository(Run);
+  // The employee's waiting Runs, through `(employeeId, status)`. Asking by
+  // `routineId` reads the Routine's whole Run history, transcripts and all, to
+  // find the one or two still waiting (AGENTS.md §7).
+  const waiting = (
+    await repo.find({
+      // A Run left behind by a reassigned Routine is skipped, not started.
+      where: { employeeId: routine.employeeId, status: "queued" },
+      select: {
+        id: true,
+        routineId: true,
+        triggerKind: true,
+        missedSlots: true,
+        createdAt: true,
+        queueActiveEmployeeId: true,
+        queueOptionsJson: true,
+      },
+      order: { createdAt: "ASC", id: "ASC" },
+    })
+  ).find(
+    (run) =>
+      run.routineId === routine.id &&
+      run.triggerKind === "schedule" &&
+      run.queueActiveEmployeeId === null,
+  );
+  if (!waiting) return false;
+  let options: StartRunOptions;
+  try {
+    options = JSON.parse(waiting.queueOptionsJson ?? "{}") as StartRunOptions;
+  } catch {
+    return false;
+  }
+  const covered = waiting.missedSlots + missedSlots + 1;
+  assertLeaseHeld();
+  // Only a Run that is still unclaimed can take the occurrence; the queue
+  // re-reads it after claiming, so a fold that wins this race is never lost.
+  const folded = await repo.update(
+    {
+      id: waiting.id,
+      status: "queued",
+      queueActiveEmployeeId: IsNull(),
+      missedSlots: waiting.missedSlots,
+    },
+    {
+      missedSlots: covered,
+      queueOptionsJson: JSON.stringify({ ...options, missedSlots: covered }),
+    },
+  );
+  return folded.affected === 1;
+}
+
+function onDispatchError(routineId: string) {
+  return (err: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error(`[cron] routine ${routineId} failed:`, err);
+  };
+}
+
+/**
+ * A retry that fails before its child Run exists must not consume an attempt.
+ * Re-stamp the parent's `retryAt` so a transient capacity or setup failure is
+ * retried without turning into a tight heartbeat loop.
+ */
+function onRetryError(parentRunId: string, routineId: string, claim: Date) {
+  return async (err: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error(`[cron] retry of run ${parentRunId} failed:`, err);
+    await settleRetryDispatchClaim(
+      parentRunId,
+      routineId,
+      claim,
+      new Date(Date.now() + BUSY_RETRY_MS),
+    );
+  };
+}
+
+/**
+ * The only durable record that a `"skip"` routine declined a catch-up — no Run
+ * row is created, so without this the missed work is invisible.
+ */
+async function journalSkippedCatchUp(
+  routine: Routine,
+  slot: Date,
+  total: number,
+  capped: boolean,
+): Promise<void> {
+  const repo = AppDataSource.getRepository(JournalEntry);
+  await repo.save(
+    repo.create({
+      employeeId: routine.employeeId,
+      kind: "system",
+      title: `Skipped ${capped ? `${total}+` : total} missed occurrence${total === 1 ? "" : "s"} of "${routine.name}"`,
+      body:
+        `The server was unavailable from ${slot.toISOString()} and this routine's catch-up ` +
+        "policy is Skip, so no catch-up run was started. The next run happens on schedule.",
+      routineId: routine.id,
+      runId: null,
+      authorUserId: null,
+    }),
+  );
+}
+
+export type RetryDispatchResult = {
+  started: number;
+  /** Exposed so service tests can let detached no-model Runs settle cleanly. */
+  completions: Array<Promise<Run>>;
+};
+
+/** A retry became ineligible while its start prerequisites were resolving. */
+class RetryDispatchIneligibleError extends Error {}
+
+function isContinuationRequest(run: Run): boolean {
+  const checkpoint = readRunCheckpoint(run);
+  return (
+    checkpoint?.state === "continue" ||
+    checkpoint?.state === "blocked" ||
+    run.triggerKind === "continuation" ||
+    run.continuationCount > 0 ||
+    Boolean(run.continuationStopReason)
+  );
+}
+
+async function hasPendingContinuation(routineId: string): Promise<boolean> {
+  // Runs owed a follow-up, through the `retryAt` index, and continuations
+  // waiting or working, through `status`: both small sets. Filtering this
+  // Routine's Runs instead would read its whole history on every due slot.
+  const repo = AppDataSource.getRepository(Run);
+  const select = {
+    id: true,
+    routineId: true,
+    triggerKind: true,
+    checkpointJson: true,
+    continuationCount: true,
+    continuationStopReason: true,
+  } as const;
+  const [owed, continuing] = await Promise.all([
+    repo.find({ where: { retryAt: anyRetryAt() }, select }),
+    repo.find({
+      where: { status: In(["queued", "running"]), triggerKind: "continuation" },
+      select,
+    }),
+  ]);
+  return [...owed, ...continuing].some(
+    (run) => run.routineId === routineId && isContinuationRequest(run),
+  );
+}
+
+function isRetryDispatchEligible(parent: Run, routine: Routine, now: Date): boolean {
+  if (isContinuationRequest(parent)) {
+    return continuationEligibility(parent, routine, now).eligible;
+  }
+  return (
+    routine.enabled &&
+    !routine.requiresApproval &&
+    shouldRetry({
+      status: parent.status,
+      errorKind: parent.errorKind,
+      triggerKind: parent.triggerKind,
+      attempt: parent.attempt,
+      maxAttempts: routine.maxAttempts,
+      retryOnTimeout: routine.retryOnTimeout,
+    })
+  );
+}
+
+async function stopQueuedContinuation(parent: Run, claim: Date, reason: string): Promise<void> {
+  // A hand-off nothing will continue is unfinished work again, and alerts so.
+  const reverted = parent.status === "continued";
+  const stopped = await AppDataSource.getRepository(Run).update(
+    { id: parent.id, retryAt: claim },
+    {
+      routineId: parent.routineId,
+      retryAt: null,
+      continuationStopReason: reason,
+      ...(reverted ? { status: "failed" as const } : {}),
+    },
+  );
+  if (stopped.affected !== 1) return;
+  parent.retryAt = null;
+  parent.continuationStopReason = reason;
+  if (reverted) parent.status = "failed";
+  await notifyRunFailure(parent).catch((err) => {
+    // A notification outage cannot resurrect an ineligible continuation.
+    // eslint-disable-next-line no-console
+    console.error(`[cron] continuation of run ${parent.id} needs attention:`, err);
+  });
+}
+
+/**
+ * Start the retry attempts whose durable `retryAt` stamps are due.
+ *
+ * The scheduler lease around the caller serializes this across replicas. An
+ * atomic, expiring claim makes cancellation and dispatch deterministic and
+ * stops concurrent schedulers from starting the same parent. A child lookup
+ * closes the process-crash window: once a retry Run row exists, a stale claim
+ * is cleared instead of dispatching that attempt twice. The claim is settled
+ * only after child creation, favoring at-least-once recovery over silent loss.
+ */
+export async function dispatchDueRetries(
+  now: Date,
+  assertLeaseHeld: () => void = () => undefined,
+): Promise<RetryDispatchResult> {
+  const routineRepo = AppDataSource.getRepository(Routine);
+  const runRepo = AppDataSource.getRepository(Run);
+  const completions: Array<Promise<Run>> = [];
+  let started = 0;
+
+  for (const queuedParent of await findDueRetries(now, MAX_RETRIES_PER_TICK)) {
+    assertLeaseHeld();
+    // Re-read after the queue scan so a member cancelling a retry does not
+    // lose a race to stale scheduler state.
+    const parent = await runRepo.findOneBy({ id: queuedParent.id });
+    if (
+      !parent?.retryAt ||
+      !queuedParent.retryAt ||
+      parent.retryAt > now ||
+      parent.retryAt.getTime() !== queuedParent.retryAt.getTime()
+    ) {
+      continue;
+    }
+    assertLeaseHeld();
+    const initialClaim = await claimRetryDispatch(parent.id, queuedParent.retryAt);
+    if (!initialClaim) continue;
+    let claim = initialClaim;
+
+    // A child is authoritative even if policy changed since its creation.
+    // Recovering an old dispatch stamp must not page about its parent again.
+    const existingChild = await runRepo.findOneBy({ parentRunId: parent.id });
+    if (existingChild) {
+      await settleRetryDispatchClaim(parent.id, parent.routineId, claim, null);
+      continue;
+    }
+
+    const continuation = isContinuationRequest(parent);
+    const routine = await routineRepo.findOneBy({ id: parent.routineId });
+    // Preserve a stood-down continuation even if its absolute budget expires
+    // during the stop. On lifting, the eligibility check reports that reason;
+    // the Standdown itself must never discard queued work.
+    if (continuation && routine?.enabled && (await workBlockedForRoutine(routine)).blocked) {
+      await settleRetryDispatchClaim(
+        parent.id,
+        parent.routineId,
+        claim,
+        new Date(now.getTime() + BUSY_RETRY_MS),
+      );
+      continue;
+    }
+    if (!routine || !isRetryDispatchEligible(parent, routine, now)) {
+      if (continuation) {
+        await stopQueuedContinuation(
+          parent,
+          claim,
+          routine
+            ? (continuationEligibility(parent, routine, now).reason ??
+                "This Run is no longer eligible to continue.")
+            : "The source Routine was removed.",
+        );
+      } else {
+        await settleRetryDispatchClaim(parent.id, parent.routineId, claim, null);
+      }
+      continue;
+    }
+
+    // A Standdown DEFERS a retry; it never cancels one (M58). `retryAt` is put
+    // back where it was, so the attempt this Routine is still owed survives the
+    // stop and fires after the lift. Cancelling would quietly convert a pause
+    // into a decision nobody made.
+    if ((await workBlockedForRoutine(routine)).blocked) {
+      await settleRetryDispatchClaim(
+        parent.id,
+        parent.routineId,
+        claim,
+        new Date(now.getTime() + BUSY_RETRY_MS),
+      );
+      continue;
+    }
+
+    // A one-hour recovery commonly lands near the routine's next natural
+    // hourly slot. Let the current Run finish before starting another copy.
+    if (await findInFlightRun(routine, now)) {
+      await settleRetryDispatchClaim(
+        parent.id,
+        parent.routineId,
+        claim,
+        new Date(now.getTime() + BUSY_RETRY_MS),
+      );
+      continue;
+    }
+
+    let completion: Promise<Run>;
+    try {
+      const startOptions: StartRunOptions = continuation
+        ? {
+            triggerKind: "continuation",
+            continuationFromRunId: parent.id,
+            attempt: parent.attempt,
+            parentRunId: parent.id,
+            missedSlots: 0,
+          }
+        : {
+            triggerKind: "retry",
+            attempt: parent.attempt + 1,
+            attemptLimit: automaticRetryLimit(parent.status, routine.maxAttempts, parent.errorKind),
+            parentRunId: parent.id,
+            missedSlots: 0,
+          };
+      startOptions.beforeRunPersist = async () => {
+        assertLeaseHeld();
+        // Renew and verify ownership after setup, so a scheduler that
+        // resumed after its claim expired cannot start work behind a newer
+        // dispatcher.
+        const renewed = await claimRetryDispatch(parent.id, claim);
+        if (!renewed) throw new Error("Retry dispatch claim was lost before child creation");
+        claim = renewed;
+
+        // Setup happens before the child row is inserted. Re-read the
+        // Routine after renewing the claim, at the last safe point before
+        // persistence, so a pause, approval gate, or deletion that landed
+        // during preparation cannot be bypassed by the stale object this
+        // dispatch started with.
+        const currentRoutine = await routineRepo.findOneBy({ id: routine.id });
+        assertLeaseHeld();
+        const currentParent = await runRepo.findOneBy({ id: parent.id });
+        if (
+          !currentRoutine ||
+          !currentParent ||
+          currentRoutine.employeeId !== routine.employeeId ||
+          !isRetryDispatchEligible(currentParent, currentRoutine, new Date())
+        ) {
+          throw new RetryDispatchIneligibleError(
+            continuation && currentRoutine && currentParent
+              ? (continuationEligibility(currentParent, currentRoutine).reason ??
+                  "This Run became ineligible to continue.")
+              : "Routine became ineligible before retry child creation",
+          );
+        }
+        if ((await workBlockedForRoutine(currentRoutine)).blocked) {
+          throw new Error("This Routine was stood down before follow-up work could start.");
+        }
+        if (await findInFlightRun(currentRoutine)) {
+          throw new Error("This Routine already has a Run in flight.");
+        }
+
+        // The child owns the current reliability policy from this point on.
+        // Keep both its transcript ceiling and any later retry stamp aligned
+        // with settings changed while preparation was in progress.
+        // The runner composes its authority after this seam. Carry every
+        // current delivery/review restriction forward, not just retry knobs.
+        Object.assign(routine, currentRoutine);
+        if (!continuation) {
+          startOptions.attemptLimit = automaticRetryLimit(
+            parent.status,
+            currentRoutine.maxAttempts,
+            parent.errorKind,
+          );
+        }
+      };
+      ({ completion } = await startRoutineRun(routine, startOptions));
+    } catch (err) {
+      // `startRoutineRun` persists its child before flushing the framing log.
+      // If setup failed after that insert, the child owns the attempt and the
+      // parent must not be re-armed. Its terminal cleanup schedules any later
+      // configured attempt on the child itself.
+      const durableChild = await runRepo.findOneBy({ parentRunId: parent.id });
+      if (durableChild) {
+        await settleRetryDispatchClaim(parent.id, parent.routineId, claim, null);
+      } else if (err instanceof RetryDispatchIneligibleError) {
+        if (continuation) await stopQueuedContinuation(parent, claim, err.message);
+        else await settleRetryDispatchClaim(parent.id, parent.routineId, claim, null);
+      } else {
+        await onRetryError(parent.id, parent.routineId, claim)(err);
+      }
+      continue;
+    }
+
+    completions.push(completion);
+    started += 1;
+    void completion.catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(`[cron] retry of run ${parent.id} failed after starting:`, err);
+    });
+    // Clear only after the child Run is durable. If the process dies first,
+    // the claim expires and the existing-child guard self-heals it.
+    await settleRetryDispatchClaim(parent.id, parent.routineId, claim, null);
+  }
+
+  return { started, completions };
+}
+
+/**
+ * One heartbeat pass: reconcile crash debris, fire due routines, then start
+ * any retries that have come due.
+ *
+ * The outer guard (`ticking`) prevents overlapping passes if a heartbeat
+ * interval fires while the previous pass is still writing rows — cheap
+ * insurance, since a single SQLite connection serializes writes anyway.
+ *
+ * Recovery lives inside the pass, not in a boot-only hook, on purpose: a
+ * boot-only recovery guarded by a long lease is skipped precisely when it is
+ * needed most, because the process that crashed is still holding the lease.
+ */
+/** One serialized heartbeat; exported for lifecycle recovery checks. */
+export function tickCron(): Promise<void> {
+  if (ticking) return ticking;
+  const pass = runHeartbeat(cronGeneration).finally(() => {
+    if (ticking === pass) ticking = null;
+  });
+  ticking = pass;
+  return pass;
+}
+
+async function runHeartbeat(generation: number): Promise<void> {
+  try {
+    await withSchedulerLease("routines", HEARTBEAT_INTERVAL_MS * 3, async (lease) => {
+      const assertHeld = (): void => {
+        lease.assertHeld();
+        if (generation !== cronGeneration || !AppDataSource.isInitialized)
+          throw new RoutineSchedulerStoppedError("The Routine scheduler was stopped.");
+      };
+      assertHeld();
+      const repo = AppDataSource.getRepository(Routine);
+      const now = new Date();
+
+      // Phase 1 — reconcile. Never starts work; only writes terminal statuses,
+      // the retry stamps that go with them, and lease deletes.
+      const boot = pendingBootReconcile;
+      // A failed pass or an unavailable scheduler lease must retain the boot
+      // marker and leave the work queue stopped for a later successful pass.
+      await reconcileOrphanedRuns({ boot, now });
+      assertHeld();
+      if (boot) pendingBootReconcile = false;
+      await reconcileStaleTldrs(now).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] TLDR recovery failed:", err);
+      });
+      await reconcileStaleBoardLetters(now).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] letter recovery failed:", err);
+      });
+
+      // Phase 2 — schedule. Oldest due slot first and capped, so a restart
+      // with a big overdue set can't fire everything at once (and can't keep
+      // starving the same routines the way an unordered scan did).
+      const due = await repo.find({
+        where: { enabled: true, nextRunAt: LessThanOrEqual(now) },
+        order: { nextRunAt: "ASC" },
+        take: MAX_DISPATCH_PER_TICK,
+      });
+      // A Routine's schedule is read in its company's time zone, so the next
+      // slot is advanced on the same clock the slot was set on. Resolved once
+      // per employee for this pass; a pass never outlives the zones it read
+      // by more than the thirty seconds before the next one.
+      const zoneOf = timeZoneLookup();
+      for (const r of due) {
+        const timeZone = await zoneOf(r.employeeId);
+        assertHeld();
+        const slot = r.nextRunAt as Date; // non-null by the query predicate
+        const { count, capped } = countMissedSlots(
+          r.cronExpr,
+          slot,
+          now,
+          MISSED_SLOT_CAP,
+          timeZone,
+        );
+        const stale = isSlotStale(slot, now, STALE_SLOT_MS);
+        // Advance BEFORE firing so a long-running routine doesn't re-trigger.
+        r.nextRunAt = nextRunFor(r.cronExpr, now, timeZone);
+        await repo.save(r);
+        // A Standdown skips the slot but keeps the schedule moving (M58).
+        // Holding `nextRunAt` still would turn a month-old stop into a
+        // catch-up storm the moment somebody lifted it, which is the opposite
+        // of what the person pressing the button asked for. Deliberately
+        // silent per slot: placement already journalled every covered
+        // employee once, and a line per skipped tick would bury that.
+        if ((await workBlockedForRoutine(r)).blocked) continue;
+        if (r.catchUpPolicy === "skip" && stale) {
+          // `count` excludes the due slot itself, which is also not being run.
+          await journalSkippedCatchUp(r, slot, count + 1, capped);
+          continue;
+        }
+        try {
+          // Wait only until the Run row is durable (not for the agent to
+          // finish) so phase 3 can see it and defer a colliding retry.
+          assertHeld();
+          await tickRoutine(r.id, { missedSlots: count }, assertHeld);
+        } catch (err) {
+          onDispatchError(r.id)(err);
+        }
+      }
+
+      // Phase 3 — retries owed by earlier failures.
+      assertHeld();
+      await dispatchDueRetries(now, assertHeld);
+      // Resume queued occurrences after restart or after a Standdown is lifted.
+      // Each Run owns its dispatch claim and executes independently in the background.
+      assertHeld();
+      if (pendingQueueResume) {
+        pendingQueueResume = false;
+        await resumeRoutineQueue();
+      } else {
+        await dispatchQueuedRoutineRuns();
+      }
+
+      // Phase 4 — durable Revenue reminders. The notification entity key
+      // makes this idempotent across heartbeats; the scheduler lease prevents
+      // two app instances racing the same reminder.
+      assertHeld();
+      await dispatchDueFollowUpReminders(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] revenue follow-up reminders failed:", err);
+      });
+
+      // Phase 5 — claim due TLDR windows. The claim and schedule advance are
+      // durable before the restricted model turn continues in the background,
+      // so this heartbeat never waits for prose generation.
+      assertHeld();
+      await dispatchDueTldrs(now, {}, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] TLDR dispatch failed:", err);
+      });
+      // The monthly letter to the board, claimed the same way: the claim is
+      // durable before the writer and the auditor run in the background.
+      assertHeld();
+      await dispatchDueBoardLetters(now, {}, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] letter dispatch failed:", err);
+      });
+
+      // Phase 6 — finish the standing questions a brief is still owed. The
+      // pass normally runs behind its own generation; this only picks up
+      // briefs whose process died before it could, and gives up on ones too
+      // old to be worth answering rather than re-scanning them forever.
+      //
+      // The sweep hands off rather than waiting: a pass is several model turns
+      // per brief, and this tick holds the scheduler lease for as long as its
+      // body runs. The two awaits here are a bounded SELECT and a single
+      // UPDATE. Same reason a button left mid-press is released from here —
+      // one guarded UPDATE, so a replica that died without a peer restarting
+      // does not leave its buttons stuck until one does.
+      assertHeld();
+      await sweepPendingStandingQuestions(now, {}, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] TLDR standing question sweep failed:", err);
+      });
+      assertHeld();
+      await retireStaleStandingClaims(now).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] TLDR standing question retirement failed:", err);
+      });
+      assertHeld();
+      await releaseInterruptedTldrQuestionActions(now).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] TLDR suggested action release failed:", err);
+      });
+
+      // Phase 7 — return snoozed Decisions to their human audience, then end
+      // the other silences. Each wake is a conditional claim, so restarts,
+      // concurrent extensions and multiple schedulers cannot page twice.
+      assertHeld();
+      await releaseDueDecisionSnoozes(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] Decision snooze wake failed:", err);
+      });
+
+      // Re-page humans about Approvals, Decisions, and Handoffs that have sat
+      // unanswered past their stall threshold. Idempotent per row.
+      assertHeld();
+      await sweepStalledWork(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] stall sweep failed:", err);
+      });
+
+      // Phase 8 — keep the Goals honest. Refresh chart-bound values (bounded
+      // per pass) and settle achieved / missed transitions, each claimed with
+      // a conditional UPDATE so a settle notifies exactly once.
+      assertHeld();
+      await sweepGoals(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] goal sweep failed:", err);
+      });
+
+      // Phase 9 — the routed-Decision fuse. A question an AI decider has held
+      // unanswered past the fuse drops back to the human flow with the bell
+      // the routing skipped; un-routing is the exactly-once claim.
+      assertHeld();
+      await sweepRoutedDecisions(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] routed decision sweep failed:", err);
+      });
+
+      // Phase 10 — earned-autonomy eligibility (hourly behind its own gate).
+      // Drafts evidence-attached promotion Approvals; demotion needs no sweep
+      // because the runner revokes at the moment a Run goes bad.
+      assertHeld();
+      await sweepAutonomyPromotions(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] autonomy sweep failed:", err);
+      });
+
+      // Phase 11 — fire due Wakeups (M54). Each is claimed with a conditional
+      // UPDATE, then briefed into a fresh employee-authority session — or the
+      // journal, when the employee has no model.
+      assertHeld();
+      await dispatchDueWakeups(now, undefined, { ...lease, assertHeld }).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] wakeup dispatch failed:", err);
+      });
+
+      // Start what's due on each AI Employee's work queue. A query, not a model
+      // turn: nothing due spends nothing. Sessions run on in the background.
+      assertHeld();
+      await dispatchTodoPickups(now).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] todo pickup dispatch failed:", err);
+      });
+
+      // Phase 12 — grade the Runs nobody graded (M58). The outcome check runs
+      // in-line right after a Run finalizes; a process that dies inside that
+      // two-minute window used to strand the Run ungraded forever, and an
+      // ungraded Run counted as a clean one toward earning autonomy. Claimed
+      // with a conditional UPDATE on `outcomeCheckedAt IS NULL`, so the sweep
+      // and a slow in-line check cannot both spend a model turn on one Run.
+      assertHeld();
+      await sweepUngradedRuns(now, assertHeld).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("[cron] ungraded run sweep failed:", err);
+      });
+    });
+  } catch (error) {
+    // Stopping cron fences a prior pass at its next dispatch boundary.
+    if (!(error instanceof RoutineSchedulerStoppedError)) throw error;
+  }
+}
+
+/**
+ * Fill in `nextRunAt` for any enabled routine that doesn't have one. Runs on
+ * boot to handle (a) rows created before this column existed, and (b) rows
+ * where a prior boot failed to compute a schedule (e.g. transient parse
+ * error). Sets the next time relative to *now* so we don't try to fabricate
+ * a missed history.
+ */
+async function initialSweep(): Promise<void> {
+  const repo = AppDataSource.getRepository(Routine);
+  const orphans = await repo.find({
+    where: { enabled: true, nextRunAt: IsNull() },
+  });
+  if (orphans.length === 0) {
+    await sweepTldrSchedules();
+    await rescheduleBoardLetters();
+    return;
+  }
+  const now = new Date();
+  const zoneOf = timeZoneLookup();
+  for (const r of orphans) {
+    r.nextRunAt = nextRunFor(r.cronExpr, now, await zoneOf(r.employeeId));
+    // A null here means the expression no longer parses, so the row stays
+    // permanently invisible to the heartbeat. Say so — otherwise a routine
+    // that silently stopped firing has no server-side signal at all.
+    if (r.nextRunAt === null) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[cron] routine "${r.name}" (${r.id}) has an unschedulable expression "${r.cronExpr}" — it will never fire`,
+      );
+    }
+    await repo.save(r);
+  }
+  await sweepTldrSchedules(now);
+  await rescheduleBoardLetters(now);
+}
+
+/**
+ * Stop the heartbeat. The backup restore path destroys the DataSource for
+ * minutes while it extracts an archive; without this the 30s tick keeps firing
+ * across the wipe and can start runs against a half-restored database.
+ */
+export function stopCron(): void {
+  cronGeneration++;
+  pendingQueueResume = false;
+  stopRoutineQueue();
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = null;
+}
+
+/**
+ * Re-anchor every enabled routine to its next *future* slot after a restore.
+ *
+ * Restored rows carry the `nextRunAt` frozen when the archive was written — by
+ * definition in the past, often by weeks — so without this the `bootCron()`
+ * that follows a restore fires every routine in the company at once.
+ */
+export async function resetSchedulesAfterRestore(): Promise<void> {
+  const repo = AppDataSource.getRepository(Routine);
+  const rows = await repo.find({ where: { enabled: true } });
+  const now = new Date();
+  const zoneOf = timeZoneLookup();
+  for (const r of rows) {
+    r.nextRunAt = nextRunFor(r.cronExpr, now, await zoneOf(r.employeeId));
+    await repo.save(r);
+  }
+  await resetTldrSchedulesAfterRestore(now);
+  await rescheduleBoardLetters(now);
+}
+
+export async function bootCron(): Promise<void> {
+  stopCron();
+  const generation = cronGeneration;
+  // The immediate tick below performs the boot reconciliation pass. This also
+  // covers the post-restore re-boot, where every restored `running` row is
+  // debris by definition.
+  pendingBootReconcile = true;
+  pendingQueueResume = true;
+  // A restore may have stopped the timer while its previous heartbeat was
+  // still grading. Join that fenced pass before reconciling restored rows.
+  if (ticking) await ticking.catch(() => undefined);
+  if (generation !== cronGeneration) return;
+  await initialSweep();
+  if (generation !== cronGeneration) return;
+  if (heartbeat) clearInterval(heartbeat);
+  heartbeat = setInterval(() => {
+    tickCron().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[cron] heartbeat failed:", err);
+    });
+  }, HEARTBEAT_INTERVAL_MS);
+  // Complete the initial reconciliation before startup launches any durable
+  // chat recoveries. Otherwise the asynchronous boot pass could clear the
+  // workload lease a recovered turn just acquired.
+  await tickCron().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error("[cron] initial tick failed:", err);
+  });
+}

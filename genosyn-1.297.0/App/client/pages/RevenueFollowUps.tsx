@@ -1,0 +1,1071 @@
+import React from "react";
+import { Link, useOutletContext } from "react-router-dom";
+import { BookmarkPlus, Bot, CalendarCheck, Check, Plus, Trash2, User, X } from "lucide-react";
+import { api, type Employee, type Member } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import {
+  dateTimeLocalToIso,
+  defaultFollowUpDue,
+  type FollowUpItem,
+  type FollowUpView,
+  type FollowUpViewFilters,
+} from "../lib/revenue";
+import { Breadcrumbs } from "../components/AppShell";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { useFocusAfterDelete } from "../components/useFocusAfterDelete";
+import { Button } from "../components/ui/Button";
+import { useDialog } from "../components/ui/Dialog";
+import { FormError } from "../components/ui/FormError";
+import { Input } from "../components/ui/Input";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import { Textarea } from "../components/ui/Textarea";
+import { RevenueOutletCtx } from "./RevenueLayout";
+
+type QueueState = "all" | "overdue" | "today" | "upcoming";
+
+function localDateTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function localInputValue(iso: string | undefined): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function itemUrl(companySlug: string, item: FollowUpItem): string | null {
+  if (item.dealId) return `/c/${companySlug}/revenue/deals/${item.dealId}`;
+  if (item.partnershipId) {
+    return `/c/${companySlug}/revenue/partnerships/${item.partnershipId}`;
+  }
+  if (item.contactId) return `/c/${companySlug}/revenue/contacts/${item.contactId}`;
+  if (item.customerId) return `/c/${companySlug}/revenue/accounts/${item.customerId}`;
+  return null;
+}
+
+/** A row's key: a task, a deal and a partnership can never share one. */
+function followUpKey(item: FollowUpItem): string {
+  return `${item.source}:${item.id}`;
+}
+
+export default function RevenueFollowUps() {
+  const { company } = useOutletContext<RevenueOutletCtx>();
+  const dialog = useDialog();
+  const base = `/api/companies/${company.id}/revenue`;
+  const sectionUrl = `/c/${company.slug}/revenue`;
+  const [state, setState] = React.useState<QueueState>("all");
+  const [q, setQ] = React.useState("");
+  const [source, setSource] = React.useState("");
+  const [assignee, setAssignee] = React.useState("");
+  const [priorityFilter, setPriorityFilter] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState("open");
+  const [closedDeals, setClosedDeals] = React.useState("exclude");
+  const [linkedType, setLinkedType] = React.useState("");
+  const [linkedId, setLinkedId] = React.useState("");
+  const [dueFrom, setDueFrom] = React.useState("");
+  const [dueTo, setDueTo] = React.useState("");
+  const [reminderFrom, setReminderFrom] = React.useState("");
+  const [reminderTo, setReminderTo] = React.useState("");
+  const [overdueMinDays, setOverdueMinDays] = React.useState("");
+  const [overdueMaxDays, setOverdueMaxDays] = React.useState("");
+  const [staleBefore, setStaleBefore] = React.useState("");
+  const [createdBefore, setCreatedBefore] = React.useState("");
+  const [dealStatus, setDealStatus] = React.useState("");
+  const [dealStageId, setDealStageId] = React.useState("");
+  const [accountStatus, setAccountStatus] = React.useState("");
+  const [archivedResources, setArchivedResources] = React.useState("exclude");
+  const [undated, setUndated] = React.useState("include");
+  const [views, setViews] = React.useState<FollowUpView[]>([]);
+  const [selectedViewId, setSelectedViewId] = React.useState("");
+  const [viewName, setViewName] = React.useState("");
+  const [viewError, setViewError] = React.useState<string | null>(null);
+  const [savingView, setSavingView] = React.useState(false);
+  const [deletingView, setDeletingView] = React.useState(false);
+  const [nextCursor, setNextCursor] = React.useState<string | null>(null);
+  const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  const [bulkAction, setBulkAction] = React.useState("complete");
+  const [bulkMode, setBulkMode] = React.useState<"atomic" | "partial">("partial");
+  const [bulkValue, setBulkValue] = React.useState("");
+  const [bulkPreview, setBulkPreview] = React.useState<{
+    matched: number;
+    valid: number;
+    skipped: number;
+    failed: number;
+  } | null>(null);
+  const [bulkJob, setBulkJob] = React.useState<{
+    id: string;
+    status: string;
+    processed: number;
+    total: number;
+    applied: number;
+    failed: number;
+  } | null>(null);
+  const [bulkError, setBulkError] = React.useState<string | null>(null);
+  const [previewing, setPreviewing] = React.useState(false);
+  const [applying, setApplying] = React.useState(false);
+  const [undoing, setUndoing] = React.useState(false);
+  const [rows, setRows] = React.useState<FollowUpItem[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+  const [completing, setCompleting] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [announcement, setAnnouncement] = React.useState("");
+  const [creating, setCreating] = React.useState(false);
+  const newFollowUpRef = React.useRef<HTMLButtonElement>(null);
+  const rowKeys = React.useMemo(
+    () => rows?.map((row) => ({ id: followUpKey(row) })) ?? null,
+    [rows],
+  );
+  // Done takes the row off the queue; focus moves on to the next row's Done,
+  // the one above, or New follow-up when the queue is clear.
+  const focusAfterDone = useFocusAfterDelete(rowKeys, newFollowUpRef);
+  const [members, setMembers] = React.useState<Member[]>([]);
+  const [employees, setEmployees] = React.useState<Employee[]>([]);
+
+  const currentFilters = React.useCallback((): FollowUpViewFilters => {
+    const filters: FollowUpViewFilters = {
+      state,
+      status: statusFilter as FollowUpViewFilters["status"],
+      closedDeals: closedDeals as FollowUpViewFilters["closedDeals"],
+      archivedResources: archivedResources as FollowUpViewFilters["archivedResources"],
+    };
+    // Include is the server's default, so a saved view only names a choice.
+    if (undated !== "include") filters.undated = undated as FollowUpViewFilters["undated"];
+    if (q) filters.q = q;
+    if (source) filters.source = source as FollowUpViewFilters["source"];
+    if (assignee === "unassigned") filters.unassigned = true;
+    else if (assignee.startsWith("user:")) filters.assignedUserId = assignee.slice(5);
+    else if (assignee.startsWith("employee:")) {
+      filters.assignedEmployeeId = assignee.slice(9);
+    }
+    if (priorityFilter) {
+      filters.priority = priorityFilter as FollowUpViewFilters["priority"];
+    }
+    if (linkedType && linkedId) {
+      filters.linkedResourceType = linkedType as FollowUpViewFilters["linkedResourceType"];
+      filters.linkedResourceId = linkedId;
+    }
+    if (dueFrom) filters.dueFrom = new Date(dueFrom).toISOString();
+    if (dueTo) filters.dueTo = new Date(dueTo).toISOString();
+    if (reminderFrom) filters.reminderFrom = new Date(reminderFrom).toISOString();
+    if (reminderTo) filters.reminderTo = new Date(reminderTo).toISOString();
+    if (overdueMinDays) filters.overdueMinDays = Number(overdueMinDays);
+    if (overdueMaxDays) filters.overdueMaxDays = Number(overdueMaxDays);
+    if (staleBefore) filters.staleBefore = new Date(staleBefore).toISOString();
+    if (createdBefore) filters.createdBefore = new Date(createdBefore).toISOString();
+    if (dealStatus) filters.dealStatus = dealStatus as FollowUpViewFilters["dealStatus"];
+    if (dealStageId) filters.dealStageId = dealStageId;
+    if (accountStatus) {
+      filters.accountStatus = accountStatus as FollowUpViewFilters["accountStatus"];
+    }
+    return filters;
+  }, [
+    accountStatus,
+    archivedResources,
+    assignee,
+    closedDeals,
+    createdBefore,
+    dealStageId,
+    dealStatus,
+    dueFrom,
+    dueTo,
+    linkedId,
+    linkedType,
+    overdueMaxDays,
+    overdueMinDays,
+    priorityFilter,
+    q,
+    reminderFrom,
+    reminderTo,
+    source,
+    staleBefore,
+    state,
+    statusFilter,
+    undated,
+  ]);
+
+  const loadPage = React.useCallback(
+    async (cursor?: string, append = false) => {
+      const params = new URLSearchParams({ limit: "100" });
+      const filters = currentFilters();
+      for (const [key, value] of Object.entries(filters)) {
+        if (value !== undefined) params.set(key, String(value));
+      }
+      if (cursor) params.set("cursor", cursor);
+      const result = await api.get<{ rows: FollowUpItem[]; nextCursor: string | null }>(
+        `${base}/follow-ups?${params.toString()}`,
+      );
+      setRows((current) => (append ? [...(current ?? []), ...result.rows] : result.rows));
+      setNextCursor(result.nextCursor);
+      setSelected(new Set());
+      setLoadError(null);
+    },
+    [base, currentFilters],
+  );
+
+  const reload = React.useCallback(() => loadPage(), [loadPage]);
+
+  React.useEffect(() => {
+    reload().catch((error) => {
+      setRows([]);
+      setLoadError(error instanceof Error ? error.message : String(error));
+    });
+  }, [reload]);
+
+  React.useEffect(() => {
+    void Promise.all([
+      api.get<Member[]>(`/api/companies/${company.id}/members`).catch(() => []),
+      api.get<Employee[]>(`/api/companies/${company.id}/employees`).catch(() => []),
+      api.get<FollowUpView[]>(`${base}/follow-up-views`).catch(() => []),
+    ]).then(([memberRows, employeeRows, savedViews]) => {
+      setMembers(memberRows);
+      setEmployees(employeeRows);
+      setViews(savedViews);
+    });
+  }, [base, company.id]);
+
+  function applyView(view: FollowUpView) {
+    const filters = view.filters;
+    setState(filters.state ?? "all");
+    setQ(filters.q ?? "");
+    setSource(filters.source ?? "");
+    setAssignee(
+      filters.unassigned
+        ? "unassigned"
+        : filters.assignedUserId
+          ? `user:${filters.assignedUserId}`
+          : filters.assignedEmployeeId
+            ? `employee:${filters.assignedEmployeeId}`
+            : "",
+    );
+    setPriorityFilter(filters.priority ?? "");
+    setStatusFilter(filters.status ?? "open");
+    setClosedDeals(filters.closedDeals ?? "exclude");
+    setArchivedResources(filters.archivedResources ?? "exclude");
+    setUndated(filters.undated ?? "include");
+    setLinkedType(filters.linkedResourceType ?? "");
+    setLinkedId(filters.linkedResourceId ?? "");
+    setDueFrom(localInputValue(filters.dueFrom));
+    setDueTo(localInputValue(filters.dueTo));
+    setReminderFrom(localInputValue(filters.reminderFrom));
+    setReminderTo(localInputValue(filters.reminderTo));
+    setOverdueMinDays(filters.overdueMinDays?.toString() ?? "");
+    setOverdueMaxDays(filters.overdueMaxDays?.toString() ?? "");
+    setStaleBefore(localInputValue(filters.staleBefore));
+    setCreatedBefore(localInputValue(filters.createdBefore));
+    setDealStatus(filters.dealStatus ?? "");
+    setDealStageId(filters.dealStageId ?? "");
+    setAccountStatus(filters.accountStatus ?? "");
+    setSelectedViewId(view.id);
+  }
+
+  async function saveView() {
+    if (!viewName.trim()) return;
+    setViewError(null);
+    setSavingView(true);
+    try {
+      const view = await api.post<FollowUpView>(`${base}/follow-up-views`, {
+        name: viewName.trim(),
+        filters: currentFilters(),
+        sortOrder: views.length,
+      });
+      setViews((current) => [...current, view]);
+      setSelectedViewId(view.id);
+      setViewName("");
+    } catch (error) {
+      setViewError(errorMessage(error));
+    } finally {
+      setSavingView(false);
+    }
+  }
+
+  async function deleteSelectedView() {
+    if (!selectedViewId) return;
+    setViewError(null);
+    setDeletingView(true);
+    try {
+      await api.del(`${base}/follow-up-views/${selectedViewId}`);
+      setViews((current) => current.filter((view) => view.id !== selectedViewId));
+      setSelectedViewId("");
+    } catch (error) {
+      setViewError(errorMessage(error));
+    } finally {
+      setDeletingView(false);
+    }
+  }
+
+  useLiveRefetch(["activity", "deal", "partnership"], reload);
+
+  /**
+   * Done, from the row itself. A task is completed. A deal or partnership row
+   * is that record's own next follow-up, so Done clears its date and reminder —
+   * what Complete in the bulk bar does to the same rows — and the deal or
+   * partnership itself is untouched.
+   */
+  async function complete(item: FollowUpItem) {
+    const key = followUpKey(item);
+    if (completing.has(key)) return;
+    setCompleting((current) => new Set(current).add(key));
+    try {
+      if (item.source === "task") {
+        await api.patch(`${base}/follow-ups/${item.id}`, { taskStatus: "completed" });
+      } else if (item.source === "deal") {
+        await api.patch(`${base}/deals/${item.dealId ?? item.id}`, {
+          nextFollowUpAt: null,
+          followUpReminderAt: null,
+        });
+      } else {
+        await api.patch(`${base}/partnerships/${item.partnershipId ?? item.id}`, {
+          nextFollowUpAt: null,
+          reminderAt: null,
+        });
+      }
+      focusAfterDone.rowDeleted(key);
+      setRows((current) => current?.filter((row) => followUpKey(row) !== key) ?? current);
+      setSelected((current) => {
+        if (!current.has(key)) return current;
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+      setAnnouncement(`Done: ${item.title}.`);
+    } catch (error) {
+      void dialog.error(error, { title: "Couldn’t complete the follow-up" });
+    } finally {
+      setCompleting((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+  }
+
+  function toggleSelected(item: FollowUpItem) {
+    const key = followUpKey(item);
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      setBulkPreview(null);
+      return next;
+    });
+  }
+
+  async function applyBulk(dryRun: boolean) {
+    if (selected.size === 0) return;
+    setBulkError(null);
+    const action =
+      bulkAction === "complete" || bulkAction === "cancel"
+        ? {
+            type: "update_follow_up",
+            taskStatus: bulkAction === "complete" ? "completed" : "cancelled",
+          }
+        : bulkAction === "priority"
+          ? { type: "update_follow_up", priority: bulkValue }
+          : bulkAction === "reschedule"
+            ? { type: "update_follow_up", dueAt: new Date(bulkValue).toISOString() }
+            : {
+                type: "update_follow_up",
+                assignedUserId: bulkValue.startsWith("user:") ? bulkValue.slice(5) : null,
+                assignedEmployeeId: bulkValue.startsWith("employee:") ? bulkValue.slice(9) : null,
+              };
+    const setRunning = dryRun ? setPreviewing : setApplying;
+    setRunning(true);
+    try {
+      const request = {
+        resourceType: "follow_up",
+        target: {
+          followUpIds: [...selected].map((key) => {
+            const separator = key.indexOf(":");
+            return { source: key.slice(0, separator), id: key.slice(separator + 1) };
+          }),
+        },
+        action,
+        mode: bulkMode,
+      };
+      if (!dryRun) {
+        const queued = await api.post<{
+          job: { id: string; status: string };
+          preview: { matched: number; failed: number };
+        }>(`${base}/bulk/jobs`, {
+          ...request,
+          dryRun: false,
+          idempotencyKey: crypto.randomUUID(),
+        });
+        setBulkJob({
+          id: queued.job.id,
+          status: queued.job.status,
+          processed: 0,
+          total: queued.preview.matched,
+          applied: 0,
+          failed: queued.preview.failed,
+        });
+        for (let attempt = 0; attempt < 240; attempt += 1) {
+          const detail = await api.get<{
+            operation: { id: string; status: string };
+            summary: {
+              progress?: { processed?: number; total?: number };
+              result?: { applied?: number; failed?: number };
+              error?: string;
+            };
+          }>(`${base}/bulk/jobs/${queued.job.id}?rowLimit=1`);
+          const status = detail.operation.status;
+          const progress = detail.summary.progress ?? {};
+          const result = detail.summary.result ?? {};
+          setBulkJob({
+            id: queued.job.id,
+            status,
+            processed: progress.processed ?? 0,
+            total: progress.total ?? queued.preview.matched,
+            applied: result.applied ?? 0,
+            failed: result.failed ?? queued.preview.failed,
+          });
+          if (["completed", "partial", "failed", "rolled_back"].includes(status)) {
+            if (status === "failed") {
+              throw new Error(detail.summary.error ?? "Bulk job failed");
+            }
+            setBulkPreview(null);
+            await reload();
+            return;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 500));
+        }
+        throw new Error("Bulk job is still running; its status remains available here");
+      }
+      const result = await api.post<{
+        matched: number;
+        valid: number;
+        applied: number;
+        skipped: number;
+        failed: number;
+      }>(`${base}/bulk`, {
+        ...request,
+        dryRun: true,
+      });
+      setBulkPreview(result);
+    } catch (error) {
+      setBulkError(errorMessage(error));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function undoBulkJob() {
+    if (!bulkJob) return;
+    setUndoing(true);
+    try {
+      await api.post(`${base}/bulk/jobs/${bulkJob.id}/undo`, { confirm: "UNDO" });
+      setBulkJob((current) => (current ? { ...current, status: "rolled_back" } : current));
+      await reload();
+    } catch (error) {
+      void dialog.error(error, { title: "Couldn’t undo the bulk changes" });
+    } finally {
+      setUndoing(false);
+    }
+  }
+
+  async function loadMore(cursor: string) {
+    setLoadingMore(true);
+    try {
+      await loadPage(cursor, true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <div className="mb-6">
+        <Breadcrumbs items={[{ label: "Revenue", to: sectionUrl }, { label: "Follow-ups" }]} />
+      </div>
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">Follow-ups</h1>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            One queue for due work across tasks, deals, and partnerships.
+          </p>
+        </div>
+        <Button ref={newFollowUpRef} onClick={() => setCreating(true)}>
+          <Plus size={15} /> New follow-up
+        </Button>
+      </div>
+
+      <div className="mb-4 flex flex-wrap gap-2">
+        {(["all", "overdue", "today", "upcoming"] as QueueState[]).map((value) => (
+          <Button
+            key={value}
+            size="sm"
+            variant={state === value ? "primary" : "secondary"}
+            onClick={() => setState(value)}
+          >
+            {value[0].toUpperCase() + value.slice(1)}
+          </Button>
+        ))}
+      </div>
+
+      <div className="mb-4 grid gap-2 rounded-xl border border-slate-200 bg-white p-3 sm:grid-cols-2 lg:grid-cols-5 dark:border-slate-800 dark:bg-slate-900">
+        <div className="col-span-full flex flex-wrap items-end gap-2 border-b border-slate-100 pb-3 dark:border-slate-800">
+          <Select
+            label="Saved view"
+            value={selectedViewId}
+            onChange={(event) => {
+              const view = views.find((candidate) => candidate.id === event.target.value);
+              if (view) applyView(view);
+              else setSelectedViewId("");
+            }}
+          >
+            <option value="">Current filters</option>
+            {views.map((view) => (
+              <option key={view.id} value={view.id}>
+                {view.name}
+              </option>
+            ))}
+          </Select>
+          <Input
+            label="Save current filters"
+            value={viewName}
+            onChange={(event) => setViewName(event.target.value)}
+            placeholder="e.g. Enterprise overdue"
+          />
+          <Button
+            size="sm"
+            loading={savingView}
+            disabled={!viewName.trim()}
+            onClick={() => void saveView()}
+          >
+            <BookmarkPlus size={14} /> Save view
+          </Button>
+          {selectedViewId && (
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={deletingView}
+              onClick={() => void deleteSelectedView()}
+              aria-label="Delete saved Follow-up view"
+            >
+              <Trash2 size={14} /> Delete view
+            </Button>
+          )}
+          {viewError && <FormError message={viewError} className="w-full" />}
+        </div>
+        <Input
+          value={q}
+          onChange={(event) => setQ(event.target.value)}
+          placeholder="Search Follow-ups"
+        />
+        <Select value={source} onChange={(event) => setSource(event.target.value)}>
+          <option value="">All sources</option>
+          <option value="task">Tasks</option>
+          <option value="deal">Deals</option>
+          <option value="partnership">Partnerships</option>
+        </Select>
+        <Select value={assignee} onChange={(event) => setAssignee(event.target.value)}>
+          <option value="">Any assignee</option>
+          <option value="unassigned">Unassigned</option>
+          {members.map((member) => (
+            <option key={member.userId} value={`user:${member.userId}`}>
+              {member.name || member.email || "Member"}
+            </option>
+          ))}
+          {employees.map((employee) => (
+            <option key={employee.id} value={`employee:${employee.id}`}>
+              {employee.name}
+            </option>
+          ))}
+        </Select>
+        <Select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}>
+          <option value="">Any priority</option>
+          <option value="low">Low</option>
+          <option value="normal">Normal</option>
+          <option value="high">High</option>
+          <option value="urgent">Urgent</option>
+        </Select>
+        <Select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+          <option value="open">Open</option>
+          <option value="completed">Completed</option>
+          <option value="cancelled">Cancelled</option>
+        </Select>
+        <Select value={closedDeals} onChange={(event) => setClosedDeals(event.target.value)}>
+          <option value="exclude">Exclude closed Deals</option>
+          <option value="include">Include closed Deals</option>
+          <option value="only">Closed Deals only</option>
+        </Select>
+        <Select value={linkedType} onChange={(event) => setLinkedType(event.target.value)}>
+          <option value="">Any linked resource</option>
+          <option value="account">Account</option>
+          <option value="contact">Contact</option>
+          <option value="deal">Deal</option>
+          <option value="partnership">Partnership</option>
+        </Select>
+        <Input
+          value={linkedId}
+          onChange={(event) => setLinkedId(event.target.value)}
+          placeholder="Linked resource ID"
+        />
+        <Input
+          type="datetime-local"
+          value={dueFrom}
+          onChange={(event) => setDueFrom(event.target.value)}
+          aria-label="Due from"
+        />
+        <Input
+          type="datetime-local"
+          value={dueTo}
+          onChange={(event) => setDueTo(event.target.value)}
+          aria-label="Due to"
+        />
+        <Input
+          type="datetime-local"
+          value={reminderFrom}
+          onChange={(event) => setReminderFrom(event.target.value)}
+          aria-label="Reminder from"
+        />
+        <Input
+          type="datetime-local"
+          value={reminderTo}
+          onChange={(event) => setReminderTo(event.target.value)}
+          aria-label="Reminder to"
+        />
+        <Input
+          type="number"
+          min="0"
+          value={overdueMinDays}
+          onChange={(event) => setOverdueMinDays(event.target.value)}
+          placeholder="Min overdue days"
+        />
+        <Input
+          type="number"
+          min="0"
+          value={overdueMaxDays}
+          onChange={(event) => setOverdueMaxDays(event.target.value)}
+          placeholder="Max overdue days"
+        />
+        <Input
+          type="datetime-local"
+          value={staleBefore}
+          onChange={(event) => setStaleBefore(event.target.value)}
+          aria-label="Stale due before"
+        />
+        <Input
+          type="datetime-local"
+          value={createdBefore}
+          onChange={(event) => setCreatedBefore(event.target.value)}
+          aria-label="Created before"
+        />
+        <Select value={dealStatus} onChange={(event) => setDealStatus(event.target.value)}>
+          <option value="">Any Deal status</option>
+          <option value="open">Open Deals</option>
+          <option value="won">Won Deals</option>
+          <option value="lost">Lost Deals</option>
+        </Select>
+        <Input
+          value={dealStageId}
+          onChange={(event) => setDealStageId(event.target.value)}
+          placeholder="Deal Stage ID"
+        />
+        <Select value={accountStatus} onChange={(event) => setAccountStatus(event.target.value)}>
+          <option value="">Any Account status</option>
+          <option value="prospect">Prospect Accounts</option>
+          <option value="customer">Customer Accounts</option>
+          <option value="former">Former Accounts</option>
+        </Select>
+        <Select
+          value={archivedResources}
+          onChange={(event) => setArchivedResources(event.target.value)}
+        >
+          <option value="exclude">Exclude archived resources</option>
+          <option value="include">Include archived resources</option>
+          <option value="only">Archived resources only</option>
+        </Select>
+        <Select
+          value={undated}
+          onChange={(event) => setUndated(event.target.value)}
+          aria-label="Follow-ups with no due date"
+        >
+          <option value="include">Include no due date</option>
+          <option value="exclude">Exclude no due date</option>
+          <option value="only">No due date only</option>
+        </Select>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setQ("");
+            setSource("");
+            setAssignee("");
+            setPriorityFilter("");
+            setStatusFilter("open");
+            setClosedDeals("exclude");
+            setLinkedType("");
+            setLinkedId("");
+            setDueFrom("");
+            setDueTo("");
+            setReminderFrom("");
+            setReminderTo("");
+            setOverdueMinDays("");
+            setOverdueMaxDays("");
+            setStaleBefore("");
+            setCreatedBefore("");
+            setDealStatus("");
+            setDealStageId("");
+            setAccountStatus("");
+            setArchivedResources("exclude");
+            setUndated("include");
+            setSelectedViewId("");
+          }}
+        >
+          <X size={14} /> Clear filters
+        </Button>
+      </div>
+
+      {selected.size > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-indigo-200 bg-indigo-50 p-3 dark:border-indigo-900 dark:bg-indigo-950/30">
+          <span className="text-sm font-medium">{selected.size} selected</span>
+          <Select value={bulkAction} onChange={(event) => setBulkAction(event.target.value)}>
+            <option value="complete">Complete</option>
+            <option value="cancel">Cancel</option>
+            <option value="priority">Reprioritize</option>
+            <option value="reschedule">Reschedule</option>
+            <option value="reassign">Reassign</option>
+          </Select>
+          <Select
+            value={bulkMode}
+            onChange={(event) => setBulkMode(event.target.value as "atomic" | "partial")}
+          >
+            <option value="partial">Apply valid rows</option>
+            <option value="atomic">All or nothing</option>
+          </Select>
+          {bulkAction === "priority" && (
+            <Select value={bulkValue} onChange={(event) => setBulkValue(event.target.value)}>
+              <option value="">Choose priority</option>
+              <option value="low">Low</option>
+              <option value="normal">Normal</option>
+              <option value="high">High</option>
+              <option value="urgent">Urgent</option>
+            </Select>
+          )}
+          {bulkAction === "reschedule" && (
+            <Input
+              type="datetime-local"
+              value={bulkValue}
+              onChange={(event) => setBulkValue(event.target.value)}
+            />
+          )}
+          {bulkAction === "reassign" && (
+            <Select value={bulkValue} onChange={(event) => setBulkValue(event.target.value)}>
+              <option value="">Unassigned</option>
+              {members.map((member) => (
+                <option key={member.userId} value={`user:${member.userId}`}>
+                  {member.name || member.email || "Member"}
+                </option>
+              ))}
+              {employees.map((employee) => (
+                <option key={employee.id} value={`employee:${employee.id}`}>
+                  {employee.name}
+                </option>
+              ))}
+            </Select>
+          )}
+          <Button
+            size="sm"
+            loading={previewing}
+            disabled={(bulkAction === "priority" || bulkAction === "reschedule") && !bulkValue}
+            onClick={() => void applyBulk(true)}
+          >
+            Preview
+          </Button>
+          <Button
+            size="sm"
+            loading={applying}
+            disabled={(bulkAction === "priority" || bulkAction === "reschedule") && !bulkValue}
+            onClick={() => void applyBulk(false)}
+          >
+            Apply
+          </Button>
+          {bulkPreview && (
+            <span className="text-xs text-slate-600 dark:text-slate-300">
+              Preview: {bulkPreview.valid} valid, {bulkPreview.skipped} skipped,{" "}
+              {bulkPreview.failed} failed
+            </span>
+          )}
+          {bulkError && <FormError message={bulkError} className="w-full" />}
+        </div>
+      )}
+
+      {bulkJob && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900">
+          <span className="font-medium capitalize">Bulk job: {bulkJob.status}</span>
+          <span className="text-slate-500">
+            {bulkJob.processed}/{bulkJob.total} processed · {bulkJob.applied} applied ·{" "}
+            {bulkJob.failed} failed
+          </span>
+          <a
+            href={`${base}/bulk/jobs/${bulkJob.id}/reconciliation?format=csv`}
+            className="font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+          >
+            Download reconciliation
+          </a>
+          {["completed", "partial"].includes(bulkJob.status) && (
+            <Button size="sm" variant="ghost" loading={undoing} onClick={() => void undoBulkJob()}>
+              Undo
+            </Button>
+          )}
+        </div>
+      )}
+
+      <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </p>
+      {loadError && <FormError message={loadError} />}
+      {rows === null ? (
+        <div className="flex justify-center py-20">
+          <Spinner />
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-300 px-6 py-16 text-center dark:border-slate-700">
+          <CalendarCheck className="mx-auto mb-3 text-slate-400" size={28} />
+          <p className="font-medium text-slate-800 dark:text-slate-200">Nothing due here</p>
+          <p className="mt-1 text-sm text-slate-500">Your queue is clear for this view.</p>
+        </div>
+      ) : (
+        <>
+          <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-900">
+            {rows.map((item) => {
+              const to = itemUrl(company.slug, item);
+              const key = followUpKey(item);
+              const busy = completing.has(key);
+              return (
+                <div
+                  key={`${item.source}-${item.id}`}
+                  className="flex flex-wrap items-center gap-4 border-b border-slate-100 px-4 py-3 last:border-0 dark:border-slate-800"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(followUpKey(item))}
+                    onChange={() => toggleSelected(item)}
+                    aria-label={`Select ${item.title}`}
+                    className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                  />
+                  {/* Busy rather than disabled while it runs: a disabled
+                    button drops focus, and this one holds it until its row is
+                    gone and focus can move to the next. */}
+                  <button
+                    type="button"
+                    ref={focusAfterDone.deleteButtonRef(key)}
+                    onClick={() => void complete(item)}
+                    aria-disabled={busy || undefined}
+                    aria-busy={busy || undefined}
+                    className="rounded-full border border-slate-300 p-1.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-600 dark:border-slate-600"
+                    aria-label={`Complete ${item.title}`}
+                    title={
+                      item.source === "task"
+                        ? "Complete"
+                        : `Done — clears this ${item.source}’s next follow-up`
+                    }
+                  >
+                    {busy ? <ButtonSpinner size={14} /> : <Check size={14} />}
+                  </button>
+                  <div className="min-w-0 flex-1">
+                    {to ? (
+                      <Link
+                        to={to}
+                        className="font-medium text-slate-900 hover:text-indigo-600 dark:text-slate-100"
+                      >
+                        {item.title}
+                      </Link>
+                    ) : (
+                      <p className="font-medium text-slate-900 dark:text-slate-100">{item.title}</p>
+                    )}
+                    <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                      <span className={item.overdue ? "font-medium text-rose-600" : ""}>
+                        {item.overdue ? "Overdue · " : ""}
+                        {item.dueAt ? localDateTime(item.dueAt) : "No due date"}
+                      </span>
+                      <span className="capitalize">{item.source}</span>
+                      {item.priority !== "normal" && (
+                        <span className="font-medium capitalize">{item.priority}</span>
+                      )}
+                      {item.assigneeName && (
+                        <span className="inline-flex items-center gap-1">
+                          {item.assignedEmployeeId ? <Bot size={12} /> : <User size={12} />}
+                          {item.assigneeName}
+                        </span>
+                      )}
+                      {item.recurrenceRule && <span>Recurring</span>}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {nextCursor && (
+            <div className="mt-4 flex justify-center">
+              <Button
+                variant="secondary"
+                loading={loadingMore}
+                onClick={() => void loadMore(nextCursor)}
+              >
+                Load more
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+
+      <NewFollowUpModal
+        open={creating}
+        onClose={() => setCreating(false)}
+        base={base}
+        members={members}
+        employees={employees}
+        onCreated={() => {
+          setCreating(false);
+          void reload();
+        }}
+      />
+    </div>
+  );
+}
+
+function NewFollowUpModal({
+  open,
+  onClose,
+  base,
+  members,
+  employees,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  base: string;
+  members: Member[];
+  employees: Employee[];
+  onCreated: () => void;
+}) {
+  const [subject, setSubject] = React.useState("");
+  const [bodyText, setBodyText] = React.useState("");
+  const [dueAt, setDueAt] = React.useState(() => defaultFollowUpDue());
+  // The default is worked out when the dialog opens, so a page left open
+  // overnight still offers the next working day — unless the person chose.
+  const dueChosen = React.useRef(false);
+  React.useEffect(() => {
+    if (open && !dueChosen.current) setDueAt(defaultFollowUpDue());
+  }, [open]);
+  const [reminderAt, setReminderAt] = React.useState("");
+  const [priority, setPriority] = React.useState("normal");
+  const [assignee, setAssignee] = React.useState("");
+  const [recurrence, setRecurrence] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const isEmployee = assignee.startsWith("employee:");
+      await api.post(`${base}/follow-ups`, {
+        subject,
+        bodyText,
+        dueAt: dateTimeLocalToIso(dueAt),
+        reminderAt: dateTimeLocalToIso(reminderAt),
+        priority,
+        assignedUserId: assignee.startsWith("user:") ? assignee.slice(5) : null,
+        assignedEmployeeId: isEmployee ? assignee.slice(9) : null,
+        recurrenceRule: recurrence || null,
+      });
+      setSubject("");
+      setBodyText("");
+      dueChosen.current = false;
+      setDueAt(defaultFollowUpDue());
+      setReminderAt("");
+      setAssignee("");
+      setRecurrence("");
+      onCreated();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} title="New follow-up" size="lg">
+      <form onSubmit={submit} className="space-y-4">
+        <Input
+          label="What needs doing?"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+          required
+        />
+        <Textarea
+          label="Context"
+          value={bodyText}
+          onChange={(e) => setBodyText(e.target.value)}
+          rows={3}
+        />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Input
+            label="Due"
+            type="datetime-local"
+            value={dueAt}
+            onChange={(e) => {
+              dueChosen.current = true;
+              setDueAt(e.target.value);
+            }}
+            required
+          />
+          <Input
+            label="Reminder"
+            type="datetime-local"
+            value={reminderAt}
+            onChange={(e) => setReminderAt(e.target.value)}
+          />
+          <Select label="Priority" value={priority} onChange={(e) => setPriority(e.target.value)}>
+            <option value="low">Low</option>
+            <option value="normal">Normal</option>
+            <option value="high">High</option>
+            <option value="urgent">Urgent</option>
+          </Select>
+          <Select label="Assignee" value={assignee} onChange={(e) => setAssignee(e.target.value)}>
+            <option value="">Unassigned</option>
+            {members.map((member) => (
+              <option key={member.userId} value={`user:${member.userId}`}>
+                {member.name || member.email || "Member"}
+              </option>
+            ))}
+            {employees.map((employee) => (
+              <option key={employee.id} value={`employee:${employee.id}`}>
+                {employee.name} · AI Employee
+              </option>
+            ))}
+          </Select>
+          <Select label="Repeat" value={recurrence} onChange={(e) => setRecurrence(e.target.value)}>
+            <option value="">Does not repeat</option>
+            <option value="FREQ=DAILY;INTERVAL=1">Daily</option>
+            <option value="FREQ=WEEKLY;INTERVAL=1">Weekly</option>
+            <option value="FREQ=MONTHLY;INTERVAL=1">Monthly</option>
+          </Select>
+        </div>
+        {error && <FormError message={error} />}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy}>
+            {busy ? "Creating…" : "Create follow-up"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

@@ -1,0 +1,140 @@
+import { Callout, Code, DocLink, H2, LI, P, PageHeader, Strong, UL } from "@/docs/Prose";
+
+export function ToolDiscovery() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Brains & tools"
+        title="How tools reach the model"
+        lead={
+          <>
+            An AI Employee has more tools than it is shown. A small working set goes out with every
+            request; everything else sits in a searchable catalogue the employee reaches on demand.
+            This is what keeps a turn cheap as Genosyn grows.
+          </>
+        }
+      />
+
+      <H2 id="why">Why it works this way</H2>
+      <P>
+        Every request to a model carries the description and argument schema of every tool the
+        employee can use. That list only ever grew — each new feature added its own tools, and every
+        unrelated turn paid for them. Before this change a single request carried around{" "}
+        <Strong>21,000 tokens</Strong> of tool definitions before the employee had a single
+        Integration connected.
+      </P>
+      <P>
+        The cost was the smaller problem. The bigger one was that an employee doing a code review
+        was handed the whole finance and mail surface too, and had to pick its way through tools
+        that had nothing to do with the job.
+      </P>
+
+      <H2 id="working-set">The working set</H2>
+      <P>
+        Roughly twenty tools go out on every request — about <Strong>4,500 tokens</Strong>. They are
+        chosen by consequence, not by how often they are used:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Coding tools</Strong> — OpenCode&apos;s native coding tools for ordinary host-mode
+          work, and none in disabled mode or restricted review turns. Repository work sessions have
+          their own scoped tools.
+        </LI>
+        <LI>
+          <Strong>Everything that writes</Strong> — creating a Routine, a Project, a Todo, a journal
+          entry. Models have a habit of <Strong>saying</Strong> they scheduled something without
+          calling anything, and making the call harder than the sentence makes that worse.
+        </LI>
+        <LI>
+          <Strong>Browser tools</Strong>, when the employee has the browser enabled.
+        </LI>
+        <LI>
+          <Code>find_tools</Code> and <Code>call_tool</Code> — the door to everything else.
+        </LI>
+      </UL>
+
+      <H2 id="catalogue">The catalogue</H2>
+      <P>
+        Everything else — mail, finance, revenue, Bases, Notes, Resources, charts, dashboards,
+        workspace channels, handoffs, <DocLink to="/docs/pipelines">Pipelines</DocLink>, and every{" "}
+        <DocLink to="/docs/integrations">Integration</DocLink> tool — lives in the catalogue. The
+        employee calls <Code>find_tools</Code> with what it is trying to do (&quot;record a
+        payment&quot;, &quot;reply to that email&quot;, &quot;read a spreadsheet&quot;) and gets
+        back the matching tools with their exact arguments, then runs one.
+      </P>
+      <P>
+        Every search result also carries the complete list of catalogue tool names. So even when a
+        search misses, the employee can see what exists — the difference between one extra step and
+        a capability that has quietly vanished.
+      </P>
+
+      <Callout kind="info" title="Grants are unchanged.">
+        Discovery decides what an employee is <Strong>shown</Strong>, never what it is{" "}
+        <Strong>allowed</Strong>. A tool the employee holds no Grant for is still refused when
+        called, and <Code>find_tools</Code> labels it as such before the employee wastes a step on
+        it.
+      </Callout>
+
+      <H2 id="long-lists">Long lists</H2>
+      <P>
+        A list tool never stops at a fixed number of rows. Banking&apos;s transactions, Entry
+        review, invoices, bills, recurring invoices, customers, a mailbox search, Run history,
+        handoffs, a project&apos;s Todos, meetings, notes and note searches, work reviews, a
+        Pipeline&apos;s Runs, Openings and applications, Revenue Contacts and the Activity
+        export, texts and calls, Workspace messages, data room questions, signature requests, and
+        support tickets and Articles all answer one page at a time: the page says
+        how many rows match in all (a mailbox search, too large to count on every page, says only
+        whether more follow), whether more follow, and gives a cursor the employee passes back,
+        with the same filters, for the next page. A page also ends early rather than overflow what
+        a tool result can hold, so nothing is cut off unseen. A cursor names where the last page
+        ended rather than counting rows, so work done between pages — filing transactions,
+        approving entries — never makes the employee skip any. Narrowing a long list by date or
+        another filter is usually quicker than reading all of it, and the tools offer the filters
+        each list needs.
+      </P>
+
+      <H2 id="skill-toolsets">Skipping the search</H2>
+      <P>
+        Searching costs a round-trip, and a search can miss. If you already know which tools a
+        procedure uses, say so: open a <DocLink to="/docs/skills">Skill</DocLink>, go to{" "}
+        <Strong>Settings → Tools</Strong>, and pick them. Those tools are loaded up-front for any
+        turn where that Skill applies, and the employee never searches for them.
+      </P>
+      <P>
+        This is the recommended fix if you ever find an employee saying it cannot do something it
+        can. Declaring a tool does not grant access to it.
+      </P>
+
+      <H2 id="reading-the-log">Reading the run log</H2>
+      <P>
+        Every run records how its catalogue was split, so you can tell &quot;never used the
+        tool&quot; from &quot;never saw the tool&quot;:
+      </P>
+      <UL>
+        <LI>
+          <Code>
+            [tools] 22 loaded, 109 in the catalogue behind find_tools — bases, mail, finance…
+          </Code>
+        </LI>
+        <LI>
+          When a Skill declared tools, they are named:{" "}
+          <Code>[tools] 24 loaded (2 from Skills: send_invoice, record_payment), …</Code>
+        </LI>
+      </UL>
+
+      <H2 id="turning-it-off">Turning it off</H2>
+      <P>
+        A master admin turns <Strong>Tool discovery</Strong> off at <Code>Admin → Runtime</Code>,
+        under <Strong>Agent</Strong>, and every tool is sent on every request again, exactly as
+        before. It takes effect on the next turn — no restart. Nothing else changes. The switch
+        exists because a model that does not think to search is the one real risk this design
+        carries, and an operator who hits it should not need to downgrade.
+      </P>
+      <P>
+        Older employees are unaffected in one specific way worth knowing: Skills written before this
+        change often name grouped tools like <Code>mail</Code> or <Code>base_rows</Code> with an{" "}
+        <Code>op</Code> argument. Those names still work and always will.
+      </P>
+    </>
+  );
+}

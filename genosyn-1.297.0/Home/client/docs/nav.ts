@@ -1,0 +1,488 @@
+export type DocsPageMeta = {
+  path: string;
+  title: string;
+  blurb?: string;
+};
+
+export type DocsSection = {
+  label: string;
+  pages: DocsPageMeta[];
+};
+
+export const DOCS_NAV: DocsSection[] = [
+  {
+    label: "Get started",
+    pages: [
+      {
+        path: "/docs",
+        title: "Introduction",
+        blurb: "What Genosyn is, who it is for, and how to think about it.",
+      },
+      {
+        path: "/docs/install",
+        title: "Install",
+        blurb: "One command to a running container on localhost:8471.",
+      },
+      {
+        path: "/docs/getting-started",
+        title: "Onboard your first AI Employee",
+        blurb: "The five-step first-run guide, from what an AI Employee is to a first request.",
+      },
+      {
+        path: "/docs/help",
+        title: "Genosyn Help",
+        blurb: "Ask any AI Employee about the product and its shipped source code.",
+      },
+      {
+        path: "/docs/ask-ai",
+        title: "Ask AI",
+        blurb:
+          "Ask any AI Employee — or several at once — about the record on screen, within their Grants.",
+      },
+      {
+        path: "/docs/mobile",
+        title: "Install on your phone",
+        blurb: "Add Genosyn to your home screen as a PWA — iOS, Android, desktop.",
+      },
+      {
+        path: "/docs/security",
+        title: "Account security",
+        blurb:
+          "Passwordless passkey sign-in, email verification, 2FA with authenticator apps and USB security keys, company SSO, and the audit log.",
+      },
+    ],
+  },
+  {
+    label: "Core concepts",
+    pages: [
+      {
+        path: "/docs/employees",
+        title: "AI Employees",
+        blurb: "Persistent personas attached to a company.",
+      },
+      {
+        path: "/docs/chat",
+        title: "Chatting with an AI Employee",
+        blurb:
+          "Watch each step live, see what a turn is waiting on, stop or queue, retry a failed reply, and read how every reply was worked.",
+      },
+      {
+        path: "/docs/collaboration",
+        title: "AI Employees working together",
+        blurb:
+          "Group discussions that come back with one outcome, asking a colleague mid-work, and handing work on.",
+      },
+      { path: "/docs/soul", title: "Soul", blurb: "The written constitution of an employee." },
+      { path: "/docs/skills", title: "Skills", blurb: "Reusable markdown playbooks." },
+      {
+        path: "/docs/routines",
+        title: "Routines & Runs",
+        blurb: "Scheduled, cron-triggered AI work.",
+      },
+      {
+        path: "/docs/tags",
+        title: "Tags",
+        blurb: "Reusable company labels for organizing resources.",
+      },
+    ],
+  },
+  {
+    label: "Brains & tools",
+    pages: [
+      {
+        path: "/docs/models",
+        title: "AI Models",
+        blurb: "Connect API keys, a custom endpoint, or an eligible ChatGPT subscription.",
+      },
+      {
+        path: "/docs/tool-discovery",
+        title: "How tools reach the model",
+        blurb: "Why an employee is shown a working set of tools and finds the rest on demand.",
+      },
+      {
+        path: "/docs/open-source-models",
+        title: "Open-source LLMs",
+        blurb: "Run Ollama, vLLM, or llama.cpp and point an employee at it.",
+      },
+      {
+        path: "/docs/integrations",
+        title: "Integrations",
+        blurb: "Connections, Grants, and the MCP surface.",
+      },
+      {
+        path: "/docs/browser",
+        title: "Web & Browser",
+        blurb:
+          "Search, read and download from the web — plus a persistent headless Chromium per employee.",
+      },
+      {
+        path: "/docs/member-browsers",
+        title: "Member browsers",
+        blurb:
+          "Connect a Chrome on your own computer — a dedicated profile you sign into, driven by the same tools.",
+      },
+    ],
+  },
+  {
+    label: "Engineering",
+    pages: [
+      {
+        path: "/docs/repositories",
+        title: "Repositories",
+        blurb:
+          "Version-controlled workspaces — code, strategy, policies. Edit in the browser, or hand one to an AI Employee.",
+      },
+    ],
+  },
+  {
+    label: "Analytics",
+    pages: [
+      {
+        path: "/docs/explore",
+        title: "Explore",
+        blurb: "Self-serve BI — Charts and Dashboards over your database integrations.",
+      },
+    ],
+  },
+  {
+    label: "Marketing",
+    pages: [
+      {
+        path: "/docs/marketing",
+        title: "Paid Marketing",
+        blurb:
+          "Campaigns, Creative, Experiments, autonomous Routines, and guarded ad-platform delivery.",
+      },
+    ],
+  },
+  {
+    label: "Revenue",
+    pages: [
+      {
+        path: "/docs/revenue",
+        title: "Revenue",
+        blurb: "Contacts, deals, the board, and a timeline that fills itself from your mailbox.",
+      },
+      {
+        path: "/docs/revenue-operations",
+        title: "Revenue operations",
+        blurb:
+          "Follow-ups, prospect accounts, custom fields, partnerships, documents, and reversible migrations.",
+      },
+      {
+        path: "/docs/revenue-data-quality",
+        title: "Revenue data quality",
+        blurb:
+          "Audited merges, bulk cleanup, historical truth, enrichment, finding and verifying Contact emails, document capture, and exports.",
+      },
+      {
+        path: "/docs/sequences",
+        title: "Sequences",
+        blurb:
+          "Multi-step outbound drafted per contact by an AI Employee, with review, send windows, and caps.",
+      },
+      {
+        path: "/docs/signals",
+        title: "Signals",
+        blurb:
+          "Product-usage triggers — a saved query over your own database, deduplicated and acted on.",
+      },
+      {
+        path: "/docs/deliverability",
+        title: "Deliverability",
+        blurb:
+          "Suppression list, unsubscribe and one-click, bounces, send caps — how not to burn your domain.",
+      },
+    ],
+  },
+  {
+    label: "People",
+    pages: [
+      {
+        path: "/docs/recruiting",
+        title: "Recruiting",
+        blurb:
+          "Openings on a careers site of your own, applications with resumes, and every applicant scored against your criteria.",
+      },
+    ],
+  },
+  {
+    label: "Operations",
+    pages: [
+      {
+        path: "/docs/workspace-chat",
+        title: "Workspace chat",
+        blurb:
+          "Channels, DMs and group chats where AI Employees discuss together, with context resets and resource tags.",
+      },
+      {
+        path: "/docs/chat-surfaces",
+        title: "External chat surfaces",
+        blurb:
+          "Reach an AI Employee from Slack, Microsoft Teams, WhatsApp, or Telegram — and link your account so it answers as you.",
+      },
+      {
+        path: "/docs/customer-channels",
+        title: "Customer channels",
+        blurb:
+          "Put an AI Employee in the Slack channels you share with customers — it takes notes onto their record and answers their questions.",
+      },
+      {
+        path: "/docs/phone-numbers",
+        title: "Phone numbers",
+        blurb:
+          "Give an AI Employee its own Twilio number — texts, verification codes, and calls it answers and places.",
+      },
+      {
+        path: "/docs/tldrs",
+        title: "TLDRs",
+        blurb:
+          "Periodic AI-written recaps, with standing questions answered beside them and one-click actions on each answer.",
+      },
+      {
+        path: "/docs/board-letters",
+        title: "Letters to the board",
+        blurb:
+          "A monthly letter to owners and admins: the Goal first, every number checked against the books, read by an auditor only they appoint.",
+      },
+      {
+        path: "/docs/vault",
+        title: "Vault",
+        blurb:
+          "Encrypted logins with authenticator codes and software passkeys, plus API keys and secure notes.",
+      },
+      {
+        path: "/docs/vault-sources",
+        title: "Vault sources",
+        blurb:
+          "Mirror a Bitwarden or Vaultwarden vault into the Vault — read-only, with secrets fetched live.",
+      },
+      {
+        path: "/docs/email",
+        title: "Email",
+        blurb:
+          "Connect Gmail, get every new email triaged with one-click action buttons and your own written instructions, review AI-written drafts, and automate the inbox with rules.",
+      },
+      {
+        path: "/docs/support",
+        title: "Support",
+        blurb:
+          "Customer email becomes Tickets an AI Employee triages and answers from your published Articles, with every check written on the draft.",
+      },
+      {
+        path: "/docs/support-chat-widget",
+        title: "Chat widget",
+        blurb:
+          "Put a chat window on your own site. A visitor's messages open and continue a Ticket, under the same checks as email.",
+      },
+      {
+        path: "/docs/help-center",
+        title: "Help center",
+        blurb:
+          "An opt-in public page where customers read and search your published Articles, with no sign-in.",
+      },
+      {
+        path: "/docs/meetings",
+        title: "Meetings",
+        blurb:
+          "Mirror a Google calendar, turn recordings and transcripts into customer timeline entries, and let an AI Employee file the follow-ups.",
+      },
+      {
+        path: "/docs/tasks",
+        title: "Tasks",
+        blurb:
+          "Projects, todos, and subtasks — assigned to humans or AI Employees; restrict who reaches each project.",
+      },
+      {
+        path: "/docs/decisions",
+        title: "Decision stack",
+        blurb:
+          "Questions your AI Employees stopped to ask, with the options they will act on — and the settings that decide which questions reach you.",
+      },
+      {
+        path: "/docs/goals",
+        title: "Goals",
+        blurb:
+          "Measurable objectives, cascaded company → employee — in every AI prompt, checked against every Run.",
+      },
+      {
+        path: "/docs/verification",
+        title: "What proves a Run worked",
+        blurb:
+          "Status, Checks, and the outcome verdict — plus the effect ledger the server writes and the model cannot narrate.",
+      },
+      {
+        path: "/docs/improvement",
+        title: "The improvement loop",
+        blurb:
+          "Lessons from graded-bad Runs feed the next brief; Revision proposals stage durable fixes a human applies.",
+      },
+      {
+        path: "/docs/autonomy",
+        title: "Earned autonomy",
+        blurb:
+          "Waivers an AI Employee earns with a clean record — proposed via Approvals, revoked automatically on any bad Run.",
+      },
+      {
+        path: "/docs/standdowns",
+        title: "Standdowns",
+        blurb:
+          "A revocable stop on all AI work at company, employee, or Routine scope, placed and lifted by an owner or admin.",
+      },
+      {
+        path: "/docs/policies",
+        title: "Company policies",
+        blurb:
+          "Standing rails that bind every AI Employee — written policies, monthly ad-spend Budgets, and held calls from tainted turns.",
+      },
+      {
+        path: "/docs/reactivity",
+        title: "Proactive work",
+        blurb:
+          "Enable standing work for email, quotes, Repository fixes, follow-ups, and company improvements with Triggers, Wakeups, Workstreams, and Initiatives.",
+      },
+      {
+        path: "/docs/pipelines",
+        title: "Pipelines",
+        blurb: "Build predictable trigger-to-step automations and inspect every Run.",
+      },
+      {
+        path: "/docs/bases",
+        title: "Bases",
+        blurb:
+          "Airtable-style tables with views, comments, attachments, and columns that link customers, projects, and more.",
+      },
+      {
+        path: "/docs/forms",
+        title: "Forms",
+        blurb:
+          "Publish a public form whose validated submissions become rows in a Base table.",
+      },
+      {
+        path: "/docs/notes",
+        title: "Notes",
+        blurb:
+          "Notion-style pages your team and AI Employees write together — blocks, / commands, Markdown shortcuts and nested pages.",
+      },
+      {
+        path: "/docs/resources",
+        title: "Resources",
+        blurb:
+          "The library your AI Employees read from — URLs, PDFs, ebooks and transcripts, searched down to the passage.",
+      },
+      {
+        path: "/docs/customers",
+        title: "Customers",
+        blurb:
+          "Accounts and everything about them — emails, activity, deals, people, billing, statements, and signed contracts.",
+      },
+      {
+        path: "/docs/pdf-forms",
+        title: "PDF forms",
+        blurb:
+          "Fill interactive PDF forms, and complete printed or scanned ones by drawing answers onto the original.",
+      },
+      {
+        path: "/docs/word-documents",
+        title: "Word documents",
+        blurb:
+          "Read, answer and edit .docx files keeping the original formatting, or write a new one from scratch.",
+      },
+      {
+        path: "/docs/excel-workbooks",
+        title: "Excel workbooks",
+        blurb:
+          "Read .xlsx sheets and cells, fill the original Excel form, and return a verified copy with its formatting intact.",
+      },
+      {
+        path: "/docs/signatures",
+        title: "Document signing",
+        blurb:
+          "Prepare, send, sign, and archive PDFs with recipient evidence and AI Employee delegation.",
+      },
+      {
+        path: "/docs/data-rooms",
+        title: "Data rooms",
+        blurb:
+          "Share documents with investors, buyers and auditors through private links — briefed, checked for readiness, and answered from the documents by AI.",
+      },
+      {
+        path: "/docs/finance",
+        title: "Finance",
+        blurb: "Estimates, invoices, bills, ledger, and reports — native double-entry accounting.",
+      },
+      {
+        path: "/docs/banking",
+        title: "Banking",
+        blurb:
+          "Bank accounts and cards in one list: mark invoices paid from deposits, match, and categorize.",
+      },
+    ],
+  },
+  {
+    label: "Self-hosting",
+    pages: [
+      {
+        path: "/docs/self-hosting",
+        title: "Configuration",
+        blurb: "config.ts, the runtime settings in Admin, the data directory.",
+      },
+      {
+        path: "/docs/backups",
+        title: "Backups",
+        blurb: "Back up now and on a schedule, keep copies off this server, see where each lives, restore.",
+      },
+      {
+        path: "/docs/connect",
+        title: "Genosyn Connect",
+        blurb: "Connect Gmail and other Integrations without your own OAuth app, or run the service.",
+      },
+      { path: "/docs/cli", title: "CLI reference", blurb: "Every genosyn command, every flag." },
+      {
+        path: "/docs/kubernetes",
+        title: "Kubernetes",
+        blurb: "Raw manifests for running Genosyn on a cluster.",
+      },
+    ],
+  },
+  {
+    label: "Reference",
+    pages: [
+      {
+        path: "/docs/api",
+        title: "REST API",
+        blurb:
+          "Script everything a Member can do with a personal API key — the base URL, the auth header, /api/docs and /api/openapi.json.",
+      },
+      {
+        path: "/docs/api-cli",
+        title: "API CLI",
+        blurb:
+          "genosyn-api: every API operation from a terminal, a script or an AI agent — login, discovery, calls, output and exit codes.",
+      },
+      {
+        path: "/docs/mcp-server",
+        title: "MCP server",
+        blurb:
+          "Connect claude.ai, ChatGPT, Claude Desktop, Claude Code, Cursor or any MCP client to Genosyn — everything the REST API does, one search away.",
+      },
+      {
+        path: "/docs/connected-apps",
+        title: "Connected apps",
+        blurb:
+          "Approve claude.ai, ChatGPT and other apps that sign in to the MCP server: who may, what they reach, how long they last and how to disconnect one.",
+      },
+      {
+        path: "/docs/vocabulary",
+        title: "Vocabulary",
+        blurb: "Words we use, and the words we don't.",
+      },
+    ],
+  },
+];
+
+export const DOCS_FLAT: DocsPageMeta[] = DOCS_NAV.flatMap((s) => s.pages);
+
+export function findPageMeta(path: string): DocsPageMeta | undefined {
+  return DOCS_FLAT.find((p) => p.path === path);
+}

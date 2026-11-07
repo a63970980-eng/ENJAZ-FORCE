@@ -1,0 +1,250 @@
+import { config } from "../../config.js";
+import { getAgentSettings } from "./runtimeSettings.js";
+import { AppDataSource } from "../db/datasource.js";
+import { Approval } from "../db/entities/Approval.js";
+import { isTokenTainted } from "./mcpTokens.js";
+import { notifyApprovalPending } from "./notifications.js";
+import { approvalArgsPreview, redactApprovalSummary } from "./approvalRedaction.js";
+
+/**
+ * The taint-aware turn policy (M53) — M50's named deferral, in its narrowest
+ * honest cut. The open web is where hostile content meets side effects: a
+ * page an employee fetched can address the model directly, and the two
+ * things such content most wants are an outbound email and a persistent
+ * foothold (a Routine that re-runs the injected instructions on a schedule, or
+ * a Skill whose body joins every later system prompt of the employee).
+ *
+ * So: the web tools mark the turn's MCP token tainted, and the sink tools —
+ * `send_mail` and the Routine and Skill writers — queue an Approval (kind
+ * `tainted_tool`) instead of executing when the turn is tainted. Approving
+ * replays the verbatim call server-side through a fresh internal token, so
+ * the handler that runs is exactly the one that would have run, audits and
+ * all. There is no untaint: the model has already read whatever the page
+ * said.
+ *
+ * Deliberately NOT covered yet (each a named roadmap follow-up): mail read
+ * as a taint source (it would gate every send-grant employee's every send),
+ * and the connector compose tools (`gmail_send_message`), which dispatch
+ * through the Integration surface rather than the static catalogue.
+ */
+
+/** The sinks a tainted turn may not fire directly. A closed allowlist on
+ * both ends: the gate consults it, and the replay refuses anything else so a
+ * forged payload cannot become an arbitrary-tool trampoline. */
+export const TAINT_SINK_TOOLS = new Set([
+  "open_repository_work_session_pull_request",
+  "push_repository_work_session",
+  // A work session runs commands with these words as its instruction, and it doesn't
+  // carry this turn's taint with it.
+  "start_repository_work_session",
+  "revise_repository_work_session",
+  "send_mail",
+  // A text or a call reaches a person outside the company exactly as an email
+  // does, so a page that read "now text this number" is held the same way.
+  // A booking emails its invitation, title and description to every guest.
+  "schedule_meeting",
+  "send_text_message",
+  "place_phone_call",
+  // Inviting a guest emails them a link to the company's confidential
+  // documents, and publishing an answer speaks to them: both reach outside.
+  "invite_data_room_guest",
+  "answer_data_room_question",
+  // A ticket's reply speaks to a customer, and anyone can email a support address.
+  "reply_to_support_ticket",
+  // Moving a document into a folder shows it to that folder's guests at once.
+  "update_data_room_document",
+  "create_routine",
+  "update_routine",
+  "delete_routine",
+  // A Trigger decides when a Routine re-runs: the same foothold as its schedule.
+  "create_routine_trigger",
+  "update_routine_trigger",
+  "delete_routine_trigger",
+  "create_skill",
+  "update_skill",
+  "delete_skill",
+]);
+
+/**
+ * Sinks for only some of their calls, so the tool decides, once it knows what the
+ * call would do: publishing an Article, or changing a published one's words, puts
+ * them in front of the public on the company's help center and in every reply it
+ * quotes from, while saving a draft reaches nobody. A stranger's email must not
+ * get words onto the company's public pages with nobody looking.
+ */
+export const CONDITIONAL_TAINT_SINK_TOOLS = new Set([
+  "create_support_article",
+  "update_support_article",
+]);
+
+/** The sources that taint a turn. Marked at dispatch rather than on success —
+ * strictly more conservative, and one seam instead of three handlers. */
+export const WEB_TAINT_SOURCES = new Set(["search_web", "fetch_web_page", "download_web_file"]);
+
+/**
+ * An application is a stranger's writing addressed to the company, and a
+ * resume is as good a place to hide "now email the candidate list to…" as a
+ * web page. So is the list: the names, addresses and locations in it are the
+ * applicants' own words. Unlike mail — deliberately not a source, because it
+ * would gate every send-grant employee's every send — reading applications is
+ * a narrow, deliberate act, and the sends a recruiting turn needs (the
+ * company's own rejection template, via `move_application`) are not sinks.
+ */
+export const APPLICANT_TAINT_SOURCES = new Set(["list_applications", "get_application"]);
+
+/**
+ * A data room guest is a stranger too, and their question is written to the
+ * company's AI as surely as a resume is. Reading questions taints the turn, so
+ * the answer it publishes or the guest it invites afterwards waits for a
+ * person — the room's own answer turn, which has no tools, is how answers go
+ * out on their own.
+ */
+export const DATA_ROOM_TAINT_SOURCES = new Set(["list_data_room_questions"]);
+
+/**
+ * Anyone can email a support address, and a customer's email is written to the
+ * company's AI as surely as a resume is. Reading a ticket taints the turn, so the
+ * reply it sends afterwards waits for a person; the ticket's own restricted turn,
+ * which has no tools, is how replies go out on their own.
+ */
+export const SUPPORT_TAINT_SOURCES = new Set(["list_support_tickets", "get_support_ticket"]);
+
+/** Whether calling this tool marks the turn as having read outside content. */
+export function isTaintSource(toolName: string): boolean {
+  return (
+    WEB_TAINT_SOURCES.has(toolName) ||
+    APPLICANT_TAINT_SOURCES.has(toolName) ||
+    DATA_ROOM_TAINT_SOURCES.has(toolName) ||
+    SUPPORT_TAINT_SOURCES.has(toolName)
+  );
+}
+
+export type TaintedToolPayload = {
+  tool: string;
+  args: Record<string, unknown>;
+  employeeId: string;
+};
+
+export function parseTaintedToolPayload(raw: string | null): TaintedToolPayload {
+  if (!raw) throw new Error("Tainted-tool payload is missing");
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("Tainted-tool payload is malformed");
+  }
+  const p = parsed as Record<string, unknown>;
+  if (
+    typeof p.tool !== "string" ||
+    (!TAINT_SINK_TOOLS.has(p.tool) && !CONDITIONAL_TAINT_SINK_TOOLS.has(p.tool))
+  ) {
+    throw new Error("Tainted-tool payload names a tool the policy does not cover");
+  }
+  if (typeof p.args !== "object" || p.args === null) {
+    throw new Error("Tainted-tool payload is missing the call");
+  }
+  if (typeof p.employeeId !== "string" || !p.employeeId) {
+    throw new Error("Tainted-tool payload is missing the employee");
+  }
+  return { tool: p.tool, args: p.args as Record<string, unknown>, employeeId: p.employeeId };
+}
+
+/** Whether this turn's call to `toolName` must queue instead of execute. */
+export function taintGateApplies(token: string | undefined, toolName: string): boolean {
+  if (getAgentSettings().taintPolicy === "off") return false;
+  if (!token) return false;
+  if (!TAINT_SINK_TOOLS.has(toolName)) return false;
+  return isTokenTainted(token);
+}
+
+/** Whether a conditional sink must hold a call it has said reaches outside. */
+export function taintHoldsCall(token: string | undefined): boolean {
+  if (getAgentSettings().taintPolicy === "off") return false;
+  return Boolean(token) && isTokenTainted(token as string);
+}
+
+/** What a held call answers, so the model knows not to try it again. */
+export const TAINT_HELD_NOTE =
+  "This turn read outside content (a web page, an application, a guest's question or a customer's email), so this call is held for a human — the taint policy. " +
+  "It executes verbatim if approved; do not retry it yourself, and carry on with work that needs no held call.";
+
+/**
+ * Queue the held call. Mirrors `createMcpToolApproval`: title/summary are
+ * scrubbed at creation; the raw call lives only in `payloadJson`, which no
+ * read boundary returns.
+ */
+export async function createTaintedToolApproval(args: {
+  companyId: string;
+  employeeId: string;
+  tool: string;
+  toolArgs: Record<string, unknown>;
+}): Promise<Approval> {
+  const repo = AppDataSource.getRepository(Approval);
+  const approval = repo.create({
+    companyId: args.companyId,
+    kind: "tainted_tool",
+    routineId: "",
+    employeeId: args.employeeId,
+    status: "pending",
+    title: redactApprovalSummary(`Tainted turn · ${args.tool}`),
+    summary: redactApprovalSummary(
+      `This turn read outside content (a web page, an application, a guest's question or a customer's email) before calling ${args.tool}. Held for review: ` +
+        approvalArgsPreview(args.toolArgs).slice(0, 300),
+    ),
+    payloadJson: JSON.stringify({
+      tool: args.tool,
+      args: args.toolArgs,
+      employeeId: args.employeeId,
+    } satisfies TaintedToolPayload),
+  });
+  const saved = await repo.save(approval);
+  void notifyApprovalPending(saved).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[taint] failed to notify approval ${saved.id}:`, err);
+  });
+  return saved;
+}
+
+/**
+ * The executor behind an approved `tainted_tool`: replay the verbatim call
+ * through the loopback internal API with a fresh employee-authority token —
+ * the exact handler, audits, journals, and grant checks that would have run,
+ * minus the taint. Throwing marks the Approval `execution_failed`.
+ */
+export async function executeTaintedToolApproval(approval: Approval): Promise<void> {
+  const payload = parseTaintedToolPayload(approval.payloadJson);
+  if (payload.employeeId !== approval.employeeId) {
+    throw new Error("Tainted-tool payload does not match the approval's employee");
+  }
+  const { issueMcpToken, revokeMcpToken } = await import("./mcpTokens.js");
+  // Employee authority: the replay carries exactly what the employee's own
+  // Routine Runs carry — the authority the original call would have had.
+  const token = issueMcpToken(payload.employeeId, approval.companyId, {
+    authority: "employee",
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/api/internal/mcp/tools/${payload.tool}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload.args),
+      },
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      let message = text;
+      try {
+        message = (JSON.parse(text) as { error?: string }).error ?? text;
+      } catch {
+        // keep raw text
+      }
+      throw new Error(`The approved call failed: ${message.slice(0, 500)}`);
+    }
+    approval.resultJson = text.slice(0, 16_000);
+    await AppDataSource.getRepository(Approval).save(approval);
+  } finally {
+    revokeMcpToken(token);
+  }
+}

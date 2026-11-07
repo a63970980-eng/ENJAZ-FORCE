@@ -1,0 +1,1336 @@
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+
+import type { Browser, BrowserContext, Page } from "playwright-core";
+
+import { getMeetingsSettings } from "../runtimeSettings.js";
+import {
+  chromeMaskInitScript,
+  chromeContextOptions,
+  chromiumLaunchOptions,
+  loadChromiumLauncher,
+} from "../browserProfile.js";
+import { humanClick, humanFill } from "../humanInput.js";
+import { registerMeetingRecorder, type MeetingCaption } from "./recorder.js";
+
+/**
+ * A meeting code, at the root or under `/meet/`. Meet now serves its pre-join
+ * page and the call itself from `/meet/<code>` and redirects a guest who
+ * opened `/<code>` there, so a path check that knew only the root form read
+ * every admitted call as already over.
+ */
+const MEET_CODE_RE = /^\/(?:meet\/)?[a-z]{3}-[a-z]{4}-[a-z]{3}\/?$/i;
+/** Workspace "nicknamed" meetings, which Calendar writes as a lookup alias. */
+const MEET_LOOKUP_RE = /^\/lookup\/[a-z0-9_-]{1,64}\/?$/i;
+const MAX_DISPLAY_NAME_LENGTH = 100;
+/** The lobby wait when the call has no scheduled end to wait until. */
+const ADMISSION_TIMEOUT_MS = 5 * 60_000;
+/** Nothing keeps a browser and a recording in a lobby longer than this. */
+const MAX_ADMISSION_WAIT_MS = 30 * 60_000;
+/** How long an unanswered "ask to join" stands before asking again. */
+const RE_ASK_AFTER_MS = 90_000;
+/** A bound on re-asking, so a broken lobby cannot spam a host forever. */
+const MAX_JOIN_REQUESTS = 8;
+const UI_POLL_MS = 500;
+/** One lobby interaction. Short, because the loop retries on the next pass. */
+const UI_ACTION_TIMEOUT_MS = 5_000;
+const MEETING_POLL_MS = 1_000;
+
+/** Both shapes of a real Meet call path: a meeting code, or a lookup alias. */
+function isMeetCallPath(pathname: string): boolean {
+  return MEET_CODE_RE.test(pathname) || MEET_LOOKUP_RE.test(pathname);
+}
+
+export type GoogleMeetJoinArgs = {
+  companyId: string;
+  meetingId: string;
+  conferenceUrl: string;
+  displayName: string;
+  scheduledEndAt: Date | null;
+  signal: AbortSignal;
+  onJoined(): Promise<void>;
+};
+
+export type GoogleMeetRecording = {
+  bytes: Buffer;
+  mime: "audio/webm";
+  durationMs: number;
+  /** Meet's own live captions, read while recording. Empty when none appeared. */
+  captions: MeetingCaption[];
+};
+
+/**
+ * A running read of Meet's captions. `stop` never rejects, and `fast` bounds
+ * it for a shutdown's short grace window.
+ */
+export type GoogleMeetCaptionCapture = {
+  stop(fast?: boolean): Promise<MeetingCaption[]>;
+};
+
+type CommandResult = { stdout: string; stderr: string };
+
+type GoogleMeetRecorderDependencies = {
+  loadLauncher(): Promise<{
+    launch(options: Record<string, unknown>): Promise<unknown>;
+  }>;
+  launchOptions(): Promise<Record<string, unknown>>;
+  contextOptions(): Promise<Record<string, unknown>>;
+  initScript(): Promise<string>;
+  runCommand(command: string, args: string[]): Promise<CommandResult>;
+  spawnProcess(command: string, args: string[]): ChildProcessWithoutNullStreams;
+  joinGuest(page: Page, args: GoogleMeetJoinArgs): Promise<void>;
+  waitForEnd(page: Page, args: GoogleMeetJoinArgs): Promise<void>;
+  captureCaptions(page: Page, admittedAt: number): GoogleMeetCaptionCapture;
+  now(): number;
+  randomToken(): string;
+  maxRecordingBytes(): number;
+  warn(message: string): void;
+};
+
+const defaultDependencies: GoogleMeetRecorderDependencies = {
+  loadLauncher: () => loadChromiumLauncher("Google Meet recording requires Chrome."),
+  launchOptions: chromiumLaunchOptions,
+  contextOptions: chromeContextOptions,
+  initScript: chromeMaskInitScript,
+  runCommand: runCommand,
+  spawnProcess: (command, args) => spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] }),
+  joinGuest: joinGoogleMeetAsGuest,
+  waitForEnd: waitForGoogleMeetToEnd,
+  captureCaptions: (page, admittedAt) => captureGoogleMeetCaptions(page, admittedAt),
+  now: Date.now,
+  randomToken: () => randomUUID().slice(0, 8),
+  // A function, not a getter and not a value. The cap is an operator-editable
+  // runtime setting, but `createGoogleMeetRecorder` builds its dependencies
+  // with `{...defaults, ...overrides}` — and spreading an object *calls* a
+  // getter and copies the number it returned. The intent was always to read
+  // the setting per call; a getter here silently read it once, at module
+  // load, and every recording for the life of the process used whatever the
+  // cap had been at boot.
+  maxRecordingBytes: () => getMeetingsSettings().maxRecordingBytes,
+  warn: (message) => {
+    // eslint-disable-next-line no-console
+    console.warn(message);
+  },
+};
+
+/**
+ * Accept only canonical Google Meet links. In particular, a lookalike host,
+ * clear-text URL, arbitrary Google page, or URL carrying credentials is never
+ * handed to the privileged browser/audio path.
+ */
+export function isGoogleMeetConferenceUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname.toLowerCase() === "meet.google.com" &&
+      (url.port === "" || url.port === "443") &&
+      url.username === "" &&
+      url.password === "" &&
+      isMeetCallPath(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A guest name that makes the recorder's role unambiguous to everybody. */
+export function disclosedNotetakerName(displayName: string): string {
+  const clean = displayName.replace(/\s+/g, " ").trim() || "Genosyn";
+  const suffix = " (AI notetaker — recording)";
+  const bounded = clean.slice(0, MAX_DISPLAY_NAME_LENGTH);
+  if (/notetaker/i.test(bounded) && /record/i.test(bounded)) {
+    return bounded;
+  }
+  return `${clean.slice(0, MAX_DISPLAY_NAME_LENGTH - suffix.length).trimEnd()}${suffix}`;
+}
+
+/**
+ * Make an isolated Google Meet recorder. Dependencies are injectable so the
+ * lifecycle and cleanup paths can be covered without a real call or sound
+ * server.
+ */
+export function createGoogleMeetRecorder(overrides: Partial<GoogleMeetRecorderDependencies> = {}): {
+  readonly id: "notetaker";
+  canJoin(conferenceUrl: string): boolean;
+  join(args: GoogleMeetJoinArgs): Promise<GoogleMeetRecording>;
+} {
+  const dependencies = { ...defaultDependencies, ...overrides };
+
+  return {
+    id: "notetaker",
+    canJoin: isGoogleMeetConferenceUrl,
+    async join(args) {
+      if (!isGoogleMeetConferenceUrl(args.conferenceUrl)) {
+        throw new Error(
+          "The built-in notetaker can only join canonical https://meet.google.com meeting links.",
+        );
+      }
+      if (args.signal.aborted) {
+        throw new Error("The notetaker was stopped before it could join the meeting.");
+      }
+      if (args.scheduledEndAt && args.scheduledEndAt.getTime() <= dependencies.now()) {
+        throw new Error("The meeting's scheduled end time has already passed.");
+      }
+
+      let sink: PulseAudioSink | null = null;
+      let silentMicrophone: PulseAudioSource | null = null;
+      let capture: FfmpegCapture | null = null;
+      let browser: Browser | null = null;
+      let context: BrowserContext | null = null;
+      let joinedAt = 0;
+      let recordingBytes: Buffer | null = null;
+      let captionCapture: GoogleMeetCaptionCapture | null = null;
+      let captions: MeetingCaption[] = [];
+      let primaryError: unknown = null;
+      const cleanupErrors: Error[] = [];
+
+      try {
+        sink = await createPulseAudioSink(args.meetingId, dependencies);
+        silentMicrophone = await createSilentCaptureSource(sink.name, dependencies);
+        capture = startFfmpegCapture(
+          sink.monitorSource,
+          dependencies.spawnProcess,
+          dependencies.maxRecordingBytes(),
+        );
+
+        const launcher = await dependencies.loadLauncher();
+        const baseLaunchOptions = await dependencies.launchOptions();
+        const inheritedArgs = Array.isArray(baseLaunchOptions.args)
+          ? baseLaunchOptions.args.filter((value): value is string => typeof value === "string")
+          : [];
+        const inheritedIgnoredArguments = Array.isArray(baseLaunchOptions.ignoreDefaultArgs)
+          ? baseLaunchOptions.ignoreDefaultArgs.filter(
+              (value): value is string => typeof value === "string",
+            )
+          : [];
+        const inheritedEnvironment = isStringRecord(baseLaunchOptions.env)
+          ? baseLaunchOptions.env
+          : {};
+
+        browser = (await launcher.launch({
+          ...baseLaunchOptions,
+          args: [...inheritedArgs, "--autoplay-policy=no-user-gesture-required"],
+          // Playwright normally mutes browser playback because most automation
+          // consumes pixels, not sound. Playback is the recording source here.
+          ignoreDefaultArgs: [...new Set([...inheritedIgnoredArguments, "--mute-audio"])],
+          env: {
+            ...stringEnvironment(process.env),
+            ...inheritedEnvironment,
+            PULSE_SINK: sink.name,
+            // Pin capture to the silent source as well as playback to the
+            // private sink. Without this Chrome takes PulseAudio's default
+            // source, which in a container is the monitor of whatever is
+            // playing — the call itself.
+            ...(silentMicrophone ? { PULSE_SOURCE: silentMicrophone.name } : {}),
+          },
+        })) as Browser;
+
+        context = await browser.newContext({
+          ...(await dependencies.contextOptions()),
+          // The guest-lobby controls below are selected by their accessible
+          // English labels. Keep this disposable automation context stable
+          // regardless of the company's employee-browser locale.
+          locale: "en-US",
+          // This exception is scoped to this disposable, unauthenticated
+          // context. The employee browser's service-worker boundary stays
+          // untouched.
+          serviceWorkers: "allow",
+          // No microphone and no camera, even with the silent source loaded.
+          // Ask to join sends Google system information "to confirm you're
+          // not a bot": a guest that had granted a microphone was answered
+          // "You can't join this video call", while the same guest bringing
+          // no devices was let into the waiting room. The lobby answers Meet's
+          // devices prompt with "Continue without microphone and camera".
+          permissions: [],
+          acceptDownloads: false,
+        });
+        const maskScript = await dependencies.initScript();
+        if (maskScript) await context.addInitScript({ content: maskScript });
+        const page = await context.newPage();
+
+        const admissionResult = await Promise.race([
+          dependencies.joinGuest(page, args).then(() => "joined" as const),
+          capture.sizeLimitReached().then(() => "size-limit" as const),
+          capture.unexpectedExit(),
+        ]);
+        if (admissionResult === "size-limit") {
+          throw new Error(
+            "The recording size limit was reached before the notetaker was admitted.",
+          );
+        }
+        joinedAt = dependencies.now();
+        await args.onJoined();
+        captionCapture = dependencies.captureCaptions(page, joinedAt);
+
+        await Promise.race([
+          dependencies.waitForEnd(page, args),
+          capture.sizeLimitReached(),
+          capture.unexpectedExit(),
+        ]);
+      } catch (err) {
+        primaryError = err;
+      } finally {
+        // Finalise audio first. On App shutdown the dispatcher has a short
+        // grace window, and the WebM trailer is the one cleanup result that
+        // cannot be reconstructed after process exit.
+        if (capture) {
+          try {
+            recordingBytes = await capture.stop(args.signal.aborted);
+          } catch (err) {
+            cleanupErrors.push(actionError("finish the Google Meet WebM recording", err));
+          }
+        }
+        // Then the captions, while the page they are read from is still open.
+        if (captionCapture) captions = await captionCapture.stop(args.signal.aborted);
+        const browserCloseTimeout = args.signal.aborted ? 750 : 10_000;
+        if (context) {
+          try {
+            await promiseWithTimeout(
+              context.close(),
+              browserCloseTimeout,
+              "Closing the dedicated Google Meet browser context timed out.",
+            );
+          } catch (err) {
+            cleanupErrors.push(actionError("close the dedicated Google Meet browser context", err));
+          }
+        }
+        if (browser) {
+          try {
+            await promiseWithTimeout(
+              browser.close(),
+              browserCloseTimeout,
+              "Closing the dedicated Google Meet browser timed out.",
+            );
+          } catch (err) {
+            cleanupErrors.push(actionError("close the dedicated Google Meet browser", err));
+          }
+        }
+        if (silentMicrophone) {
+          try {
+            const removing = removePulseAudioSource(silentMicrophone, dependencies.runCommand);
+            if (args.signal.aborted) {
+              await promiseWithTimeout(
+                removing,
+                750,
+                "Removing the notetaker's silent microphone timed out.",
+              );
+            } else {
+              await removing;
+            }
+          } catch (err) {
+            cleanupErrors.push(actionError("remove the notetaker's silent microphone", err));
+          }
+        }
+        if (sink) {
+          try {
+            const removing = removePulseAudioSink(sink, dependencies.runCommand);
+            if (args.signal.aborted) {
+              await promiseWithTimeout(
+                removing,
+                750,
+                "Removing the meeting's PulseAudio device timed out.",
+              );
+            } else {
+              await removing;
+            }
+          } catch (err) {
+            cleanupErrors.push(actionError("remove the meeting's PulseAudio device", err));
+          }
+        }
+      }
+
+      const hasFinalizedPartialRecording = joinedAt > 0 && Boolean(recordingBytes?.length);
+      if (
+        primaryError &&
+        !(hasFinalizedPartialRecording && isAbortDrivenError(primaryError, args.signal))
+      ) {
+        throw errorWithCleanup(primaryError, cleanupErrors);
+      }
+      if (cleanupErrors.length > 0) {
+        if (!recordingBytes) {
+          throw errorWithCleanup(cleanupErrors[0], cleanupErrors.slice(1));
+        }
+        dependencies.warn(
+          `[meetings] Google Meet recorder cleanup failed for ${args.meetingId}: ${cleanupErrors
+            .map((error) => error.message)
+            .join("; ")}`,
+        );
+      }
+      if (!recordingBytes) {
+        throw new Error("The Google Meet recorder finished without producing audio.");
+      }
+
+      return {
+        bytes: recordingBytes,
+        mime: "audio/webm",
+        durationMs: joinedAt === 0 ? 0 : Math.max(0, dependencies.now() - joinedAt),
+        captions,
+      };
+    },
+  };
+}
+
+export const googleMeetRecorder = createGoogleMeetRecorder();
+
+/** Register the stock-image Google Meet driver during meeting-service boot. */
+export function registerBuiltInMeetingRecorder(): void {
+  registerMeetingRecorder(googleMeetRecorder);
+}
+
+type PulseAudioSink = {
+  name: string;
+  monitorSource: string;
+  moduleId: string;
+};
+
+type PulseAudioSource = {
+  name: string;
+  moduleId: string;
+};
+
+async function createPulseAudioSink(
+  meetingId: string,
+  dependencies: Pick<GoogleMeetRecorderDependencies, "runCommand" | "randomToken">,
+): Promise<PulseAudioSink> {
+  const meetingPart = meetingId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24) || "meeting";
+  const name = `genosyn_meeting_${meetingPart}_${dependencies.randomToken().replace(/[^a-zA-Z0-9]/g, "")}`;
+  let result: CommandResult;
+  try {
+    result = await dependencies.runCommand("pactl", [
+      "load-module",
+      "module-null-sink",
+      `sink_name=${name}`,
+      "rate=48000",
+      "channels=2",
+      `sink_properties=device.description=Genosyn_${meetingPart}`,
+    ]);
+  } catch (err) {
+    const cleanupError = await removePulseAudioSinkByName(name, dependencies.runCommand);
+    throw new Error(
+      `The notetaker could not create its isolated audio device. Ensure PulseAudio and pactl are installed and running. ${errorMessage(err)}${
+        cleanupError ? ` Cleanup also failed: ${cleanupError.message}` : ""
+      }`,
+      { cause: err },
+    );
+  }
+
+  const moduleId = result.stdout.trim();
+  if (!/^\d+$/.test(moduleId)) {
+    const cleanupError = await removePulseAudioSinkByName(name, dependencies.runCommand);
+    throw new Error(
+      `PulseAudio did not return a module id while creating the meeting audio device${
+        result.stderr.trim() ? `: ${result.stderr.trim()}` : "."
+      }${cleanupError ? ` Cleanup also failed: ${cleanupError.message}` : ""}`,
+    );
+  }
+  return { name, monitorSource: `${name}.monitor`, moduleId };
+}
+
+/**
+ * A silent microphone for the guest.
+ *
+ * Google Meet asks for `getUserMedia` before it will let anybody into the
+ * lobby, and a container has no capture hardware at all. Left alone, Chrome
+ * either fails the request outright or falls back to the **only** source
+ * PulseAudio does offer — the monitor of the very sink we are recording — and
+ * a notetaker whose microphone is the call's own output is a feedback loop
+ * with a disclosure label on it.
+ *
+ * So the recorder brings its own capture device: a null source, which produces
+ * real, honest silence, and pins Chrome to it. The notetaker grants Meet no
+ * microphone at all (see the context's permissions), so this is the guarantee
+ * beneath that one: whatever Chrome is ever allowed to capture, it is never
+ * the call's own output, and nothing is ever contributed to the call.
+ *
+ * Best-effort by design. `module-null-source` is not in every PulseAudio
+ * build, and a deployment without it is still better served by the
+ * dialog-dismissal path in the lobby than by a recorder that refuses to start.
+ *
+ * Its label is `description=`, not the `source_properties=` the null *sink*
+ * takes: PulseAudio refuses any argument a module does not declare, so the
+ * sink's spelling made every load fail and every notetaker join without a
+ * microphone.
+ */
+async function createSilentCaptureSource(
+  sinkName: string,
+  dependencies: Pick<GoogleMeetRecorderDependencies, "runCommand" | "warn">,
+): Promise<PulseAudioSource | null> {
+  const name = `${sinkName}_mic`;
+  try {
+    const result = await dependencies.runCommand("pactl", [
+      "load-module",
+      "module-null-source",
+      `source_name=${name}`,
+      "rate=48000",
+      "channels=1",
+      "description=Genosyn_silent_mic",
+    ]);
+    const moduleId = result.stdout.trim();
+    if (!/^\d+$/.test(moduleId)) {
+      dependencies.warn(
+        `[meetings] PulseAudio returned no module id for the notetaker's silent microphone${
+          result.stderr.trim() ? `: ${result.stderr.trim()}` : "."
+        } Joining without one.`,
+      );
+      return null;
+    }
+    return { name, moduleId };
+  } catch (err) {
+    dependencies.warn(
+      `[meetings] the notetaker could not create a silent microphone (${errorMessage(
+        err,
+      )}). Joining without one; Google Meet may ask to continue without a microphone.`,
+    );
+    return null;
+  }
+}
+
+async function removePulseAudioSink(
+  sink: PulseAudioSink,
+  run: GoogleMeetRecorderDependencies["runCommand"],
+): Promise<void> {
+  await run("pactl", ["unload-module", sink.moduleId]);
+}
+
+async function removePulseAudioSource(
+  source: PulseAudioSource,
+  run: GoogleMeetRecorderDependencies["runCommand"],
+): Promise<void> {
+  await run("pactl", ["unload-module", source.moduleId]);
+}
+
+/** Recover the unique module when `pactl load-module` did not return its id. */
+async function removePulseAudioSinkByName(
+  name: string,
+  run: GoogleMeetRecorderDependencies["runCommand"],
+): Promise<Error | null> {
+  try {
+    const listed = await run("pactl", ["list", "short", "modules"]);
+    const row = listed.stdout
+      .split(/\r?\n/)
+      .find((line) => line.includes("module-null-sink") && line.includes(`sink_name=${name}`));
+    const moduleId = row?.match(/^\s*(\d+)\b/)?.[1];
+    if (moduleId) await run("pactl", ["unload-module", moduleId]);
+    return null;
+  } catch (err) {
+    return actionError("remove the partially-created PulseAudio device", err);
+  }
+}
+
+type ProcessExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error: Error | null;
+};
+
+class FfmpegCapture {
+  private output = Buffer.alloc(0);
+  private outputBytes = 0;
+  private readonly errorOutput: Buffer[] = [];
+  private errorOutputBytes = 0;
+  private readonly exit: Promise<ProcessExit>;
+  private readonly sizeLimit: Promise<void>;
+  private resolveSizeLimit: () => void = () => undefined;
+  private readonly stopAtBytes: number;
+  private settled = false;
+  private stopping = false;
+  private sizeLimited = false;
+  private overflowError: Error | null = null;
+  private stdinError: Error | null = null;
+
+  constructor(
+    private readonly child: ChildProcessWithoutNullStreams,
+    private readonly maxBytes: number,
+  ) {
+    // Node normally delivers pipe data in <=64 KiB chunks and WebM's final
+    // cluster/trailer is small. Half a MiB leaves ample room for both at the
+    // stock 25 MiB limit without sacrificing much useful call audio. Tiny
+    // injected limits keep a proportional reserve so this path is testable.
+    const finalizationReserve = Math.max(1, Math.min(512 * 1024, Math.floor(maxBytes * 0.05)));
+    this.stopAtBytes = maxBytes - finalizationReserve;
+    this.sizeLimit = new Promise((resolve) => {
+      this.resolveSizeLimit = resolve;
+    });
+
+    child.stdout.on("data", (chunk: Buffer | string) => this.appendOutput(chunk));
+    // ffmpeg can close its input pipe just before Node delivers the child
+    // `close` event. A simultaneous Stop/shutdown would otherwise turn the
+    // resulting EPIPE into an unhandled stream error and crash the App.
+    child.stdin.on("error", (error) => {
+      this.stdinError ??= error;
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      const bytes = Buffer.from(chunk);
+      this.errorOutput.push(bytes);
+      this.errorOutputBytes += bytes.length;
+      while (this.errorOutputBytes > 64 * 1024) {
+        const removed = this.errorOutput.shift();
+        if (removed) this.errorOutputBytes -= removed.length;
+      }
+    });
+    this.exit = new Promise((resolve) => {
+      child.once("error", (error) => {
+        this.settled = true;
+        resolve({ code: null, signal: null, error });
+      });
+      child.once("close", (code, signal) => {
+        this.settled = true;
+        resolve({ code, signal, error: null });
+      });
+    });
+  }
+
+  unexpectedExit(): Promise<never> {
+    return this.exit.then((exit) => {
+      if (this.stopping) return new Promise<never>(() => undefined);
+      throw this.exitError(exit, "ffmpeg stopped before the meeting ended");
+    });
+  }
+
+  /** Resolves when output reaches the clean-finalization threshold. */
+  sizeLimitReached(): Promise<void> {
+    return this.sizeLimit;
+  }
+
+  async stop(fast = false): Promise<Buffer> {
+    this.requestStop();
+
+    let exit = await raceWithTimeout(this.exit, fast ? 2_000 : 5_000);
+    if (!exit) {
+      this.child.kill("SIGINT");
+      exit = await raceWithTimeout(this.exit, fast ? 500 : 2_000);
+    }
+    if (!exit) {
+      this.child.kill("SIGKILL");
+      exit = await raceWithTimeout(this.exit, fast ? 250 : 1_000);
+    }
+    if (!exit) {
+      throw new Error("ffmpeg did not exit after SIGKILL; its recording could not be finalised.");
+    }
+    if (exit.error || exit.code !== 0) {
+      throw this.exitError(exit, "ffmpeg could not finalise the recording");
+    }
+    if (this.overflowError) throw this.overflowError;
+
+    if (this.outputBytes === 0) {
+      throw new Error(
+        "ffmpeg produced an empty recording. Check that Chrome can play audio through PulseAudio.",
+      );
+    }
+    // A view avoids Buffer.concat's second full-size allocation. The retained
+    // backing allocation never exceeds maxBytes, so concurrent meetings have
+    // a predictable memory ceiling while the public result remains a Buffer.
+    return this.output.subarray(0, this.outputBytes);
+  }
+
+  private appendOutput(chunk: Buffer | string): void {
+    const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    const required = this.outputBytes + bytes.length;
+    if (required > this.maxBytes) {
+      this.overflowError = new Error(
+        `ffmpeg exceeded the ${this.maxBytes}-byte recording limit while finalising.`,
+      );
+      this.signalSizeLimit();
+      return;
+    }
+
+    this.ensureOutputCapacity(required);
+    bytes.copy(this.output, this.outputBytes);
+    this.outputBytes = required;
+    if (this.outputBytes >= this.stopAtBytes) this.signalSizeLimit();
+  }
+
+  private ensureOutputCapacity(required: number): void {
+    if (required <= this.output.length) return;
+    let capacity = this.output.length || Math.min(this.maxBytes, 64 * 1024);
+    while (capacity < required) capacity = Math.min(this.maxBytes, capacity * 2);
+    const next = Buffer.allocUnsafe(capacity);
+    this.output.copy(next, 0, 0, this.outputBytes);
+    this.output = next;
+  }
+
+  private signalSizeLimit(): void {
+    if (this.sizeLimited) return;
+    this.sizeLimited = true;
+    this.resolveSizeLimit();
+    this.requestStop();
+  }
+
+  private requestStop(): void {
+    if (this.stopping) return;
+    this.stopping = true;
+    if (this.settled) return;
+    this.child.stdin.write("q\n");
+    this.child.stdin.end();
+  }
+
+  private exitError(exit: ProcessExit, summary: string): Error {
+    const stderrDetail =
+      this.errorOutput.length > 0 ? Buffer.concat(this.errorOutput).toString("utf8").trim() : "";
+    const detail = [
+      stderrDetail,
+      this.stdinError?.message ? `stdin: ${this.stdinError.message}` : "",
+    ]
+      .filter(Boolean)
+      .join(". ");
+    const status = exit.error
+      ? exit.error.message
+      : exit.signal
+        ? `terminated by ${exit.signal}`
+        : `exited with status ${exit.code ?? "unknown"}`;
+    return new Error(`${summary}: ${status}${detail ? `. ${detail}` : ""}`);
+  }
+}
+
+function startFfmpegCapture(
+  monitorSource: string,
+  spawnProcess: GoogleMeetRecorderDependencies["spawnProcess"],
+  maxBytes: number,
+): FfmpegCapture {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 2) {
+    throw new Error("The meeting recording byte limit must be an integer greater than one.");
+  }
+  const child = spawnProcess("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-thread_queue_size",
+    "1024",
+    "-f",
+    "pulse",
+    "-i",
+    monitorSource,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-c:a",
+    "libopus",
+    "-application",
+    "voip",
+    "-b:a",
+    "32k",
+    "-f",
+    "webm",
+    "pipe:1",
+  ]);
+  return new FfmpegCapture(child, maxBytes);
+}
+
+/** Drive Meet's unsigned guest lobby and resolve only after admission. */
+export async function joinGoogleMeetAsGuest(page: Page, args: GoogleMeetJoinArgs): Promise<void> {
+  page.setDefaultTimeout(UI_ACTION_TIMEOUT_MS);
+  try {
+    await withAbortSignal(
+      page.goto(args.conferenceUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }),
+      args.signal,
+      "The notetaker was stopped while it was opening Google Meet.",
+    );
+  } catch (err) {
+    // A Stop is not a broken lobby. Wrapping it in "could not open the Google
+    // Meet lobby" put a Playwright abort message in front of a human who had
+    // just pressed Stop, and buried the fact that it worked.
+    if (args.signal.aborted) {
+      throw new Error("The notetaker was stopped while it was opening Google Meet.", {
+        cause: err,
+      });
+    }
+    throw new Error(`The notetaker could not open the Google Meet lobby. ${errorMessage(err)}`, {
+      cause: err,
+    });
+  }
+
+  const cutoff = admissionCutoff(args, Date.now());
+  let named = false;
+  let needsNameFill = true;
+  let needsJoinClick = true;
+  let waitingForAdmission = false;
+  let hadConfirmedRequest = false;
+  let mutedMicrophone = false;
+  let stoppedCamera = false;
+  let askedAt = 0;
+  let asks = 0;
+
+  for (;;) {
+    if (args.signal.aborted) {
+      throw new Error("The notetaker was stopped while it was waiting for admission.");
+    }
+    if (page.isClosed()) {
+      throw new Error("Google Meet closed while the notetaker was waiting for admission.");
+    }
+    const body = (await bodyText(page)).replace(/\s+/g, " ");
+    // Admitted. Everything below this line is lobby work, and once the call
+    // controls are on screen none of it applies any more.
+    if (!isGoogleMeetWaitingForAdmission(body) && (await isInGoogleMeetCall(page))) {
+      return;
+    }
+
+    const failure = googleMeetJoinFailure(page.url(), body);
+    if (failure) throw new Error(failure);
+
+    // A click can open a device-choice dialog instead of sending a request.
+    // Only Meet's waiting screen proves there is something for the host to
+    // admit. An expired request can still use the existing bounded retries.
+    const unanswered = /no one responded|ask to join again|nobody responded/i.test(body);
+    if (unanswered) waitingForAdmission = false;
+    else if (asks > 0 && isGoogleMeetWaitingForAdmission(body)) {
+      waitingForAdmission = true;
+      hadConfirmedRequest = true;
+    }
+
+    if (Date.now() >= cutoff) {
+      // Say which step the lobby stopped at. One sentence for all three is
+      // how a notetaker that never pressed the button at all read, on every
+      // meeting, as a host who had not opened guest access.
+      throw new Error(
+        hadConfirmedRequest
+          ? "Google Meet confirmed the notetaker was waiting, but it was not admitted before the join window closed. The notetaker has left; press Start notetaker to retry, then admit the new request."
+          : asks > 0
+            ? "The notetaker asked to join, but Google Meet did not confirm that the request reached the host before the join window closed. Press Start notetaker to retry while the host is in the call."
+            : named
+              ? "The notetaker entered its name, but Google Meet never offered an Ask to join button it could press before the join window closed, so no request reached the host. Press Start notetaker to retry, or upload a recording or paste a transcript."
+              : "The notetaker could not reach the Google Meet waiting room before the join window closed. No lobby request was confirmed. Check the meeting link and guest access, then press Start notetaker to retry.",
+      );
+    }
+
+    if (waitingForAdmission) {
+      await delayUntil(Math.min(UI_POLL_MS, cutoff - Date.now()), args.signal);
+      continue;
+    }
+
+    // These choices may arrive before the guest name or after Ask to join,
+    // and Meet renders the devices-off choice as either a button or a link.
+    const continueWithoutMedia = /^continue without (?:a )?(?:microphone|camera|audio|video)\b/i;
+    const joinWithoutMedia = /^join without (?:a )?(?:microphone|camera|audio|video)\b/i;
+    if (
+      await clickFirstVisible(page, [
+        page.getByRole("button", { name: continueWithoutMedia }),
+        page.getByRole("link", { name: continueWithoutMedia }),
+        page.getByRole("button", { name: joinWithoutMedia }),
+        page.getByRole("link", { name: joinWithoutMedia }),
+      ])
+    ) {
+      // Some versions submit now; others return to a rebuilt guest form.
+      // Poll again before resubmitting, and restore the disclosed name if
+      // the form returned. Never re-ask after a denial or confirmed waiting.
+      needsNameFill = true;
+      needsJoinClick = true;
+      mutedMicrophone = false;
+      stoppedCamera = false;
+      await delayUntil(Math.min(UI_POLL_MS, cutoff - Date.now()), args.signal);
+      continue;
+    }
+    if (
+      await clickFirstVisible(page, [
+        page.getByRole("button", { name: /accept all|reject all/i }),
+        page.getByRole("button", { name: /^got it$/i }),
+        page.getByRole("button", { name: /^dismiss$/i }),
+      ])
+    ) {
+      await delayUntil(Math.min(UI_POLL_MS, cutoff - Date.now()), args.signal);
+      continue;
+    }
+
+    if (needsNameFill) {
+      const nameInput = await firstVisible([
+        page.getByRole("textbox", { name: /your name|name/i }),
+        page.locator('input[placeholder*="name" i]'),
+      ]);
+      if (nameInput) {
+        // Typed, not set. Ask to join sends Google "system info … to confirm
+        // you're not a bot", and a name that arrived with no keystrokes, then
+        // a click from a pointer that never moved, is refused with "You can't
+        // join this video call" — even on a call that lets anyone in.
+        if (
+          await attempt(() =>
+            humanFill(page, nameInput, disclosedNotetakerName(args.displayName)),
+          )
+        ) {
+          named = true;
+          needsNameFill = false;
+        }
+      }
+    }
+
+    // The microphone is silent by construction (see createSilentCaptureSource)
+    // and these clicks make it visibly off as well, for the humans in the
+    // room. Best-effort: a lobby that renders the devices already off has no
+    // button here, and failing the whole join over a decoration would be
+    // absurd.
+    if (!mutedMicrophone) {
+      mutedMicrophone = await clickFirstVisible(page, [
+        page.getByRole("button", { name: /turn off microphone|disable microphone/i }),
+        page.locator('[aria-label*="microphone" i][data-is-muted="false"]'),
+      ]);
+    }
+    if (!stoppedCamera) {
+      stoppedCamera = await clickFirstVisible(page, [
+        page.getByRole("button", { name: /turn off camera|disable camera/i }),
+        page.locator('[aria-label*="camera" i][data-is-muted="false"]'),
+      ]);
+    }
+
+    // Meet expires an unanswered request after a couple of minutes and offers
+    // to ask again. That is a normal thing to happen to a bot waiting on a
+    // host who is still in their previous call — treating it as terminal is
+    // what made "the notetaker never joined" the ordinary outcome of a
+    // meeting that started late.
+    const dueToAsk = needsJoinClick || unanswered || Date.now() - askedAt >= RE_ASK_AFTER_MS;
+    if (named && dueToAsk && asks < MAX_JOIN_REQUESTS) {
+      // Matched by how the label starts. Meet names the button after the
+      // devices the guest brings — a notetaker with none gets "Ask to join
+      // without microphone & camera" — and a pattern anchored at both ends
+      // never found it, so no request was ever sent. `\b` still keeps "Ask to
+      // present" and "Ask to use Companion mode" out.
+      const joinButton = await firstVisible([
+        page.getByRole("button", { name: /^ask to join\b/i }),
+        page.getByRole("button", { name: /^join now\b/i }),
+      ]);
+      if (
+        joinButton &&
+        (await joinButton.isEnabled().catch(() => false)) &&
+        // Asking navigates the page, and an ordinary click waits for that
+        // navigation and then times out — a request that was sent, counted
+        // as one that was not.
+        (await attempt(() => humanClick(page, joinButton, { noWaitAfter: true })))
+      ) {
+        askedAt = Date.now();
+        asks += 1;
+        needsJoinClick = false;
+      }
+    }
+
+    await delayUntil(Math.min(UI_POLL_MS, cutoff - Date.now()), args.signal);
+  }
+}
+
+function isGoogleMeetWaitingForAdmission(body: string): boolean {
+  return /you.?ll join (?:the call|the meeting) when someone lets you in|someone (?:in the (?:call|meeting) )?(?:will|should) let you in soon|waiting for (?:the |a )?host to (?:let you in|admit)|(?:you are|you.?re) in the waiting room|your request (?:to join )?has been sent|please wait until (?:a |the )?(?:meeting )?host brings you into the (?:call|meeting)/i.test(body);
+}
+
+/**
+ * Inside the call, not waiting outside it.
+ *
+ * Meet's waiting room already shows Leave call — with Audio settings, Video
+ * settings and Chat — so Leave call alone admitted the notetaker the moment
+ * it knocked, and it went on to record the lobby. These controls appear only
+ * once a host has let the guest in.
+ */
+async function isInGoogleMeetCall(page: Page): Promise<boolean> {
+  const canLeave = await anyVisible([
+    page.getByRole("button", { name: /leave call/i }),
+    page.locator('[aria-label*="leave call" i], [data-tooltip*="leave call" i]'),
+  ]);
+  if (!canLeave) return false;
+  return anyVisible([
+    page.getByRole("button", { name: /^raise hand\b/i }),
+    page.getByRole("button", { name: /^send a reaction\b/i }),
+    page.getByRole("button", { name: /^turn (?:on|off) captions\b/i }),
+    page.getByRole("button", { name: /^meeting details\b/i }),
+    page.getByRole("button", { name: /^(?:share screen|present now)\b/i }),
+  ]);
+}
+
+/** Interpret only known UI messages; never expose page text or account data. */
+function googleMeetJoinFailure(url: string, body: string): string | null {
+  if (/request to join (?:was )?denied|you were denied|someone denied your request/i.test(body)) {
+    return "The Google Meet host denied the notetaker's request to join.";
+  }
+  if (/meeting has ended|this meeting is no longer available/i.test(body)) {
+    return "The Google Meet call ended before the notetaker was admitted.";
+  }
+  if (
+    /^https:\/\/accounts\.google\.com\//i.test(url) ||
+    /sign in to join|you (?:need|must|have) to (?:sign|log) in/i.test(body)
+  ) {
+    return "Google Meet requires a Google account for this call, so the guest notetaker cannot ask to join. Check Host controls → Meeting access. Allow guests to ask to join, or upload a recording or paste a transcript.";
+  }
+  // Google's own answer to a guest it does not accept. It is not the host's
+  // meeting access: it appears on calls open to anyone, and the request never
+  // reaches the host.
+  if (/(?:can.?t|cannot|not allowed to) join this (?:video )?(?:call|meeting)/i.test(body)) {
+    return "Google Meet blocked the guest notetaker (“You can't join this video call”) before the host saw a request. Google refuses signed-out guests it does not trust, even on calls that allow guests. Press Start notetaker to retry, or upload a recording or paste a transcript.";
+  }
+  if (/check (?:the |your )?meeting code|could(?:n.?t| not) find (?:the |this )?meeting|invalid meeting (?:code|link)/i.test(body)) {
+    return "Google Meet could not find this meeting. Check its link, then press Start notetaker to retry.";
+  }
+  if (/can.?t connect (?:you )?to (?:the |this )?(?:video )?(?:call|meeting)|check your (?:internet |network )?connection/i.test(body)) {
+    return "The notetaker could not connect to Google Meet. Check the App's network connection, then press Start notetaker to retry.";
+  }
+  return null;
+}
+
+/**
+ * How long to sit in the lobby.
+ *
+ * It used to be five minutes flat, which reads as generous and is not: the
+ * dispatcher asks to join thirty seconds *before* the start time, so the
+ * notetaker gave up at four and a half minutes past the hour. A host who
+ * joins late — the single most ordinary thing that happens to a meeting —
+ * arrived to no notetaker and a `failed` row blaming them for not admitting
+ * it. A call is worth joining right up until it is scheduled to end, so that
+ * is the deadline, bounded so that a mis-entered all-day-length invite cannot
+ * park a browser and a recording for the rest of the afternoon.
+ */
+export function admissionCutoff(
+  args: Pick<GoogleMeetJoinArgs, "scheduledEndAt">,
+  now: number,
+): number {
+  if (!args.scheduledEndAt) return now + ADMISSION_TIMEOUT_MS;
+  return Math.min(
+    Math.max(args.scheduledEndAt.getTime(), now + ADMISSION_TIMEOUT_MS),
+    now + MAX_ADMISSION_WAIT_MS,
+  );
+}
+
+/** Run one Playwright action, reporting whether it landed rather than throwing.
+ *
+ * Every lobby interaction is a guess about a UI Google reserves the right to
+ * change, and a guess that misses should cost one polling pass, not the call.
+ * The loop re-reads the page each time round, so anything that failed because
+ * the element was stale, covered, or mid-animation is simply tried again. */
+async function attempt(action: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await action();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Wait until Meet ends, the schedule expires, or the dispatcher aborts. */
+export async function waitForGoogleMeetToEnd(page: Page, args: GoogleMeetJoinArgs): Promise<void> {
+  for (;;) {
+    if (args.signal.aborted || page.isClosed()) return;
+    const remaining = args.scheduledEndAt
+      ? args.scheduledEndAt.getTime() - Date.now()
+      : Number.POSITIVE_INFINITY;
+    if (remaining <= 0) return;
+
+    const body = await bodyText(page);
+    // Captions put what people say on the page, and "the meeting has ended"
+    // is something people say. Meet's own end screens count only once the
+    // call controls have gone with them.
+    if (
+      /you left the meeting|meeting has ended|you were removed from the meeting|return to home screen/i.test(
+        body,
+      ) &&
+      !(await isInGoogleMeetCall(page))
+    ) {
+      return;
+    }
+    try {
+      const current = new URL(page.url());
+      if (current.hostname !== "meet.google.com" || !isMeetCallPath(current.pathname)) return;
+    } catch {
+      return;
+    }
+
+    await delayUntil(Math.min(MEETING_POLL_MS, remaining), args.signal);
+  }
+}
+
+/** How often the captions on screen are read. */
+const CAPTION_POLL_MS = 1_000;
+/** Pressing Turn on captions is retried this many times, then left alone. */
+const CAPTION_ENABLE_ATTEMPTS = 10;
+/**
+ * How long stopping may wait for a read in flight and then a last one. A page
+ * that stopped answering must not hold the recorder — and its audio — open.
+ */
+const CAPTION_STOP_WAIT_MS = 2_000;
+const CAPTION_FAST_STOP_WAIT_MS = 500;
+
+type VisibleCaption = { id: number; speaker: string; text: string };
+
+/**
+ * Keep Meet's live captions as the call's transcript.
+ *
+ * Meet transcribes every speaker itself, names them, and shows the result to
+ * anyone who turns captions on. Reading that is what lets a recorded call
+ * reach a customer's timeline on an install whose AI Models have no
+ * speech-to-text at all, and it attributes every line to the person who said
+ * it, which one mixed audio track cannot. The captions are the notetaker's own
+ * view: turning them on shows nothing to anybody else in the call.
+ *
+ * Meet revises a line in place as recognition settles, so each entry keeps
+ * its latest reading; an entry that scrolls away keeps the last one it had.
+ */
+export function captureGoogleMeetCaptions(
+  page: Page,
+  admittedAt: number,
+  now: () => number = Date.now,
+): GoogleMeetCaptionCapture {
+  const entries = new Map<
+    number,
+    { speaker: string; text: string; firstSeenAt: number; changedAt: number }
+  >();
+  let stopped = false;
+  let wake: () => void = () => undefined;
+
+  async function read(): Promise<void> {
+    const visible = await page.evaluate(readGoogleMeetCaptions).catch(() => [] as VisibleCaption[]);
+    const at = now();
+    for (const caption of visible) {
+      const known = entries.get(caption.id);
+      if (!known) {
+        entries.set(caption.id, { ...caption, firstSeenAt: at, changedAt: at });
+      } else if (known.text !== caption.text) {
+        known.text = caption.text;
+        known.speaker = caption.speaker || known.speaker;
+        known.changedAt = at;
+      }
+    }
+  }
+
+  const running = (async () => {
+    let enabled = false;
+    for (let pass = 0; !stopped; pass += 1) {
+      if (!enabled && pass < CAPTION_ENABLE_ATTEMPTS) enabled = await enableGoogleMeetCaptions(page);
+      await read();
+      if (stopped) break;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, CAPTION_POLL_MS);
+        wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+    }
+  })().catch(() => undefined);
+
+  return {
+    async stop(fast = false) {
+      stopped = true;
+      wake();
+      const waitMs = fast ? CAPTION_FAST_STOP_WAIT_MS : CAPTION_STOP_WAIT_MS;
+      await promiseWithTimeout(running, waitMs, "").catch(() => undefined);
+      // Meet settles the last words after they are spoken; take its final
+      // reading of them.
+      await promiseWithTimeout(read(), waitMs, "").catch(() => undefined);
+      return [...entries.values()]
+        .filter((entry) => entry.text !== "")
+        .sort((a, b) => a.firstSeenAt - b.firstSeenAt)
+        .map((entry) => {
+          const startMs = Math.max(0, entry.firstSeenAt - admittedAt);
+          return {
+            startMs,
+            endMs: Math.max(startMs, entry.changedAt - admittedAt),
+            speaker: entry.speaker,
+            text: entry.text,
+          };
+        });
+    },
+  };
+}
+
+/** Turn captions on, reporting whether they are on afterwards. Never throws. */
+async function enableGoogleMeetCaptions(page: Page): Promise<boolean> {
+  const turnOff = page.getByRole("button", { name: /^turn off captions\b/i }).first();
+  if (await turnOff.isVisible().catch(() => false)) return true;
+  const turnOn = await firstVisible([page.getByRole("button", { name: /^turn on captions\b/i })]);
+  if (!turnOn || !(await attempt(() => humanClick(page, turnOn)))) return false;
+  return turnOff.isVisible().catch(() => false);
+}
+
+/**
+ * Runs in the page. Meet renders each turn as a child of its Captions region:
+ * a header with the speaker's name, then a block of text it rewrites as the
+ * speaker goes on. The jump-to-latest control lives in the same region and is
+ * the one child with a button. Each entry keeps its id for as long as Meet
+ * keeps the element, which is what makes a revision an update, not a repeat.
+ */
+function readGoogleMeetCaptions(): VisibleCaption[] {
+  const store = window as unknown as {
+    __genosynCaptionIds?: WeakMap<Element, number>;
+    __genosynCaptionNext?: number;
+  };
+  const ids = (store.__genosynCaptionIds ??= new WeakMap<Element, number>());
+  const region = document.querySelector('[role="region"][aria-label="Captions"]');
+  if (!region) return [];
+  const visible: VisibleCaption[] = [];
+  for (const entry of Array.from(region.children)) {
+    if (!(entry instanceof HTMLElement) || entry.children.length < 2) continue;
+    if (entry.querySelector("button")) continue;
+    const header = entry.firstElementChild as HTMLElement;
+    const body = entry.lastElementChild as HTMLElement;
+    const text = body.innerText.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    let id = ids.get(entry);
+    if (id === undefined) {
+      id = (store.__genosynCaptionNext ?? 0) + 1;
+      store.__genosynCaptionNext = id;
+      ids.set(entry, id);
+    }
+    visible.push({ id, speaker: header.innerText.replace(/\s+/g, " ").trim(), text });
+  }
+  return visible;
+}
+
+/** The first of these that is on screen right now, or null. One pass only —
+ * the lobby loop owns the waiting, so this never blocks. */
+async function firstVisible(
+  locators: ReturnType<Page["locator"]>[],
+): Promise<ReturnType<Page["locator"]> | null> {
+  for (const locator of locators) {
+    const candidate = locator.first();
+    if (await candidate.isVisible().catch(() => false)) return candidate;
+  }
+  return null;
+}
+
+/** Click the first visible locator. Never throws: a click that loses a race
+ * with Meet's own re-render is retried by the next pass of the lobby loop. */
+async function clickFirstVisible(
+  page: Page,
+  locators: ReturnType<Page["locator"]>[],
+): Promise<boolean> {
+  const candidate = await firstVisible(locators);
+  if (!candidate) return false;
+  return attempt(() => humanClick(page, candidate));
+}
+
+async function anyVisible(locators: ReturnType<Page["locator"]>[]): Promise<boolean> {
+  for (const locator of locators) {
+    if (
+      await locator
+        .first()
+        .isVisible()
+        .catch(() => false)
+    )
+      return true;
+  }
+  return false;
+}
+
+async function bodyText(page: Page): Promise<string> {
+  return page
+    .locator("body")
+    .innerText({ timeout: 5_000 })
+    .catch(() => "");
+}
+
+async function delayUntil(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+  });
+}
+
+function runCommand(command: string, args: string[]): Promise<CommandResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 256 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = String(stderr).trim();
+          reject(
+            new Error(`${command} failed: ${error.message}${detail ? `. ${detail}` : ""}`, {
+              cause: error,
+            }),
+          );
+          return;
+        }
+        resolve({ stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+  });
+}
+
+function stringEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(environment).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.values(value).every((entry) => typeof entry === "string")
+  );
+}
+
+function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+}
+
+function promiseWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function withAbortSignal<T>(promise: Promise<T>, signal: AbortSignal, message: string): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error(message));
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error(message));
+    signal.addEventListener("abort", aborted, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener("abort", aborted);
+        reject(err);
+      },
+    );
+  });
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function actionError(action: string, err: unknown): Error {
+  return new Error(`Could not ${action}: ${errorMessage(err)}`, { cause: err });
+}
+
+function errorWithCleanup(primary: unknown, cleanupErrors: Error[]): Error {
+  const cleanup = cleanupErrors.map((error) => error.message).join("; ");
+  return new Error(`${errorMessage(primary)}${cleanup ? ` Cleanup also failed: ${cleanup}` : ""}`, {
+    cause: primary,
+  });
+}
+
+function isAbortDrivenError(err: unknown, signal: AbortSignal): boolean {
+  if (!signal.aborted) return false;
+  if (err === signal.reason) return true;
+  if (err instanceof DOMException && err.name === "AbortError") return true;
+  return /abort|stopp(?:ed|ing)|shutting down/i.test(errorMessage(err));
+}

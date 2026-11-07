@@ -1,0 +1,196 @@
+import type { SubsidiaryIssuerSnapshot } from "./Subsidiary.js";
+import { dateTimeColumnType } from "./columnTypes.js";
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  Index,
+} from "typeorm";
+
+/**
+ * Invoice statuses for Phase A of the Finance milestone (M19).
+ *
+ * - `draft`  — fully editable, deletable. Has a `numberSeq` of 0 and no
+ *              display number until issued.
+ * - `sent`   — Number minted at issue; customer and issuer fixed. Still
+ *              editable, under the same number, so a mistake can be
+ *              corrected and resent (`services/finance.ts >
+ *              updateInvoice()`). Payments may be recorded; voiding is
+ *              allowed.
+ * - `paid`   — `paidCents >= totalCents`. Same as `sent` for editing
+ *              rules; transitions back to `sent` if a payment is deleted
+ *              or an edit raises the total.
+ * - `void`   — terminal. Cannot be edited or deleted.
+ *
+ * "Overdue" is computed at read-time from `dueDate` + status, not stored,
+ * so flipping the system clock or extending the due date can't leave
+ * invoices in an inconsistent state.
+ */
+export type InvoiceStatus = "draft" | "sent" | "paid" | "void";
+
+/**
+ * An Invoice is a billable document issued to a `Customer`. Phase A of
+ * the Finance milestone (M19) — see ROADMAP.md.
+ *
+ * Numbering: `numberSeq` is a per-company gapless integer minted at
+ * issue (transition draft → sent). Drafts carry `numberSeq = 0` and
+ * `number = ""`. Display format is `INV-0001`; format is owned by
+ * `lib/money.ts > formatInvoiceNumber()`.
+ *
+ * Cent columns (`subtotalCents`, `taxCents`, `totalCents`, `paidCents`,
+ * `balanceCents`) are recomputed by the service layer from the lines +
+ * payments. The route layer never writes them directly.
+ */
+@Entity("invoices")
+@Index(["companyId", "slug"], { unique: true })
+@Index(["companyId", "status"])
+@Index(["companyId", "customerId"])
+@Index(["companyId", "numberSeq"])
+@Index(["companyId", "archivedAt"])
+@Index(["companyId", "recurringInvoiceId"])
+export class Invoice {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  @Column({ type: "varchar" })
+  customerId!: string;
+
+  /** Optional legal issuer; null retains the company default. */
+  @Column({ type: "varchar", nullable: true })
+  subsidiaryId!: string | null;
+
+  /** Frozen when the issuer is selected; later profile edits never rewrite documents. */
+  @Column({ type: "simple-json", nullable: true })
+  issuerSnapshot!: SubsidiaryIssuerSnapshot | null;
+
+  /** URL slug — `inv-0001` once issued, `draft-<short>` while in draft.
+   *  Renames don't change the slug; voiding doesn't either. */
+  @Column({ type: "varchar" })
+  slug!: string;
+
+  /** Gapless per-company sequence. `0` until the invoice is issued. */
+  @Column({ type: "int", default: 0 })
+  numberSeq!: number;
+
+  /** Display string — e.g. `INV-0001`. Empty while in draft. */
+  @Column({ type: "varchar", default: "" })
+  number!: string;
+
+  @Column({ type: "varchar", default: "draft" })
+  status!: InvoiceStatus;
+
+  @Column({ type: dateTimeColumnType })
+  issueDate!: Date;
+
+  @Column({ type: dateTimeColumnType })
+  dueDate!: Date;
+
+  @Column({ type: "varchar", default: "USD" })
+  currency!: string;
+
+  /** The rate into the home currency the invoice was booked at, locked when it
+   *  is issued: 1 in the home currency, and null on a draft. The payments,
+   *  credits and write-offs that clear its receivable convert at this rate,
+   *  so a rate that arrives afterwards for the issue date can't leave part of
+   *  the receivable behind. Re-locked only when an edit moves the issue date
+   *  or currency, which nothing applied to the invoice allows. An invoice
+   *  issued before rates were locked reads the rate back from its issue entry
+   *  (`invoiceBookedRate` in `services/fx.ts`). */
+  @Column({ type: "real", nullable: true })
+  exchangeRate!: number | null;
+
+  /** Pre-tax amount charged: the lines' subtotal less any discount, so
+   *  `subtotalCents + taxCents = totalCents` and revenue is the subtotal. */
+  @Column({ type: "int", default: 0 })
+  subtotalCents!: number;
+
+  /** Whole-document discount as a percentage (0–100), taken off before tax.
+   *  Zero when the discount is a fixed amount or there is none — see
+   *  `shared/documentDiscount.ts`. */
+  @Column({ type: "real", default: 0 })
+  discountPercent!: number;
+
+  /** Whole-document discount as a fixed pre-tax amount in minor units. Zero
+   *  when the discount is a percentage or there is none. */
+  @Column({ type: "int", default: 0 })
+  discountAmountCents!: number;
+
+  /** The discount actually taken, pre-tax. Derived like the other cent
+   *  columns; `subtotalCents` is already net of it. */
+  @Column({ type: "int", default: 0 })
+  discountCents!: number;
+
+  @Column({ type: "int", default: 0 })
+  taxCents!: number;
+
+  @Column({ type: "int", default: 0 })
+  totalCents!: number;
+
+  @Column({ type: "int", default: 0 })
+  paidCents!: number;
+
+  /** Sum of non-reversed customer-credit applications against this
+   *  invoice, in document currency. A credit relieves the receivable
+   *  without cash moving, so it settles the invoice but is deliberately
+   *  kept out of `paidCents` — "paid" must keep meaning "cash arrived". */
+  @Column({ type: "int", default: 0 })
+  creditedCents!: number;
+
+  /** Sum of non-reversed write-offs against this invoice, in document
+   *  currency. Also settles the invoice without cash. */
+  @Column({ type: "int", default: 0 })
+  writtenOffCents!: number;
+
+  /** `totalCents - paidCents - creditedCents - writtenOffCents`. Stored so
+   *  list views can sort/filter on it without recomputing. */
+  @Column({ type: "int", default: 0 })
+  balanceCents!: number;
+
+  /** Free-form note shown on the invoice (above the totals). */
+  @Column({ type: "text", default: "" })
+  notes!: string;
+
+  /** Free-form footer (payment terms, bank details, thank-you note). */
+  @Column({ type: "text", default: "" })
+  footer!: string;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  sentAt!: Date | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  paidAt!: Date | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  voidedAt!: Date | null;
+
+  /** Filing, not a status: an archived invoice leaves the default lists but
+   *  keeps its number, status, payments, PDF, and ledger entries, and still
+   *  counts in every balance, statement, and report. Only an invoice with
+   *  nothing left to collect can be archived (`shared/invoiceArchive.ts`),
+   *  and one that is owed money again comes back to the lists by itself
+   *  (`recomputeInvoiceTotals`). Restoring clears it. */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  archivedAt!: Date | null;
+
+  /** The recurring invoice schedule that created this invoice, or null for
+   *  one made any other way. Set when a scheduled run or Run now creates the
+   *  invoice (`services/recurringInvoices.ts`) and never changed after, except
+   *  that deleting the schedule clears it. A duplicate is made by hand, so it
+   *  never carries one. */
+  @Column({ type: "varchar", nullable: true })
+  recurringInvoiceId!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  createdById!: string | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}

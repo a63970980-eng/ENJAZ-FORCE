@@ -1,0 +1,589 @@
+import { Router } from "express";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { Company } from "../db/entities/Company.js";
+import { validateBody, validateQuery } from "../middleware/validate.js";
+import {
+  onRoutePaths,
+  requireAuth,
+  requireBrowserSession,
+  requireCompanyMember,
+} from "../middleware/auth.js";
+import { ListQueryError } from "../services/listPaging.js";
+import {
+  addChannelMembers,
+  archiveChannel,
+  CHANNEL_HISTORY_PAGE,
+  channelHistoryQuerySchema,
+  channelMessagesQuerySchema,
+  createChannel,
+  editMessage,
+  findOrCreateDM,
+  getChannel,
+  listChannelsForUser,
+  listCompanyDirectory,
+  listCompanyMentionables,
+  listMessages,
+  markChannelRead,
+  pageChannelMessages,
+  postMessage,
+  removeChannelMember,
+  renameChannel,
+  resetDirectMessageContext,
+  softDeleteMessage,
+  toggleReaction,
+  userHasChannelAccess,
+} from "../services/workspaceChat.js";
+import { mintWsToken } from "../services/realtime.js";
+import { realtimeAuthenticationForRequest } from "../services/realtimeAuthorization.js";
+import { recordAttachment, resolveAttachmentFile, uploadMiddleware } from "../services/uploads.js";
+import {
+  getChannelWebhookSettings,
+  updateChannelWebhookSettings,
+} from "../services/channelWebhooks.js";
+import { recordAudit } from "../services/audit.js";
+
+/**
+ * HTTP surface for the Slack-style workspace chat (channels, DMs, messages,
+ * reactions, file uploads, realtime token mint).
+ *
+ * Conventions borrowed from the rest of the codebase:
+ *   - Mounted under `/api/companies/:cid/workspace`, so `requireAuth` and
+ *     `requireCompanyMember` cover every route.
+ *   - Services own business logic; handlers parse input, call in, and shape
+ *     the response.
+ *   - Every write endpoint runs through a zod schema via `validateBody`.
+ */
+
+export const workspaceRouter = Router({ mergeParams: true });
+workspaceRouter.use(requireAuth);
+workspaceRouter.use(requireCompanyMember);
+
+/**
+ * The paths this router serves. `workspaceCompanyLoad.test.ts` fails when one
+ * of its routes falls outside them.
+ */
+const WORKSPACE_PATHS = [
+  "/directory",
+  "/mentionables",
+  "/ws-token",
+  "/channels",
+  "/dms",
+  "/messages",
+  "/attachments",
+];
+
+// Hydrate `req.company` from the URL param: every route here answers for that
+// company, and uploads use its slug to compute the on-disk target dir. Scoped
+// to this router's own paths, so the group chat and discussion routes mounted
+// after it at the same place skip the read, apart from those nested under a
+// channel.
+workspaceRouter.use(
+  onRoutePaths(WORKSPACE_PATHS, async (req, res, next) => {
+    const cid = (req.params as Record<string, string>).cid;
+    let co: Company | null;
+    try {
+      co = await AppDataSource.getRepository(Company).findOneBy({ id: cid });
+    } catch (error) {
+      // Express 4 drops a rejected promise; answer through the error handler.
+      return next(error);
+    }
+    if (!co) return res.status(404).json({ error: "Company not found" });
+    (req as unknown as { company: Company }).company = co;
+    next();
+  }),
+);
+
+function companyOf(req: { company?: Company }): Company {
+  if (!req.company) throw new Error("Company context missing");
+  return req.company;
+}
+
+// ───────────────────────── Directory ─────────────────────────────────────
+
+workspaceRouter.get("/directory", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const dir = await listCompanyDirectory(co.id);
+  res.json(dir);
+});
+
+// Flat list of everything @-mentionable from the composer — users by handle,
+// AI by slug, channels, bases, base tables, connections. The client filters
+// by handle prefix as the user types; each entry carries the `href` the
+// clickable pill should navigate to.
+workspaceRouter.get("/mentionables", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const list = await listCompanyMentionables(co.id, co.slug);
+  res.json(list);
+});
+
+// ───────────────────────── Realtime token ────────────────────────────────
+
+workspaceRouter.post("/ws-token", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
+  const token = await mintWsToken(req.userId, co.id, realtimeAuthenticationForRequest(req));
+  res.json({ token });
+});
+
+// ───────────────────────── Channels ──────────────────────────────────────
+
+workspaceRouter.get("/channels", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const list = await listChannelsForUser(co.id, req.userId!);
+  res.json(list);
+});
+
+workspaceRouter.get("/channels/:channelId", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const ok = await userHasChannelAccess({
+    channelId: req.params.channelId,
+    userId: req.userId!,
+    companyId: co.id,
+  });
+  if (!ok) return res.status(404).json({ error: "Channel not found" });
+  const c = await getChannel(req.params.channelId, co.id, req.userId!);
+  if (!c) return res.status(404).json({ error: "Channel not found" });
+  res.json(c);
+});
+
+const createChannelSchema = z.object({
+  name: z.string().min(1).max(80),
+  topic: z.string().max(280).optional().default(""),
+  kind: z.enum(["public", "private"]).default("public"),
+  memberUserIds: z.array(z.string().uuid()).optional().default([]),
+  employeeIds: z.array(z.string().uuid()).optional().default([]),
+});
+workspaceRouter.post("/channels", validateBody(createChannelSchema), async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const body = req.body as z.infer<typeof createChannelSchema>;
+  try {
+    const channel = await createChannel({
+      companyId: co.id,
+      name: body.name,
+      topic: body.topic,
+      kind: body.kind,
+      createdByUserId: req.userId!,
+      initialMemberUserIds: body.memberUserIds,
+      initialEmployeeIds: body.employeeIds,
+    });
+    const hydrated = await getChannel(channel.id, co.id, req.userId!);
+    res.status(201).json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Create failed" });
+  }
+});
+
+const renameChannelSchema = z.object({
+  /** An empty name clears a group chat's, which then shows its members. */
+  name: z.string().max(80).optional(),
+  topic: z.string().max(280).optional(),
+});
+workspaceRouter.patch(
+  "/channels/:channelId",
+  validateBody(renameChannelSchema),
+  async (req, res) => {
+    const co = companyOf(req as unknown as { company?: Company });
+    const ok = await userHasChannelAccess({
+      channelId: req.params.channelId,
+      userId: req.userId!,
+      companyId: co.id,
+    });
+    if (!ok) return res.status(404).json({ error: "Channel not found" });
+    const body = req.body as z.infer<typeof renameChannelSchema>;
+    if (body.name !== undefined && !body.name.trim()) {
+      const channel = await getChannel(req.params.channelId, co.id, req.userId!);
+      if (channel?.kind !== "group") {
+        return res.status(400).json({ error: "A channel needs a name." });
+      }
+    }
+    try {
+      await renameChannel({
+        channelId: req.params.channelId,
+        name: body.name,
+        topic: body.topic,
+      });
+      const hydrated = await getChannel(req.params.channelId, co.id, req.userId!);
+      res.json(hydrated);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Rename failed" });
+    }
+  },
+);
+
+const channelWebhookParamsSchema = z.object({ channelId: z.string().uuid() });
+workspaceRouter.get("/channels/:channelId/webhook", async (req, res) => {
+  const params = channelWebhookParamsSchema.safeParse(req.params);
+  if (!params.success) {
+    return res.status(400).json({ error: "ValidationError", issues: params.error.issues });
+  }
+  const co = companyOf(req as unknown as { company?: Company });
+  const ok = await userHasChannelAccess({
+    channelId: params.data.channelId,
+    userId: req.userId!,
+    companyId: co.id,
+  });
+  if (!ok) return res.status(404).json({ error: "Channel not found" });
+  try {
+    res.json(await getChannelWebhookSettings(co.id, params.data.channelId));
+  } catch {
+    res.status(404).json({ error: "Channel not found" });
+  }
+});
+
+const channelWebhookSettingsSchema = z
+  .object({
+    enabled: z.boolean(),
+    regenerate: z.boolean().optional().default(false),
+  })
+  .strict();
+workspaceRouter.post(
+  "/channels/:channelId/webhook",
+  validateBody(channelWebhookSettingsSchema),
+  async (req, res) => {
+    const params = channelWebhookParamsSchema.safeParse(req.params);
+    if (!params.success) {
+      return res.status(400).json({ error: "ValidationError", issues: params.error.issues });
+    }
+    const co = companyOf(req as unknown as { company?: Company });
+    const ok = await userHasChannelAccess({
+      channelId: params.data.channelId,
+      userId: req.userId!,
+      companyId: co.id,
+    });
+    if (!ok) return res.status(404).json({ error: "Channel not found" });
+    const body = req.body as z.infer<typeof channelWebhookSettingsSchema>;
+    try {
+      const settings = await updateChannelWebhookSettings({
+        companyId: co.id,
+        channelId: params.data.channelId,
+        enabled: body.enabled,
+        regenerate: body.regenerate,
+      });
+      await recordAudit({
+        companyId: co.id,
+        actorUserId: req.userId ?? null,
+        action: body.enabled
+          ? body.regenerate
+            ? "channel.webhook.regenerate"
+            : "channel.webhook.enable"
+          : "channel.webhook.disable",
+        targetType: "channel",
+        targetId: params.data.channelId,
+        targetLabel: params.data.channelId,
+      });
+      res.json(settings);
+    } catch {
+      res.status(404).json({ error: "Channel not found" });
+    }
+  },
+);
+
+workspaceRouter.post("/channels/:channelId/archive", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const ok = await userHasChannelAccess({
+    channelId: req.params.channelId,
+    userId: req.userId!,
+    companyId: co.id,
+  });
+  if (!ok) return res.status(404).json({ error: "Channel not found" });
+  await archiveChannel(req.params.channelId);
+  res.json({ ok: true });
+});
+
+const resetContextSchema = z.object({}).strict();
+workspaceRouter.post(
+  "/channels/:channelId/context/reset",
+  validateBody(resetContextSchema),
+  async (req, res) => {
+    const co = companyOf(req as unknown as { company?: Company });
+    try {
+      const message = await resetDirectMessageContext({
+        channelId: req.params.channelId,
+        companyId: co.id,
+        userId: req.userId!,
+      });
+      res.json(message);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Context reset failed",
+      });
+    }
+  },
+);
+
+const addMembersSchema = z.object({
+  userIds: z.array(z.string().uuid()).optional().default([]),
+  employeeIds: z.array(z.string().uuid()).optional().default([]),
+});
+workspaceRouter.post(
+  "/channels/:channelId/members",
+  validateBody(addMembersSchema),
+  async (req, res) => {
+    const co = companyOf(req as unknown as { company?: Company });
+    const ok = await userHasChannelAccess({
+      channelId: req.params.channelId,
+      userId: req.userId!,
+      companyId: co.id,
+    });
+    if (!ok) return res.status(404).json({ error: "Channel not found" });
+    const body = req.body as z.infer<typeof addMembersSchema>;
+    await addChannelMembers({
+      channelId: req.params.channelId,
+      companyId: co.id,
+      userIds: body.userIds,
+      employeeIds: body.employeeIds,
+    });
+    const hydrated = await getChannel(req.params.channelId, co.id, req.userId!);
+    res.json(hydrated);
+  },
+);
+
+workspaceRouter.delete("/channels/:channelId/members/:memberId", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const ok = await userHasChannelAccess({
+    channelId: req.params.channelId,
+    userId: req.userId!,
+    companyId: co.id,
+  });
+  if (!ok) return res.status(404).json({ error: "Channel not found" });
+  await removeChannelMember(req.params.channelId, req.params.memberId);
+  res.json({ ok: true });
+});
+
+workspaceRouter.post("/channels/:channelId/read", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const ok = await userHasChannelAccess({
+    channelId: req.params.channelId,
+    userId: req.userId!,
+    companyId: co.id,
+  });
+  if (!ok) return res.status(404).json({ error: "Channel not found" });
+  await markChannelRead({
+    channelId: req.params.channelId,
+    userId: req.userId!,
+  });
+  res.json({ ok: true });
+});
+
+// ───────────────────────── DMs ───────────────────────────────────────────
+
+const openDMSchema = z.object({
+  targetUserId: z.string().uuid().optional(),
+  targetEmployeeId: z.string().uuid().optional(),
+});
+workspaceRouter.post("/dms", validateBody(openDMSchema), async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const body = req.body as z.infer<typeof openDMSchema>;
+  if (!body.targetUserId && !body.targetEmployeeId) {
+    return res.status(400).json({ error: "Must specify a target" });
+  }
+  if (body.targetUserId === req.userId) {
+    return res.status(400).json({ error: "Cannot DM yourself" });
+  }
+  const target = body.targetUserId
+    ? ({ kind: "user", userId: body.targetUserId } as const)
+    : ({ kind: "ai", employeeId: body.targetEmployeeId! } as const);
+  const channel = await findOrCreateDM({
+    companyId: co.id,
+    from: { kind: "user", userId: req.userId! },
+    target,
+  });
+  const hydrated = await getChannel(channel.id, co.id, req.userId!);
+  res.json(hydrated);
+});
+
+// ───────────────────────── Messages ──────────────────────────────────────
+
+// The newest messages as a plain array, or those before an instant — the
+// answer API clients have always read. Paging back by timestamp can pass over
+// messages sharing the boundary second; `/history` below pages exactly.
+workspaceRouter.get(
+  "/channels/:channelId/messages",
+  validateQuery(channelMessagesQuerySchema),
+  async (req, res, next) => {
+    try {
+      const co = companyOf(req as unknown as { company?: Company });
+      const ok = await userHasChannelAccess({
+        channelId: req.params.channelId,
+        userId: req.userId!,
+        companyId: co.id,
+      });
+      if (!ok) return res.status(404).json({ error: "Channel not found" });
+      const query = req.query as unknown as z.infer<typeof channelMessagesQuerySchema>;
+      const rows = await listMessages({
+        channelId: req.params.channelId,
+        companyId: co.id,
+        viewerUserId: req.userId!,
+        before: query.before,
+        limit: query.limit,
+      });
+      res.json(rows);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// A channel's history, newest page first and each page oldest first, with the
+// cursor further back — what the Workspace and the Home peek scroll through.
+// The cursor names the oldest message shown, (createdAt, id), so messages
+// sharing a second are neither skipped nor repeated, and deleted messages stay
+// as the line the Workspace shows in their place.
+workspaceRouter.get(
+  "/channels/:channelId/history",
+  validateQuery(channelHistoryQuerySchema),
+  async (req, res, next) => {
+    try {
+      const co = companyOf(req as unknown as { company?: Company });
+      const ok = await userHasChannelAccess({
+        channelId: req.params.channelId,
+        userId: req.userId!,
+        companyId: co.id,
+      });
+      if (!ok) return res.status(404).json({ error: "Channel not found" });
+      const query = req.query as unknown as z.infer<typeof channelHistoryQuerySchema>;
+      const {
+        rows,
+        tainted: _tainted,
+        ...info
+      } = await pageChannelMessages({
+        channelId: req.params.channelId,
+        companyId: co.id,
+        viewerUserId: req.userId!,
+        before: query.before,
+        includeDeleted: true,
+        limits: CHANNEL_HISTORY_PAGE,
+        page: { limit: query.limit, cursor: query.cursor },
+        present: (message) => message,
+      });
+      res.json({ ...info, messages: rows });
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+const sendMessageSchema = z.object({
+  content: z.string().max(16_000),
+  parentMessageId: z.string().uuid().nullable().optional(),
+  attachmentIds: z.array(z.string().uuid()).optional().default([]),
+});
+workspaceRouter.post(
+  "/channels/:channelId/messages",
+  requireBrowserSession,
+  validateBody(sendMessageSchema),
+  async (req, res) => {
+    const co = companyOf(req as unknown as { company?: Company });
+    const body = req.body as z.infer<typeof sendMessageSchema>;
+    const ok = await userHasChannelAccess({
+      channelId: req.params.channelId,
+      userId: req.userId!,
+      companyId: co.id,
+    });
+    if (!ok) return res.status(404).json({ error: "Channel not found" });
+    if (!body.content.trim() && body.attachmentIds.length === 0) {
+      return res.status(400).json({ error: "Empty message" });
+    }
+    try {
+      const msg = await postMessage({
+        channelId: req.params.channelId,
+        companyId: co.id,
+        author: { kind: "user", userId: req.userId! },
+        requesterSessionVersion: req.session!.sessionVersion!,
+        content: body.content,
+        parentMessageId: body.parentMessageId ?? null,
+        attachmentIds: body.attachmentIds,
+      });
+      res.status(201).json(msg);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Send failed" });
+    }
+  },
+);
+
+const editMessageSchema = z.object({ content: z.string().min(1).max(16_000) });
+workspaceRouter.patch("/messages/:messageId", validateBody(editMessageSchema), async (req, res) => {
+  const body = req.body as z.infer<typeof editMessageSchema>;
+  try {
+    const updated = await editMessage({
+      messageId: req.params.messageId,
+      userId: req.userId!,
+      content: body.content,
+    });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Edit failed" });
+  }
+});
+
+workspaceRouter.delete("/messages/:messageId", async (req, res) => {
+  try {
+    await softDeleteMessage({
+      messageId: req.params.messageId,
+      userId: req.userId!,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Delete failed" });
+  }
+});
+
+const reactionSchema = z.object({
+  emoji: z.string().min(1).max(32),
+});
+workspaceRouter.post(
+  "/messages/:messageId/reactions",
+  validateBody(reactionSchema),
+  async (req, res) => {
+    const co = companyOf(req as unknown as { company?: Company });
+    const body = req.body as z.infer<typeof reactionSchema>;
+    try {
+      const r = await toggleReaction({
+        messageId: req.params.messageId,
+        emoji: body.emoji,
+        userId: req.userId!,
+        companyId: co.id,
+      });
+      res.json(r);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Reaction failed" });
+    }
+  },
+);
+
+// ─────────────────────── Uploads + download ──────────────────────────────
+
+workspaceRouter.post("/attachments", uploadMiddleware.single("file"), async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const file = (req as unknown as { file?: Express.Multer.File }).file;
+  if (!file) return res.status(400).json({ error: "No file uploaded" });
+  const row = await recordAttachment({
+    companyId: co.id,
+    companySlug: co.slug,
+    file,
+    uploadedByUserId: req.userId!,
+  });
+  res.status(201).json({
+    id: row.id,
+    filename: row.filename,
+    mimeType: row.mimeType,
+    sizeBytes: Number(row.sizeBytes),
+    isImage: row.mimeType.startsWith("image/"),
+  });
+});
+
+workspaceRouter.get("/attachments/:id", async (req, res) => {
+  const co = companyOf(req as unknown as { company?: Company });
+  const resolved = await resolveAttachmentFile(req.params.id, co.id);
+  if (!resolved) return res.status(404).json({ error: "Attachment not found" });
+  res.setHeader("Content-Type", resolved.row.mimeType);
+  const inline = resolved.row.mimeType.startsWith("image/");
+  const disposition = inline ? "inline" : "attachment";
+  res.setHeader(
+    "Content-Disposition",
+    `${disposition}; filename="${encodeURIComponent(resolved.row.filename)}"`,
+  );
+  res.sendFile(resolved.absPath);
+});

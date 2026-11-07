@@ -1,0 +1,233 @@
+import React from "react";
+import { Check, X } from "lucide-react";
+import { api, Approval, ApprovalStatus, Company } from "../lib/api";
+import { approvalCopy } from "../components/approvals/approvalCopy";
+import { errorMessage } from "../lib/errors";
+import { Button } from "../components/ui/Button";
+import { Card, CardBody } from "../components/ui/Card";
+import { EmptyState } from "../components/ui/EmptyState";
+import { FormError } from "../components/ui/FormError";
+import { Spinner } from "../components/ui/Spinner";
+import { TopBar } from "../components/AppShell";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { useLiveRefetch } from "../components/CompanySocket";
+
+/**
+ * Company-wide inbox for action gates outside the Decision stack. Email and
+ * proposed-work reviews live only in the Decision stack; this page covers
+ * routine ticks (`requiresApproval`), Lightning payments over a Connection's
+ * threshold, browser form submits
+ * (`browserApprovalRequired` — the AI re-fires via `browser_resume` after
+ * approval, in the same turn or any later one), guarded MCP tool calls,
+ * and ad-spend mutations. `approvalCopy` in
+ * `components/approvals/approvalCopy.ts` is the per-kind rendering contract,
+ * shared with the peek Home opens over a pending row so the two surfaces
+ * cannot describe the same gate differently.
+ *
+ * Decided rows stick around so the inbox doubles as a recent history of
+ * what was gated and what the human decided.
+ */
+
+const STATUS_STYLE: Record<ApprovalStatus, string> = {
+  pending: "bg-amber-50 text-amber-700 border-amber-200",
+  executing: "bg-sky-50 text-sky-700 border-sky-200",
+  approved: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  execution_failed: "bg-rose-50 text-rose-700 border-rose-200",
+  rejected: "bg-rose-50 text-rose-700 border-rose-200",
+  expired: "bg-slate-50 text-slate-600 border-slate-200",
+};
+
+export default function Approvals({ company }: { company: Company }) {
+  const [rows, setRows] = React.useState<Approval[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const dialog = useDialog();
+  const background = useBackgroundAction();
+  const base = `/api/companies/${company.id}/approvals`;
+  const canDecide = company.role === "owner" || company.role === "admin";
+
+  async function reload() {
+    if (!canDecide) {
+      setRows([]);
+      return;
+    }
+    try {
+      const list = await api.get<Approval[]>(`${base}?kind=other`);
+      setRows(list);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load approvals"));
+      setRows([]);
+    }
+  }
+
+  React.useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [company.id]);
+
+  useLiveRefetch("approval", reload);
+
+  function decide(row: Approval, action: "approve" | "reject") {
+    setRows(
+      (current) =>
+        current?.map((item) =>
+          item.id === row.id
+            ? {
+                ...item,
+                status: action === "approve" ? "approved" : "rejected",
+                decidedAt: new Date().toISOString(),
+              }
+            : item,
+        ) ?? current,
+    );
+
+    background(
+      () => api.post<Approval & { executeError?: string }>(`${base}/${row.id}/${action}`),
+      {
+        title: "Couldn’t update this Approval",
+        error: (error) => `${errorMessage(error)} The approval is pending again.`,
+        onSuccess: (updated) => {
+          setRows(
+            (current) =>
+              current?.map((item) => (item.id === updated.id ? updated : item)) ?? current,
+          );
+          if (action === "approve" && updated.executeError) {
+            void dialog.error(updated.executeError, { title: "Approved, but the action failed" });
+          }
+        },
+        onError: () => {
+          setRows(
+            (current) => current?.map((item) => (item.id === row.id ? row : item)) ?? current,
+          );
+        },
+      },
+    );
+  }
+
+  const pending = rows?.filter((r) => r.status === "pending") ?? [];
+  const history = rows?.filter((r) => r.status !== "pending") ?? [];
+
+  if (!canDecide) {
+    return (
+      <div className="page-shell p-4 sm:p-8">
+        <TopBar title="Approvals" />
+        <EmptyState
+          title="Owner or admin access required"
+          description="Approval requests can contain sensitive external-action details. Ask a company owner or admin to review them."
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="page-shell p-4 sm:p-8">
+      <TopBar title="Approvals" />
+      {loadError ? (
+        <FormError message={loadError} />
+      ) : rows === null ? (
+        <Spinner />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          title="No approvals yet"
+          description="Routines that require approval, Lightning payments and ad-spend changes above their Connection's safety threshold, and guarded MCP tool calls show up here for a human to decide."
+        />
+      ) : (
+        <div className="flex flex-col gap-6">
+          <section>
+            <div className="text-xs mb-2 font-medium text-slate-500 dark:text-slate-400">
+              Pending ({pending.length})
+            </div>
+            {pending.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-slate-200 p-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                Nothing waiting.
+              </div>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {pending.map((a) => {
+                  const c = approvalCopy(a);
+                  return (
+                    <li key={a.id}>
+                      <Card>
+                        <CardBody className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-slate-100">
+                              <c.Icon size={14} className={c.iconClass} />
+                              {c.title}
+                            </div>
+                            <div className="text-xs text-slate-500 dark:text-slate-400">
+                              {a.employee?.name ?? "(deleted employee)"} · {c.subtitle} · requested{" "}
+                              {new Date(a.requestedAt).toLocaleString()}
+                            </div>
+                          </div>
+                          {canDecide ? (
+                            <div className="flex gap-1">
+                              <Button size="sm" onClick={() => decide(a, "approve")}>
+                                <Check size={14} /> Approve
+                              </Button>
+                              <Button size="sm" variant="ghost" onClick={() => decide(a, "reject")}>
+                                <X size={14} /> Reject
+                              </Button>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-slate-500 dark:text-slate-400">
+                              An owner or admin must decide
+                            </span>
+                          )}
+                        </CardBody>
+                      </Card>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+
+          {history.length > 0 && (
+            <section>
+              <div className="text-xs mb-2 font-medium text-slate-500 dark:text-slate-400">
+                History
+              </div>
+              <ul className="flex flex-col gap-1">
+                {history.map((a) => {
+                  const c = approvalCopy(a);
+                  return (
+                    <li key={a.id}>
+                      <div className="flex items-center gap-2 rounded-md border border-slate-100 bg-white px-3 py-2 text-xs dark:bg-slate-900 dark:border-slate-800">
+                        <span
+                          className={
+                            "rounded border px-1.5 py-0.5 text-xs font-medium inline-block first-letter:uppercase " +
+                            STATUS_STYLE[a.status]
+                          }
+                        >
+                          {a.status}
+                        </span>
+                        <c.Icon size={12} className={c.iconClass} />
+                        <span className="truncate text-slate-700 dark:text-slate-200">
+                          {c.title}
+                        </span>
+                        <span className="text-slate-400 dark:text-slate-500">·</span>
+                        <span className="truncate text-slate-500 dark:text-slate-400">
+                          {a.employee?.name ?? "(deleted employee)"}
+                        </span>
+                        {a.errorMessage ? (
+                          <span className="truncate text-rose-600 dark:text-rose-400">
+                            · {a.errorMessage}
+                          </span>
+                        ) : null}
+                        <span className="ml-auto text-slate-400 dark:text-slate-500">
+                          {a.decidedAt
+                            ? new Date(a.decidedAt).toLocaleString()
+                            : new Date(a.requestedAt).toLocaleString()}
+                        </span>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

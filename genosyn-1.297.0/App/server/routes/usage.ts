@@ -1,0 +1,168 @@
+import { Router } from "express";
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { Run } from "../db/entities/Run.js";
+import { Routine } from "../db/entities/Routine.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  requireAuth,
+  requireCompanyMember,
+  requireCompanyRole,
+  onRoutePaths,
+} from "../middleware/auth.js";
+
+/**
+ * Run-count, compute-time, and token rollups. Tokens come from the provider's
+ * own per-turn counts, summed onto each Run by the runner (`Run.tokensIn` /
+ * `Run.tokensOut`) — the only source that can be right, since a custom
+ * endpoint can serve any tokenizer. Dollar costs are still not computed:
+ * pricing varies per provider/model/contract, so the UI shows tokens and lets
+ * the operator do their own arithmetic. Runs from before token accounting
+ * shipped count as zero.
+ *
+ * Returns per-window totals plus per-employee and per-routine breakdowns so
+ * the Usage page can render a dashboard from a single round-trip.
+ */
+export const usageRouter = Router({ mergeParams: true });
+usageRouter.use(requireAuth);
+usageRouter.use(requireCompanyMember);
+usageRouter.use(onRoutePaths(["/usage"], requireCompanyRole("admin")));
+
+type RunBucket = {
+  runs: number;
+  completed: number;
+  reviewed: number;
+  /** Hand-offs: the work went on in a continuation, which carries the outcome. */
+  continued: number;
+  failed: number;
+  error: number;
+  skipped: number;
+  timeout: number;
+  interrupted: number;
+  durationMs: number;
+  tokensIn: number;
+  tokensOut: number;
+};
+
+function emptyBucket(): RunBucket {
+  return {
+    runs: 0,
+    completed: 0,
+    reviewed: 0,
+    continued: 0,
+    failed: 0,
+    error: 0,
+    skipped: 0,
+    timeout: 0,
+    interrupted: 0,
+    durationMs: 0,
+    tokensIn: 0,
+    tokensOut: 0,
+  };
+}
+
+// No compiler help here: a status missing from this chain still increments
+// `runs`, so it silently skews the success rate rather than failing a build.
+function accumulate(b: RunBucket, run: Run): void {
+  b.runs += 1;
+  if (run.status === "completed") b.completed += 1;
+  else if (run.status === "reviewed") b.reviewed += 1;
+  else if (run.status === "continued") b.continued += 1;
+  else if (run.status === "failed") b.failed += 1;
+  else if (run.status === "error") b.error += 1;
+  else if (run.status === "skipped") b.skipped += 1;
+  else if (run.status === "timeout") b.timeout += 1;
+  else if (run.status === "interrupted") b.interrupted += 1;
+  if (run.finishedAt && run.startedAt) {
+    const ms = run.finishedAt.getTime() - run.startedAt.getTime();
+    if (ms > 0) b.durationMs += ms;
+  }
+  b.tokensIn += run.tokensIn ?? 0;
+  b.tokensOut += run.tokensOut ?? 0;
+}
+
+usageRouter.get("/usage", async (req, res) => {
+  const { cid } = req.params as Record<string, string>;
+  const windowDays = Math.min(90, Math.max(1, parseInt(String(req.query.days ?? "30"), 10) || 30));
+
+  // Scope: all routines in the company → their runs since (now - windowDays).
+  const emps = await AppDataSource.getRepository(AIEmployee).find({
+    where: { companyId: cid },
+  });
+  const empById = new Map(emps.map((e) => [e.id, e]));
+  if (emps.length === 0) {
+    return res.json({
+      windowDays,
+      totals: emptyBucket(),
+      byEmployee: [],
+      byRoutine: [],
+    });
+  }
+  const routines = await AppDataSource.getRepository(Routine).find({
+    where: { employeeId: In(emps.map((e) => e.id)) },
+  });
+  const routineById = new Map(routines.map((r) => [r.id, r]));
+  if (routines.length === 0) {
+    return res.json({
+      windowDays,
+      totals: emptyBucket(),
+      byEmployee: emps.map((e) => ({
+        employeeId: e.id,
+        name: e.name,
+        slug: e.slug,
+        ...emptyBucket(),
+      })),
+      byRoutine: [],
+    });
+  }
+
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const runs = await AppDataSource.getRepository(Run)
+    .createQueryBuilder("run")
+    .where("run.routineId IN (:...ids)", { ids: routines.map((r) => r.id) })
+    .andWhere("run.status != :queued", { queued: "queued" })
+    .andWhere("run.startedAt >= :since", { since })
+    .getMany();
+
+  const totals = emptyBucket();
+  const byEmployee = new Map<string, RunBucket>();
+  const byRoutine = new Map<string, RunBucket>();
+  for (const e of emps) byEmployee.set(e.id, emptyBucket());
+  for (const r of routines) byRoutine.set(r.id, emptyBucket());
+
+  for (const run of runs) {
+    accumulate(totals, run);
+    const routine = routineById.get(run.routineId);
+    if (!routine) continue;
+    accumulate(byRoutine.get(run.routineId)!, run);
+    const empBucket = byEmployee.get(routine.employeeId);
+    if (empBucket) accumulate(empBucket, run);
+  }
+
+  res.json({
+    windowDays,
+    totals,
+    byEmployee: emps
+      .map((e) => ({
+        employeeId: e.id,
+        name: e.name,
+        slug: e.slug,
+        ...byEmployee.get(e.id)!,
+      }))
+      .sort((a, b) => b.runs - a.runs),
+    byRoutine: routines
+      .map((r) => {
+        const emp = empById.get(r.employeeId);
+        return {
+          routineId: r.id,
+          name: r.name,
+          slug: r.slug,
+          employeeId: r.employeeId,
+          employeeName: emp?.name ?? "",
+          employeeSlug: emp?.slug ?? "",
+          ...byRoutine.get(r.id)!,
+        };
+      })
+      .sort((a, b) => b.runs - a.runs),
+  });
+});

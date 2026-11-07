@@ -1,0 +1,66 @@
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { AIModel } from "../db/entities/AIModel.js";
+import { EmployeeRepositoryGrant } from "../db/entities/EmployeeRepositoryGrant.js";
+import type { Repository } from "../db/entities/Repository.js";
+import { attachedModelsByEmployee, resolveChatModel } from "./models.js";
+import { isModelConnected, PROVIDERS } from "./providers.js";
+import { modelEffortLevels, modelThinking } from "./modelEffort.js";
+
+/** Only employees granted this company's Repository, with credential-free model choices. */
+export async function repositoryWorkSessionCandidates(repo: Repository) {
+  const grants = await AppDataSource.getRepository(EmployeeRepositoryGrant).find({
+    where: { repositoryId: repo.id },
+  });
+  const employees = grants.length
+    ? await AppDataSource.getRepository(AIEmployee).find({
+        where: { companyId: repo.companyId, id: In(grants.map((grant) => grant.employeeId)) },
+        order: { createdAt: "ASC" },
+      })
+    : [];
+  const attached = await attachedModelsByEmployee(employees.map((employee) => employee.id));
+  return employees.map((employee) => {
+    const { models, activeId } = attached.get(employee.id) ?? { models: [], activeId: null };
+    // Oldest attachment first, the order the picker has always listed them in.
+    const choices = [...models].reverse();
+    return {
+      id: employee.id,
+      name: employee.name,
+      slug: employee.slug,
+      role: employee.role,
+      avatarKey: employee.avatarKey ?? null,
+      models: choices.map((model) => ({
+        id: model.id,
+        provider: model.provider,
+        model: model.model,
+        label: [PROVIDERS[model.provider].label, model.model].filter(Boolean).join(" · "),
+        status: isModelConnected(model) ? ("connected" as const) : ("not_connected" as const),
+        isActive: model.id === activeId,
+        effortLevels: modelEffortLevels(model),
+        // The default a session left on Default thinks at, and the highest
+        // level its owners allow, so the picker can say both.
+        thinking: modelThinking(model),
+      })),
+    };
+  });
+}
+
+/** An explicit choice must never silently fall back to a different model. */
+export async function requireWorkSessionModel(
+  employee: AIEmployee,
+  modelId?: string | null,
+): Promise<AIModel> {
+  const model = await resolveChatModel(employee.id, modelId);
+  if (!model) {
+    throw new Error(
+      modelId
+        ? "The selected AI Model is no longer available for this employee. Start a new work session with an available model."
+        : `${employee.name} has no AI Model connected yet.`,
+    );
+  }
+  if (!isModelConnected(model)) {
+    throw new Error("The selected AI Model is not connected. Connect it before starting work.");
+  }
+  return model;
+}

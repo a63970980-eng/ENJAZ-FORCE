@@ -1,0 +1,954 @@
+import React from "react";
+import { useComposerFileDrop } from "../lib/fileDrop";
+import { useChatAttachments } from "../lib/stagedChatAttachments";
+import { ChatAttachments } from "../components/chat/ChatAttachments";
+import { CopyTextButton, REVEAL_ON_HOVER } from "../components/chat/CopyTextButton";
+import { Select } from "@/components/ui/Select";
+import { Link } from "react-router-dom";
+import {
+  AlertCircle,
+  CircleHelp,
+  Paperclip,
+  MessageSquarePlus,
+  Send,
+  Sparkles,
+} from "lucide-react";
+import { ContextualLayout } from "@/components/AppShell";
+import { ChatMarkdown } from "@/components/ChatMarkdown";
+import {
+  LiveTurnCard,
+  shouldShowTurnSummary,
+  TurnWorkSummary,
+} from "@/components/chat/TurnActivity";
+import { Avatar, employeeAvatarUrl } from "@/components/ui/Avatar";
+import { ButtonSpinner, Spinner } from "@/components/ui/Spinner";
+import { EMPTY_LIVE_TURN, reduceLiveTurn, type LiveTurnState } from "@/lib/chatActivity";
+import { useDialog } from "@/components/ui/Dialog";
+import { FormError } from "@/components/ui/FormError";
+import {
+  api,
+  type ChatAttachment,
+  type Company,
+  type ConversationDetail,
+  type ConversationMessage,
+  type ConversationSummary,
+  type Employee,
+} from "@/lib/api";
+import { errorMessage } from "@/lib/errors";
+
+const SUGGESTIONS = [
+  "How do I create and schedule a Routine?",
+  "Why can’t an AI Employee access a Connection?",
+  "Where is AI Model configuration implemented?",
+  "How does Genosyn keep credentials safe?",
+];
+
+export default function Help({ company }: { company: Company }) {
+  const dialog = useDialog();
+  const [employees, setEmployees] = React.useState<Employee[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [conversations, setConversations] = React.useState<ConversationSummary[]>([]);
+  const [conversationsError, setConversationsError] = React.useState<string | null>(null);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [loadedId, setLoadedId] = React.useState<string | null>(null);
+  const [messages, setMessages] = React.useState<ConversationMessage[]>([]);
+  const [messagesError, setMessagesError] = React.useState<string | null>(null);
+  const [loadingConversations, setLoadingConversations] = React.useState(false);
+  const [loadingMessages, setLoadingMessages] = React.useState(false);
+  const [input, setInput] = React.useState("");
+  const [sending, setSending] = React.useState(false);
+  const [claimingLegacy, setClaimingLegacy] = React.useState(false);
+  const [startingConversation, setStartingConversation] = React.useState(false);
+  const [claimError, setClaimError] = React.useState<string | null>(null);
+  const [streamingReply, setStreamingReply] = React.useState("");
+  /** What the reply in flight has done so far, from whichever stream is following it. */
+  const [live, setLive] = React.useState<LiveTurnState>(EMPTY_LIVE_TURN);
+  /** A reply this page did not send but found running — after a reload — and follows. */
+  const [followingId, setFollowingId] = React.useState<string | null>(null);
+  const [stopping, setStopping] = React.useState(false);
+  const [stopError, setStopError] = React.useState<string | null>(null);
+  const inputRef = React.useRef<HTMLTextAreaElement>(null);
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+
+  const selected = employees?.find((employee) => employee.id === selectedId) ?? null;
+  /** A reply still running is drawn as live activity, never as a finished bubble. */
+  const visibleMessages = messages.filter((message) => message.status !== "working");
+  const activeConversation =
+    conversations.find((conversation) => conversation.id === activeId) ?? null;
+
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [uploadError, setUploadError] = React.useState<string | null>(null);
+  const attachmentDraft = useChatAttachments({
+    scopeKey: `${company.id}:${selectedId}`,
+    upload: (file) =>
+      api.uploadFile<ChatAttachment>(
+        `/api/companies/${company.id}/employees/${selectedId}/chat-attachments`,
+        file,
+      ),
+    onError: setUploadError,
+  });
+  const { onPaste, dragProps } = useComposerFileDrop(attachmentDraft.addFiles, {
+    disabled: !selected || sending || Boolean(activeConversation?.legacyUnclaimed),
+  });
+  const attachmentUrl = (id: string) =>
+    `/api/companies/${company.id}/employees/${selectedId}/chat-attachments/${id}`;
+
+  React.useEffect(() => {
+    let cancelled = false;
+    api
+      .get<Employee[]>(`/api/companies/${company.id}/employees`)
+      .then((list) => {
+        if (cancelled) return;
+        setEmployees(list);
+        setSelectedId(
+          (current) =>
+            (current && list.some((employee) => employee.id === current) ? current : null) ??
+            list.find((employee) => employee.model?.status === "connected")?.id ??
+            list[0]?.id ??
+            null,
+        );
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setEmployees([]);
+        setLoadError(errorMessage(error, "Could not load your AI Employees"));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [company.id]);
+
+  React.useEffect(() => {
+    if (!selectedId) {
+      setConversations([]);
+      setConversationsError(null);
+      setActiveId(null);
+      setLoadedId(null);
+      setMessages([]);
+      return;
+    }
+    let cancelled = false;
+    setLoadingConversations(true);
+    setConversationsError(null);
+    setConversations([]);
+    setActiveId(null);
+    setLoadedId(null);
+    setMessages([]);
+    api
+      .get<ConversationSummary[]>(
+        `/api/companies/${company.id}/employees/${selectedId}/conversations?surface=help`,
+      )
+      .then((list) => {
+        if (cancelled) return;
+        setConversations(list);
+        setActiveId(list[0]?.id ?? null);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setConversationsError(errorMessage(error, "Could not load the conversations"));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingConversations(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [company.id, selectedId]);
+
+  React.useEffect(() => {
+    if (!selectedId || !activeId || loadedId === activeId) return;
+    let cancelled = false;
+    setLoadingMessages(true);
+    setMessagesError(null);
+    api
+      .get<ConversationDetail>(
+        `/api/companies/${company.id}/employees/${selectedId}/conversations/${activeId}`,
+      )
+      .then((detail) => {
+        if (cancelled) return;
+        setMessages(detail.messages);
+        setLoadedId(activeId);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setMessagesError(errorMessage(error, "Could not load the conversation"));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingMessages(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, company.id, loadedId, selectedId]);
+
+  // A Help reply keeps running on the server when the page reloads. Follow it
+  // to its end over the same stream the chat uses, so its steps and text are
+  // live here too instead of an empty bubble.
+  const runningReply = !sending
+    ? messages.find((message) => message.role === "assistant" && message.status === "working")
+    : undefined;
+  React.useEffect(() => {
+    if (!selectedId || !activeId || !runningReply) return;
+    const controller = new AbortController();
+    const messageId = runningReply.id;
+    setFollowingId(messageId);
+    setLive({
+      ...EMPTY_LIVE_TURN,
+      turnId: messageId,
+      startedAt: Date.parse(runningReply.createdAt) || null,
+    });
+    setStreamingReply(runningReply.content);
+    void (async () => {
+      for (let attempt = 0; attempt < 30 && !controller.signal.aborted; attempt += 1) {
+        let finished = false;
+        try {
+          await api.streamGet(
+            `/api/companies/${company.id}/employees/${selectedId}/conversations/${activeId}/messages/${messageId}/activity/stream`,
+            (event, data) => {
+              if (event === "assistant") {
+                finished = true;
+                const final = data as ConversationMessage;
+                setMessages((current) =>
+                  current.map((message) => (message.id === final.id ? final : message)),
+                );
+                return;
+              }
+              if (event === "snapshot") {
+                setStreamingReply(String((data as { text?: unknown } | null)?.text ?? ""));
+              } else if (event === "chunk") {
+                const text = (data as { text?: unknown } | null)?.text;
+                if (typeof text === "string") setStreamingReply((current) => current + text);
+              }
+              setLive((current) => reduceLiveTurn(current, { event, data }, Date.now()));
+            },
+            { signal: controller.signal },
+          );
+        } catch {
+          // Reconnect below.
+        }
+        if (finished || controller.signal.aborted) break;
+        await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+      }
+      if (!controller.signal.aborted) {
+        setFollowingId(null);
+        setStreamingReply("");
+        setLive(EMPTY_LIVE_TURN);
+      }
+    })();
+    return () => {
+      controller.abort();
+      setFollowingId(null);
+    };
+    // The reply's id is the identity; its content changes while it streams.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, company.id, runningReply?.id, selectedId]);
+
+  React.useEffect(() => {
+    if (!scrollRef.current) return;
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, streamingReply, sending, live.events]);
+
+  /** Stop the reply in flight; whatever it wrote so far stays in the thread. */
+  async function stopReply() {
+    if (!selectedId || !activeId) return;
+    setStopping(true);
+    setStopError(null);
+    try {
+      await api.post(
+        `/api/companies/${company.id}/employees/${selectedId}/conversations/${activeId}/interrupt`,
+        {},
+      );
+    } catch (error) {
+      setStopping(false);
+      setStopError(errorMessage(error, "Could not stop the reply"));
+    }
+  }
+
+  React.useEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
+  }, [input]);
+
+  async function newConversation(keepAttachments = false): Promise<ConversationSummary | null> {
+    if (!selectedId || sending || claimingLegacy) return null;
+    try {
+      const created = await api.post<ConversationSummary>(
+        `/api/companies/${company.id}/employees/${selectedId}/conversations`,
+        { surface: "help" },
+      );
+      setConversations((current) => [
+        created,
+        ...current.filter((conversation) => conversation.id !== created.id),
+      ]);
+      if (!keepAttachments) attachmentDraft.clear();
+      setActiveId(created.id);
+      setLoadedId(created.id);
+      setMessages([]);
+      // The detail effect returns early on `loadedId === activeId`, so it can
+      // never clear a previous conversation's load failure for us.
+      setMessagesError(null);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+      return created;
+    } catch (error) {
+      void dialog.error(error, { title: "Couldn’t start a Help conversation" });
+      return null;
+    }
+  }
+
+  async function startNewConversation() {
+    setStartingConversation(true);
+    try {
+      await newConversation();
+    } finally {
+      setStartingConversation(false);
+    }
+  }
+
+  function selectConversation(id: string) {
+    if (sending || claimingLegacy || id === activeId) return;
+    attachmentDraft.clear();
+    setClaimError(null);
+    setMessagesError(null);
+    setActiveId(id);
+    setLoadedId(null);
+    setMessages([]);
+  }
+
+  async function claimLegacyConversation() {
+    if (!selectedId || !activeId || claimingLegacy) return;
+    setClaimingLegacy(true);
+    setClaimError(null);
+    try {
+      const base = `/api/companies/${company.id}/employees/${selectedId}/conversations/${activeId}`;
+      const claimed = await api.post<ConversationSummary>(`${base}/claim`, {});
+      const detail = await api.get<ConversationDetail>(base);
+      setConversations((current) =>
+        current.map((conversation) => (conversation.id === claimed.id ? claimed : conversation)),
+      );
+      setMessages(detail.messages);
+      setLoadedId(activeId);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    } catch (error) {
+      setClaimError(errorMessage(error, "Could not claim the conversation"));
+    } finally {
+      setClaimingLegacy(false);
+    }
+  }
+
+  async function sendMessage() {
+    const content = input.trim();
+    if (
+      (!content && attachmentDraft.pending.length === 0) ||
+      !selectedId ||
+      !selected ||
+      sending ||
+      attachmentDraft.isUploading()
+    )
+      return;
+    const attachments = attachmentDraft.pending.map(
+      ({ previewUrl: _previewUrl, ...attachment }) => attachment,
+    );
+    if (activeConversation?.legacyUnclaimed) {
+      // The banner above the thread owns this instruction — say it there.
+      setClaimError("Claim this legacy conversation before continuing it.");
+      return;
+    }
+    let conversationId = activeId;
+    if (!conversationId) {
+      const created = await newConversation(true);
+      if (!created) return;
+      conversationId = created.id;
+    }
+
+    const tempId = `help-user-${Date.now()}`;
+    const optimistic: ConversationMessage = {
+      id: tempId,
+      conversationId,
+      role: "user",
+      content,
+      attachments,
+      status: null,
+      createdAt: new Date().toISOString(),
+    };
+    setInput("");
+    setMessages((current) => [...current, optimistic]);
+    setSending(true);
+    setStreamingReply("");
+    setLive(EMPTY_LIVE_TURN);
+    setStopping(false);
+    setStopError(null);
+    let accumulated = "";
+    let receivedAssistant = false;
+    let accepted = false;
+
+    try {
+      await api.stream(
+        `/api/companies/${company.id}/employees/${selectedId}/conversations/${conversationId}/messages`,
+        { message: content, attachmentIds: attachments.map((attachment) => attachment.id) },
+        (event, data) => {
+          if (event === "user") {
+            accepted = true;
+            attachmentDraft.clear();
+            const persisted = data as ConversationMessage;
+            setMessages((current) =>
+              current.map((message) => (message.id === tempId ? persisted : message)),
+            );
+          } else if (event === "working") {
+            accepted = true;
+            attachmentDraft.clear();
+            setLive((current) => reduceLiveTurn(current, { event, data }, Date.now()));
+          } else if (
+            event === "turn" ||
+            event === "activity" ||
+            event === "heartbeat" ||
+            event === "pulse" ||
+            event === "tool_output"
+          ) {
+            setLive((current) => reduceLiveTurn(current, { event, data }, Date.now()));
+          } else if (event === "chunk") {
+            accumulated += (data as { text?: string } | null)?.text ?? "";
+            setStreamingReply(accumulated);
+            setLive((current) => reduceLiveTurn(current, { event, data }, Date.now()));
+          } else if (event === "assistant") {
+            receivedAssistant = true;
+            setMessages((current) => [...current, data as ConversationMessage]);
+            setStreamingReply("");
+          } else if (event === "conversation") {
+            const updated = data as ConversationSummary;
+            setConversations((current) => [
+              updated,
+              ...current.filter((conversation) => conversation.id !== updated.id),
+            ]);
+          } else if (event === "error") {
+            throw new Error(
+              (data as { message?: string } | null)?.message ?? "Help response failed",
+            );
+          }
+        },
+      );
+      if (!receivedAssistant && accumulated.trim()) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: `help-local-${Date.now()}`,
+            conversationId,
+            role: "assistant",
+            content: accumulated,
+            status: "ok",
+            createdAt: new Date().toISOString(),
+          },
+        ]);
+      }
+    } catch (error) {
+      const detail = errorMessage(error, "Unknown error");
+      if (!accepted) setInput(content);
+      setMessages((current) => [
+        ...current.filter((message) => accepted || message.id !== tempId),
+        {
+          id: `help-error-${Date.now()}`,
+          conversationId,
+          role: "assistant",
+          content: `Genosyn couldn’t complete this Help response.\n\n${detail}`,
+          status: "error",
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+    } finally {
+      setSending(false);
+      setStreamingReply("");
+      setLive(EMPTY_LIVE_TURN);
+      setStopping(false);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    }
+  }
+
+  return (
+    <ContextualLayout>
+      <div className="flex h-full min-h-0 bg-white dark:bg-slate-950">
+        <aside className="hidden w-72 shrink-0 flex-col border-r border-slate-200 bg-slate-50/60 lg:flex dark:border-slate-800 dark:bg-slate-950">
+          <div className="border-b border-slate-200 p-4 dark:border-slate-800">
+            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+              Ask an AI Employee
+            </div>
+            <div className="mt-3 flex flex-col gap-1">
+              {employees?.map((employee) => (
+                <button
+                  key={employee.id}
+                  type="button"
+                  disabled={sending || claimingLegacy}
+                  onClick={() => setSelectedId(employee.id)}
+                  className={
+                    "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left transition " +
+                    (employee.id === selectedId
+                      ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700"
+                      : "text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-800")
+                  }
+                >
+                  <Avatar
+                    name={employee.name}
+                    kind="ai"
+                    size="md"
+                    src={employeeAvatarUrl(company.id, employee.id, employee.avatarKey)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">{employee.name}</span>
+                    <span className="block truncate text-[11px] text-slate-400">
+                      {employee.role}
+                    </span>
+                  </span>
+                  <span
+                    className={
+                      "h-2 w-2 shrink-0 rounded-full " +
+                      (employee.model?.status === "connected"
+                        ? "bg-emerald-500"
+                        : "bg-slate-300 dark:bg-slate-600")
+                    }
+                    title={
+                      employee.model?.status === "connected"
+                        ? "AI Model connected"
+                        : "AI Model required"
+                    }
+                  />
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex items-center justify-between px-4 py-3">
+              <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                Help conversations
+              </div>
+              <button
+                type="button"
+                onClick={() => void startNewConversation()}
+                disabled={!selected || sending || claimingLegacy || startingConversation}
+                aria-busy={startingConversation || undefined}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+                aria-label="New Help conversation"
+                title="New Help conversation"
+              >
+                {startingConversation ? (
+                  <ButtonSpinner size={15} />
+                ) : (
+                  <MessageSquarePlus size={15} />
+                )}
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+              {conversationsError ? (
+                <FormError message={conversationsError} className="mt-2" />
+              ) : loadingConversations ? (
+                <div className="flex justify-center py-6">
+                  <Spinner />
+                </div>
+              ) : conversations.length === 0 ? (
+                <p className="px-2 py-4 text-xs text-slate-400 dark:text-slate-500">
+                  Your Help questions with this AI Employee will appear here.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-0.5">
+                  {conversations.map((conversation) => (
+                    <button
+                      key={conversation.id}
+                      type="button"
+                      disabled={sending || claimingLegacy}
+                      onClick={() => selectConversation(conversation.id)}
+                      className={
+                        "rounded-md px-3 py-2 text-left text-[13px] transition " +
+                        (conversation.id === activeId
+                          ? "bg-white font-medium text-slate-900 shadow-sm ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700"
+                          : "text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-800")
+                      }
+                    >
+                      <span className="block truncate">
+                        {conversation.title ?? "New Help conversation"}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </aside>
+
+        <section className="flex min-w-0 flex-1 flex-col">
+          <header className="border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-950 sm:px-6">
+            <div className="flex items-center gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-300">
+                <CircleHelp size={18} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  Genosyn Help
+                </h1>
+                <p className="truncate text-xs text-slate-500 dark:text-slate-400">
+                  Ask how the product works. Your AI Employee can inspect this release&apos;s
+                  source.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void startNewConversation()}
+                disabled={!selected || sending || claimingLegacy || startingConversation}
+                aria-busy={startingConversation || undefined}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 lg:hidden dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                {startingConversation ? (
+                  <ButtonSpinner size={13} />
+                ) : (
+                  <MessageSquarePlus size={13} />
+                )}{" "}
+                New
+              </button>
+            </div>
+
+            {employees && employees.length > 0 && (
+              <div className="mt-3 flex gap-2 lg:hidden">
+                <Select
+                  aria-label="AI Employee"
+                  value={selectedId ?? ""}
+                  disabled={sending || claimingLegacy}
+                  onChange={(event) => setSelectedId(event.target.value)}
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                >
+                  {employees.map((employee) => (
+                    <option key={employee.id} value={employee.id}>
+                      {employee.name} — {employee.role}
+                    </option>
+                  ))}
+                </Select>
+                {conversations.length > 0 && (
+                  <Select
+                    aria-label="Help conversation"
+                    value={activeId ?? ""}
+                    disabled={sending || claimingLegacy}
+                    onChange={(event) => selectConversation(event.target.value)}
+                    className="h-9 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  >
+                    {conversations.map((conversation) => (
+                      <option key={conversation.id} value={conversation.id}>
+                        {conversation.title ?? "New Help conversation"}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </div>
+            )}
+
+            {/* The sidebar that owns this list is `lg:flex` only, so the
+              narrow layout needs its own copy of the failure. */}
+            <FormError message={conversationsError} className="mt-3 lg:hidden" />
+          </header>
+
+          {activeConversation?.legacyUnclaimed && (
+            <div className="border-b border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-500/30 dark:bg-amber-500/10 sm:px-6">
+              <div className="mx-auto flex max-w-3xl flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm font-medium text-amber-900 dark:text-amber-100">
+                    Legacy Help conversation needs an owner
+                  </p>
+                  <p className="mt-0.5 text-xs text-amber-800 dark:text-amber-200/80">
+                    This thread predates private Member conversations. Claim it before asking
+                    another question.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={claimingLegacy}
+                  onClick={() => void claimLegacyConversation()}
+                  className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg bg-amber-700 px-3 text-xs font-medium text-white transition hover:bg-amber-800 disabled:opacity-60 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400"
+                >
+                  {claimingLegacy ? "Claiming…" : "Claim conversation"}
+                </button>
+              </div>
+              <FormError message={claimError} className="mx-auto mt-2 max-w-3xl" />
+            </div>
+          )}
+
+          {messagesError && (
+            <div className="border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-950 sm:px-6">
+              <FormError message={messagesError} className="mx-auto max-w-3xl" />
+            </div>
+          )}
+
+          <div
+            ref={scrollRef}
+            className="min-h-0 flex-1 overflow-y-auto bg-slate-50/50 px-4 py-6 dark:bg-slate-900/40 sm:px-8"
+          >
+            {loadError ? (
+              <FormError message={loadError} className="mx-auto max-w-3xl" />
+            ) : employees === null || loadingMessages ? (
+              <div className="flex h-full items-center justify-center">
+                <Spinner size={22} />
+              </div>
+            ) : employees.length === 0 ? (
+              <div className="mx-auto flex h-full max-w-lg flex-col items-center justify-center text-center">
+                <CircleHelp size={30} className="text-slate-300 dark:text-slate-600" />
+                <h2 className="mt-4 text-lg font-semibold text-slate-900 dark:text-slate-100">
+                  Hire an AI Employee first
+                </h2>
+                <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+                  Help is answered by one of your AI Employees, using their AI Model plus the
+                  complete Genosyn product and source context.
+                </p>
+                <Link
+                  to={`/c/${company.slug}/employees/new`}
+                  className="mt-5 inline-flex h-10 items-center justify-center rounded-lg bg-indigo-600 px-4 text-sm font-medium text-white transition hover:bg-indigo-700"
+                >
+                  Hire AI Employee
+                </Link>
+              </div>
+            ) : !selected ? (
+              <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                Select an AI Employee to ask for help.
+              </div>
+            ) : messages.length === 0 && !sending ? (
+              <div className="mx-auto flex h-full max-w-2xl flex-col items-center justify-center text-center">
+                <Avatar
+                  name={selected.name}
+                  kind="ai"
+                  size="xl"
+                  src={employeeAvatarUrl(company.id, selected.id, selected.avatarKey)}
+                />
+                <h2 className="mt-4 text-lg font-semibold text-slate-900 dark:text-slate-100">
+                  Ask {selected.name} about Genosyn
+                </h2>
+                <p className="mt-2 max-w-lg text-sm leading-relaxed text-slate-500 dark:text-slate-400">
+                  {selected.name} receives Genosyn&apos;s product vocabulary,
+                  documentation, and a read-only snapshot of the full codebase shipped with this
+                  version.
+                </p>
+                {selected.model?.status !== "connected" && (
+                  <Link
+                    to={`/c/${company.slug}/employees/${selected.slug}/settings/model`}
+                    className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+                  >
+                    <AlertCircle size={13} /> Connect an AI Model before asking
+                  </Link>
+                )}
+                <div className="mt-6 grid w-full gap-2 sm:grid-cols-2">
+                  {SUGGESTIONS.map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      onClick={() => {
+                        setInput(suggestion);
+                        inputRef.current?.focus();
+                      }}
+                      className="flex items-start gap-2 rounded-xl border border-slate-200 bg-white px-3 py-3 text-left text-sm text-slate-700 shadow-sm transition hover:border-indigo-300 hover:bg-indigo-50/40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-indigo-500/60 dark:hover:bg-indigo-500/10"
+                    >
+                      <Sparkles size={14} className="mt-0.5 shrink-0 text-indigo-500" />
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="mx-auto flex max-w-3xl flex-col gap-5">
+                {visibleMessages.map((message, index) => (
+                  <HelpBubble
+                    key={message.id}
+                    message={message}
+                    employee={selected}
+                    companyId={company.id}
+                    companySlug={company.slug}
+                    showAvatar={index === 0 || visibleMessages[index - 1].role !== message.role}
+                  />
+                ))}
+                {(sending || followingId) && (
+                  <LiveTurnCard
+                    authorName={selected.name}
+                    avatar={
+                      <Avatar
+                        name={selected.name}
+                        kind="ai"
+                        size="md"
+                        src={employeeAvatarUrl(company.id, selected.id, selected.avatarKey)}
+                      />
+                    }
+                    live={live}
+                    streamingReply={streamingReply}
+                    progress={null}
+                    connectionState="streaming"
+                    stopping={stopping}
+                    onStop={activeId ? () => void stopReply() : undefined}
+                    companySlug={company.slug}
+                  />
+                )}
+                <FormError message={stopError} />
+              </div>
+            )}
+          </div>
+
+          <form
+            {...dragProps}
+            className="border-t border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-950 sm:px-6"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendMessage();
+            }}
+          >
+            <div className="mx-auto max-w-3xl">
+              {uploadError && <FormError message={uploadError} />}
+              <ChatAttachments
+                attachments={attachmentDraft.pending}
+                urlFor={attachmentUrl}
+                onRemove={attachmentDraft.remove}
+              />
+              <div className="flex items-end gap-2 rounded-2xl border border-slate-300 bg-white px-3 py-2 focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/20 dark:border-slate-700 dark:bg-slate-900">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(event) => {
+                    if (event.target.files) attachmentDraft.addFiles(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  aria-label="Attach a file"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!selected || sending || Boolean(activeConversation?.legacyUnclaimed)}
+                  aria-busy={attachmentDraft.uploading > 0 || undefined}
+                  className="mb-1 rounded-md p-1.5 text-slate-400 hover:text-indigo-600 disabled:opacity-40"
+                >
+                  {attachmentDraft.uploading > 0 ? (
+                    <ButtonSpinner size={16} />
+                  ) : (
+                    <Paperclip size={16} />
+                  )}
+                </button>
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  disabled={!selected || sending || Boolean(activeConversation?.legacyUnclaimed)}
+                  rows={1}
+                  maxLength={8000}
+                  placeholder={
+                    selected ? `Ask ${selected.name} about Genosyn…` : "Select an AI Employee"
+                  }
+                  onPaste={onPaste}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendMessage();
+                    }
+                  }}
+                  className="max-h-[180px] min-h-8 flex-1 resize-none bg-transparent py-1.5 text-sm text-slate-900 outline-none placeholder:text-slate-400 disabled:opacity-60 dark:text-slate-100"
+                />
+                <button
+                  type="submit"
+                  disabled={
+                    !selected ||
+                    sending ||
+                    Boolean(activeConversation?.legacyUnclaimed) ||
+                    attachmentDraft.uploading > 0 ||
+                    (!input.trim() && attachmentDraft.pending.length === 0)
+                  }
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white transition hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 dark:disabled:bg-slate-800 dark:disabled:text-slate-600"
+                  aria-label="Ask for Help"
+                  aria-busy={sending || undefined}
+                >
+                  {sending ? <ButtonSpinner size={14} /> : <Send size={15} />}
+                </button>
+              </div>
+              <p className="mt-1.5 px-1 text-[11px] text-slate-400 dark:text-slate-500">
+                Help source access is read-only. Use ordinary Chat when you want this AI Employee to
+                take action in your company.
+              </p>
+            </div>
+          </form>
+        </section>
+      </div>
+    </ContextualLayout>
+  );
+}
+
+function HelpBubble({
+  message,
+  employee,
+  companyId,
+  companySlug,
+  showAvatar,
+}: {
+  message: ConversationMessage;
+  employee: Employee;
+  companyId: string;
+  companySlug: string;
+  showAvatar: boolean;
+}) {
+  if (message.role === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[85%] rounded-2xl rounded-br-md bg-indigo-600 px-3.5 py-2 text-sm leading-relaxed text-white shadow-sm sm:max-w-[75%]">
+          <ChatMarkdown content={message.content} />
+          <ChatAttachments
+            attachments={message.attachments ?? []}
+            urlFor={(id) =>
+              `/api/companies/${companyId}/employees/${employee.id}/chat-attachments/${id}`
+            }
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const isError = message.status === "error";
+  const isUnavailable = message.status === "skipped" || message.status === "busy";
+  return (
+    <div className="flex items-start gap-2.5">
+      <div className={showAvatar ? "" : "invisible"}>
+        <Avatar
+          name={employee.name}
+          kind="ai"
+          size="md"
+          src={employeeAvatarUrl(companyId, employee.id, employee.avatarKey)}
+        />
+      </div>
+      <div className="group min-w-0 flex-1">
+        {shouldShowTurnSummary(message.activity) && message.activity && (
+          <TurnWorkSummary
+            summary={message.activity}
+            activityUrl={`/api/companies/${companyId}/employees/${employee.id}/conversations/${message.conversationId}/messages/${message.id}/activity`}
+            messageId={message.id}
+            companySlug={companySlug}
+          />
+        )}
+        <div
+          className={
+            "w-fit max-w-full rounded-2xl rounded-tl-md px-3.5 py-2 text-sm leading-relaxed shadow-sm " +
+            (isError
+              ? "border border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-100"
+              : isUnavailable
+                ? "border border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-100"
+                : "border border-slate-200 bg-white text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100")
+          }
+        >
+          {isError ? (
+            <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          ) : (
+            <ChatMarkdown content={message.content} />
+          )}
+          <ChatAttachments
+            attachments={message.attachments ?? []}
+            urlFor={(id) =>
+              `/api/companies/${companyId}/employees/${employee.id}/chat-attachments/${id}`
+            }
+          />
+        </div>
+        {!isError && !isUnavailable && message.content.trim() && (
+          <div className={`mt-1 pl-1 ${REVEAL_ON_HOVER}`}>
+            <CopyTextButton text={message.content} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

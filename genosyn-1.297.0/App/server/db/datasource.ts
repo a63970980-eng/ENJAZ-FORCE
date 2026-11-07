@@ -1,0 +1,775 @@
+import "reflect-metadata";
+import { DataSource } from "typeorm";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import fs from "node:fs";
+import { config } from "../../config.js";
+import { installSqliteTransactionGate } from "./sqliteTransactionGate.js";
+import { ResourceChangeSubscriber } from "./subscribers/resourceChangeSubscriber.js";
+import { User } from "./entities/User.js";
+import { UserSession } from "./entities/UserSession.js";
+import { Company } from "./entities/Company.js";
+import { Membership } from "./entities/Membership.js";
+import { Invitation } from "./entities/Invitation.js";
+import { AIModel } from "./entities/AIModel.js";
+import { AIModelKeyHealth } from "./entities/AIModelKeyHealth.js";
+import { AIModelOutage } from "./entities/AIModelOutage.js";
+import { AIModelWait } from "./entities/AIModelWait.js";
+import { EmployeeModel } from "./entities/EmployeeModel.js";
+import { AIEmployee } from "./entities/AIEmployee.js";
+import { Skill } from "./entities/Skill.js";
+import { Routine } from "./entities/Routine.js";
+import { RoutineFolder } from "./entities/RoutineFolder.js";
+import { EmployeeRoutineGrant } from "./entities/EmployeeRoutineGrant.js";
+import { Goal } from "./entities/Goal.js";
+import { RunLesson } from "./entities/RunLesson.js";
+import { RevisionProposal } from "./entities/RevisionProposal.js";
+import { DecisionPolicy } from "./entities/DecisionPolicy.js";
+import { AutonomyWaiver } from "./entities/AutonomyWaiver.js";
+import { Budget } from "./entities/Budget.js";
+import { CompanyPolicy } from "./entities/CompanyPolicy.js";
+import { RoutineTrigger } from "./entities/RoutineTrigger.js";
+import { EmployeeWakeup } from "./entities/EmployeeWakeup.js";
+import { Workstream } from "./entities/Workstream.js";
+import { ParallelWorkerResult } from "./entities/ParallelWorkerResult.js";
+import { Initiative } from "./entities/Initiative.js";
+import { RoutineCheck } from "./entities/RoutineCheck.js";
+import { RunCheckResult } from "./entities/RunCheckResult.js";
+import { Standdown } from "./entities/Standdown.js";
+import { RoutineChatMessage } from "./entities/RoutineChatMessage.js";
+import { Run } from "./entities/Run.js";
+import { Project } from "./entities/Project.js";
+import { ProjectMember } from "./entities/ProjectMember.js";
+import { Todo } from "./entities/Todo.js";
+import { TodoComment } from "./entities/TodoComment.js";
+import { TodoLink } from "./entities/TodoLink.js";
+import { TodoPickup } from "./entities/TodoPickup.js";
+import { ProjectIntake } from "./entities/ProjectIntake.js";
+import { Conversation } from "./entities/Conversation.js";
+import { ConversationMessage } from "./entities/ConversationMessage.js";
+import { ConversationActivityEvent } from "./entities/ConversationActivityEvent.js";
+import { JournalEntry } from "./entities/JournalEntry.js";
+import { Approval } from "./entities/Approval.js";
+import { Decision } from "./entities/Decision.js";
+import { McpServer } from "./entities/McpServer.js";
+import { Secret } from "./entities/Secret.js";
+import { AuditEvent } from "./entities/AuditEvent.js";
+import { Base } from "./entities/Base.js";
+import { BaseTable } from "./entities/BaseTable.js";
+import { BaseField } from "./entities/BaseField.js";
+import { BaseRecord } from "./entities/BaseRecord.js";
+import { BaseRecordComment } from "./entities/BaseRecordComment.js";
+import { BaseRecordAttachment } from "./entities/BaseRecordAttachment.js";
+import { BaseView } from "./entities/BaseView.js";
+import { BaseForm } from "./entities/BaseForm.js";
+import { BaseFormSubmission } from "./entities/BaseFormSubmission.js";
+import { Backup } from "./entities/Backup.js";
+import { BackupSchedule } from "./entities/BackupSchedule.js";
+import { BackupDestination } from "./entities/BackupDestination.js";
+import { BackupCopy } from "./entities/BackupCopy.js";
+import { IntegrationConnection } from "./entities/IntegrationConnection.js";
+import { IntegrationContinuation } from "./entities/IntegrationContinuation.js";
+import { AskAiConversation } from "./entities/AskAiConversation.js";
+import { AskAiMessage } from "./entities/AskAiMessage.js";
+import { EmployeeConnectionGrant } from "./entities/EmployeeConnectionGrant.js";
+import { ExternalChatIdentity } from "./entities/ExternalChatIdentity.js";
+import { CustomerChannel } from "./entities/CustomerChannel.js";
+import { CustomerChannelMessage } from "./entities/CustomerChannelMessage.js";
+import { EmployeeBaseGrant } from "./entities/EmployeeBaseGrant.js";
+import { EmployeeMemory } from "./entities/EmployeeMemory.js";
+import { Channel } from "./entities/Channel.js";
+import { ChannelMember } from "./entities/ChannelMember.js";
+import { ChannelMessage } from "./entities/ChannelMessage.js";
+import { ChannelTurn } from "./entities/ChannelTurn.js";
+import { MessageReaction } from "./entities/MessageReaction.js";
+import { GroupDiscussion } from "./entities/GroupDiscussion.js";
+import { Attachment } from "./entities/Attachment.js";
+import { Pipeline } from "./entities/Pipeline.js";
+import { PipelineRun } from "./entities/PipelineRun.js";
+import { EmailProvider } from "./entities/EmailProvider.js";
+import { EmailLog } from "./entities/EmailLog.js";
+import { Notebook } from "./entities/Notebook.js";
+import { Note } from "./entities/Note.js";
+import { EmployeeNoteGrant } from "./entities/EmployeeNoteGrant.js";
+import { EmployeeNotebookGrant } from "./entities/EmployeeNotebookGrant.js";
+import { Notification } from "./entities/Notification.js";
+import { Team } from "./entities/Team.js";
+import { Handoff } from "./entities/Handoff.js";
+import { ApiKey } from "./entities/ApiKey.js";
+import { OAuthClient } from "./entities/OAuthClient.js";
+import { ConnectedApp } from "./entities/ConnectedApp.js";
+import { ConnectedAppToken } from "./entities/ConnectedAppToken.js";
+import { Resource } from "./entities/Resource.js";
+import { ResourceFolder } from "./entities/ResourceFolder.js";
+import { EmployeeResourceGrant } from "./entities/EmployeeResourceGrant.js";
+import { EmployeeResourceLibraryGrant } from "./entities/EmployeeResourceLibraryGrant.js";
+import { Repository } from "./entities/Repository.js";
+import { RepositoryWorkSession } from "./entities/RepositoryWorkSession.js";
+import { RepositoryWorkSessionTurn } from "./entities/RepositoryWorkSessionTurn.js";
+import { RepositoryWorkSessionEvent } from "./entities/RepositoryWorkSessionEvent.js";
+import { EmployeeRepositoryGrant } from "./entities/EmployeeRepositoryGrant.js";
+import { EmployeeFinanceGrant } from "./entities/EmployeeFinanceGrant.js";
+import { Customer } from "./entities/Customer.js";
+import { CustomerContact } from "./entities/CustomerContact.js";
+import { CustomerContract } from "./entities/CustomerContract.js";
+import { SignatureEnvelope } from "./entities/SignatureEnvelope.js";
+import { SignatureRecipient } from "./entities/SignatureRecipient.js";
+import { SignatureField } from "./entities/SignatureField.js";
+import { SignatureEvent } from "./entities/SignatureEvent.js";
+import { EmployeeSigningGrant } from "./entities/EmployeeSigningGrant.js";
+import { Product } from "./entities/Product.js";
+import { TaxRate } from "./entities/TaxRate.js";
+import { Invoice } from "./entities/Invoice.js";
+import { Subsidiary } from "./entities/Subsidiary.js";
+import { InvoiceLineItem } from "./entities/InvoiceLineItem.js";
+import { InvoicePayment } from "./entities/InvoicePayment.js";
+import { InvoiceWriteOff } from "./entities/InvoiceWriteOff.js";
+import { CustomerCredit } from "./entities/CustomerCredit.js";
+import { CustomerCreditLine } from "./entities/CustomerCreditLine.js";
+import { CustomerCreditApplication } from "./entities/CustomerCreditApplication.js";
+import { CustomerRefund } from "./entities/CustomerRefund.js";
+import { VendorCredit } from "./entities/VendorCredit.js";
+import { VendorCreditLine } from "./entities/VendorCreditLine.js";
+import { VendorCreditApplication } from "./entities/VendorCreditApplication.js";
+import { VendorRefund } from "./entities/VendorRefund.js";
+import { FinanceProposal } from "./entities/FinanceProposal.js";
+import { RecurringInvoice } from "./entities/RecurringInvoice.js";
+import { RecurringInvoiceLineItem } from "./entities/RecurringInvoiceLineItem.js";
+import { RecurringInvoiceRun } from "./entities/RecurringInvoiceRun.js";
+import { Estimate } from "./entities/Estimate.js";
+import { EstimateLineItem } from "./entities/EstimateLineItem.js";
+import { Account } from "./entities/Account.js";
+import { LedgerEntry } from "./entities/LedgerEntry.js";
+import { LedgerLine } from "./entities/LedgerLine.js";
+import { BankFeed } from "./entities/BankFeed.js";
+import { BankTransaction } from "./entities/BankTransaction.js";
+import { CardFeed } from "./entities/CardFeed.js";
+import { CardTransaction } from "./entities/CardTransaction.js";
+import { Currency } from "./entities/Currency.js";
+import { ExchangeRate } from "./entities/ExchangeRate.js";
+import { CompanyFinanceSettings } from "./entities/CompanyFinanceSettings.js";
+import { AccountingPeriod } from "./entities/AccountingPeriod.js";
+import { Vendor } from "./entities/Vendor.js";
+import { Bill } from "./entities/Bill.js";
+import { BillLineItem } from "./entities/BillLineItem.js";
+import { BillPayment } from "./entities/BillPayment.js";
+import { BrowserSession } from "./entities/BrowserSession.js";
+import { MemberBrowser } from "./entities/MemberBrowser.js";
+import { EmployeeMemberBrowserGrant } from "./entities/EmployeeMemberBrowserGrant.js";
+import { Chart } from "./entities/Chart.js";
+import { Dashboard } from "./entities/Dashboard.js";
+import { DashboardCard } from "./entities/DashboardCard.js";
+import { EmployeeChartGrant } from "./entities/EmployeeChartGrant.js";
+import { EmployeeDashboardGrant } from "./entities/EmployeeDashboardGrant.js";
+import { AppSetting } from "./entities/AppSetting.js";
+import { PushSubscription } from "./entities/PushSubscription.js";
+import { MailAccount } from "./entities/MailAccount.js";
+import { MailThread } from "./entities/MailThread.js";
+import { MailMessage } from "./entities/MailMessage.js";
+import { MailMessageAddress } from "./entities/MailMessageAddress.js";
+import { MailAddressIndexState } from "./entities/MailAddressIndexState.js";
+import { MailLabel } from "./entities/MailLabel.js";
+import { MailRule } from "./entities/MailRule.js";
+import { MailHandover } from "./entities/MailHandover.js";
+import { MailSavedSearch } from "./entities/MailSavedSearch.js";
+import { MailChatMessage } from "./entities/MailChatMessage.js";
+import { MailDraftSendBatch } from "./entities/MailDraftSendBatch.js";
+import { MailInboundAnalysis } from "./entities/MailInboundAnalysis.js";
+import { MailInboundAutomation } from "./entities/MailInboundAutomation.js";
+import { EmployeeMailAccountGrant } from "./entities/EmployeeMailAccountGrant.js";
+import { AdSpendEvent } from "./entities/AdSpendEvent.js";
+import { Tag } from "./entities/Tag.js";
+import { TagAssignment } from "./entities/TagAssignment.js";
+import { WebAuthnCredential } from "./entities/WebAuthnCredential.js";
+import { TotpCredential } from "./entities/TotpCredential.js";
+import { AuthRateLimit } from "./entities/AuthRateLimit.js";
+import { WorkloadLease } from "./entities/WorkloadLease.js";
+import { SchedulerLease } from "./entities/SchedulerLease.js";
+import { AuthFlowState } from "./entities/AuthFlowState.js";
+import { RealtimeEvent } from "./entities/RealtimeEvent.js";
+import { Contact } from "./entities/Contact.js";
+import { DealStage } from "./entities/DealStage.js";
+import { Deal } from "./entities/Deal.js";
+import { DealContact } from "./entities/DealContact.js";
+import { Activity } from "./entities/Activity.js";
+import { Suppression } from "./entities/Suppression.js";
+import { Sequence } from "./entities/Sequence.js";
+import { SequenceStep } from "./entities/SequenceStep.js";
+import { SequenceEnrollment } from "./entities/SequenceEnrollment.js";
+import { SequenceStepRun } from "./entities/SequenceStepRun.js";
+import { Signal } from "./entities/Signal.js";
+import { SignalEvent } from "./entities/SignalEvent.js";
+import { EmployeeRevenueGrant } from "./entities/EmployeeRevenueGrant.js";
+import { RevenueClassification } from "./entities/RevenueClassification.js";
+import { RevenueCustomField } from "./entities/RevenueCustomField.js";
+import { RevenueCustomValue } from "./entities/RevenueCustomValue.js";
+import { Partnership } from "./entities/Partnership.js";
+import { PartnershipContact } from "./entities/PartnershipContact.js";
+import { RevenueDocument } from "./entities/RevenueDocument.js";
+import { RevenueImportBatch } from "./entities/RevenueImportBatch.js";
+import { RevenueOperation } from "./entities/RevenueOperation.js";
+import { RevenueOperationRow } from "./entities/RevenueOperationRow.js";
+import { RevenueRecordAlias } from "./entities/RevenueRecordAlias.js";
+import { DealHistoryEvent } from "./entities/DealHistoryEvent.js";
+import { RevenueImportRow } from "./entities/RevenueImportRow.js";
+import { RevenueFieldEvidence } from "./entities/RevenueFieldEvidence.js";
+import { RevenueDocumentCandidate } from "./entities/RevenueDocumentCandidate.js";
+import { RevenueDuplicateCandidate } from "./entities/RevenueDuplicateCandidate.js";
+import { RevenueFollowUpView } from "./entities/RevenueFollowUpView.js";
+import { RevenueFirmographicLookup } from "./entities/RevenueFirmographicLookup.js";
+import { MarketingCampaign } from "./entities/MarketingCampaign.js";
+import { MarketingCreative } from "./entities/MarketingCreative.js";
+import { MarketingExperiment } from "./entities/MarketingExperiment.js";
+import { MarketingPerformanceSnapshot } from "./entities/MarketingPerformanceSnapshot.js";
+import { EmployeeMarketingGrant } from "./entities/EmployeeMarketingGrant.js";
+import { CalendarAccount } from "./entities/CalendarAccount.js";
+import { CalendarEvent } from "./entities/CalendarEvent.js";
+import { Meeting } from "./entities/Meeting.js";
+import { MeetingParticipant } from "./entities/MeetingParticipant.js";
+import { MeetingTranscriptSegment } from "./entities/MeetingTranscriptSegment.js";
+import { EmployeeCalendarGrant } from "./entities/EmployeeCalendarGrant.js";
+import { VaultItem } from "./entities/VaultItem.js";
+import { VaultItemMemberAccess } from "./entities/VaultItemMemberAccess.js";
+import { EmployeeVaultGrant } from "./entities/EmployeeVaultGrant.js";
+import { VaultSource } from "./entities/VaultSource.js";
+import { TldrSettings } from "./entities/TldrSettings.js";
+import { Tldr } from "./entities/Tldr.js";
+import { TldrDismissal } from "./entities/TldrDismissal.js";
+import { TldrQuestion } from "./entities/TldrQuestion.js";
+import { TldrQuestionMessage } from "./entities/TldrQuestionMessage.js";
+import { TldrQuestionAction } from "./entities/TldrQuestionAction.js";
+import { TldrStandingQuestion } from "./entities/TldrStandingQuestion.js";
+import { BoardLetter } from "./entities/BoardLetter.js";
+import { BoardLetterSettings } from "./entities/BoardLetterSettings.js";
+import { RecruitingSettings } from "./entities/RecruitingSettings.js";
+import { RecruitingOpening } from "./entities/RecruitingOpening.js";
+import { RecruitingApplication } from "./entities/RecruitingApplication.js";
+import { RecruitingScorecard } from "./entities/RecruitingScorecard.js";
+import { RecruitingApplicationEvent } from "./entities/RecruitingApplicationEvent.js";
+import { EmployeeRecruitingGrant } from "./entities/EmployeeRecruitingGrant.js";
+import { CompanySso } from "./entities/CompanySso.js";
+import { PhoneNumber } from "./entities/PhoneNumber.js";
+import { PhoneMessage } from "./entities/PhoneMessage.js";
+import { PhoneCall } from "./entities/PhoneCall.js";
+import { DataRoom } from "./entities/DataRoom.js";
+import { DataRoomFolder } from "./entities/DataRoomFolder.js";
+import { DataRoomDocument } from "./entities/DataRoomDocument.js";
+import { DataRoomGuest } from "./entities/DataRoomGuest.js";
+import { DataRoomEvent } from "./entities/DataRoomEvent.js";
+import { DataRoomQuestion } from "./entities/DataRoomQuestion.js";
+import { DataRoomJob } from "./entities/DataRoomJob.js";
+import { EmployeeDataRoomGrant } from "./entities/EmployeeDataRoomGrant.js";
+import { SupportSettings } from "./entities/SupportSettings.js";
+import { SupportChatVisitor } from "./entities/SupportChatVisitor.js";
+import { SupportChatWidget } from "./entities/SupportChatWidget.js";
+import { SupportInbox } from "./entities/SupportInbox.js";
+import { SupportTicket } from "./entities/SupportTicket.js";
+import { SupportMessage } from "./entities/SupportMessage.js";
+import { SupportDraft } from "./entities/SupportDraft.js";
+import { SupportEvent } from "./entities/SupportEvent.js";
+import { SupportArticle } from "./entities/SupportArticle.js";
+import { SupportSavedReply } from "./entities/SupportSavedReply.js";
+import { SupportJob } from "./entities/SupportJob.js";
+import { EmployeeSupportGrant } from "./entities/EmployeeSupportGrant.js";
+
+const entities = [
+  User,
+  UserSession,
+  Company,
+  Membership,
+  Invitation,
+  AIModel,
+  // How each of an AI Model's API keys has been doing (backup-key failover).
+  AIModelKeyHealth,
+  AIModelOutage,
+  // AI work with no queue of its own, waiting for its AI Model to come back.
+  AIModelWait,
+  EmployeeModel,
+  AIEmployee,
+  Skill,
+  Routine,
+  RoutineFolder,
+  // Routines → AI access: read + run or read + write, per AI Employee.
+  EmployeeRoutineGrant,
+  Goal,
+  RunLesson,
+  RevisionProposal,
+  DecisionPolicy,
+  AutonomyWaiver,
+  Budget,
+  CompanyPolicy,
+  RoutineTrigger,
+  EmployeeWakeup,
+  Workstream,
+  ParallelWorkerResult,
+  Initiative,
+  RoutineCheck,
+  RunCheckResult,
+  Standdown,
+  RoutineChatMessage,
+  Run,
+  Project,
+  ProjectMember,
+  Todo,
+  TodoComment,
+  TodoLink,
+  TodoPickup,
+  ProjectIntake,
+  Conversation,
+  ConversationMessage,
+  // What an AI Employee did while it answered in chat, step by step.
+  ConversationActivityEvent,
+  JournalEntry,
+  Approval,
+  Decision,
+  McpServer,
+  AdSpendEvent,
+  Tag,
+  TagAssignment,
+  WebAuthnCredential,
+  TotpCredential,
+  AuthRateLimit,
+  WorkloadLease,
+  SchedulerLease,
+  AuthFlowState,
+  RealtimeEvent,
+  Secret,
+  AuditEvent,
+  Base,
+  BaseTable,
+  BaseField,
+  BaseRecord,
+  BaseRecordComment,
+  BaseRecordAttachment,
+  BaseView,
+  BaseForm,
+  BaseFormSubmission,
+  Backup,
+  BackupSchedule,
+  BackupDestination,
+  BackupCopy,
+  IntegrationConnection,
+  IntegrationContinuation,
+  AskAiConversation,
+  AskAiMessage,
+  EmployeeConnectionGrant,
+  ExternalChatIdentity,
+  CustomerChannel,
+  CustomerChannelMessage,
+  EmployeeBaseGrant,
+  EmployeeMemory,
+  Channel,
+  ChannelMember,
+  ChannelMessage,
+  // An AI Employee's turn in a channel: its activity is the chat turn feed.
+  ChannelTurn,
+  MessageReaction,
+  GroupDiscussion,
+  Attachment,
+  Pipeline,
+  PipelineRun,
+  EmailProvider,
+  EmailLog,
+  Notebook,
+  Note,
+  EmployeeNoteGrant,
+  EmployeeNotebookGrant,
+  Notification,
+  Team,
+  Handoff,
+  ApiKey,
+  // OAuth for the Genosyn MCP server: clients that registered themselves, the
+  // apps a Member approved, and their tokens.
+  OAuthClient,
+  ConnectedApp,
+  ConnectedAppToken,
+  Resource,
+  ResourceFolder,
+  EmployeeResourceGrant,
+  EmployeeResourceLibraryGrant,
+  Repository,
+  RepositoryWorkSession,
+  RepositoryWorkSessionTurn,
+  RepositoryWorkSessionEvent,
+  EmployeeRepositoryGrant,
+  EmployeeFinanceGrant,
+  Customer,
+  CustomerContact,
+  CustomerContract,
+  SignatureEnvelope,
+  SignatureRecipient,
+  SignatureField,
+  SignatureEvent,
+  EmployeeSigningGrant,
+  Product,
+  TaxRate,
+  Invoice,
+  Subsidiary,
+  InvoiceLineItem,
+  InvoicePayment,
+  InvoiceWriteOff,
+  CustomerCredit,
+  CustomerCreditLine,
+  CustomerCreditApplication,
+  CustomerRefund,
+  VendorCredit,
+  VendorCreditLine,
+  VendorCreditApplication,
+  VendorRefund,
+  FinanceProposal,
+  RecurringInvoice,
+  RecurringInvoiceLineItem,
+  RecurringInvoiceRun,
+  Estimate,
+  EstimateLineItem,
+  Account,
+  LedgerEntry,
+  LedgerLine,
+  BankFeed,
+  BankTransaction,
+  CardFeed,
+  CardTransaction,
+  Currency,
+  ExchangeRate,
+  CompanyFinanceSettings,
+  AccountingPeriod,
+  Vendor,
+  Bill,
+  BillLineItem,
+  BillPayment,
+  BrowserSession,
+  MemberBrowser,
+  EmployeeMemberBrowserGrant,
+  Chart,
+  Dashboard,
+  DashboardCard,
+  EmployeeChartGrant,
+  EmployeeDashboardGrant,
+  AppSetting,
+  PushSubscription,
+  MailAccount,
+  MailThread,
+  MailMessage,
+  MailMessageAddress,
+  MailAddressIndexState,
+  MailLabel,
+  MailRule,
+  MailHandover,
+  MailSavedSearch,
+  MailChatMessage,
+  MailDraftSendBatch,
+  MailInboundAutomation,
+  MailInboundAnalysis,
+  EmployeeMailAccountGrant,
+  // Revenue (M32) — contacts, deals, activities, outbound, signals.
+  Contact,
+  DealStage,
+  Deal,
+  DealContact,
+  Activity,
+  Suppression,
+  Sequence,
+  SequenceStep,
+  SequenceEnrollment,
+  SequenceStepRun,
+  Signal,
+  SignalEvent,
+  EmployeeRevenueGrant,
+  RevenueClassification,
+  RevenueCustomField,
+  RevenueCustomValue,
+  Partnership,
+  PartnershipContact,
+  RevenueDocument,
+  RevenueImportBatch,
+  RevenueOperation,
+  RevenueOperationRow,
+  RevenueRecordAlias,
+  DealHistoryEvent,
+  RevenueImportRow,
+  RevenueFieldEvidence,
+  RevenueDocumentCandidate,
+  RevenueDuplicateCandidate,
+  RevenueFollowUpView,
+  RevenueFirmographicLookup,
+  // Marketing agency (M35) — strategy, Creative, Experiments and measurements.
+  MarketingCampaign,
+  MarketingCreative,
+  MarketingExperiment,
+  MarketingPerformanceSnapshot,
+  EmployeeMarketingGrant,
+  VaultItem,
+  VaultItemMemberAccess,
+  EmployeeVaultGrant,
+  VaultSource,
+  // Calendar + Meetings (M44) — the mirrored agenda, recorded calls, and the
+  // transcripts the revenue timeline and the follow-up pass both read.
+  CalendarAccount,
+  CalendarEvent,
+  Meeting,
+  MeetingParticipant,
+  MeetingTranscriptSegment,
+  EmployeeCalendarGrant,
+  // TLDRs — one company policy, generated briefs, and per-Member dismissals.
+  TldrSettings,
+  Tldr,
+  TldrDismissal,
+  TldrQuestion,
+  TldrQuestionMessage,
+  TldrQuestionAction,
+  TldrStandingQuestion,
+  BoardLetterSettings,
+  BoardLetter,
+  // Per-company SSO (M56 Phase B).
+  CompanySso,
+  // Phone numbers — Twilio numbers given to AI Employees, with their texts
+  // and calls.
+  PhoneNumber,
+  PhoneMessage,
+  PhoneCall,
+  // Recruiting — Openings, the people who apply, their Scorecards, and the
+  // careers site they apply through.
+  RecruitingSettings,
+  RecruitingOpening,
+  RecruitingApplication,
+  RecruitingScorecard,
+  RecruitingApplicationEvent,
+  EmployeeRecruitingGrant,
+  // Data rooms — documents shared with guests outside the company, what each
+  // guest did there, their questions, and the room's queue of AI work.
+  DataRoom,
+  DataRoomFolder,
+  DataRoomDocument,
+  DataRoomGuest,
+  DataRoomEvent,
+  DataRoomQuestion,
+  DataRoomJob,
+  EmployeeDataRoomGrant,
+  SupportSettings,
+  SupportChatWidget,
+  SupportChatVisitor,
+  SupportInbox,
+  SupportTicket,
+  SupportMessage,
+  SupportDraft,
+  SupportEvent,
+  SupportArticle,
+  SupportSavedReply,
+  SupportJob,
+  EmployeeSupportGrant,
+];
+
+// Migrations glob -- matches .ts files under server/db/migrations in dev (via tsx)
+// and the compiled .js files under dist/server/db/migrations in production.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const migrations = [
+  config.db.driver === "postgres"
+    ? path.join(__dirname, "migrations", "postgres", "*.{ts,js}")
+    : path.join(__dirname, "migrations", "*.{ts,js}"),
+];
+
+function buildDataSource(): DataSource {
+  if (config.db.driver === "postgres") {
+    return new DataSource({
+      type: "postgres",
+      url: config.db.postgresUrl,
+      entities,
+      migrations,
+      synchronize: false,
+      logging: false,
+    });
+  }
+  const sqlitePath = path.resolve(config.db.sqlitePath);
+  fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
+  return new DataSource({
+    type: "better-sqlite3",
+    database: sqlitePath,
+    entities,
+    migrations,
+    synchronize: false,
+    logging: false,
+    prepareDatabase: tuneSqliteConnection,
+  });
+}
+
+/** The slice of a better-sqlite3 handle {@link tuneSqliteConnection} needs. */
+export type SqlitePragmaTarget = {
+  pragma(source: string, options?: { simple?: boolean }): unknown;
+};
+
+/**
+ * Connection settings for the one SQLite handle the whole process shares.
+ *
+ * better-sqlite3 is synchronous, so every statement — and every commit's
+ * fsyncs — runs on the event loop and holds every other request until it
+ * returns. SQLite's defaults are tuned for a different shape of program:
+ *
+ * - **WAL.** The default rollback journal copies each changed page out to a
+ *   journal and fsyncs the journal and the database on every commit. WAL
+ *   appends the new pages to a log and checkpoints them in batches, so a
+ *   commit is a sequential write; readers in another process (the CLI, an
+ *   operator's `sqlite3`) also stop blocking the writer. The mode is
+ *   persistent in the file and `-wal`/`-shm` sit beside it; backups, restore
+ *   and the CLI already treat both as part of the database.
+ * - **synchronous = NORMAL**, in WAL only: commits stop fsyncing and
+ *   checkpoints still do. A power cut can lose the last few commits but never
+ *   corrupts the file. In rollback mode NORMAL is not corruption-safe, so a
+ *   database that refuses WAL (an in-memory one, a filesystem without shared
+ *   memory) keeps SQLite's FULL default.
+ * - **A 64 MiB page cache** (better-sqlite3 ships 16 MiB), so hot pages stop
+ *   round-tripping through read(2). Temporary storage stays on disk (SQLite's
+ *   default here): the mail search index lives in the `temp` schema and is
+ *   the size of a large mailbox's text (services/mail/searchIndex.ts).
+ * - **journal_size_limit** trims the WAL back after a large transaction
+ *   instead of leaving it at its high-water mark.
+ */
+export function tuneSqliteConnection(db: SqlitePragmaTarget): void {
+  const mode = db.pragma("journal_mode = WAL", { simple: true });
+  if (String(mode).toLowerCase() === "wal") {
+    db.pragma("synchronous = NORMAL");
+    db.pragma("journal_size_limit = 67108864");
+  }
+  db.pragma("cache_size = -65536");
+}
+
+// Every request shares the one SQLite connection; transactions take turns on
+// it rather than nesting into each other (see sqliteTransactionGate.ts).
+installSqliteTransactionGate();
+
+export const AppDataSource = buildDataSource();
+
+export async function initDb(): Promise<void> {
+  if (!AppDataSource.isInitialized) {
+    await AppDataSource.initialize();
+    // App-wide live sync: one subscriber turns every content write into a
+    // coarse `resource.changed` broadcast. Registered here rather than in the
+    // DataSource options so there is exactly one instance; inert until the
+    // socket layer wires its sink (`attachRealtime`), so the migrations that
+    // run just below never fan out.
+    AppDataSource.subscribers.push(new ResourceChangeSubscriber());
+  }
+  await runMigrationsExclusively();
+  // After the migrations, never before: an index they just created has no
+  // statistics yet, and the planner treats an unanalyzed index as selective.
+  optimizeSqliteStatistics();
+  if (!statisticsTimer && AppDataSource.options.type === "better-sqlite3") {
+    statisticsTimer = setInterval(optimizeSqliteStatistics, STATISTICS_REFRESH_MS);
+    statisticsTimer.unref();
+  }
+}
+
+const STATISTICS_REFRESH_MS = 6 * 60 * 60 * 1000;
+let statisticsTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Bring SQLite's query-planner statistics (`sqlite_stat1`) up to date.
+ *
+ * Without statistics SQLite assumes every indexed equality is selective. Here
+ * that is badly wrong: `companyId` has a handful of values across hundreds of
+ * thousands of rows, so `companyId = ? AND threadId IN (...)` was planned on
+ * the company index — reading every message in the mailbox, about a minute
+ * with the server held, to label one page of the Mail list.
+ *
+ * `PRAGMA optimize` analyzes only what needs it — a table with an index that
+ * has no statistics, or one whose row count grew 25x since it was last
+ * analyzed — so it is cheap to repeat: half a second on a 15 GB database when
+ * every table needs it, nothing measurable otherwise. The mask leaves out
+ * `0x10`, the sampled analysis: a sample of N rows caps the estimate for a
+ * column like `companyId` near N rows per value, and that low cardinality is
+ * the very thing the planner most needs to know. A no-op on Postgres, whose
+ * autovacuum keeps its own statistics.
+ *
+ * Never throws: statistics only steer the planner, so failing to refresh
+ * them must not fail a boot or a restore.
+ */
+export function optimizeSqliteStatistics(): void {
+  if (AppDataSource.options.type !== "better-sqlite3" || !AppDataSource.isInitialized) return;
+  try {
+    const db = (AppDataSource.driver as unknown as { databaseConnection: SqlitePragmaTarget })
+      .databaseConnection;
+    // `main` only: the `temp` schema holds the mail search index, whose
+    // FTS5 tables gain nothing from statistics and are large to analyze.
+    db.pragma("main.optimize = 0x10002");
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[db] refreshing SQLite planner statistics failed:", err);
+  }
+}
+
+/**
+ * Advisory-lock keys for the boot migration. `classid` spells "GENO"
+ * (0x47454E4F) so a `pg_locks` row is recognisably ours; `objid` 1 is the
+ * migration lock specifically, leaving the rest of the space for later needs.
+ */
+export const MIGRATION_LOCK_CLASS_ID = 0x47454e4f;
+export const MIGRATION_LOCK_OBJECT_ID = 1;
+
+/**
+ * How long a replica waits for a peer's migration before giving up.
+ *
+ * Generous, because a real migration on a large table legitimately takes
+ * minutes and killing it halfway is far worse than waiting. Bounded, because a
+ * lock held by a pod that died without releasing its session must eventually
+ * fail the boot loudly — Kubernetes then restarts and retries — rather than
+ * hang forever behind a liveness probe that never fires.
+ */
+export const MIGRATION_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Run pending migrations under a Postgres advisory lock.
+ *
+ * `runMigrations()` reads the `migrations` table, decides what is missing, and
+ * applies it — with no lock between the read and the write. One pod is fine.
+ * Several pods starting together (a RollingUpdate, a scaled Deployment, a
+ * cluster restart) each read "nothing applied" and race the same DDL: the
+ * losers crash on `relation already exists`, and with `failureThreshold: 6` on
+ * the liveness probe that turns into a slow, partial rollout rather than an
+ * obvious failure.
+ *
+ * The lock is session-scoped and taken on a dedicated QueryRunner, so it is
+ * held for exactly the span of the migration and released even if the pool
+ * hands `runMigrations` a different connection. A crashed holder releases it
+ * when Postgres reaps the backend, which is the property a row-in-a-table
+ * lock would not have given us.
+ *
+ * SQLite is single-process by construction and has no advisory locks, so it
+ * keeps the direct call.
+ */
+export async function runMigrationsExclusively(): Promise<void> {
+  if (AppDataSource.options.type !== "postgres") {
+    // Idempotent -- already-run migrations are tracked in the `migrations`
+    // table that TypeORM manages.
+    await AppDataSource.runMigrations();
+    return;
+  }
+
+  const runner = AppDataSource.createQueryRunner();
+  let held = false;
+  try {
+    await runner.connect();
+    // Applies to advisory-lock waits too, so the acquire below fails rather
+    // than blocking boot indefinitely behind a wedged peer.
+    await runner.query(`SET lock_timeout = ${MIGRATION_LOCK_TIMEOUT_MS}`);
+    await runner.query("SELECT pg_advisory_lock($1, $2)", [
+      MIGRATION_LOCK_CLASS_ID,
+      MIGRATION_LOCK_OBJECT_ID,
+    ]);
+    held = true;
+    await AppDataSource.runMigrations();
+  } finally {
+    if (held) {
+      try {
+        await runner.query("SELECT pg_advisory_unlock($1, $2)", [
+          MIGRATION_LOCK_CLASS_ID,
+          MIGRATION_LOCK_OBJECT_ID,
+        ]);
+      } catch (error) {
+        // Releasing the session below drops the lock anyway; failing here
+        // must not mask whatever the migration itself threw.
+        // eslint-disable-next-line no-console
+        console.error("[db] failed to release the migration advisory lock:", error);
+      }
+    }
+    await runner.release();
+  }
+}

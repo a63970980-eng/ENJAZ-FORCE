@@ -1,0 +1,2472 @@
+import React from "react";
+import { Link } from "react-router-dom";
+import {
+  Activity,
+  AlertTriangle,
+  AtSign,
+  BellRing,
+  Briefcase,
+  Calendar,
+  Check,
+  CheckCircle2,
+  ChevronRight,
+  ClipboardCheck,
+  FilePenLine,
+  FolderLock,
+  GitBranch,
+  GitPullRequest,
+  Hourglass,
+  Landmark,
+  LifeBuoy,
+  Lightbulb,
+  ListChecks,
+  Mail,
+  MessageCircleQuestion,
+  MessageSquare,
+  PiggyBank,
+  RotateCw,
+  ScrollText,
+  ShieldAlert,
+  ShieldCheck,
+  Sparkles,
+  Star,
+  Target,
+  Users,
+  X,
+  CloudOff,
+  Cloud,
+} from "lucide-react";
+// The API's Notification row is aliased so the DOM global `Notification`
+// (used for the push-permission check) stays reachable in value positions.
+import {
+  api,
+  BoardLetterSummary,
+  Company,
+  Employee,
+  HomeApproval,
+  HomeChannel,
+  HomeData,
+  HomeFailedRun,
+  HomeTodo,
+  HealthSeverity,
+  Me,
+  Member,
+  Notification as NotificationRow,
+  NotificationKind,
+  TldrItem,
+  TodoPriority,
+  WorkEntry,
+} from "../lib/api";
+import { workspaceApi, workspaceChannelHref } from "../lib/workspace";
+import { ContextualLayout } from "../components/AppShell";
+import { ApprovalPeekModal } from "../components/home/ApprovalPeekModal";
+import { ChannelPeekModal } from "../components/home/ChannelPeekModal";
+import { GoalGlance } from "../components/home/GoalGlance";
+import { HealthCheckPeekModal } from "../components/home/HealthCheckPeekModal";
+import { NotificationPeekModal } from "../components/home/NotificationPeekModal";
+import { TodoPeekModal } from "../components/home/TodoPeekModal";
+import { WorkTimelinePanel } from "../components/home/WorkTimelinePanel";
+import { RepositoryWorkCard } from "@/components/home/RepositoryWorkCard";
+import { BoardLetterCard, showsBoardLetter } from "@/components/home/BoardLetterCard";
+import { RunLiveModal, RunStatusChip } from "../components/routines/RunViews";
+import { RunResumeButton } from "@/components/routines/RunResumeButton";
+import { runExplanationLabel, runExplanationPrompt } from "@/lib/runStatus";
+import { useAskAi } from "@/components/askAi/AskAiProvider";
+import { TldrBriefing } from "@/components/tldrs/TldrBriefing";
+import { shouldOpenEventInPlace } from "../lib/inPlaceLink";
+import { openNotifications } from "../components/NotificationsPanel";
+import { companyNotificationLink } from "../../shared/notificationLink";
+import { StackList } from "@/components/decisions/StackList";
+import {
+  compareStackItems,
+  decisionItem,
+  reviewItem,
+  stackItemPending,
+  stackItemWorking,
+  useDecisionFollowUps,
+  type DecisionFollowUps,
+} from "@/components/decisions/useDecisionFollowUps";
+import { Avatar, employeeAvatarUrl, memberAvatarUrl } from "../components/ui/Avatar";
+import { ButtonSpinner, Spinner } from "../components/ui/Spinner";
+import { Button } from "../components/ui/Button";
+import { FormError } from "@/components/ui/FormError";
+import { useBackgroundAction, useDialog } from "../components/ui/Dialog";
+import { useCompanySocketSubscription, useLiveRefetch } from "../components/CompanySocket";
+import { SetupBanner } from "../components/SetupBanner";
+import { errorMessage } from "../lib/errors";
+import { enablePush, pushSupported } from "../lib/push";
+import { clsx } from "../components/ui/clsx";
+
+/**
+ * Home — the landing page after sign-in. One aggregation call
+ * (`GET /api/companies/:cid/home`) fills the cards: unread notifications,
+ * todos assigned to me, reviews waiting on my sign-off, pending approvals,
+ * email summaries, unread channels, and, for owners and admins, the newest
+ * letter to the board they have not read. Every card deep-links into the full
+ * section.
+ *
+ * Every queue here hides itself when it has nothing. An empty queue is not
+ * news — a card that spends a grid slot to say "nothing is waiting on you"
+ * pushes the things that *are* waiting further down. When every queue is empty
+ * {@link AllClear} says it once. The AI employee work panel is not a
+ * queue: its bubble roster remains useful on a quiet day as the quickest way
+ * to see an employee and check in.
+ */
+
+const PUSH_PROMPT_DISMISSED_KEY = "genosyn.pushPromptDismissed";
+
+/**
+ * Which row Home currently has open over itself.
+ *
+ * One piece of state for the whole page rather than one per card: only ever
+ * one of these is open, and eight independent `open` flags is how two of them
+ * end up on screen at once.
+ */
+type HomeOverlay =
+  | { kind: "channel"; channel: HomeChannel }
+  | { kind: "notification"; notification: NotificationRow }
+  | { kind: "todo"; todo: HomeTodo; review: boolean }
+  | { kind: "approval"; approval: HomeApproval }
+  /**
+   * `onDismiss` rides along because the "I've seen this" flag lives in the
+   * health card's own state (it is per-device, not server state), and the
+   * modal offers the same dismissal the row does.
+   */
+  | { kind: "health"; checkId: string; title: string; onDismiss: () => void }
+  | { kind: "run"; run: HomeFailedRun }
+  /** A run opened from the work timeline, where the row is an entry not a
+   *  failure — same viewer, different source row. */
+  | { kind: "workRun"; entry: WorkEntry };
+
+export default function HomePage({ company, me }: { company: Company; me: Me }) {
+  const [data, setData] = React.useState<HomeData | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const homeRequest = React.useRef(0);
+  const homeSuccessfulRequest = React.useRef(0);
+  const activeCompanyId = React.useRef(company.id);
+  const mailRefreshTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [overlay, setOverlay] = React.useState<HomeOverlay | null>(null);
+  const [decisionNotice, setDecisionNotice] = React.useState<{ message: string } | null>(null);
+  const [readNotice, setReadNotice] = React.useState<string | null>(null);
+  const [retrying, setRetrying] = React.useState(false);
+  const background = useBackgroundAction();
+  const decisionFollowUps = useDecisionFollowUps(company, me.id);
+  const clearClosedFollowUps = decisionFollowUps.clearClosed;
+  activeCompanyId.current = company.id;
+
+  // The todo peek needs the company's people to fill its assignee and reviewer
+  // pickers and the employee bubble roster. Fetched beside the Home payload
+  // rather than on each open, so the modal has them the moment it appears;
+  // both are small reads. Resource events keep the roster current.
+  // The work panel owns the roster's inline failure state, while the optional
+  // modal pickers simply remain empty.
+  const [employees, setEmployees] = React.useState<Employee[]>([]);
+  const [employeesError, setEmployeesError] = React.useState<string | null>(null);
+  const [members, setMembers] = React.useState<Member[]>([]);
+  const peopleRequest = React.useRef(0);
+
+  const reload = React.useCallback(async () => {
+    const request = ++homeRequest.current;
+    try {
+      const d = await api.get<HomeData>(`/api/companies/${company.id}/home`);
+      if (request !== homeRequest.current) return;
+      homeSuccessfulRequest.current = request;
+      setData(d);
+      clearClosedFollowUps("decision");
+      clearClosedFollowUps("review");
+      setLoadError(null);
+    } catch (err) {
+      if (request !== homeRequest.current) return;
+      // Keep the last successful overview, but make a stale count explicit.
+      setLoadError(errorMessage(err, "Could not refresh your home screen."));
+    }
+  }, [company.id, clearClosedFollowUps]);
+
+  async function retry() {
+    setRetrying(true);
+    try {
+      await reload();
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  const reloadPendingDecisions = React.useCallback(
+    async (announcement?: string) => {
+      await reload();
+      if (announcement) setDecisionNotice({ message: announcement });
+    },
+    [reload],
+  );
+
+  React.useEffect(() => {
+    setData(null);
+    setLoadError(null);
+    setOverlay(null);
+    setDecisionNotice(null);
+    setReadNotice(null);
+    void reload();
+    return () => {
+      homeRequest.current += 1;
+      if (mailRefreshTimer.current) clearTimeout(mailRefreshTimer.current);
+      mailRefreshTimer.current = null;
+    };
+  }, [reload]);
+
+  const reloadPeople = React.useCallback(async () => {
+    const request = ++peopleRequest.current;
+    const [emps, mems] = await Promise.allSettled([
+      api.get<Employee[]>(`/api/companies/${company.id}/employees`),
+      api.get<Member[]>(`/api/companies/${company.id}/members`),
+    ]);
+    if (request !== peopleRequest.current) return;
+    if (emps.status === "fulfilled") {
+      setEmployees(emps.value);
+      setEmployeesError(null);
+    } else {
+      setEmployees([]);
+      setEmployeesError(errorMessage(emps.reason, "Could not load your AI employees."));
+    }
+    setMembers(mems.status === "fulfilled" ? mems.value : []);
+  }, [company.id]);
+
+  React.useEffect(() => {
+    setEmployees([]);
+    setEmployeesError(null);
+    setMembers([]);
+    void reloadPeople();
+    return () => {
+      peopleRequest.current += 1;
+    };
+  }, [reloadPeople]);
+
+  // Live-refresh when something lands in my bell, and on tab focus so the
+  // page is current when the user comes back to it.
+  useCompanySocketSubscription((ev) => {
+    if (ev.type === "mail.updated") {
+      // A sync or bulk action can change many drafts together. Refresh all
+      // mailboxes once per burst, through the authorized Home endpoint.
+      if (!mailRefreshTimer.current) {
+        mailRefreshTimer.current = setTimeout(() => {
+          mailRefreshTimer.current = null;
+          void reload();
+        }, 120);
+      }
+      return;
+    }
+    if (
+      (ev.type === "notification.new" || ev.type === "notification.read") &&
+      ev.userId === me.id
+    ) {
+      reload();
+    }
+  });
+  React.useEffect(() => {
+    const onFocus = () => {
+      void reload();
+      void reloadPeople();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [reload, reloadPeople]);
+  // Keep Home counts, briefings, and the pending Decision preview current when
+  // their source rows change in another tab.
+  useLiveRefetch(
+    ["approval", "decision", "tldr", "tldr_question", "board_letter", "repository"],
+    reload,
+  );
+  useLiveRefetch("employee", reloadPeople);
+
+  function dismissTldr(item: TldrItem) {
+    const originalIndex = data?.tldrs.findIndex((row) => row.id === item.id) ?? -1;
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            tldrs: current.tldrs.filter((row) => row.id !== item.id),
+            unreadTldrCount: Math.max(0, current.unreadTldrCount - 1),
+          }
+        : current,
+    );
+
+    background(() => api.post(`/api/companies/${company.id}/tldrs/${item.id}/dismiss`), {
+      title: "Couldn’t dismiss the TLDR",
+      error: (err) => `${errorMessage(err)} It has been restored.`,
+      onSuccess: () => void reload(),
+      onError: () => {
+        setData((current) => {
+          if (!current || current.tldrs.some((row) => row.id === item.id)) return current;
+          const restored = [...current.tldrs];
+          restored.splice(Math.max(0, Math.min(originalIndex, restored.length)), 0, item);
+          return {
+            ...current,
+            tldrs: restored,
+            unreadTldrCount: current.unreadTldrCount + 1,
+          };
+        });
+      },
+    });
+  }
+
+  /**
+   * Dismissing the letter reads it, for this person only: the same read as
+   * opening it, so it also leaves their bell. It goes at once; the next unread
+   * letter, if there is one, arrives with the refetch that follows.
+   */
+  function dismissBoardLetter(letter: BoardLetterSummary) {
+    const successfulRequestAtClick = homeSuccessfulRequest.current;
+    const companyId = company.id;
+    setData((current) =>
+      current?.boardLetter?.id === letter.id
+        ? {
+            ...current,
+            boardLetter: null,
+            unreadBoardLetterCount: Math.max(0, current.unreadBoardLetterCount - 1),
+          }
+        : current,
+    );
+
+    background(
+      () => api.post(`/api/companies/${companyId}/board-letters/${letter.number}/read`, {}),
+      {
+        title: "Couldn’t dismiss the letter",
+        error: (err) =>
+          `${errorMessage(err)} ${
+            activeCompanyId.current !== companyId ||
+            homeSuccessfulRequest.current > successfulRequestAtClick
+              ? "The latest Home data has been kept."
+              : "It has been restored."
+          }`,
+        onSuccess: () => {
+          if (activeCompanyId.current === companyId) void reload();
+        },
+        onError: () => {
+          setData((current) => {
+            if (
+              activeCompanyId.current !== companyId ||
+              homeSuccessfulRequest.current > successfulRequestAtClick ||
+              !current ||
+              current.boardLetter
+            ) {
+              return current;
+            }
+            return {
+              ...current,
+              boardLetter: letter,
+              unreadBoardLetterCount: current.unreadBoardLetterCount + 1,
+            };
+          });
+        },
+      },
+    );
+  }
+
+  function markChannelRead(channel: HomeChannel): boolean {
+    const originalIndex = data?.unreadChannels.findIndex((row) => row.id === channel.id) ?? -1;
+    if (originalIndex < 0) return false;
+    const successfulRequestAtClick = homeSuccessfulRequest.current;
+    const companyId = company.id;
+
+    // The card is an unread queue, so the successful shape is simply the row
+    // disappearing. Do that immediately and put it back in exactly the same
+    // place if the server refuses the write.
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            unreadChannels: current.unreadChannels.filter((row) => row.id !== channel.id),
+          }
+        : current,
+    );
+
+    background(() => workspaceApi.markRead(companyId, channel.id), {
+      title: `Couldn’t mark ${channel.label} as read`,
+      error: (err) =>
+        `${errorMessage(err)} ${
+          activeCompanyId.current !== companyId ||
+          homeSuccessfulRequest.current > successfulRequestAtClick
+            ? "The latest Home data has been kept."
+            : "It has been restored."
+        }`,
+      onSuccess: () => {
+        if (activeCompanyId.current !== companyId) return;
+        setReadNotice(`${channel.label} marked as read.`);
+        void reload();
+      },
+      onError: () => {
+        setReadNotice(null);
+        setData((current) => {
+          if (
+            activeCompanyId.current !== companyId ||
+            homeSuccessfulRequest.current > successfulRequestAtClick ||
+            !current ||
+            current.unreadChannels.some((row) => row.id === channel.id)
+          ) {
+            return current;
+          }
+          const unreadChannels = [...current.unreadChannels];
+          unreadChannels.splice(
+            Math.max(0, Math.min(originalIndex, unreadChannels.length)),
+            0,
+            channel,
+          );
+          return { ...current, unreadChannels };
+        });
+      },
+    });
+    return true;
+  }
+
+  function markAllNotificationsRead(): boolean {
+    if (!data || data.notifications.length === 0 || data.unreadNotificationCount === 0) {
+      return false;
+    }
+    const previousNotifications = data.notifications;
+    const previousCount = data.unreadNotificationCount;
+    const successfulRequestAtClick = homeSuccessfulRequest.current;
+    const companyId = company.id;
+
+    setReadNotice(null);
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            notifications: [],
+            unreadNotificationCount: 0,
+          }
+        : current,
+    );
+
+    background(() => api.post(`/api/companies/${companyId}/notifications/mark-all-read`), {
+      title: "Couldn’t mark all notifications as read",
+      error: (err) =>
+        `${errorMessage(err)} ${
+          activeCompanyId.current !== companyId ||
+          homeSuccessfulRequest.current > successfulRequestAtClick
+            ? "The latest Home data has been kept."
+            : "They have been restored."
+        }`,
+      onSuccess: () => {
+        if (activeCompanyId.current !== companyId) return;
+        setReadNotice("All notifications marked as read.");
+        void reload();
+      },
+      onError: () => {
+        setReadNotice(null);
+        setData((current) => {
+          if (
+            activeCompanyId.current !== companyId ||
+            homeSuccessfulRequest.current > successfulRequestAtClick ||
+            !current ||
+            current.notifications.length > 0 ||
+            current.unreadNotificationCount > 0
+          ) {
+            return current;
+          }
+          return {
+            ...current,
+            notifications: previousNotifications,
+            unreadNotificationCount: previousCount,
+          };
+        });
+      },
+    });
+    return true;
+  }
+
+  return (
+    <ContextualLayout>
+      <div className="page-shell px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        <header
+          aria-label="Home greeting"
+          className="flex items-start gap-3 sm:items-center sm:gap-6"
+        >
+          <Greeting me={me} company={company} />
+          {/* The roster stays available even when Home's queues are empty. */}
+          <WorkTimelinePanel
+            company={company}
+            employees={employees}
+            employeeLoadError={employeesError}
+            onOpenRun={(entry) => setOverlay({ kind: "workRun", entry })}
+          />
+        </header>
+        <SetupBanner company={company} />
+        <PushPromptBanner />
+        {loadError && (
+          <div className="mt-4 space-y-2">
+            <FormError message={loadError} />
+            {data && (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Showing the last update. Counts may have changed.
+              </p>
+            )}
+            <Button variant="secondary" size="sm" loading={retrying} onClick={() => void retry()}>
+              Retry
+            </Button>
+          </div>
+        )}
+        {decisionNotice && (
+          <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+            {decisionNotice.message}
+          </div>
+        )}
+        {readNotice && (
+          <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+            {readNotice}
+          </div>
+        )}
+        {data === null ? (
+          !loadError && (
+            <div className="flex min-h-[40vh] items-center justify-center">
+              <Spinner size={22} />
+            </div>
+          )
+        ) : (
+          <>
+            {hasAnythingToShow(data, company) || decisionFollowUps.items.length > 0 ? (
+              <>
+                <ActiveDecisions
+                  key={`decisions:${company.id}`}
+                  company={company}
+                  data={data}
+                  followUps={decisionFollowUps}
+                  onResolved={reloadPendingDecisions}
+                  viewerId={me.id}
+                />
+                <RepositoryWorkCard
+                  key={`repository-work:${company.id}`}
+                  company={company}
+                  initialItems={data.repositoryWork}
+                  initialTotal={data.repositoryWorkCount}
+                  onChanged={reload}
+                />
+                <FailedRoutinesAlert
+                  company={company}
+                  data={data}
+                  onChanged={reload}
+                  onOpen={setOverlay}
+                />
+                <BoardLetterCard
+                  company={company}
+                  letter={data.boardLetter}
+                  unreadCount={data.unreadBoardLetterCount}
+                  onDismiss={dismissBoardLetter}
+                />
+                <HomeTldrPanel company={company} data={data} onDismiss={dismissTldr} />
+                <StatStrip company={company} data={data} />
+                {/* `empty:hidden` so the grid's own top margin goes away too on
+                  a day when every card inside it has hidden itself. */}
+                <div className="mt-4 grid grid-cols-1 gap-4 empty:hidden lg:grid-cols-2">
+                  <EmailsCard company={company} data={data} />
+                  <AttentionCard
+                    company={company}
+                    data={data}
+                    onOpen={setOverlay}
+                    onMarkAllRead={markAllNotificationsRead}
+                  />
+                  <SystemHealthCard company={company} data={data} onOpen={setOverlay} />
+                  <MyTodosCard company={company} data={data} onOpen={setOverlay} />
+                  <MessagesCard
+                    company={company}
+                    data={data}
+                    onOpen={setOverlay}
+                    onMarkRead={markChannelRead}
+                  />
+                  <ReviewsCard company={company} data={data} onOpen={setOverlay} />
+                  <ApprovalsCard company={company} data={data} onOpen={setOverlay} />
+                </div>
+              </>
+            ) : (
+              <AllClear company={company} data={data} />
+            )}
+          </>
+        )}
+      </div>
+      <HomeOverlayHost
+        company={company}
+        me={me}
+        overlay={overlay}
+        employees={employees}
+        members={members}
+        onClose={() => setOverlay(null)}
+        onChanged={reload}
+      />
+    </ContextualLayout>
+  );
+}
+
+/**
+ * Whichever row is open, rendered once at the bottom of the page.
+ *
+ * Every one of these used to be a navigation. They are modals now because the
+ * queues on Home are things you answer, not places you go: reading four
+ * messages, approving one gate, marking one todo done. The full page each row
+ * used to jump to is still a labelled button inside its modal, for the times
+ * you want the context around the thing rather than the thing.
+ */
+function HomeOverlayHost({
+  company,
+  me,
+  overlay,
+  employees,
+  members,
+  onClose,
+  onChanged,
+}: {
+  company: Company;
+  me: Me;
+  overlay: HomeOverlay | null;
+  employees: Employee[];
+  members: Member[];
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  if (!overlay) return null;
+  switch (overlay.kind) {
+    case "channel":
+      return (
+        <ChannelPeekModal
+          company={company}
+          me={me}
+          channel={overlay.channel}
+          onClose={onClose}
+          onRead={onChanged}
+        />
+      );
+    case "notification":
+      return (
+        <NotificationPeekModal
+          company={company}
+          notification={overlay.notification}
+          onClose={onClose}
+        />
+      );
+    case "todo":
+      return (
+        <TodoPeekModal
+          company={company}
+          row={overlay.todo}
+          review={overlay.review}
+          employees={employees}
+          members={members}
+          onClose={onClose}
+          onChanged={onChanged}
+        />
+      );
+    case "approval":
+      return (
+        <ApprovalPeekModal
+          company={company}
+          approval={overlay.approval}
+          onClose={onClose}
+          onDecided={onChanged}
+        />
+      );
+    case "health":
+      return (
+        <HealthCheckPeekModal
+          company={company}
+          checkId={overlay.checkId}
+          title={overlay.title}
+          onClose={onClose}
+          onDismiss={overlay.onDismiss}
+        />
+      );
+    case "run":
+      // The routines page's own run viewer — it already tails the log and
+      // shows the checks verdict, so Home has no business growing a second
+      // one.
+      //
+      // `onRetry` is deliberately not passed, which is what suppresses
+      // RunLiveModal's own Retry button. Home already decides who may start a
+      // routine again and on what terms: the retry lives on the row in
+      // {@link FailedRoutinesAlert}, behind a confirm warning that the run may
+      // already have sent the email or moved the money. A second, unguarded
+      // Retry inside this modal would route around that.
+      return (
+        <RunLiveModal
+          key={overlay.run.runId}
+          company={company}
+          routine={{ id: overlay.run.routineId, name: overlay.run.routineName }}
+          run={{
+            id: overlay.run.runId,
+            routineId: overlay.run.routineId,
+            startedAt: overlay.run.startedAt,
+            finishedAt: null,
+            status: overlay.run.status,
+            errorKind: overlay.run.errorKind,
+            failureReason: overlay.run.failureReason,
+            hasUnfinishedWork: overlay.run.hasUnfinishedWork,
+            retryAt: overlay.run.retryAt,
+            continuationPending: overlay.run.continuationPending,
+            followUpRun: overlay.run.followUpRun,
+            exitCode: overlay.run.exitCode,
+            createdAt: overlay.run.startedAt,
+          }}
+          onClose={onClose}
+          onResumed={onChanged}
+        />
+      );
+    case "workRun": {
+      // The same viewer the failure panel opens, from a work-timeline row.
+      // `onRetry` is withheld here for the same reason it is there: Home
+      // decides who may start a routine again, and on what terms.
+      const run = overlay.entry.run;
+      if (!run) return null;
+      return (
+        <RunLiveModal
+          key={run.id}
+          company={company}
+          routine={{ id: run.routineId, name: run.routineName }}
+          run={{
+            id: run.id,
+            routineId: run.routineId,
+            startedAt: overlay.entry.at,
+            finishedAt: overlay.entry.endedAt,
+            status: run.status,
+            errorKind: run.errorKind,
+            failureReason: run.failureReason,
+            exitCode: run.exitCode,
+            createdAt: overlay.entry.at,
+          }}
+          onClose={onClose}
+          onResumed={onChanged}
+        />
+      );
+    }
+  }
+}
+
+// ───────────────────────── visibility ────────────────────────────────────────
+
+/**
+ * True when at least one panel below has something in it.
+ *
+ * These predicates are the same conditions the panels themselves guard on, in
+ * the same order they render. Keep them in step: a panel that renders while
+ * this returns `false` would sit under the all-clear message contradicting it.
+ *
+ * System health is the one that isn't a row count. A check the viewer dismissed
+ * on this device still counts as visible, because the card stays up to offer it
+ * back — {@link SystemHealthCard} owns that distinction and only disappears
+ * when nothing is failing at all.
+ *
+ * The work timeline is deliberately **not** one of these predicates, and it
+ * sits beside the all-clear rather than inside it. Everything above is a
+ * queue, and {@link AllClear} says the queues are empty — which stays true on a
+ * night the roster worked straight through. Folding the timeline in here would
+ * either hide a full day's work behind "Nothing needs you right now" or quietly
+ * change what that sentence means. Its bubble roster deliberately stays below
+ * the all-clear even when the work window itself is empty, because choosing a
+ * teammate and checking in is still useful.
+ */
+function hasAnythingToShow(data: HomeData, company: Company): boolean {
+  return (
+    data.decisions.length > 0 ||
+    homeDecisionReviews(company, data).length > 0 ||
+    data.repositoryWorkCount > 0 ||
+    data.failedRuns.length > 0 ||
+    showsBoardLetter(company, data.boardLetter) ||
+    data.tldrs.length > 0 ||
+    data.draftEmailCount > 0 ||
+    data.starredEmailCount > 0 ||
+    statTotal(data) > 0 ||
+    data.notifications.length > 0 ||
+    data.myTodos.length > 0 ||
+    data.reviewTodos.length > 0 ||
+    data.unreadChannels.length > 0 ||
+    data.approvals.length > 0 ||
+    data.systemHealth.checks.some((c) => c.severity !== "ok")
+  );
+}
+
+/**
+ * What Home shows on a day when nothing needs a human.
+ *
+ * Hiding the empty panels leaves a greeting over blank space, which reads as a
+ * page that failed to load rather than one with nothing to report. This says
+ * the quiet part once, in the space six empty cards used to take.
+ *
+ * It also carries the one thing a company on Genosyn is asked for: its Goal.
+ * A quiet day shows where the Goal stands, and a company that has not written
+ * one is pointed at writing it. This used to send a new owner off to create a
+ * project, which is a step further from the company's direction than a Goal is.
+ */
+function AllClear({ company }: { company: Company; data?: HomeData }) {
+  return (
+    <section className="mt-6 flex flex-col items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-6 py-16 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <span className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300">
+        <CheckCircle2 size={20} />
+      </span>
+      <h2
+        data-home-all-clear
+        tabIndex={-1}
+        className="text-sm font-semibold text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-slate-100"
+      >
+        Nothing needs you right now
+      </h2>
+      <p className="max-w-sm text-xs text-slate-500 dark:text-slate-400">
+        Active Decisions, Repository AI work, routines needing attention, mentions, todos, emails,
+        and approvals appear here the moment they arrive.
+      </p>
+      <GoalGlance company={company} />
+    </section>
+  );
+}
+
+// ───────────────────────── active decisions ──────────────────────────────────
+
+function homeDecisionReviews(company: Company, data: HomeData): HomeApproval[] {
+  if (company.role !== "owner" && company.role !== "admin") return [];
+  return (data.decisionApprovals ?? []).filter(
+    (approval) => approval.kind === "proactive_work" || approval.kind === "mail_send",
+  );
+}
+
+/** Pending choices and the outcomes this Member is still following. */
+function ActiveDecisions({
+  company,
+  data,
+  followUps,
+  onResolved,
+  viewerId,
+}: {
+  company: Company;
+  data: HomeData;
+  followUps: DecisionFollowUps;
+  onResolved: (announcement?: string) => Promise<void> | void;
+  viewerId: string;
+}) {
+  const [editingReviewIds, setEditingReviewIds] = React.useState<string[]>([]);
+  const previewKeys = React.useRef<string[]>([]);
+  const handleReviewEditingChange = React.useCallback((approvalId: string, editing: boolean) => {
+    setEditingReviewIds((current) => {
+      if (current.includes(approvalId) === editing) return current;
+      return editing ? [...current, approvalId] : current.filter((id) => id !== approvalId);
+    });
+  }, []);
+  const reviews = homeDecisionReviews(company, data);
+  const canReview = company.role === "owner" || company.role === "admin";
+  const total =
+    data.pendingDecisionCount +
+    (canReview ? (data.pendingDecisionApprovalCount ?? reviews.length) : 0);
+  const pendingItems = [
+    ...data.decisions
+      .filter((row) => !followUps.hiddenKeys.has(`decision-${row.id}`))
+      .map(decisionItem),
+    ...reviews
+      .filter((row) => !followUps.hiddenKeys.has(`review-${row.id}`))
+      .map((approval) => reviewItem(approval)),
+  ];
+  const itemsByKey = new Map(pendingItems.map((item) => [item.key, item]));
+  for (const item of followUps.items) {
+    if (!stackItemPending(item) || !itemsByKey.has(item.key)) itemsByKey.set(item.key, item);
+  }
+  const items = [...itemsByKey.values()].sort(compareStackItems);
+  const followingKeys = new Set(followUps.items.map((item) => item.key));
+  // Keep both an open editor and an outcome in their original slot. A new
+  // urgent item must not push the result the Member is reading off Home.
+  const retained = previewKeys.current.flatMap((key) => {
+    const item = itemsByKey.get(key);
+    return item ? [item] : [];
+  });
+  const retainedKeys = new Set(retained.map((item) => item.key));
+  const ordered =
+    editingReviewIds.length > 0 || followingKeys.size > 0
+      ? [...retained, ...items.filter((item) => !retainedKeys.has(item.key))]
+      : items;
+  const preview = ordered.filter((item, index) => index < 3 || followingKeys.has(item.key));
+  React.useEffect(() => {
+    previewKeys.current = preview.map((item) => item.key);
+  }, [preview]);
+  if (preview.length === 0) return null;
+  const hidden = Math.max(0, total - preview.filter(stackItemPending).length);
+  const following = preview.filter((item) => !stackItemPending(item)).length;
+  const working = preview.filter(stackItemWorking).length;
+  const href = `/c/${company.slug}/decisions`;
+
+  return (
+    <section
+      aria-labelledby="home-active-decisions"
+      className="mt-6 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"
+    >
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300">
+          <GitBranch size={15} />
+        </span>
+        <h2
+          id="home-active-decisions"
+          className="text-sm font-semibold text-slate-900 dark:text-slate-100"
+        >
+          Active decisions
+        </h2>
+        <span className="inline-flex h-5 items-center rounded-full bg-slate-100 px-2 text-xs font-medium tabular-nums text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+          {total} waiting
+        </span>
+        {following > 0 && (
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            {working > 0 ? `${working} in progress · ` : ""}
+            {following} following
+          </span>
+        )}
+        <Link
+          to={href}
+          className="touch-target relative ml-auto flex shrink-0 items-center gap-0.5 text-xs text-indigo-700 hover:underline dark:text-indigo-300"
+        >
+          All decisions <ChevronRight size={12} />
+        </Link>
+      </div>
+      <StackList
+        bare
+        company={company}
+        items={preview}
+        followUps={followUps}
+        onResolved={(announcement) => onResolved(announcement)}
+        onEditingChange={handleReviewEditingChange}
+        viewerId={viewerId}
+      />
+      {hidden > 0 && (
+        <Link
+          to={href}
+          className="block border-t border-slate-200 px-4 py-3 text-center text-xs font-medium text-indigo-700 hover:bg-slate-50 dark:border-slate-800 dark:text-indigo-300 dark:hover:bg-slate-800"
+        >
+          View all decisions · {hidden} more waiting
+        </Link>
+      )}
+    </section>
+  );
+}
+
+// ───────────────────────── header ────────────────────────────────────────────
+
+function Greeting({ me, company }: { me: Me; company: Company }) {
+  const hour = new Date().getHours();
+  const salute =
+    hour < 5
+      ? "Good night"
+      : hour < 12
+        ? "Good morning"
+        : hour < 18
+          ? "Good afternoon"
+          : "Good evening";
+  const firstName = (me.name || me.email).split(/[\s@]/)[0];
+  const today = new Date().toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+  return (
+    <div className="min-w-0 flex-1 break-words">
+      <h1
+        data-home-mark-read-fallback
+        tabIndex={-1}
+        className="text-xl font-semibold tracking-tight text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus sm:text-2xl dark:text-slate-50"
+      >
+        {salute}, {firstName}
+      </h1>
+      <p className="mt-1 text-sm leading-6 text-slate-500 dark:text-slate-400">
+        {today} · Here&apos;s what needs your attention at {company.name}.
+      </p>
+    </div>
+  );
+}
+
+// ───────────────────────── push prompt ───────────────────────────────────────
+
+function PushPromptBanner() {
+  const dialog = useDialog();
+  const [visible, setVisible] = React.useState(
+    () =>
+      pushSupported() &&
+      Notification.permission === "default" &&
+      localStorage.getItem(PUSH_PROMPT_DISMISSED_KEY) !== "1",
+  );
+  const [busy, setBusy] = React.useState(false);
+  if (!visible) return null;
+
+  async function enable() {
+    setBusy(true);
+    try {
+      await enablePush();
+      setVisible(false);
+    } catch (err) {
+      // The banner removes itself once permission is denied, so the failure
+      // has nowhere on the page left to sit — say it in the modal instead.
+      void dialog.error(err, { title: "Couldn’t enable push notifications" });
+      if (Notification.permission === "denied") setVisible(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+  function dismiss() {
+    localStorage.setItem(PUSH_PROMPT_DISMISSED_KEY, "1");
+    setVisible(false);
+  }
+
+  return (
+    // A phone puts Enable under the text, so the sentence keeps the width;
+    // from `sm` up everything sits on one line.
+    <div className="mt-5 grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-2 rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-3 sm:flex sm:items-center dark:border-indigo-500/30 dark:bg-indigo-500/10">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-300">
+        <BellRing size={17} />
+      </span>
+      <div className="min-w-0 sm:flex-1">
+        <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+          Get notified when something needs you
+        </div>
+        <div className="text-xs leading-5 text-slate-600 dark:text-slate-400">
+          Mentions, review requests, and approvals arrive as push notifications — even when Genosyn
+          is closed.
+        </div>
+      </div>
+      <Button
+        size="sm"
+        onClick={enable}
+        loading={busy}
+        className="col-start-2 row-start-2 justify-self-start sm:shrink-0"
+      >
+        {busy ? "Enabling…" : "Enable"}
+      </Button>
+      <button
+        onClick={dismiss}
+        className="col-start-3 row-start-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:bg-indigo-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-indigo-500/20 dark:hover:text-slate-200"
+        title="Not now"
+        aria-label="Dismiss"
+      >
+        <X size={15} />
+      </button>
+    </div>
+  );
+}
+
+// ───────────────────────── stat strip ────────────────────────────────────────
+
+/**
+ * The counters the strip can show. Split out so {@link hasAnythingToShow}
+ * can ask whether any of them is non-zero without rebuilding the tiles.
+ */
+function statTotal(data: HomeData): number {
+  return (
+    data.unreadNotificationCount +
+    data.myTodoCount +
+    data.reviewTodoCount +
+    data.pendingApprovalCount
+  );
+}
+
+/**
+ * Counters across the top. A tile at zero is dropped rather than rendered — the
+ * strip exists to say how much is waiting, and "0" is the one number that says
+ * nothing. All counters at zero and the strip goes with them.
+ *
+ * The counts are the company's real backlog, not the length of the list in the
+ * card below: a Member whose only pending approvals are vault captures sees the
+ * tile (the count was never the sensitive part) while the card, which would
+ * have to name them, stays hidden.
+ */
+/**
+ * A plain click on a link to Home's own notifications opens the bell where it
+ * is, rather than "navigating" to the page already showing. A new-tab click is
+ * left alone.
+ */
+function openBellInPlace(event: React.MouseEvent<HTMLAnchorElement>) {
+  if (!shouldOpenEventInPlace(event)) return;
+  event.preventDefault();
+  openNotifications();
+}
+
+function StatStrip({ company, data }: { company: Company; data: HomeData }) {
+  const stats: {
+    label: string;
+    value: number;
+    icon: React.ReactNode;
+    to: string;
+    accent: string;
+    onClick?: (event: React.MouseEvent<HTMLAnchorElement>) => void;
+  }[] = [
+    {
+      label: "Unread notifications",
+      value: data.unreadNotificationCount,
+      icon: <AtSign size={15} />,
+      // Home is where this link already is; the click opens the bell instead.
+      to: `/c/${company.slug}`,
+      accent: "text-rose-600 bg-rose-100 dark:bg-rose-500/15 dark:text-rose-300",
+      onClick: openBellInPlace,
+    },
+    {
+      label: "Todos assigned to you",
+      value: data.myTodoCount,
+      icon: <ListChecks size={15} />,
+      to: `/c/${company.slug}/tasks`,
+      accent: "text-indigo-600 bg-indigo-100 dark:bg-indigo-500/15 dark:text-indigo-300",
+    },
+    {
+      label: "Reviews waiting on you",
+      value: data.reviewTodoCount,
+      icon: <ClipboardCheck size={15} />,
+      to: `/c/${company.slug}/tasks/review`,
+      accent: "text-violet-600 bg-violet-100 dark:bg-violet-500/15 dark:text-violet-300",
+    },
+    {
+      label: "Pending approvals",
+      value: data.pendingApprovalCount,
+      icon: <ShieldCheck size={15} />,
+      to: `/c/${company.slug}/decisions/approvals`,
+      accent: "text-amber-600 bg-amber-100 dark:bg-amber-500/15 dark:text-amber-300",
+    },
+  ].filter((s) => s.value > 0);
+  if (stats.length === 0) return null;
+  return (
+    <div className="mt-6 flex flex-wrap gap-3">
+      {stats.map((s) => (
+        <Link
+          key={s.label}
+          to={s.to}
+          onClick={s.onClick}
+          className="flex min-w-0 flex-1 basis-[calc(50%-0.375rem)] items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm transition-colors hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900 dark:hover:border-slate-700 lg:basis-0"
+        >
+          <span
+            className={clsx(
+              "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+              s.accent,
+            )}
+          >
+            {s.icon}
+          </span>
+          <span className="min-w-0">
+            <span className="block text-lg font-semibold tabular-nums leading-tight text-slate-900 dark:text-slate-100">
+              {s.value}
+            </span>
+            <span className="block truncate text-[11px] text-slate-500 dark:text-slate-400">
+              {s.label}
+            </span>
+          </span>
+        </Link>
+      ))}
+    </div>
+  );
+}
+
+// ───────────────────────── failed routines alert ─────────────────────────────
+
+function failedRunLink(company: Company, r: HomeFailedRun): string {
+  const params = new URLSearchParams({ routine: r.routineId, run: r.runId });
+  // The rollup knows a routine id but not its slug; the Routines index resolves
+  // the id and forwards to that run's history.
+  return `/c/${company.slug}/routines?${params.toString()}`;
+}
+
+/**
+ * High-visibility alert listing routine runs that failed in the last 24h and
+ * are still worth acting on — the server drops a failure the routine's next
+ * run already fixed by itself, so a stale red panel never trains people to
+ * scroll past a real one. Only renders when something is broken; a clean day
+ * shows nothing here. Each row deep-links into the routine's run history (on
+ * the failing run) and carries a retry.
+ */
+function FailedRoutinesAlert({
+  company,
+  data,
+  onChanged,
+  onOpen,
+}: {
+  company: Company;
+  data: HomeData;
+  /** Refetch Home data after a run is retried or dismissed so the panel updates. */
+  onChanged: () => Promise<void> | void;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  const dialog = useDialog();
+  const askAi = useAskAi();
+  // Which row is mid-request, and which of its two buttons owns the spinner.
+  const [busy, setBusy] = React.useState<{ runId: string; action: "retry" | "dismiss" } | null>(
+    null,
+  );
+
+  async function dismiss(runId: string) {
+    setBusy({ runId, action: "dismiss" });
+    try {
+      await api.post(`/api/companies/${company.id}/runs/${runId}/dismiss`);
+      await onChanged();
+    } catch (err) {
+      void dialog.error(err, { title: "Couldn’t dismiss the failure" });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * Start the routine again from here — offered on every row, because the
+   * commonest answer to a failed routine is "try it again" and the alternative
+   * was three clicks into the routine's own page. Anything with an automatic
+   * retry still pending never reaches this panel, so nothing here is racing the
+   * retry chain.
+   *
+   * Every row asks first. A run that failed part-way through, and an
+   * interrupted one especially, may already have sent the email or moved the
+   * money — the same caution the run history prints before its "Run now"
+   * button, asked here as a confirm because this panel is one click from a
+   * page nobody opened to think about side effects.
+   *
+   * A different accepted Run acknowledges the failed one. If cleanup still
+   * owns this same Run, open its log and retain the failure for a later retry.
+   */
+  async function retry(r: HomeFailedRun) {
+    const ok = await dialog.confirm({
+      title: `Run ${r.routineName} again?`,
+      message:
+        r.status === "interrupted" || r.errorKind === "interrupted"
+          ? "This Run was interrupted. Review its recorded reason, log, and Effects before running it again; work already done may repeat."
+          : "The run stopped part-way through, so any work it had already done stands. Run it again only if repeating that work is safe — otherwise open the log first.",
+      confirmLabel: "Retry",
+    });
+    if (!ok) return;
+    setBusy({ runId: r.runId, action: "retry" });
+    try {
+      const accepted = await api.post<{ id: string }>(
+        `/api/companies/${company.id}/routines/${r.routineId}/run`,
+      );
+      if (accepted.id === r.runId) onOpen({ kind: "run", run: r });
+      else await api.post(`/api/companies/${company.id}/runs/${r.runId}/dismiss`);
+      await onChanged();
+    } catch (err) {
+      void dialog.error(err, { title: `Couldn’t run ${r.routineName} again` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (data.failedRuns.length === 0) return null;
+  return (
+    <section className="mt-6 overflow-hidden rounded-xl border border-rose-200 bg-rose-50/60 shadow-sm dark:border-rose-500/30 dark:bg-rose-500/10">
+      <div className="flex items-center gap-2 border-b border-rose-200/70 px-4 py-3 dark:border-rose-500/20">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-rose-100 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300">
+          <AlertTriangle size={15} />
+        </span>
+        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+          Routines needing attention
+        </h2>
+        <span className="inline-flex h-5 items-center rounded-full bg-rose-100 px-2 text-xs font-medium tabular-nums text-rose-700 dark:bg-rose-500/20 dark:text-rose-200">
+          {data.failedRunCount}
+        </span>
+        <Link
+          to={`/c/${company.slug}/tldrs/journal`}
+          className="touch-target relative ml-auto flex items-center gap-0.5 text-xs text-rose-700 hover:underline dark:text-rose-300"
+        >
+          Journal <ChevronRight size={12} />
+        </Link>
+      </div>
+      <ul className="divide-y divide-rose-100 dark:divide-rose-500/15">
+        {data.failedRuns.map((r) => (
+          <li key={r.runId} className="flex flex-wrap items-stretch sm:flex-nowrap">
+            <HomeRow
+              to={failedRunLink(company, r)}
+              onOpen={() => onOpen({ kind: "run", run: r })}
+              className="flex min-w-0 basis-full items-center gap-3 px-4 py-2.5 hover:bg-rose-100/50 sm:flex-1 sm:basis-auto dark:hover:bg-rose-500/10"
+            >
+              <Avatar
+                name={r.employee.name}
+                kind="ai"
+                size="sm"
+                src={employeeAvatarUrl(company.id, r.employee.id, r.employee.avatarKey)}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                  {r.routineName}
+                </span>
+                <span className="block truncate text-[11px] text-slate-500 dark:text-slate-400">
+                  {r.employee.name} · {formatRelative(r.startedAt)}
+                </span>
+              </span>
+              <RunStatusChip status={r.status} errorKind={r.errorKind} size="xs" />
+            </HomeRow>
+            <button
+              type="button"
+              // Ask AI explains it in a new conversation, with this Run in
+              // context; the routine's own employee answers by default because
+              // it wrote the log.
+              onClick={() =>
+                askAi?.ask({
+                  refs: [{ kind: "run", id: r.runId }],
+                  prompt: runExplanationPrompt(r.status),
+                  newConversation: true,
+                })
+              }
+              aria-label={`${runExplanationLabel(r.status)} ${r.routineName}`}
+              className="flex shrink-0 items-center gap-1 px-3 py-2 text-xs font-medium text-rose-700 transition hover:bg-rose-100/50 dark:text-rose-300 dark:hover:bg-rose-500/10"
+            >
+              <Sparkles size={14} /> {runExplanationLabel(r.status)}
+            </button>
+            <RunResumeButton
+              company={company}
+              routineName={r.routineName}
+              run={{ ...r, id: r.runId }}
+              onResumed={async () => onChanged()}
+            />
+            {r.followUpRun === null && (
+              <button
+                type="button"
+                onClick={() => retry(r)}
+                disabled={busy?.runId === r.runId}
+                aria-busy={(busy?.runId === r.runId && busy.action === "retry") || undefined}
+                title="Retry"
+                aria-label={`Retry ${r.routineName}`}
+                className="flex min-w-8 shrink-0 items-center justify-center gap-1 px-2 text-xs font-medium text-rose-700 transition hover:bg-rose-100/50 disabled:opacity-50 dark:text-rose-300 dark:hover:bg-rose-500/10"
+              >
+                {busy?.runId === r.runId && busy.action === "retry" ? (
+                  <ButtonSpinner size={14} />
+                ) : (
+                  <RotateCw size={14} />
+                )}
+                <span className="hidden sm:inline">Retry</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => dismiss(r.runId)}
+              disabled={busy?.runId === r.runId}
+              aria-busy={(busy?.runId === r.runId && busy.action === "dismiss") || undefined}
+              title="Dismiss"
+              aria-label={`Dismiss ${r.routineName} failure`}
+              className="flex shrink-0 items-center px-3 text-rose-400 transition hover:bg-rose-100/50 hover:text-rose-700 disabled:opacity-50 dark:text-rose-500/70 dark:hover:bg-rose-500/10 dark:hover:text-rose-200"
+            >
+              {busy?.runId === r.runId && busy.action === "dismiss" ? (
+                <ButtonSpinner size={14} />
+              ) : (
+                <X size={15} />
+              )}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+// ──────────────────────────────── TLDRs ──────────────────────────────────
+
+/**
+ * The newest unread company briefings. These sit below failed Routines because
+ * they are context, not an interruption, but above the small queue cards so
+ * the day's work can be understood at a glance.
+ */
+function HomeTldrPanel({
+  company,
+  data,
+  onDismiss,
+}: {
+  company: Company;
+  data: HomeData;
+  onDismiss: (item: TldrItem) => void;
+}) {
+  if (data.tldrs.length === 0) return null;
+  const visible = data.tldrs.slice(0, 1);
+  const hidden = Math.max(0, data.unreadTldrCount - visible.length);
+  const base = `/c/${company.slug}/tldrs`;
+
+  return (
+    <section className="mt-6 overflow-hidden rounded-xl border border-violet-200 bg-white shadow-sm dark:border-violet-500/25 dark:bg-slate-900">
+      <div className="flex items-center gap-2 border-b border-violet-100 bg-violet-50/60 px-4 py-3 dark:border-violet-500/15 dark:bg-violet-500/10">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-violet-100 text-violet-600 dark:bg-violet-500/20 dark:text-violet-300">
+          <Sparkles size={15} />
+        </span>
+        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Latest TLDR</h2>
+        <span className="inline-flex h-5 items-center rounded-full bg-violet-100 px-2 text-xs font-medium tabular-nums text-violet-700 dark:bg-violet-500/20 dark:text-violet-200">
+          {data.unreadTldrCount}
+        </span>
+        <Link
+          to={base}
+          className="ml-auto flex shrink-0 items-center gap-0.5 text-xs font-medium text-violet-700 hover:underline dark:text-violet-300"
+        >
+          All TLDRs <ChevronRight size={12} />
+        </Link>
+      </div>
+
+      <div className="divide-y divide-slate-100 dark:divide-slate-800">
+        {visible.map((item) => (
+          <article key={item.id} className="px-4 py-4 sm:px-5">
+            <div className="flex items-start gap-3">
+              <Avatar
+                name={item.employee.name || "AI Employee"}
+                src={
+                  item.employee.id
+                    ? employeeAvatarUrl(company.id, item.employee.id, item.employee.avatarKey)
+                    : null
+                }
+                kind="ai"
+                size="md"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-start">
+                  <div className="min-w-0 flex-1">
+                    <Link
+                      to={`${base}#tldr-${item.id}`}
+                      className="font-medium text-slate-900 hover:text-violet-700 dark:text-slate-100 dark:hover:text-violet-300"
+                    >
+                      {item.title || "Company TLDR"}
+                    </Link>
+                    <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                      {item.employee.name || "AI Employee"} · {homeTldrPeriod(item)}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onDismiss(item)}
+                    className="touch-target relative -mr-1 inline-flex shrink-0 items-center gap-1 self-start rounded-md px-2 py-1 text-xs font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                    aria-label={`Dismiss ${item.title || "TLDR"}`}
+                  >
+                    <X size={13} /> Dismiss
+                  </button>
+                </div>
+
+                <div className="mt-2">
+                  <TldrBriefing company={company} item={item} />
+                </div>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+
+      {hidden > 0 && (
+        <Link
+          to={base}
+          className="block border-t border-violet-100 bg-violet-50/30 px-4 py-2 text-center text-xs font-medium text-violet-700 hover:bg-violet-50 dark:border-violet-500/15 dark:bg-violet-500/5 dark:text-violet-300 dark:hover:bg-violet-500/10"
+        >
+          {hidden} more unread {hidden === 1 ? "briefing" : "briefings"}
+        </Link>
+      )}
+    </section>
+  );
+}
+
+function homeTldrPeriod(item: TldrItem): string {
+  const start = new Date(item.periodStart);
+  const end = new Date(item.periodEnd);
+  const time = (date: Date) => date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (start.toDateString() === end.toDateString()) {
+    return `${start.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${time(start)}–${time(end)}`;
+  }
+  return `${start.toLocaleDateString(undefined, { month: "short", day: "numeric" })}–${end.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
+}
+
+// Shared card chrome for the smaller two-column attention queues below.
+function HomeCard({
+  title,
+  icon,
+  count,
+  headerAction,
+  linkTo,
+  linkLabel,
+  onLinkClick,
+  children,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  count?: number;
+  headerAction?: React.ReactNode;
+  linkTo: string;
+  linkLabel: string;
+  /** Handles a click on the header link in place, e.g. opening the bell. */
+  onLinkClick?: (event: React.MouseEvent<HTMLAnchorElement>) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="flex flex-col rounded-xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 lg:last:odd:col-span-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+        <span className="text-slate-400 dark:text-slate-500">{icon}</span>
+        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h2>
+        {count !== undefined && count > 0 && (
+          <span className="inline-flex h-5 items-center rounded-full bg-slate-100 px-2 text-xs font-medium tabular-nums text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+            {count}
+          </span>
+        )}
+        <div
+          className={clsx(
+            "ml-auto flex shrink-0 items-center gap-3",
+            Boolean(headerAction) && "basis-full justify-end sm:basis-auto",
+          )}
+        >
+          {headerAction}
+          <Link
+            to={linkTo}
+            onClick={onLinkClick}
+            className="touch-target relative flex shrink-0 items-center gap-0.5 text-xs text-indigo-600 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-indigo-400"
+          >
+            {linkLabel} <ChevronRight size={12} />
+          </Link>
+        </div>
+      </div>
+      <div>{children}</div>
+    </section>
+  );
+}
+
+// ───────────────────────── emails card ──────────────────────────────────────
+
+function mailViewHref(company: Company, view: "drafts" | "starred", accountId?: string): string {
+  const params = new URLSearchParams({ view });
+  if (accountId) params.set("account", accountId);
+  return `/c/${company.slug}/mail?${params.toString()}`;
+}
+
+function EmailsCard({ company, data }: { company: Company; data: HomeData }) {
+  if (data.draftEmailCount === 0 && data.starredEmailCount === 0) return null;
+
+  const accounts = new Map<
+    string,
+    { id: string; email: string; draftCount: number; starredCount: number }
+  >();
+  for (const account of data.draftEmailAccounts) {
+    accounts.set(account.id, {
+      id: account.id,
+      email: account.email,
+      draftCount: account.count,
+      starredCount: 0,
+    });
+  }
+  for (const account of data.starredEmailAccounts) {
+    const current = accounts.get(account.id);
+    accounts.set(account.id, {
+      id: account.id,
+      email: account.email,
+      draftCount: current?.draftCount ?? 0,
+      starredCount: account.count,
+    });
+  }
+  const emailAccounts = [...accounts.values()].sort(
+    (a, b) => a.email.localeCompare(b.email) || a.id.localeCompare(b.id),
+  );
+  const firstAccountId = emailAccounts[0]?.id;
+  const draftAccountId = data.draftEmailAccounts[0]?.id ?? firstAccountId;
+  const starredAccountId = data.starredEmailAccounts[0]?.id ?? firstAccountId;
+
+  return (
+    <HomeCard
+      title="Emails"
+      icon={<Mail size={15} />}
+      linkTo={`/c/${company.slug}/mail${
+        firstAccountId ? `?account=${encodeURIComponent(firstAccountId)}` : ""
+      }`}
+      linkLabel="Open email"
+    >
+      <div className="grid grid-cols-2 divide-x divide-slate-100 border-b border-slate-100 dark:divide-slate-800 dark:border-slate-800">
+        <Link
+          to={mailViewHref(company, "drafts", draftAccountId)}
+          className="group min-w-0 px-4 py-3 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:hover:bg-slate-800/60"
+        >
+          <span className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+            <FilePenLine size={13} className="text-indigo-500" />
+            Drafts
+          </span>
+          <span className="mt-1 block text-2xl font-semibold tabular-nums text-slate-900 dark:text-slate-100">
+            {data.draftEmailCount.toLocaleString()}
+          </span>
+          <span className="block truncate text-[11px] text-slate-500 group-hover:text-slate-600 dark:text-slate-400 dark:group-hover:text-slate-300">
+            Waiting for review
+          </span>
+        </Link>
+        <Link
+          to={mailViewHref(company, "starred", starredAccountId)}
+          className="group min-w-0 px-4 py-3 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:hover:bg-slate-800/60"
+        >
+          <span className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
+            <Star size={13} className="text-amber-500" />
+            Starred
+          </span>
+          <span className="mt-1 block text-2xl font-semibold tabular-nums text-slate-900 dark:text-slate-100">
+            {data.starredEmailCount.toLocaleString()}
+          </span>
+          <span className="block truncate text-[11px] text-slate-500 group-hover:text-slate-600 dark:text-slate-400 dark:group-hover:text-slate-300">
+            Saved for later
+          </span>
+        </Link>
+      </div>
+      {data.draftEmailCount > 0 && (
+        <>
+          <div className="px-4 py-3">
+            <h3 className="text-xs font-medium text-slate-700 dark:text-slate-200">
+              Recent drafts
+            </h3>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              Review these messages before they are sent.
+            </p>
+          </div>
+          <ul className="divide-y divide-slate-100 border-t border-slate-100 dark:divide-slate-800 dark:border-slate-800">
+            {data.draftEmails.map((draft) => (
+              <li key={draft.id}>
+                <Link
+                  to={`/c/${company.slug}/mail/t/${encodeURIComponent(draft.threadId)}?${new URLSearchParams({ account: draft.accountId })}`}
+                  className="flex min-w-0 items-center gap-3 px-4 py-3 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:hover:bg-slate-800/60"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                      {draft.subject.trim() || "(No subject)"}
+                    </span>
+                    <span className="block truncate text-xs text-slate-600 dark:text-slate-300">
+                      {draft.recipientSummary || "No recipient yet"}
+                    </span>
+                    <span className="block truncate text-[11px] text-slate-500 dark:text-slate-400">
+                      {draft.accountEmail} · {formatRelative(draft.updatedAt)}
+                    </span>
+                  </span>
+                  <ChevronRight size={14} className="shrink-0 text-slate-400" />
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <div className="space-y-2 border-t border-slate-100 px-4 py-3 dark:border-slate-800">
+        {data.draftEmailCount > data.draftEmails.length && (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Showing {data.draftEmails.length} of {data.draftEmailCount} drafts. Review each mailbox
+            to see the rest.
+          </p>
+        )}
+        <ul className="space-y-2">
+          {emailAccounts.map((account) => (
+            <li key={account.id} className="flex min-w-0 items-center gap-3 text-xs">
+              <span className="min-w-0 flex-1 truncate text-slate-500 dark:text-slate-400">
+                {account.email}
+              </span>
+              <span className="flex shrink-0 flex-col items-end gap-1 sm:flex-row sm:items-center sm:gap-2">
+                {account.draftCount > 0 && (
+                  <Link
+                    to={mailViewHref(company, "drafts", account.id)}
+                    aria-label={`${account.email}: ${account.draftCount.toLocaleString()} ${
+                      account.draftCount === 1 ? "draft" : "drafts"
+                    }`}
+                    className="rounded px-2 py-1.5 tabular-nums text-indigo-600 hover:bg-indigo-50 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+                  >
+                    {account.draftCount.toLocaleString()}{" "}
+                    {account.draftCount === 1 ? "draft" : "drafts"}
+                  </Link>
+                )}
+                {account.starredCount > 0 && (
+                  <Link
+                    to={mailViewHref(company, "starred", account.id)}
+                    aria-label={`${account.email}: ${account.starredCount.toLocaleString()} starred`}
+                    className="rounded px-2 py-1.5 tabular-nums text-indigo-600 hover:bg-indigo-50 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+                  >
+                    {account.starredCount.toLocaleString()} starred
+                  </Link>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </HomeCard>
+  );
+}
+
+// ───────────────────────── notifications card ────────────────────────────────
+
+function AttentionCard({
+  company,
+  data,
+  onOpen,
+  onMarkAllRead,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+  onMarkAllRead: () => boolean;
+}) {
+  const background = useBackgroundAction();
+
+  /**
+   * Open it, and mark it read on the way.
+   *
+   * This card lists unread notifications only, so marking read is what makes a
+   * row leave — which is why it now happens when you actually look at the
+   * thing rather than the instant you click. The read call is fire-and-forget
+   * against a modal that is already open: if it fails, the row is still there
+   * next refetch, which is the harmless direction to fail in.
+   */
+  function open(n: NotificationRow) {
+    // An approval or a review Home already holds opens straight into its own
+    // peek, where it is decided — not a note pointing somewhere else. Deciding
+    // is unchanged: the peek is the review, with its Approve or Reject.
+    const approval =
+      n.entityKind === "approval"
+        ? data.approvals.find((candidate) => candidate.id === n.entityId)
+        : undefined;
+    const review =
+      n.kind === "todo_review_requested" && n.entityKind === "todo"
+        ? data.reviewTodos.find((candidate) => candidate.id === n.entityId)
+        : undefined;
+    if (approval) onOpen({ kind: "approval", approval });
+    else if (review) onOpen({ kind: "todo", todo: review, review: true });
+    else onOpen({ kind: "notification", notification: n });
+    background(
+      () =>
+        api.post(`/api/companies/${company.id}/notifications/mark-read`, {
+          notificationId: n.id,
+        }),
+      { title: "Couldn’t mark the notification read" },
+    );
+  }
+
+  if (data.notifications.length === 0) return null;
+  return (
+    <HomeCard
+      title="Needs your attention"
+      icon={<AtSign size={15} />}
+      count={data.unreadNotificationCount}
+      headerAction={
+        <button
+          type="button"
+          onClick={() => {
+            if (!onMarkAllRead()) return;
+            requestAnimationFrame(() => {
+              const fallback =
+                document.querySelector<HTMLElement>("[data-home-all-clear]") ??
+                document.querySelector<HTMLElement>("[data-home-mark-read-fallback]");
+              fallback?.focus();
+            });
+          }}
+          className="inline-flex min-h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-indigo-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-indigo-300"
+        >
+          Mark all as read
+        </button>
+      }
+      linkTo={`/c/${company.slug}`}
+      linkLabel="All notifications"
+      onLinkClick={openBellInPlace}
+    >
+      <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+        {data.notifications.map((n) => (
+          <li key={n.id}>
+            <HomeRow
+              // Only a notification carrying a link has a full page to fall
+              // back to; the rest are the notification itself, so the row
+              // points at Home and the modal is the whole story.
+              to={companyNotificationLink(company.slug, n.link) ?? `/c/${company.slug}`}
+              onOpen={() => open(n)}
+              className="flex w-full items-start gap-3 px-4 py-2.5 text-left hover:bg-slate-50 dark:hover:bg-slate-800/60"
+            >
+              <NotificationAvatar company={company} n={n} />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm text-slate-900 dark:text-slate-100">
+                  {n.title}
+                </span>
+                <span className="block text-[11px] text-slate-400 dark:text-slate-500">
+                  {formatRelative(n.createdAt)}
+                </span>
+              </span>
+            </HomeRow>
+          </li>
+        ))}
+      </ul>
+    </HomeCard>
+  );
+}
+
+function NotificationAvatar({ company, n }: { company: Company; n: NotificationRow }) {
+  const tone = KIND_TONE[n.kind] ?? KIND_TONE.mention;
+  const actor = n.actor;
+  const src = actor
+    ? actor.kind === "user" && actor.id
+      ? memberAvatarUrl(company.id, actor.id, actor.avatarKey)
+      : actor.kind === "ai" && actor.id
+        ? employeeAvatarUrl(company.id, actor.id, actor.avatarKey)
+        : null
+    : null;
+  if (actor) {
+    return (
+      <Avatar name={actor.name} src={src} kind={actor.kind === "ai" ? "ai" : "human"} size="sm" />
+    );
+  }
+  return (
+    <span
+      className={clsx("flex h-6 w-6 shrink-0 items-center justify-center rounded-full", tone.bg)}
+    >
+      <KindIcon kind={n.kind} className={tone.fg} />
+    </span>
+  );
+}
+
+function KindIcon({ kind, className }: { kind: NotificationKind; className?: string }) {
+  switch (kind) {
+    case "mention":
+      return <AtSign size={12} className={className} />;
+    case "todo_review_requested":
+      return <ClipboardCheck size={12} className={className} />;
+    case "approval_pending":
+      return <ShieldCheck size={12} className={className} />;
+    case "decision_pending":
+      return <GitBranch size={12} className={className} />;
+    case "finance_review_ready":
+      return <Landmark size={12} className={className} />;
+    case "todo_needs_attention":
+      return <AlertTriangle size={12} className={className} />;
+    case "mail_handover":
+      return <Mail size={12} className={className} />;
+    case "revenue_follow_up":
+      return <BellRing size={12} className={className} />;
+    case "run_failed":
+      return <AlertTriangle size={12} className={className} />;
+    case "run_off_goal":
+      return <Target size={12} className={className} />;
+    case "approval_stale":
+      return <Hourglass size={12} className={className} />;
+    case "decision_stale":
+      return <Hourglass size={12} className={className} />;
+    case "handoff_overdue":
+      return <Hourglass size={12} className={className} />;
+    case "goal_achieved":
+      return <Target size={12} className={className} />;
+    case "goal_missed":
+      return <Target size={12} className={className} />;
+    case "goal_confirmation_pending":
+      return <Target size={12} className={className} />;
+    case "revision_pending":
+      return <GitPullRequest size={12} className={className} />;
+    case "revision_stale":
+      return <GitPullRequest size={12} className={className} />;
+    case "autonomy_revoked":
+      return <ShieldAlert size={12} className={className} />;
+    case "budget_exhausted":
+      return <PiggyBank size={12} className={className} />;
+    case "initiative_pending":
+      return <Lightbulb size={12} className={className} />;
+    case "board_letter_ready":
+      return <ScrollText size={12} className={className} />;
+    case "recruiting_application":
+      return <Briefcase size={12} className={className} />;
+    case "recruiting_strong_match":
+      return <Star size={12} className={className} />;
+    case "data_room_question":
+      return <MessageCircleQuestion size={12} className={className} />;
+    case "data_room_visit":
+      return <FolderLock size={12} className={className} />;
+    case "support_ticket_assigned":
+    case "support_customer_replied":
+      return <LifeBuoy size={12} className={className} />;
+    case "support_sla_breached":
+      return <Hourglass size={12} className={className} />;
+    case "support_low_rating":
+      return <Star size={12} className={className} />;
+    case "group_discussion":
+      return <Users size={12} className={className} />;
+    case "model_unavailable":
+      return <CloudOff size={12} className={className} />;
+    case "model_available":
+      return <Cloud size={12} className={className} />;
+  }
+}
+
+const KIND_TONE: Record<NotificationKind, { bg: string; fg: string }> = {
+  mention: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  todo_review_requested: {
+    bg: "bg-violet-100 dark:bg-violet-500/15",
+    fg: "text-violet-600 dark:text-violet-300",
+  },
+  approval_pending: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  decision_pending: {
+    bg: "bg-violet-100 dark:bg-violet-500/15",
+    fg: "text-violet-600 dark:text-violet-300",
+  },
+  finance_review_ready: {
+    bg: "bg-emerald-100 dark:bg-emerald-500/15",
+    fg: "text-emerald-600 dark:text-emerald-300",
+  },
+  todo_needs_attention: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  mail_handover: {
+    bg: "bg-sky-100 dark:bg-sky-500/15",
+    fg: "text-sky-600 dark:text-sky-300",
+  },
+  revenue_follow_up: {
+    bg: "bg-sky-100 dark:bg-sky-500/15",
+    fg: "text-sky-600 dark:text-sky-300",
+  },
+  run_failed: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  run_off_goal: {
+    bg: "bg-orange-100 dark:bg-orange-500/15",
+    fg: "text-orange-600 dark:text-orange-300",
+  },
+  approval_stale: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  decision_stale: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  handoff_overdue: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  goal_achieved: {
+    bg: "bg-emerald-100 dark:bg-emerald-500/15",
+    fg: "text-emerald-600 dark:text-emerald-300",
+  },
+  goal_missed: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  goal_confirmation_pending: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  revision_pending: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  revision_stale: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  autonomy_revoked: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  budget_exhausted: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  initiative_pending: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  board_letter_ready: {
+    bg: "bg-violet-100 dark:bg-violet-500/15",
+    fg: "text-violet-600 dark:text-violet-300",
+  },
+  recruiting_application: {
+    bg: "bg-cyan-100 dark:bg-cyan-500/15",
+    fg: "text-cyan-600 dark:text-cyan-300",
+  },
+  recruiting_strong_match: {
+    bg: "bg-emerald-100 dark:bg-emerald-500/15",
+    fg: "text-emerald-600 dark:text-emerald-300",
+  },
+  data_room_question: {
+    bg: "bg-indigo-100 dark:bg-indigo-500/15",
+    fg: "text-indigo-600 dark:text-indigo-300",
+  },
+  data_room_visit: {
+    bg: "bg-slate-100 dark:bg-slate-700/40",
+    fg: "text-slate-600 dark:text-slate-300",
+  },
+  support_ticket_assigned: {
+    bg: "bg-sky-100 dark:bg-sky-500/15",
+    fg: "text-sky-600 dark:text-sky-300",
+  },
+  support_customer_replied: {
+    bg: "bg-sky-100 dark:bg-sky-500/15",
+    fg: "text-sky-600 dark:text-sky-300",
+  },
+  support_sla_breached: {
+    bg: "bg-rose-100 dark:bg-rose-500/15",
+    fg: "text-rose-600 dark:text-rose-300",
+  },
+  support_low_rating: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  group_discussion: {
+    bg: "bg-indigo-100 dark:bg-indigo-500/15",
+    fg: "text-indigo-600 dark:text-indigo-300",
+  },
+  model_unavailable: {
+    bg: "bg-amber-100 dark:bg-amber-500/15",
+    fg: "text-amber-600 dark:text-amber-300",
+  },
+  model_available: {
+    bg: "bg-emerald-100 dark:bg-emerald-500/15",
+    fg: "text-emerald-600 dark:text-emerald-300",
+  },
+};
+
+/**
+ * A queue row: a real link that opens in place on a plain click.
+ *
+ * Keeping the anchor is the point. ⌘-click, middle-click and "open in new
+ * tab" keep working, the browser still previews the destination in the status
+ * bar, and the modal is what an ordinary click gets — a product affordance
+ * added without taking a browser one away.
+ */
+function HomeRow({
+  to,
+  onOpen,
+  className,
+  children,
+}: {
+  to: string;
+  onOpen: () => void;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Link
+      to={to}
+      onClick={(event) => {
+        if (!shouldOpenEventInPlace(event)) return;
+        event.preventDefault();
+        onOpen();
+      }}
+      className={className}
+    >
+      {children}
+    </Link>
+  );
+}
+
+// ───────────────────────── todos / reviews cards ─────────────────────────────
+
+const PRIORITY_DOT: Record<TodoPriority, string> = {
+  none: "bg-slate-300 dark:bg-slate-600",
+  low: "bg-slate-400",
+  medium: "bg-amber-400",
+  high: "bg-orange-500",
+  urgent: "bg-red-500",
+};
+
+function TodoList({
+  company,
+  todos,
+  review,
+  onOpen,
+}: {
+  company: Company;
+  todos: HomeTodo[];
+  review: boolean;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  return (
+    <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+      {todos.map((t) => {
+        const due = formatDue(t.dueAt);
+        return (
+          <li key={t.id}>
+            <HomeRow
+              to={`/c/${company.slug}/tasks/p/${t.project.slug}`}
+              onOpen={() => onOpen({ kind: "todo", todo: t, review })}
+              className="flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+            >
+              <span
+                className={clsx("h-2 w-2 shrink-0 rounded-full", PRIORITY_DOT[t.priority])}
+                title={`Priority: ${t.priority}`}
+              />
+              <span className="w-16 shrink-0 font-mono text-[11px] text-slate-400 dark:text-slate-500">
+                {t.project.key}-{t.number}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-slate-900 dark:text-slate-100">
+                {t.title}
+              </span>
+              {due && (
+                <span className={clsx("flex shrink-0 items-center gap-1 text-[11px]", due.cls)}>
+                  <Calendar size={11} /> {due.label}
+                </span>
+              )}
+            </HomeRow>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function MyTodosCard({
+  company,
+  data,
+  onOpen,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  if (data.myTodos.length === 0) return null;
+  return (
+    <HomeCard
+      title="Your todos"
+      icon={<ListChecks size={15} />}
+      count={data.myTodoCount}
+      linkTo={`/c/${company.slug}/tasks`}
+      linkLabel="All tasks"
+    >
+      <TodoList company={company} todos={data.myTodos} review={false} onOpen={onOpen} />
+    </HomeCard>
+  );
+}
+
+function ReviewsCard({
+  company,
+  data,
+  onOpen,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  if (data.reviewTodos.length === 0) return null;
+  return (
+    <HomeCard
+      title="Reviews waiting on you"
+      icon={<ClipboardCheck size={15} />}
+      count={data.reviewTodoCount}
+      linkTo={`/c/${company.slug}/tasks/review`}
+      linkLabel="Review queue"
+    >
+      <TodoList company={company} todos={data.reviewTodos} review onOpen={onOpen} />
+    </HomeCard>
+  );
+}
+
+// ───────────────────────── messages card ─────────────────────────────────────
+
+function MessagesCard({
+  company,
+  data,
+  onOpen,
+  onMarkRead,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+  onMarkRead: (channel: HomeChannel) => boolean;
+}) {
+  const suppressClickThroughUntil = React.useRef(0);
+  if (data.unreadChannels.length === 0) return null;
+  return (
+    <HomeCard
+      title="Unread messages"
+      icon={<MessageSquare size={15} />}
+      count={data.unreadChannels.reduce((sum, c) => sum + c.unreadCount, 0)}
+      linkTo={`/c/${company.slug}/workspace`}
+      linkLabel="Workspace"
+    >
+      <ul
+        className="divide-y divide-slate-100 dark:divide-slate-800"
+        onClickCapture={(event) => {
+          if (event.detail === 0 || Date.now() >= suppressClickThroughUntil.current) return;
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+      >
+        {data.unreadChannels.map((c: HomeChannel, index) => (
+          <li
+            key={c.id}
+            className="group flex items-center hover:bg-slate-50 dark:hover:bg-slate-800/60"
+          >
+            <HomeRow
+              to={workspaceChannelHref(company.slug, c.id)}
+              onOpen={() => onOpen({ kind: "channel", channel: c })}
+              className="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-4 pr-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500"
+            >
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300">
+                <MessageSquare size={12} />
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-slate-900 dark:text-slate-100">
+                {c.label}
+              </span>
+              <span className="inline-flex h-5 min-w-[1.25rem] shrink-0 items-center justify-center rounded-full bg-rose-600 px-1.5 text-xs font-semibold tabular-nums leading-none text-white">
+                {c.unreadCount > 99 ? "99+" : c.unreadCount}
+              </span>
+            </HomeRow>
+            <button
+              type="button"
+              aria-label={`Mark ${c.label} as read`}
+              data-home-mark-read-channel={c.id}
+              onClick={() => {
+                const focusChannelId =
+                  data.unreadChannels[index + 1]?.id ?? data.unreadChannels[index - 1]?.id ?? null;
+                if (!onMarkRead(c)) return;
+                suppressClickThroughUntil.current = Date.now() + 500;
+                requestAnimationFrame(() => {
+                  const nextButton = focusChannelId
+                    ? Array.from(
+                        document.querySelectorAll<HTMLButtonElement>(
+                          "[data-home-mark-read-channel]",
+                        ),
+                      ).find((button) => button.dataset.homeMarkReadChannel === focusChannelId)
+                    : null;
+                  const fallback =
+                    document.querySelector<HTMLElement>("[data-home-all-clear]") ??
+                    document.querySelector<HTMLElement>("[data-home-mark-read-fallback]");
+                  if (nextButton) nextButton.focus({ preventScroll: true });
+                  else fallback?.focus();
+                });
+              }}
+              title="Mark as read"
+              className="pointer-events-none mr-2 hidden h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 opacity-0 shadow-sm transition hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:border-indigo-500/40 dark:hover:bg-indigo-500/10 dark:hover:text-indigo-300 [@media(hover:hover)]:inline-flex"
+            >
+              <Check size={14} aria-hidden="true" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </HomeCard>
+  );
+}
+
+// ───────────────────────── approvals card ────────────────────────────────────
+
+/**
+ * Pending approvals — gates the system put in front of an action an employee
+ * already attempted. Decisions raised by an employee stay on their dedicated
+ * page; see `AGENTS.md` on why the two never share a surface.
+ *
+ * Hidden when there is nothing to approve. The count in the header is the
+ * company's full backlog, so it can exceed the rows shown when the server
+ * withheld a vault-capture row from a non-admin Member.
+ */
+function ApprovalsCard({
+  company,
+  data,
+  onOpen,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  if (data.approvals.length === 0) return null;
+  return (
+    <HomeCard
+      title="Pending approvals"
+      icon={<ShieldCheck size={15} />}
+      count={data.pendingApprovalCount}
+      linkTo={`/c/${company.slug}/decisions/approvals`}
+      linkLabel="Approvals"
+    >
+      <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+        {data.approvals.map((a: HomeApproval) => (
+          <li key={a.id}>
+            <HomeRow
+              to={`/c/${company.slug}/decisions/approvals`}
+              onOpen={() => onOpen({ kind: "approval", approval: a })}
+              className="flex items-start gap-3 px-4 py-2.5 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+            >
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+                <ShieldCheck size={12} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm text-slate-900 dark:text-slate-100">
+                  {a.title || (a.routine ? `Run "${a.routine.name}"` : "Approval requested")}
+                </span>
+                <span className="block truncate text-[11px] text-slate-400 dark:text-slate-500">
+                  {a.employee ? `${a.employee.name} · ` : ""}
+                  {formatRelative(a.requestedAt)}
+                </span>
+              </span>
+            </HomeRow>
+          </li>
+        ))}
+      </ul>
+    </HomeCard>
+  );
+}
+
+// ───────────────────────── system health card ────────────────────────────────
+
+const HEALTH_DOT: Record<HealthSeverity, string> = {
+  ok: "bg-emerald-500",
+  warn: "bg-amber-500",
+  error: "bg-rose-500",
+};
+
+// Dismissals are remembered per-company in localStorage (a personal "I've seen
+// this" on this device, like the push prompt above). We store the issue count
+// at dismiss time so a check resurfaces only when it gets *worse*.
+const HEALTH_DISMISS_PREFIX = "genosyn.systemHealth.dismissed.";
+
+function loadHealthDismissed(companyId: string): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(HEALTH_DISMISS_PREFIX + companyId);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "number") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveHealthDismissed(companyId: string, map: Record<string, number>) {
+  try {
+    if (Object.keys(map).length === 0) {
+      localStorage.removeItem(HEALTH_DISMISS_PREFIX + companyId);
+    } else {
+      localStorage.setItem(HEALTH_DISMISS_PREFIX + companyId, JSON.stringify(map));
+    }
+  } catch {
+    // localStorage may be unavailable (private mode) — dismissals just won't
+    // persist across reloads, which is an acceptable degradation.
+  }
+}
+
+function SystemHealthCard({
+  company,
+  data,
+  onOpen,
+}: {
+  company: Company;
+  data: HomeData;
+  onOpen: (overlay: HomeOverlay) => void;
+}) {
+  const failing = data.systemHealth.checks.filter((c) => c.severity !== "ok");
+  const failingKey = failing
+    .map((c) => c.id)
+    .sort()
+    .join(",");
+
+  const [dismissed, setDismissed] = React.useState<Record<string, number>>(() =>
+    loadHealthDismissed(company.id),
+  );
+
+  // Re-sync from storage when the company or the set of failing checks changes,
+  // dropping dismissals for checks that have since recovered — so a brand-new
+  // occurrence resurfaces instead of staying hidden under a stale count.
+  React.useEffect(() => {
+    const stored = loadHealthDismissed(company.id);
+    const live = new Set(failing.map((c) => c.id));
+    const pruned: Record<string, number> = {};
+    for (const [id, count] of Object.entries(stored)) {
+      if (live.has(id)) pruned[id] = count;
+    }
+    if (Object.keys(pruned).length !== Object.keys(stored).length) {
+      saveHealthDismissed(company.id, pruned);
+    }
+    setDismissed(pruned);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [company.id, failingKey]);
+
+  function dismiss(checkId: string, count: number) {
+    setDismissed((prev) => {
+      const next = { ...prev, [checkId]: count };
+      saveHealthDismissed(company.id, next);
+      return next;
+    });
+  }
+
+  function restoreAll() {
+    saveHealthDismissed(company.id, {});
+    setDismissed({});
+  }
+
+  // Show a check unless it's been dismissed at a count >= its current one
+  // (i.e. nothing new has happened since you dismissed it).
+  const visible = failing.filter((c) => !(c.id in dismissed) || c.count > dismissed[c.id]);
+  const dismissedCount = failing.length - visible.length;
+
+  // Nothing failing means nothing to say — the card disappears rather than
+  // taking up a grid slot to report that all is well.
+  if (failing.length === 0) return null;
+
+  return (
+    <HomeCard
+      title="System health"
+      icon={<Activity size={15} />}
+      count={visible.length}
+      linkTo={`/c/${company.slug}/settings/system-health`}
+      linkLabel="Details"
+    >
+      {visible.length === 0 ? (
+        <div className="flex h-full min-h-[8rem] flex-col items-center justify-center gap-1.5 px-6 py-6 text-center">
+          <CheckCircle2 size={18} className="text-slate-400 dark:text-slate-500" />
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            {dismissedCount} {dismissedCount === 1 ? "issue" : "issues"} dismissed on this device.
+          </span>
+          <button
+            type="button"
+            onClick={restoreAll}
+            className="text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+          >
+            Show {dismissedCount === 1 ? "it" : "them"}
+          </button>
+        </div>
+      ) : (
+        <ul className="divide-y divide-slate-100 dark:divide-slate-800">
+          {visible.map((c) => (
+            <li key={c.id} className="flex items-center">
+              <HomeRow
+                to={`/c/${company.slug}/settings/system-health`}
+                onOpen={() =>
+                  onOpen({
+                    kind: "health",
+                    checkId: c.id,
+                    title: c.title,
+                    onDismiss: () => dismiss(c.id, c.count),
+                  })
+                }
+                className="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-4 pr-2 hover:bg-slate-50 dark:hover:bg-slate-800/60"
+              >
+                <span
+                  className={clsx("h-2 w-2 shrink-0 rounded-full", HEALTH_DOT[c.severity])}
+                  title={c.severity}
+                />
+                <span className="min-w-0 flex-1 truncate text-sm text-slate-900 dark:text-slate-100">
+                  {c.title}
+                </span>
+                <span
+                  className={clsx(
+                    "inline-flex h-5 shrink-0 items-center rounded-full px-2 text-xs font-medium tabular-nums",
+                    c.severity === "error"
+                      ? "bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-200"
+                      : "bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-200",
+                  )}
+                >
+                  {c.count}
+                </span>
+              </HomeRow>
+              <button
+                type="button"
+                onClick={() => dismiss(c.id, c.count)}
+                className="touch-target relative mr-2 shrink-0 rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+                title="Dismiss"
+                aria-label={`Dismiss ${c.title}`}
+              >
+                <X size={13} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </HomeCard>
+  );
+}
+
+// ───────────────────────── tiny formatters ───────────────────────────────────
+
+function formatRelative(iso: string): string {
+  const d = new Date(iso);
+  const sec = Math.round((Date.now() - d.getTime()) / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  return d.toLocaleDateString();
+}
+
+function formatDue(iso: string | null): { label: string; cls: string } | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const days = Math.round((d.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+  const month = d.toLocaleString("en-US", { month: "short", day: "numeric" });
+  if (days < 0) return { label: month, cls: "text-red-600 dark:text-red-400" };
+  if (days === 0) return { label: "Today", cls: "text-amber-600 dark:text-amber-400" };
+  if (days === 1) return { label: "Tomorrow", cls: "text-amber-600 dark:text-amber-400" };
+  return { label: month, cls: "text-slate-500 dark:text-slate-400" };
+}

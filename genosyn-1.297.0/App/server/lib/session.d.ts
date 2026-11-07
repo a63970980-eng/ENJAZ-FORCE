@@ -1,0 +1,39 @@
+import "express-serve-static-core";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    session?: {
+      userId?: string;
+      sessionVersion?: number;
+      userSessionId?: string;
+      /** Absolute sign-in expiry, enforced by the server as well as the cookie. */
+      expiresAt?: number;
+      /** Successful primary authentication time, retained as session metadata. */
+      authenticatedAt?: number;
+      /** Successful TOTP, recovery-code, or WebAuthn completion time. */
+      secondFactorAt?: number;
+      twoFactorUserId?: string;
+      twoFactorSessionVersion?: number;
+      twoFactorExpiresAt?: number;
+      twoFactorAttempts?: number;
+      primaryAuthenticatedAt?: number;
+      webAuthnChallenge?: string;
+      webAuthnChallengeExpiresAt?: number;
+      webAuthnPurpose?: "login" | "registration";
+      webAuthnCredentialName?: string;
+      webAuthnCredentialKind?: "passkey" | "security_key";
+      /** The `totp_credentials` row the in-flight enrollment belongs to. */
+      totpSetupId?: string;
+      totpSetupExpiresAt?: number;
+      ssoBrowserBinding?: string;
+      /** Per-company SSO handshake binding — separate from the instance one. */
+      companySsoBrowserBinding?: string;
+      /** Stable signed-cookie binding for passwordless passkey ceremonies in this browser. */
+      passkeyBrowserBinding?: string;
+    } | null;
+  }
+}
+
+declare module "cookie-session" {
+  // cookie-session ships its own types; this file only augments Express.
+}

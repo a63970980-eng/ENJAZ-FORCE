@@ -1,0 +1,392 @@
+import { Callout, Code, DocLink, H2, LI, OL, P, PageHeader, Strong, UL } from "@/docs/Prose";
+
+export function Security() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Get started"
+        title="Account security"
+        lead={
+          <>
+            Protect each human Member account with verified email, revocable sessions, and an
+            authenticator app, passwordless passkey, or FIDO2 USB security key such as YubiKey —
+            and give each company its own single sign-on and audit log.
+          </>
+        }
+      />
+
+      <H2 id="email-verification">Email verification and passwords</H2>
+      <P>
+        Genosyn sends a single-use verification link after signup. To accept an invitation, the
+        signed-in address must exactly match the invitation recipient. New and reset passwords
+        require at least 12 characters. A password change invalidates every older signed-in
+        session. A password reset also revokes every personal API key and unlinks any identity a
+        company&apos;s single sign-on linked, because it is treated as account recovery after a
+        possible credential compromise. That company&apos;s SSO asks for the new password once;
+        install-wide SSO is unaffected.
+      </P>
+      <P>
+        <Strong>Account → Profile</Strong> shows the state of your own address under the email
+        field: a green <Strong>Verified</Strong> tag once the mailbox is proven, or an amber{" "}
+        <Strong>Unverified</Strong> one with a{" "}
+        <Strong>Resend verification email</Strong> button beside it. Each resend issues a new link
+        and retires the previous one, so use the newest email you received. Links are valid for 24
+        hours.
+      </P>
+      <P>
+        If you were invited, open the invitation before choosing <Strong>Create account</Strong>
+        {" "}or <Strong>Sign in</Strong>. Use the email address that received it. A valid invitation
+        lets that address register even when public sign-ups are closed. The verification email
+        brings you back to <Strong>Accept invitation</Strong>; creating an account does not join
+        the company automatically. Accepting opens the company you just joined, even when you
+        already belong to another.
+      </P>
+      <Callout kind="info" title="Instance administration needs a verified email.">
+        Instance administration is closed to an unverified account — <Code>Admin</Code> answers
+        &ldquo;Verify your email before using instance administration&rdquo; until the mailbox is
+        proven. Resend the link from{" "}
+        <Strong>Account → Profile</Strong>. If the instance has no email transport configured yet,
+        the page says so rather than claiming the mail was sent, and the link is written to the
+        server log — see <DocLink to="/docs/self-hosting">Configuration</DocLink> for how to read it
+        and how to set a transport up.
+      </Callout>
+      <P>
+        Changing your account email requires your current password. Genosyn keeps the existing
+        address active and sends a single-use confirmation to the new mailbox; the identity changes
+        only after that link is opened. Confirmation signs out older sessions and revokes personal
+        API keys.
+      </P>
+
+      <H2 id="sessions">Signing out and session expiry</H2>
+      <P>
+        <Strong>Sign out</Strong> revokes the current browser sign-in on the server; your other
+        browsers stay signed in. Each sign-in also has an absolute lifetime, seven days by default,
+        that browsing cannot extend. When it expires, sign in again. The first upgrade to persisted
+        browser sessions requires existing Members to sign in once again.
+      </P>
+      <P>
+        Live workspace connections use the same sign-in. Signing out, changing your password, or
+        losing company membership stops further updates. Idle connections close within 15 seconds,
+        including when another application replica handled the change.
+      </P>
+
+      <H2 id="enable">Enable two-factor authentication</H2>
+      <OL>
+        <LI>
+          Sign in and open <Strong>Account → Security</Strong>.
+        </LI>
+        <LI>
+          Add at least one method: an authenticator app, a passkey, or a USB security key. Adding
+          the first method turns two-factor authentication on for your account.
+        </LI>
+        <LI>
+          Save the ten recovery codes when they appear. Each code works once and is never shown
+          again.
+        </LI>
+      </OL>
+      <P>
+        Every method opens in its own dialog that carries you from naming the device through to the
+        recovery codes without leaving the page. Each dialog asks for your current password at the
+        point it needs it, so there is no separate confirmation field to fill in first.
+      </P>
+
+      <Callout kind="warn" title="Keep recovery codes separate.">
+        Download or copy the codes and store them somewhere other than the device that holds your
+        authenticator. If you lose every enrolled method and all recovery codes, an instance
+        operator must restore access at the database level.
+      </Callout>
+
+      <H2 id="authenticator-app">Authenticator apps</H2>
+      <P>
+        Choose <Strong>Add authenticator app</Strong>, name the device, confirm your password, scan
+        the QR code, then enter the current six-digit code to finish enrollment. The standard TOTP
+        format works with 1Password, Google Authenticator, Authy, Microsoft Authenticator, and
+        compatible apps.
+      </P>
+      <P>
+        Enroll as many as you like — a phone, a password manager, and a tablet can all hold a seed,
+        and a code from any of them completes a sign-in. Each one is listed separately with the date
+        it was added and last used, so you can remove a lost device without disturbing the rest.
+        Names must be unique within your account. Each seed is encrypted on its own{" "}
+        <Code>TotpCredential</Code> row, and Genosyn does not count it as a second factor until its
+        first code verifies successfully.
+      </P>
+
+      <H2 id="passkeys">Passkeys</H2>
+      <P>
+        Give the credential a recognizable name, then choose <Strong>Add passkey</Strong>. Your
+        browser can offer Touch ID, Face ID, Windows Hello, a password-manager passkey, or a nearby
+        device. The private key stays in the authenticator; Genosyn stores only the public key and
+        verification counter. Once it is enrolled, choose <Strong>Sign in with a passkey</Strong>
+        on the login page and approve the browser&apos;s account picker — no email or password is
+        required.
+      </P>
+      <P>
+        New passkeys are created as discoverable credentials so the browser can find the account
+        without Genosyn asking who you are first. Most platform and password-manager passkeys added
+        on earlier versions are already discoverable. If an older credential does not appear in the
+        account picker, keep using it after password sign-in or remove and add it again. A USB key
+        can sign in directly only when it stores a discoverable credential; other FIDO2 keys remain
+        available as the second step after a password.
+      </P>
+      <Callout kind="info" title="Account security and Vault authenticators are separate">
+        Everything on this page protects a human Member&apos;s Genosyn account and is never
+        available to an AI Employee. <DocLink to="/docs/vault">Vault</DocLink> authenticators belong
+        to external company logins instead. Vault TOTP setup keys and software-passkey private keys
+        are encrypted so an explicitly granted AI Employee can complete those external sign-ins in
+        Genosyn&apos;s browser; they do not use a Member&apos;s phone, biometrics, password manager,
+        or security key.
+      </Callout>
+
+      <H2 id="security-keys">USB security keys</H2>
+      <P>
+        Choose <Strong>Add USB security key</Strong> to steer the browser toward a roaming FIDO2
+        key. Insert or tap the key and complete its PIN or verification prompt. YubiKey 5 and other
+        FIDO2/WebAuthn-compatible keys work; older OTP-only YubiKeys do not provide a WebAuthn
+        credential.
+      </P>
+
+      <H2 id="https">HTTPS and the public URL</H2>
+      <P>
+        Browsers allow WebAuthn only on secure origins. <Code>localhost</Code> is the development
+        exception; every remote deployment needs HTTPS. The public URL saved at{" "}
+        <Code>Admin → General</Code> supplies the WebAuthn relying-party ID and origin, so it must
+        exactly match the URL Members use to open Genosyn. See{" "}
+        <DocLink to="/docs/self-hosting#public-url">Configuration</DocLink>.
+      </P>
+
+      <H2 id="sign-in">Sign in with a passkey or 2FA</H2>
+      <P>
+        <Strong>Sign in with a passkey</Strong> opens the browser&apos;s own passkey picker and
+        completes the whole sign-in after local user verification. It supplies both primary and second-factor evidence
+        to the browser session. Once that session completes its required factors, it stays authorized
+        until its normal expiry or revocation; Genosyn does not impose a separate recent-authentication
+        window. The five-minute challenge is single-use, stored across application replicas, and bound
+        to the browser that started it.
+      </P>
+      <P>
+        Password and SSO remain available. When the account has two-factor authentication enabled,
+        either one creates a five-minute verification step instead of a full session. Complete it
+        with any enrolled passkey/security key, a current authenticator code, or an unused recovery
+        code. Failed-factor and passkey attempts are throttled in the database across replacement
+        cookies and application replicas.
+      </P>
+
+      <H2 id="sso">SSO protections</H2>
+      <P>
+        OpenID Connect sign-in uses authorization code flow with S256 PKCE. Its single-use state is
+        bound to the signed cookie of the browser that started sign-in, and Genosyn links or creates
+        an account only when the identity provider affirmatively reports a verified email address.
+      </P>
+
+      <H2 id="company-sso">Company single sign-on</H2>
+      <P>
+        Each company can sign its Members in through its own identity provider, separately from the
+        install-wide SSO a master admin configures at <Code>Admin → SSO</Code> (see{" "}
+        <DocLink to="/docs/self-hosting#sso">Configuration</DocLink>). A company owner or admin
+        opens <Strong>Settings → Advanced → Single sign-on</Strong>, picks <Strong>Google</Strong> or{" "}
+        <Strong>Custom OpenID Connect</Strong> (Okta, Keycloak, Microsoft Entra ID, Auth0, or
+        anything OIDC-compliant), then:
+      </P>
+      <Callout kind="info" title="A master admin allows it first.">
+        Company single sign-on is off on every install until a master admin turns on{" "}
+        <Strong>Let companies use their own identity provider</Strong> at{" "}
+        <Code>Admin → SSO</Code>. A company&apos;s provider can sign its Members in to their whole
+        Genosyn account, so that is the operator&apos;s call. Until then a company can save its
+        settings but not turn them on. An install where a company already has its own SSO turned
+        on keeps it allowed until a master admin decides.
+      </Callout>
+      <OL>
+        <LI>
+          Registers an OAuth client at the identity provider with the <Strong>Callback URL</Strong>{" "}
+          shown under <Strong>URLs</Strong> as its authorized redirect URI. Every company on the
+          install shares <Code>&lt;public URL&gt;/api/auth/sso/company/callback</Code>.
+        </LI>
+        <LI>
+          Pastes the <Strong>Client ID</Strong> and <Strong>Client secret</Strong>, plus the{" "}
+          <Strong>Issuer URL</Strong> for a custom provider. <Strong>Check issuer</Strong> verifies
+          the provider&apos;s discovery document first. The secret is stored encrypted and never
+          shown again; leave the field blank later to keep it.
+        </LI>
+        <LI>
+          Turns on <Strong>Enable SSO sign-in</Strong>, chooses <Strong>Save SSO settings</Strong>,
+          and shares the <Strong>Login URL</Strong> —{" "}
+          <Code>&lt;public URL&gt;/login/sso/&lt;company-slug&gt;</Code> — with the company&apos;s
+          Members.
+        </LI>
+      </OL>
+      <P>
+        Once any company on the install has enabled its own SSO, the ordinary login page also offers{" "}
+        <Strong>Sign in with your company&apos;s SSO</Strong>, which asks for the workspace name from
+        the company&apos;s Genosyn URL. Password login keeps working either way, and{" "}
+        <Strong>Reset</Strong> removes the stored configuration and turns company SSO off.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Auto-join on first sign-in</Strong> — anyone the identity provider vouches for
+          joins the company as a Member, and an unknown email gets a new Genosyn account. Turned
+          off, company SSO signs in existing Members only. Because any company can point SSO at a
+          provider it runs, a company&apos;s provider never counts as proof that someone owns an
+          address: an account it creates is sent a verification link, like a signup. While
+          sign-ups are disabled at <Code>Admin → Sign-ups</Code>, only people the company has
+          invited get a new account this way.
+        </LI>
+        <LI>
+          <Strong>Allowed email domains</Strong> — a comma-separated list. Only emails on these
+          domains can join or get an account through company SSO; Members already linked keep
+          signing in. The Google preset requires the list before auto-join can be enabled, because a
+          Google OAuth client signs in any Google account. Leave it blank with a custom provider to
+          trust whoever that provider vouches for.
+        </LI>
+        <LI>
+          <Strong>Existing accounts</Strong> — a company&apos;s identity provider never takes over
+          an existing Genosyn account silently. When it asserts an email that already has an
+          account, that account must already be a Member of the company — invite it first. The
+          confirmation names the company, its workspace name, and the provider&apos;s address,
+          and warns that the provider will be able to sign in to the whole account; the person
+          enters their password once and chooses{" "}
+          <Strong>Link and sign in</Strong>, and after that the provider&apos;s stable subject
+          identifies the account. A wrong password or a confirmation older than ten minutes means
+          starting the SSO sign-in again, and wrong passwords count toward the same lockout as the
+          login form.
+        </LI>
+      </UL>
+
+      <H2 id="api-keys">Personal API keys</H2>
+      <P>
+        A personal API key is bound to exactly one company and is accepted only under that
+        company&apos;s <Code>/api/companies/:cid</Code> REST surface, with its Member&apos;s
+        current role and Finance access. It cannot act as a browser session to change account
+        identity or MFA, accept invitations, create companies, mint another key, or use instance
+        administration, and the operations that pass a human gate, hold credentials, or hand a
+        Member&apos;s authority to an AI Employee need a signed-in browser too. Password recovery
+        and a confirmed email change revoke all of the account&apos;s personal API keys. The{" "}
+        <DocLink to="/docs/api">REST API</DocLink> page covers minting a key, making requests, and
+        the full list of browser-only operations.
+      </P>
+
+      <H2 id="ai-employee-delegation">AI Employee delegation</H2>
+      <P>
+        A direct or Help conversation belongs to the Member who created it. Other Members in the
+        same company cannot list, open, continue, or download attachments from that conversation.
+        After an upgrade, older conversations without a recorded owner remain hidden from ordinary
+        Members. An owner or admin with a valid browser session can inspect one and use{" "}
+        <Strong>Claim conversation</Strong> to assign it privately before continuing it.
+      </P>
+      <P>
+        During an interactive turn, both people in the delegation chain must be allowed to act:
+        Genosyn intersects the requesting Member&apos;s current access with the AI Employee&apos;s
+        Grants. For example, a Finance write needs the Member to have full Finance access and the AI
+        Employee to hold the matching Finance Grant; a restricted Project must include both of them.
+        Removing the Member or changing either side takes effect on the next tool call, even when a
+        durable turn resumes after a restart.
+      </P>
+      <P>
+        Memory and repository context, coding and browser tools, company Connections and configured
+        MCP servers are available in interactive chat only to owners and admins until those sources
+        have resource-level provenance. An external chat channel that is not linked to an
+        authenticated Member receives conversation-only replies: no Soul, Skills, company context,
+        Memory, Grants, or company tools. Routine Runs and trusted internal automation continue to
+        act with the AI Employee&apos;s Grants alone.
+      </P>
+      <P>
+        The same Member-bound authority applies when a person assigns a todo to an AI Employee or
+        starts or retries a manual Mail handover. Those launches require a browser session and keep
+        the accepting sign-in&apos;s revocation epoch. Routine Runs, Pipelines, and Mail rules
+        remain explicitly trusted employee automation.
+      </P>
+
+      <P>
+        An email is a stranger&apos;s writing, and the <Code>From</Code> line is free text. So an
+        email never grants anything. A Project&apos;s{" "}
+        <DocLink to="/docs/tasks#email-intake">email intake</DocLink> moves the human gate ahead of
+        time instead: only an owner or admin can change it, from a signed-in browser, never an API
+        key or an AI Employee, and each change is in the audit log. A trusted sender counts only when
+        the verdict the mailbox&apos;s own receiving server wrote on the message, the topmost{" "}
+        <Code>Authentication-Results</Code>, shows DMARC or an aligned DKIM signature passing. A
+        forged header lower down isn&apos;t read, and an IMAP mailbox trusts nobody. Whatever it is
+        set to, the email reaches the session as data, Grants still decide, browser host lists and
+        submit approval still apply, and the session can only prepare, plus the one thing you opted
+        into: replying on that thread, or the browser and Vault for a trusted sender. That limit
+        stays with the todo, so a later email or a colleague can&apos;t lift it. Only you can, by
+        starting the work yourself.
+      </P>
+
+      <H2 id="manage">Manage methods</H2>
+      <UL>
+        <LI>
+          Add more than one authenticator app, passkey, or security key so a spare device can get
+          you back in.
+        </LI>
+        <LI>
+          Remove individual methods from <Strong>Account → Security</Strong>. Removing the last
+          method turns 2FA off and clears recovery codes unless a company you belong to requires
+          2FA.
+        </LI>
+        <LI>
+          <Strong>Generate new codes</Strong> invalidates every existing recovery code immediately
+          and displays a fresh set once.
+        </LI>
+        <LI>
+          <Strong>Turn off two-factor authentication</Strong> removes every authenticator app, all
+          passkeys/security keys, and all recovery codes.
+        </LI>
+      </UL>
+
+      <H2 id="company-policy">Require 2FA for a company</H2>
+      <P>
+        An owner or admin with a valid browser session who already has 2FA can open{" "}
+        <Strong>Settings → Company → Advanced</Strong> and turn on{" "}
+        <Strong>Require two-factor authentication</Strong>, then <Strong>Save</Strong>. The closed
+        Advanced line reads <em>Two-factor sign-in required</em> while it is on. Members without a
+        method must enroll one
+        under <Strong>Account → Security</Strong> before they can access or join that company.
+        Genosyn then prevents them from removing their final method.
+      </P>
+
+      <H2 id="audit-log">Audit log</H2>
+      <P>
+        Every company keeps an append-only record of changes made by Members, AI Employees, the
+        scheduler, webhooks, and the system. Company owners and admins read it at{" "}
+        <Strong>Settings → Advanced → Audit log</Strong>, newest first; expand an event to see its recorded
+        details, and follow <Strong>in a routine run</Strong> to open the Run an AI Employee made
+        the change from.
+      </P>
+      <P>
+        Narrow the log by actor kind, by one AI Employee, by action prefix —{" "}
+        <Code>invoice.</Code> matches every invoice change — or by start date, then choose{" "}
+        <Strong>Load older events</Strong> to page further back. Each page carries on from the
+        oldest event already shown, so the many events one bulk action records in the same instant
+        all appear, once each. Every Member can see one
+        employee&apos;s recorded work on its{" "}
+        <DocLink to="/docs/employees#work-timeline">work timeline</DocLink> and a Run&apos;s own
+        effects in its Run log.
+      </P>
+
+      <H2 id="record-history">A record&apos;s History</H2>
+      <P>
+        Detail pages across the product — invoices and estimates, customers, contacts and deals,
+        Routines and Skills, notes, Projects and their todos, and the rest — end with a{" "}
+        <Strong>History</Strong> feed: who changed that record, what they did, and when, newest
+        first and grouped by day. Each entry names its actor and marks what kind it is:{" "}
+        <Strong>Member</Strong> or <Strong>AI Employee</Strong>, or the scheduler, a webhook, or the
+        system. An AI Employee&apos;s entry links to the employee and, when it happened inside a
+        Routine, to that Run. Entries show which fields changed and short details such as an amount
+        or a recipient; the full recorded payload stays in the audit log.
+      </P>
+      <P>
+        History is read from the same audit rows, but only one record&apos;s, so anyone who can open
+        the record can read it: a finance record needs Finance read access, and a restricted
+        Project&apos;s History stays with that Project&apos;s members. Older records also show the
+        dates they carry, such as when an invoice was issued or paid, for changes made before who
+        made them was kept.
+      </P>
+
+      <Callout kind="tip" title="SSO-only account?">
+        Security changes require your current Genosyn password. If SSO created the account with no
+        known password, use <Strong>Forgot password</Strong> once to set one, then return to{" "}
+        <Strong>Account → Security</Strong>.
+      </Callout>
+    </>
+  );
+}

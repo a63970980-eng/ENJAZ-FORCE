@@ -1,0 +1,235 @@
+import React from "react";
+import { Outlet, useLocation, useOutletContext, useParams } from "react-router-dom";
+import {
+  ArrowLeft,
+  Bot,
+  FileCode,
+  FolderGit2,
+  History,
+  KeyRound,
+  LayoutDashboard,
+  Settings,
+  Users,
+} from "lucide-react";
+import { Breadcrumbs, ContextualLayout, SidebarLink } from "../components/AppShell";
+import { FormError } from "../components/ui/FormError";
+import { Spinner } from "../components/ui/Spinner";
+import { api, Repository, Company } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { useLiveRefetch } from "../components/CompanySocket";
+import { SectionRailHeader } from "../components/SectionRail";
+
+export type RepositoriesOutletCtx = {
+  company: Company;
+  currentUserId: string;
+  repo: Repository | null;
+  repositories: Repository[];
+  reload: () => Promise<void>;
+};
+
+const PAGE_LABELS: Record<string, string> = {
+  files: "Files",
+  history: "History",
+  ai: "AI work",
+  access: "AI access",
+  settings: "Settings",
+};
+
+/**
+ * Repository section shell. The index gets a compact repository switcher;
+ * selecting one replaces it with a focused management menu so the repository
+ * is split into Overview, AI access, and Settings instead of one long page.
+ */
+export default function RepositoriesLayout({
+  company,
+  currentUserId,
+}: {
+  company: Company;
+  currentUserId: string;
+}) {
+  const { slug } = useParams<{ slug: string }>();
+  const location = useLocation();
+  const [repositories, setRepositories] = React.useState<Repository[] | null>(null);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+
+  const reload = React.useCallback(async () => {
+    try {
+      setRepositories(await api.get<Repository[]>(`/api/companies/${company.id}/repositories`));
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(errorMessage(err, "Could not load repositories"));
+      setRepositories([]);
+    }
+  }, [company.id]);
+
+  React.useEffect(() => {
+    reload();
+  }, [reload]);
+
+  useLiveRefetch("repository", reload);
+
+  const rows = repositories ?? [];
+  const repo = slug ? (rows.find((item) => item.slug === slug) ?? null) : null;
+  const base = `/c/${company.slug}/repositories`;
+  const repoBase = repo ? `${base}/${repo.slug}` : null;
+
+  const sidebar = (
+    <div className="flex h-full flex-col">
+      <SectionRailHeader section="repositories" label="Repositories" />
+
+      {repositories === null ? (
+        <div className="flex flex-1 items-center justify-center">
+          <Spinner size={16} />
+        </div>
+      ) : repo && repoBase ? (
+        <nav className="flex-1 overflow-y-auto p-2">
+          <SidebarLink to={base} icon={<ArrowLeft size={14} />} label="All repositories" />
+          <div className="mx-2 my-3 border-t border-slate-100 dark:border-slate-800" />
+          <div className="px-2 pb-2">
+            <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+              {repo.name}
+            </div>
+            {/* This used to print `defaultBranch`, which is a stored setting
+              rather than the live checkout — so it went on saying `main` while
+              Files was sitting on a feature branch. A wrong fact is worse than
+              no fact, and the description is one the sidebar can actually be
+              sure of. */}
+            {repo.description && (
+              <div
+                title={repo.description}
+                className="mt-0.5 truncate text-[10px] text-slate-400 dark:text-slate-500"
+              >
+                {repo.description}
+              </div>
+            )}
+          </div>
+          <SidebarLink to={repoBase} end icon={<LayoutDashboard size={14} />} label="Overview" />
+          <SidebarLink to={`${repoBase}/files`} icon={<FileCode size={14} />} label="Files" />
+          <SidebarLink to={`${repoBase}/history`} icon={<History size={14} />} label="History" />
+          <SidebarLink to={`${repoBase}/ai`} icon={<Bot size={14} />} label="AI work" />
+          <SidebarLink to={`${repoBase}/access`} icon={<Users size={14} />} label="AI access" />
+          <SidebarLink to={`${repoBase}/settings`} icon={<Settings size={14} />} label="Settings" />
+          <div className="text-xs font-medium mt-4 px-2 pb-1 text-slate-500 dark:text-slate-400">
+            Other repositories
+          </div>
+          {rows
+            .filter((item) => item.id !== repo.id)
+            .slice(0, 8)
+            .map((item) => (
+              <SidebarLink
+                key={item.id}
+                to={`${base}/${item.slug}`}
+                icon={<FolderGit2 size={14} />}
+                label={item.name}
+              />
+            ))}
+        </nav>
+      ) : (
+        <nav className="flex-1 overflow-y-auto p-2">
+          <SidebarLink
+            to={base}
+            end
+            icon={<LayoutDashboard size={14} />}
+            label="All repositories"
+          />
+          {rows.length > 0 && (
+            <div className="text-xs font-medium mt-4 px-2 pb-1 text-slate-500 dark:text-slate-400">
+              Repositories
+            </div>
+          )}
+          {rows.map((item) => (
+            <SidebarLink
+              key={item.id}
+              to={`${base}/${item.slug}`}
+              icon={<FolderGit2 size={14} />}
+              label={item.name}
+            />
+          ))}
+        </nav>
+      )}
+
+      <div className="border-t border-slate-100 p-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+        <div className="flex items-start gap-2">
+          <KeyRound size={13} className="mt-0.5 shrink-0" />
+          Credentials stay encrypted and are never shown to AI employees.
+        </div>
+      </div>
+    </div>
+  );
+
+  // Not the trailing segment: a page can have a sub-route below it (an open AI
+  // work session is `/ai/<id>`), and reading the last segment would lose the
+  // page's name the moment anyone opened one.
+  const segments = location.pathname.split("/").filter(Boolean);
+  const slugIndex = slug ? segments.lastIndexOf(slug) : -1;
+  const pageSegment = slugIndex >= 0 ? segments[slugIndex + 1] : undefined;
+  const pageLabel = pageSegment ? PAGE_LABELS[pageSegment] : undefined;
+  // With something open below the page (a work session), the page itself is
+  // where "back" goes, so it earns a link rather than being dead text.
+  const pageHref =
+    pageLabel && repoBase && slugIndex >= 0 && segments.length > slugIndex + 2
+      ? `${repoBase}/${pageSegment}`
+      : undefined;
+
+  return (
+    <ContextualLayout sidebar={sidebar}>
+      {slug ? (
+        <div className="page-shell px-6 py-8 sm:px-8">
+          <div className="mb-5">
+            <Breadcrumbs
+              items={[
+                { label: "Repositories", to: base },
+                {
+                  label: repo?.name ?? slug,
+                  to: pageLabel && repoBase ? repoBase : undefined,
+                },
+                ...(pageLabel ? [{ label: pageLabel, to: pageHref }] : []),
+              ]}
+            />
+          </div>
+          {/* A list we could not read leaves `repositories` as `[]`, which is
+            indistinguishable from a repository that no longer exists — so the
+            failure has to be tested first, or it reads as "Repository not
+            found." It belongs in the main pane rather than the sidebar: the
+            contextual rail is hidden below `md`, so a message parked there is
+            off screen on a phone. */}
+          {loadError ? (
+            <FormError message={loadError} />
+          ) : repositories !== null && !repo ? (
+            <div className="rounded-xl border border-dashed border-slate-200 bg-white px-6 py-12 text-center text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+              Repository not found.
+            </div>
+          ) : (
+            <Outlet
+              context={
+                {
+                  company,
+                  currentUserId,
+                  repo,
+                  repositories: rows,
+                  reload,
+                } satisfies RepositoriesOutletCtx
+              }
+            />
+          )}
+        </div>
+      ) : (
+        <Outlet
+          context={
+            {
+              company,
+              currentUserId,
+              repo: null,
+              repositories: rows,
+              reload,
+            } satisfies RepositoriesOutletCtx
+          }
+        />
+      )}
+    </ContextualLayout>
+  );
+}
+
+export function useRepositoriesContext(): RepositoriesOutletCtx {
+  return useOutletContext<RepositoriesOutletCtx>();
+}

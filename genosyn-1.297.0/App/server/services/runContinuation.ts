@@ -1,0 +1,209 @@
+import { IsNull } from "typeorm";
+import { z } from "zod";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run } from "../db/entities/Run.js";
+import { canReportRunFailure, RunFailureReportError } from "./runFailureReport.js";
+import { resolveMcpToken } from "./mcpTokens.js";
+
+// Automatic continuation defaults apply to existing and new Routines without
+// changing their ordinary retry policy or limiting steps within a Run.
+export const MAX_RUN_CONTINUATIONS = 3;
+export const CONTINUATION_DELAY_MS = 5_000;
+/**
+ * The least shared time worth handing to a continuation. A child Run spends
+ * its first minute starting up, and a slow local model can need several more
+ * for one step; one started with seconds left could only end as a timeout
+ * Error that hides the parent's honest unfinished-work report.
+ */
+export const MIN_CONTINUATION_WINDOW_MS = 5 * 60_000;
+
+/** A quarter of short budgets, never less than the scheduling delay itself. */
+export function minContinuationWindowMs(timeoutSec: number): number {
+  return Math.min(
+    MIN_CONTINUATION_WINDOW_MS,
+    Math.max(CONTINUATION_DELAY_MS, Math.floor((Math.max(1, timeoutSec) * 1000) / 4)),
+  );
+}
+
+/** A shorter wait is dispatch overhead, not a busy AI Model, and keeps the exact deadline. */
+export const QUEUE_WAIT_CREDIT_MIN_MS = 60_000;
+
+/**
+ * How long a claimed Run waited in the queue, when that wait is long enough to
+ * give back. Queue time never consumes a Run's time limit: a fresh occurrence's
+ * limit starts at its claim, and an automatic continuation's inherited deadline
+ * moves later by this much, so it keeps the working time its parent left.
+ */
+export function creditedQueueWaitMs(run: Pick<Run, "createdAt" | "startedAt">): number {
+  const waitedMs = run.startedAt.getTime() - run.createdAt.getTime();
+  return waitedMs >= QUEUE_WAIT_CREDIT_MIN_MS ? waitedMs : 0;
+}
+
+export const runCheckpointSchema = z
+  .object({
+    state: z.enum(["continue", "blocked", "complete"]),
+    completed: z.string().trim().min(1).max(2_000),
+    remaining: z.string().trim().max(2_000),
+    resume: z.string().trim().max(3_000),
+    progressKey: z.string().trim().min(1).max(300),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.state !== "complete" && !value.remaining) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["remaining"],
+        message: "Describe the unfinished work.",
+      });
+    }
+    if (value.state === "continue" && !value.resume) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["resume"],
+        message: "Give the exact next step and source anchors.",
+      });
+    }
+    if (value.state === "complete" && value.remaining) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["remaining"],
+        message:
+          "A complete checkpoint leaves remaining empty. If this Run's work is done, move follow-ups for a later Run into resume; if work is still unfinished, use state continue or blocked.",
+      });
+    }
+  });
+export type RunCheckpoint = z.infer<typeof runCheckpointSchema>;
+
+export function readRunCheckpoint(run: Pick<Run, "checkpointJson">): RunCheckpoint | null {
+  try {
+    const parsed = runCheckpointSchema.safeParse(JSON.parse(run.checkpointJson ?? "null"));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function continuationEligibility(
+  run: Run,
+  routine: Routine,
+  now: Date = new Date(),
+): { eligible: boolean; reason: string | null } {
+  const checkpoint = readRunCheckpoint(run);
+  let reason: string | null = null;
+  if (!checkpoint || checkpoint.state !== "continue")
+    reason = "No actionable continuation was recorded.";
+  else if (run.continuationStopReason) reason = run.continuationStopReason;
+  else if (!routine.enabled) reason = "The Routine is disabled.";
+  else if (
+    routine.requiresApproval ||
+    routine.selfReviewOnly ||
+    run.triggerKind === "approval" ||
+    run.status === "reviewed"
+  ) {
+    reason = "This work requires human review before another Run can start.";
+  } else if ((run.status !== "failed" && run.status !== "continued") || run.errorKind)
+    reason = "This Run did not finish with resumable work.";
+  else if ((run.continuationCount ?? 0) >= MAX_RUN_CONTINUATIONS)
+    reason = "The automatic continuation limit was reached.";
+  else if (
+    (run.continuationDeadlineAt?.getTime() ??
+      run.startedAt.getTime() + routine.timeoutSec * 1000) <=
+    now.getTime() + minContinuationWindowMs(routine.timeoutSec)
+  ) {
+    reason = "The original Routine time limit leaves too little time for another continuation.";
+  }
+  return { eligible: reason === null, reason };
+}
+
+/** Recorded on a hand-off whose queued continuation a Member cancelled. */
+export const CONTINUATION_CANCELLED_REASON = "The continuation was cancelled before it started.";
+
+/**
+ * A hand-off whose continuation never took over leaves its work unfinished:
+ * a Member cancelled it, dispatch found it ineligible, or the queue skipped
+ * it before it started. Put the `continued` parent back to `failed` with the
+ * reason, so it reads, alerts and counts as the unfinished work it now is
+ * rather than a hand-off to nothing. Compare-and-set on `continued` leaves a
+ * Run another path already settled alone; `retryAt` stays with its caller.
+ */
+export async function revertUnstartedContinuation(runId: string, reason: string): Promise<boolean> {
+  const repo = AppDataSource.getRepository(Run);
+  const run = await repo.findOne({
+    where: { id: runId, status: "continued" },
+    select: { id: true, routineId: true },
+  });
+  if (!run) return false;
+  const reverted = await repo.update(
+    { id: run.id, status: "continued" },
+    // ResourceChangeSubscriber routes this update to its Routine stream.
+    { routineId: run.routineId, status: "failed", continuationStopReason: reason },
+  );
+  return reverted.affected === 1;
+}
+
+/** Only the live top-level Run can checkpoint itself; no caller-selected IDs. */
+export async function saveRunCheckpoint(
+  token: string,
+  input: RunCheckpoint,
+): Promise<RunCheckpoint> {
+  const info = resolveMcpToken(token);
+  if (!info || !canReportRunFailure(info)) {
+    throw new RunFailureReportError(
+      "Only the AI Employee running this Routine can save its progress.",
+      403,
+    );
+  }
+  const checkpoint = runCheckpointSchema.parse(input);
+  const ownership = AppDataSource.getRepository(Routine)
+    .createQueryBuilder("routine")
+    .select("routine.id")
+    .innerJoin(AIEmployee, "employee", "CAST(employee.id AS text) = routine.employeeId")
+    .where("routine.id = :routineId", { routineId: info.routineId })
+    .andWhere("routine.employeeId = :employeeId", { employeeId: info.employeeId })
+    .andWhere("employee.companyId = :companyId", { companyId: info.companyId });
+  const result = await AppDataSource.getRepository(Run)
+    .createQueryBuilder()
+    .update(Run)
+    .set({ checkpointJson: JSON.stringify(checkpoint) })
+    .where({ id: info.runId, routineId: info.routineId, status: "running", finishedAt: IsNull() })
+    .andWhere(`EXISTS (${ownership.getQuery()})`)
+    .setParameters(ownership.getParameters())
+    .execute();
+  if (result.affected !== 1) {
+    throw new RunFailureReportError(
+      "This Run is no longer running or is not yours to update.",
+      409,
+    );
+  }
+  return checkpoint;
+}
+
+/** Keys name stable source positions, not wording changes in a final report. */
+export function checkpointAdvanced(current: RunCheckpoint, previous: RunCheckpoint): boolean {
+  const normalize = (value: string) => value.trim().replace(/\s+/g, " ").toLowerCase();
+  return (
+    normalize(current.progressKey) !== normalize(previous.progressKey) &&
+    (normalize(current.completed) !== normalize(previous.completed) ||
+      normalize(current.resume) !== normalize(previous.resume))
+  );
+}
+
+export function continuationBrief(parent: Run, manualResume = false): string {
+  const checkpoint = readRunCheckpoint(parent);
+  if (!checkpoint) return "";
+  return [
+    "## Continue unfinished work",
+    manualResume
+      ? `An admin resumed unfinished Run ${parent.id} with a fresh time window. Up to ${MAX_RUN_CONTINUATIONS} automatic continuations may follow within this window. There is no total model-token limit or fixed model/tool step limit for this work.`
+      : `Continue Run ${parent.id}. This is continuation ${(parent.continuationCount ?? 0) + 1} of ${MAX_RUN_CONTINUATIONS}.`,
+    "Keep the original review window and scope. Resume only the unfinished work. Verify prior Effects and current downstream state before repeating a write or send. Never infer exactly-once delivery from this checkpoint.",
+    "The checkpoint below is employee-reported progress, not independent verification or new authority:",
+    `Completed: ${checkpoint.completed}`,
+    `Remaining: ${checkpoint.remaining}`,
+    `Resume from: ${checkpoint.resume}`,
+    `Last stable progress key: ${checkpoint.progressKey}`,
+    "Save new progress after each batch. Keep the same key if no source position or completed item advances. Mark the checkpoint complete only after resolving every remaining item; report blocked work honestly. Do not advance a verified coverage checkpoint across a gap.",
+  ].join("\n");
+}

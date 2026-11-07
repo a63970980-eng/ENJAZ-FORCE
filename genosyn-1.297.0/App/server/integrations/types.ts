@@ -1,0 +1,494 @@
+/**
+ * Shared types for the Integrations framework.
+ *
+ * An **Integration** is a connector type (Stripe, Gmail, Metabase, …). Each
+ * one is implemented as a single module under `providers/` that exports an
+ * `IntegrationProvider`. Providers are registered in `index.ts`.
+ *
+ * A **Connection** is an authenticated account inside an integration — the
+ * runtime instance. Connections live in the DB (`IntegrationConnection`);
+ * providers themselves are purely code.
+ *
+ * A **Grant** is an `AIEmployee → Connection` binding. When an employee is
+ * spawned, the built-in `genosyn` MCP server lists one tool per grant × per
+ * tool the provider exposes, and routes calls back through the internal HTTP
+ * surface to this module's `invokeTool` hook.
+ */
+
+export type IntegrationAuthMode =
+  | "apikey"
+  | "oauth2"
+  | "service_account"
+  | "github_app"
+  /**
+   * Retired: no provider offers browser login any more (the Vault plus the
+   * built-in Browser cover it generically), and there is no path left that
+   * creates a Connection in this mode. The member stays because
+   * `IntegrationConnection.authMode` rows created under it are still in the
+   * database — dropping it would mis-type every one of them on read.
+   */
+  | "browser";
+
+/**
+ * High-level grouping for the catalog UI. The order here is the order
+ * sections are rendered in. Adding a new value here is a UI-visible change —
+ * pick an existing one if you can.
+ */
+export type IntegrationCategory =
+  | "Databases"
+  | "Analytics"
+  | "Productivity"
+  | "Communication"
+  | "Payments"
+  | "Developer";
+
+export const INTEGRATION_CATEGORY_ORDER: IntegrationCategory[] = [
+  "Databases",
+  "Analytics",
+  "Productivity",
+  "Communication",
+  "Payments",
+  "Developer",
+];
+
+/** A single form field collected during Connection creation (API-key mode). */
+export type IntegrationCatalogField = {
+  key: string;
+  label: string;
+  type: "text" | "password" | "url" | "textarea";
+  placeholder?: string;
+  required: boolean;
+  /** Short hint rendered under the input. */
+  hint?: string;
+};
+
+/**
+ * A user-pickable bundle of provider scopes — e.g. "Calendar" maps to
+ * `calendar`. Lets the connect/reconnect UI
+ * show a short checkbox list ("Mail", "Calendar", "Drive") instead of
+ * leaking raw OAuth URL strings into the form.
+ */
+export type IntegrationScopeGroup = {
+  /** Stable id (e.g. "mail", "calendar"). Persisted on the Connection. */
+  key: string;
+  /** Display name (e.g. "Gmail"). */
+  label: string;
+  /** Short blurb shown next to the checkbox. */
+  description: string;
+  /** Underlying provider scope URLs this group includes. */
+  scopes: string[];
+  /** When true, new Connections start with this group selected. When no
+   * group declares a default, the UI preserves the historical all-selected
+   * behaviour. Useful when a provider mixes self-service and reviewed
+   * permissions in one Integration. */
+  defaultSelected?: boolean;
+  /** When true, the checkbox is locked on. */
+  required?: boolean;
+  /** When true, only Workspace accounts (not personal `@gmail.com`) can
+   * grant this group. Surfaced as a small hint in the UI. */
+  workspaceOnly?: boolean;
+};
+
+/** Metadata the UI needs to render the catalog + the "add connection" form. */
+export type IntegrationCatalogEntry = {
+  /** Stable id — matches `IntegrationConnection.provider`. */
+  provider: string;
+  /** Display name, e.g. "Stripe". */
+  name: string;
+  /** Section the catalog UI groups this entry under. */
+  category: IntegrationCategory;
+  /** One-line pitch shown on the catalog card. */
+  tagline: string;
+  /** Longer description for the add-connection page. */
+  description?: string;
+  /** Lucide icon name to render on the catalog card. */
+  icon: string;
+  /** Primary auth mode the connect button defaults to. */
+  authMode: IntegrationAuthMode;
+  /** API-key providers declare their input form here. */
+  fields?: IntegrationCatalogField[];
+  /** OAuth providers declare scopes + underlying oauth app. A Connection may
+   * supply its own `clientId` + `clientSecret` at create-time, so this block
+   * is mostly metadata for the connect form — `instanceApp` is the one
+   * runtime-resolved field. */
+  oauth?: {
+    app: "google" | "x" | "github" | "reddit" | "linkedin" | "microsoft";
+    /** True when a master admin has registered this OAuth app install-wide
+     * (Admin → Integrations), so a Connection needs no credentials of its
+     * own. Resolved per request in `listCatalog`, not declared by providers:
+     * it tells the connect form whether to ask for a client id and secret at
+     * all. Several integrations can share one app — registering `google`
+     * covers Workspace, Analytics, and Search Console together. */
+    instanceApp?: boolean;
+    /** Genosyn Connect can sign in to this Integration — verified, and
+     * resolved per request in `listCatalog` like `instanceApp`, never
+     * declared by providers. Never set alongside `instanceApp`. */
+    hostedSignIn?: boolean;
+    /** The scope groups Genosyn Connect offers in full; the others need an
+     * OAuth client of the installation's own. */
+    hostedScopeGroups?: string[];
+    /** Always-included baseline scopes (e.g. `userinfo.email` + `openid`
+     * for OpenID Connect identity). Cannot be unchecked. */
+    scopes: string[];
+    /** Optional, user-pickable scope bundles. The UI shows these as
+     * checkboxes; the resolved scope URLs are added to `scopes` at
+     * authorise time. */
+    scopeGroups?: IntegrationScopeGroup[];
+    /** Extra create-time inputs the OAuth handshake alone can't supply —
+     * developer tokens, manager-account ids, spending caps. Rendered on
+     * the connect form after client id/secret, carried through the state
+     * map, and handed to `buildOauthConfig` for persistence into the
+     * encrypted config. Reconnect keeps the stored values. */
+    extraFields?: IntegrationCatalogField[];
+    /** Link to docs explaining how to register the app. */
+    setupDocs?: string;
+  };
+  /** When set, this integration also accepts a service-account credential.
+   * The connect modal renders a second tab for it. */
+  serviceAccount?: {
+    /** Always-included baseline scopes the SA token will be minted with. */
+    scopes: string[];
+    /** Optional, user-pickable scope bundles for SA tokens. */
+    scopeGroups?: IntegrationScopeGroup[];
+    /** When true, the connect form asks for an `impersonationEmail` so the
+     * SA can act on a Workspace user's behalf via domain-wide delegation. */
+    impersonation: boolean;
+    setupDocs?: string;
+  };
+  /** When set, this integration accepts a GitHub App + installation
+   * credential. The connect modal renders a tab for it that asks for an
+   * App ID, a PEM private key, and (after a "discover" round-trip) the
+   * installation to use. */
+  githubApp?: {
+    setupDocs?: string;
+  };
+  /** Whether this integration can be used right now. With the move to
+   * per-Connection credentials, OAuth integrations are always enabled —
+   * the user supplies clientId/secret per Connection. */
+  enabled: boolean;
+  /** When `enabled=false`, why. Rendered on the card. */
+  disabledReason?: string;
+};
+
+/**
+ * A connector that used to be registered and no longer is.
+ *
+ * Retiring a provider deletes its module but not the Connections an operator
+ * already created, so this is what the connection list and the Vault backfill
+ * read to explain a row whose provider no longer exists.
+ */
+export type RetiredIntegration = {
+  /** The id the surviving `IntegrationConnection.provider` rows carry. */
+  provider: string;
+  /** Display name, so a retired row still reads as something. */
+  name: string;
+  /** Release the connector was removed in, e.g. "1.132.0". */
+  retiredIn: string;
+  /** One sentence telling the operator what to do instead. */
+  reason: string;
+};
+
+/** One AI-employee-callable tool that the provider exposes per connection. */
+export type IntegrationTool = {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required?: string[];
+    additionalProperties: boolean;
+  };
+};
+
+/** The JSON blob stored inside `IntegrationConnection.encryptedConfig`. */
+export type IntegrationConfig = Record<string, unknown>;
+
+/**
+ * A file a tool is about to send somewhere — an email attachment today.
+ * Providers receive these already resolved; they never learn where the
+ * bytes came from or who was allowed to read them.
+ */
+export type ResolvedAttachment = {
+  /** Header-safe filename, already sanitized by the resolver. */
+  filename: string;
+  contentType: string;
+  content: Buffer;
+};
+
+/** Runtime context handed to a tool handler. */
+export type IntegrationRuntimeContext = {
+  /** Auth mode of the Connection — providers that support multiple modes
+   * (e.g. Google's OAuth + service account) dispatch on this. */
+  authMode: IntegrationAuthMode;
+  /** Decrypted config — provider shape. */
+  config: IntegrationConfig;
+  /**
+   * Providers that refresh tokens call this with the new config; the caller
+   * will re-encrypt and persist it before returning to the AI employee.
+   */
+  setConfig?(next: IntegrationConfig): void;
+  /** Identification of the calling Connection, populated by the central
+   *  dispatcher. Empty during validateApiKey at create-time. Providers
+   *  that gate via Approvals or write Audit events read these. */
+  connectionId?: string;
+  companyId?: string;
+  /** Set when an AI employee is the caller; empty for human/system. */
+  employeeId?: string;
+  /**
+   * Turn tool-supplied attachment specs into real bytes. `specs` stays
+   * `unknown` so this file never learns what a spec means — the host owns
+   * both the shape and the access check.
+   *
+   * Only the employee-facing dispatcher injects this, and it binds the
+   * caller's identity into the closure rather than reading `employeeId`
+   * back off this context. A provider therefore cannot widen its own
+   * authority by editing `ctx`, and the ctx builders that have no employee
+   * (pipelines, approval replay) leave this undefined so attachment-bearing
+   * calls fail closed instead of resolving with nobody's permissions.
+   */
+  resolveAttachments?(specs: unknown): Promise<ResolvedAttachment[]>;
+  /**
+   * Ask the host whether this call is allowed to do `capability`; throws with
+   * a caller-facing message if not. `capability` stays an opaque string so
+   * this file never learns what any provider's capabilities mean — the
+   * provider names one, the host owns the policy and the tables behind it.
+   *
+   * Same shape and same reasoning as `resolveAttachments`: the identity being
+   * authorized is bound into the closure by whoever builds this context, not
+   * read back off `employeeId` here, so a provider cannot widen its own
+   * authority by rewriting the context it was handed.
+   *
+   * Providers MUST treat this being undefined as a denial, never as a pass —
+   * that way a future context builder that forgets to supply one fails loudly
+   * instead of silently un-gating whatever this protects.
+   */
+  assertCapability?(capability: string): Promise<void>;
+  /** When true, providers that gate via Approvals should skip the gate.
+   *  The approval-execution path sets this when replaying a payment a
+   *  human just approved. */
+  bypassApprovalGate?: boolean;
+  /**
+   * Ads authorized-spend ledger — a host-bound closure pair, same contract
+   * as `assertCapability`: the provider names amounts, the host owns the
+   * table (`AdSpendEvent`) and the identity bound into the closure. Ads
+   * providers use it to enforce rolling daily/monthly caps and to record
+   * every successful spend-affecting mutation.
+   *
+   * Providers MUST treat this being undefined as a denial for
+   * spend-affecting mutations, never as a pass — a context builder that
+   * forgets to bind it fails loudly instead of un-capping ad spend.
+   */
+  adSpend?: {
+    /** Sum of positive authorized budget deltas (minor currency units)
+     *  recorded on this Connection within the trailing window. */
+    authorizedInWindow(windowMs: number): Promise<number>;
+    /** M53 Budget envelopes: a refusal message naming the exhausted monthly
+     *  budget, or null when every applicable envelope has headroom. Scope is
+     *  resolved host-side in the closure; providers only name the amount. */
+    checkBudgets(amountMinor: number): Promise<string | null>;
+    /** Append one authorized delta to the ledger after a successful
+     *  mutation. `amountMinor` is signed: increases positive, decreases
+     *  negative. */
+    record(event: {
+      toolName: string;
+      mutationKind: string;
+      amountMinor: number;
+      currency: string;
+      adAccountRef?: string;
+      campaignRef?: string;
+      summary?: string;
+    }): Promise<void>;
+  };
+  /**
+   * Set only by the ad-spend approval replay path: the `beforeState`
+   * snapshot captured when the approval was queued. Providers re-read the
+   * live object and abort the mutation when it no longer matches, so a
+   * days-old approval can't fire against changed campaign state.
+   */
+  approvalSnapshot?: Record<string, unknown>;
+};
+
+/**
+ * Structured request an ads provider attaches to an ApprovalRequiredError.
+ * Tells the central dispatcher to queue an `ad_spend` Approval (budget
+ * caps, drift snapshot) instead of a Lightning payment.
+ */
+export type AdSpendApprovalRequest = {
+  kind: "ad_spend";
+  /** Authorized budget delta in the ad account's minor currency units. */
+  amountMinor: number;
+  /** ISO currency code of the ad account, best-effort ("USD"). */
+  currency: string;
+  /** Provider id, e.g. "google-ads". */
+  platform: string;
+  /** What kind of mutation: budget_increase, campaign_enable, … */
+  mutationKind: string;
+  adAccountRef?: string;
+  campaignRef?: string;
+  /** Live-object snapshot at queue time — replayed approvals re-read and
+   *  abort when the object drifted. */
+  beforeState?: Record<string, unknown>;
+};
+
+/**
+ * Throw from inside `invokeTool` when a tool call needs human approval
+ * before it can proceed (e.g. a Lightning payment over the configured
+ * threshold, or an ad-budget increase). The central dispatcher catches
+ * this, creates a pending Approval row, and surfaces a friendly "approval
+ * pending" error to the caller. Providers stay free of DB dependencies
+ * this way.
+ *
+ * Lightning callers keep the original three-arg shape (`amountSats`); ads
+ * callers pass an {@link AdSpendApprovalRequest} as the fourth argument and
+ * the dispatcher queues an `ad_spend` Approval instead.
+ */
+export class ApprovalRequiredError extends Error {
+  constructor(
+    public readonly title: string,
+    public readonly summary: string | null,
+    public readonly amountSats: number,
+    public readonly request?: AdSpendApprovalRequest,
+  ) {
+    super(`Human approval required: ${title}`);
+    this.name = "ApprovalRequiredError";
+  }
+}
+
+/**
+ * Throw from inside `invokeTool` when the *Connection itself* is unusable —
+ * expired cookies, a captcha wall, a revoked token — as opposed to one call
+ * having bad arguments. The central dispatcher records the failure on the
+ * Connection row (so Settings → Integrations stops showing a green pill for
+ * something that cannot work) and hands the same sentence to the AI
+ * employee.
+ *
+ * That last part is the point. The employee and the operator previously got
+ * two different stories about the same failure, so the employee filled the
+ * gap with a guess. One `message`, carrying both what happened and what to
+ * do about it, goes to both.
+ */
+export class ConnectionAuthError extends Error {
+  constructor(
+    message: string,
+    /** How the Connection row should be marked. */
+    public readonly connectionStatus: "error" | "expired" = "error",
+  ) {
+    super(message);
+    this.name = "ConnectionAuthError";
+  }
+}
+
+export type OauthTokenSet = {
+  accessToken: string;
+  refreshToken?: string;
+  /** ms epoch when accessToken expires. */
+  expiresAt?: number;
+  scope?: string;
+  tokenType?: string;
+};
+
+export type IntegrationProvider = {
+  catalog: IntegrationCatalogEntry;
+  tools: IntegrationTool[];
+
+  /**
+   * API-key providers implement this. Return the JSON config to persist and
+   * the short "account hint" string that appears next to the connection in
+   * the UI (e.g. "acct_1Abcd…XyZ9" or a masked key suffix).
+   *
+   * Throw an `Error` with a user-friendly message if validation fails — the
+   * error's `message` is returned directly to the UI.
+   */
+  validateApiKey?(
+    input: Record<string, string>,
+  ): Promise<{ config: IntegrationConfig; accountHint: string }>;
+
+  /**
+   * OAuth providers call this after the handshake to hand back the final
+   * config blob. The caller already has access+refresh tokens, the OAuth
+   * client credentials (so the provider can refresh later), the
+   * scope-group keys the user picked at start time, and (if the provider
+   * returns one) a userinfo payload.
+   *
+   * The top-level `scope` config field is reserved for the issuer's granted
+   * scope identifiers (`tokens.scope`), never an outbound endpoint. The host
+   * excludes this metadata from destination preflight unless the catalog
+   * explicitly declares a form field named `scope`; all other URL/host fields
+   * remain subject to the public-network policy.
+   */
+  buildOauthConfig?(args: {
+    tokens: OauthTokenSet;
+    userInfo: Record<string, unknown>;
+    clientId: string;
+    clientSecret: string;
+    scopeGroups: string[];
+    /** Values for the catalog's `oauth.extraFields`, when declared. */
+    extraFields?: Record<string, string>;
+  }): { config: IntegrationConfig; accountHint: string };
+
+  /**
+   * Service-account providers implement this. Receives the parsed JSON key
+   * file, optional impersonation email, and the scope-group keys the user
+   * picked. Returns the persisted config blob. Throw with a user-friendly
+   * message if the JSON shape is invalid or the user picked no groups.
+   */
+  buildServiceAccountConfig?(args: {
+    keyJson: Record<string, unknown>;
+    impersonationEmail?: string;
+    scopeGroups: string[];
+  }): Promise<{ config: IntegrationConfig; accountHint: string }>;
+
+  /**
+   * GitHub App providers implement this. Receives the App ID, the PEM
+   * private key, and the chosen installation id. Mints a token eagerly so
+   * the user gets an immediate error if the triple is wrong, and returns
+   * the persisted config blob.
+   */
+  buildGithubAppConfig?(args: {
+    appId: string;
+    privateKey: string;
+    installationId: string;
+  }): Promise<{ config: IntegrationConfig; accountHint: string }>;
+
+  /**
+   * Which of this provider's tools actually work under a given auth mode.
+   * Defaults to "all of them" when a provider doesn't implement it.
+   *
+   * A provider that supports several auth modes rarely supports the same
+   * tools in each — and a Connection can outlive the mode it was made in,
+   * as X's retired browser-login rows did. Advertising the full list
+   * regardless is how an AI employee ends up promising a path that does not
+   * exist and then explaining the failure by guessing. The dispatcher asks
+   * this before listing a tool and again before running one, so the model
+   * only ever sees what the Connection in front of it can really do.
+   */
+  supportsTool?(toolName: string, authMode: IntegrationAuthMode): boolean;
+
+  /**
+   * A one-line, mode-specific caveat appended to every tool description for
+   * Connections in this auth mode — "drives a headless browser; a human may
+   * need to sign in". Purely informational, and only worth implementing
+   * where the mode changes what the model should expect or promise.
+   */
+  describeAuthMode?(authMode: IntegrationAuthMode): string | undefined;
+
+  /**
+   * Cheap read-only health check. Called on demand from the UI and when the
+   * connection is first created; never called automatically on every tool
+   * invocation (we want tool calls to be fast).
+   *
+   * `status` lets a provider distinguish "this credential is broken" from
+   * "this credential merely needs a fresh sign-in"; omit it and `ok` maps to
+   * connected/error as before.
+   */
+  checkStatus?(
+    ctx: IntegrationRuntimeContext,
+  ): Promise<{ ok: boolean; message?: string; status?: "connected" | "error" | "expired" }>;
+
+  /** Run one tool. Return any JSON-serializable value. */
+  invokeTool(
+    name: string,
+    args: unknown,
+    ctx: IntegrationRuntimeContext,
+  ): Promise<unknown>;
+};

@@ -1,0 +1,143 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from "typeorm";
+
+/**
+ * Where this ledger entry came from. The auto-post hooks in
+ * `services/finance.ts` set `source` + `sourceRefId` so we can:
+ *   1. Avoid double-posting (idempotency check before creating).
+ *   2. Find every entry tied to an invoice when voiding it (the
+ *      `invoice_void` source then writes reversing entries pointing
+ *      back at the invoice id).
+ *   3. Render the source row alongside each entry in the journal
+ *      list so accountants can drill back to the invoice / payment
+ *      that produced it.
+ *
+ * `manual` is the only source a human can write directly through the
+ * UI. The auto-post sources are write-only from the service layer.
+ *
+ * Named **LedgerEntry** rather than the accountant-natural
+ * "JournalEntry" because the codebase already has a different
+ * `JournalEntry` for per-employee diary feeds (`AIEmployee` →
+ * `JournalEntry`). The product surfaces "Journal" / "Journal entries"
+ * in copy; only the entity class avoids the collision.
+ */
+export type LedgerEntrySource =
+  | "manual"
+  | "invoice_issue"
+  // An issued invoice edited after the fact. Keyed on the invoice id like
+  // `invoice_issue`; the two together net to what the invoice says now, and
+  // a void reverses both.
+  | "invoice_revision"
+  | "invoice_payment"
+  | "invoice_void"
+  // Customer credits (Phase H). A credit note never touches 1200 AR on
+  // issue — it parks the obligation in 2400 Customer Credits, and only an
+  // *application* relieves the receivable. `customer_refund` is the only
+  // source in this family that credits 1100 Bank.
+  | "credit_note_issue"
+  | "credit_note_apply"
+  | "credit_note_unapply"
+  | "credit_note_void"
+  | "customer_refund"
+  | "customer_refund_void"
+  // Uncollectible / immaterial receivables. Deliberately NOT a credit
+  // note: this debits 6100 Bad Debt Expense so the original revenue stays
+  // recognized in the period it was earned.
+  | "invoice_writeoff"
+  | "invoice_writeoff_reversal"
+  // Vendor credits (AP mirror). Issue parks in 1300 Vendor Credits; apply
+  // relieves 2200 AP; refund brings cash in via 1100.
+  | "vendor_credit_issue"
+  | "vendor_credit_apply"
+  | "vendor_credit_unapply"
+  | "vendor_credit_void"
+  | "vendor_refund"
+  | "vendor_refund_void"
+  // A bank-feed line categorized into the ledger: DR/CR the feed's bank account
+  // against a chosen category. The first path that turns an uncleared bank line
+  // into a real journal entry.
+  | "bank_categorization"
+  | "bank_categorization_void"
+  // A card purchase, refund, card bill payment, or Banking's change of a
+  // purchase's category. Named for Brex, the first card provider, and used for
+  // every card (Ramp's too): the card feed says which provider it was, and
+  // everything that reads these — category repair, cash flow, Entry review —
+  // treats every card the same way.
+  | "brex_card_expense"
+  | "brex_card_refund"
+  | "brex_card_payment"
+  | "brex_card_reclass"
+  | "ledger_reclass";
+
+export type LedgerReviewStatus = "unreviewed" | "ai_reviewed" | "approved";
+
+/**
+ * A balanced double-entry transaction. Phase B of the Finance milestone
+ * (M19) — see ROADMAP.md. Each `LedgerEntry` has one or more
+ * `LedgerLine` children whose `sum(debits) === sum(credits)`. The
+ * service layer enforces the balance check; the database does not (no
+ * DB-level trigger, since we want the same rule on both sqlite and
+ * postgres).
+ */
+@Entity("ledger_entries")
+@Index(["companyId", "date"])
+@Index(["companyId", "source", "sourceRefId"])
+@Index(["companyId", "reviewStatus"])
+export class LedgerEntry {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  /** Accounting date — when the transaction *happened*, not when it was
+   *  recorded. Reports filter on this; `createdAt` is for audit only. */
+  @Column({ type: dateTimeColumnType })
+  date!: Date;
+
+  @Column({ type: "varchar", default: "" })
+  memo!: string;
+
+  @Column({ type: "varchar", default: "manual" })
+  source!: LedgerEntrySource;
+
+  /** ID of the source record — `Invoice.id` for invoice_issue /
+   *  invoice_revision / invoice_void, `InvoicePayment.id` for
+   *  invoice_payment, null for manual entries. Indexed with `source` so
+   *  reversal lookups are O(1). */
+  @Column({ type: "varchar", nullable: true })
+  sourceRefId!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  createdById!: string | null;
+
+  /** Bookkeeping review. An owner/admin, or an AI Employee with full
+   *  Finance access, applies any category changes and moves the entry to
+   *  `approved`. `ai_reviewed` is left only by staged reviews from before AI
+   *  approval was final; approving one applies its staged changes. */
+  @Column({ type: "varchar", default: "unreviewed" })
+  reviewStatus!: LedgerReviewStatus;
+
+  /** JSON array of `{lineId,fromAccountId,toAccountId}` category changes:
+   *  staged on an `ai_reviewed` entry, and the ones applied once approved. */
+  @Column({ type: "text", nullable: true })
+  reviewChangesJson!: string | null;
+
+  @Column({ type: "text", nullable: true })
+  reviewNote!: string | null;
+
+  @Column({ type: "varchar", nullable: true })
+  reviewedByEmployeeId!: string | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  reviewedAt!: Date | null;
+
+  @Column({ type: "varchar", nullable: true })
+  approvedById!: string | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  approvedAt!: Date | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+}

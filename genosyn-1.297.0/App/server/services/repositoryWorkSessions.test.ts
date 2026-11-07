@@ -1,0 +1,2834 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { after, before, beforeEach, describe, test } from "node:test";
+
+import { config } from "../../config.js";
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { AIModel } from "../db/entities/AIModel.js";
+import { Attachment } from "../db/entities/Attachment.js";
+import { Company } from "../db/entities/Company.js";
+import { EmployeeModel } from "../db/entities/EmployeeModel.js";
+import { EmployeeRepositoryGrant } from "../db/entities/EmployeeRepositoryGrant.js";
+import { Repository } from "../db/entities/Repository.js";
+import { RepositoryWorkSession } from "../db/entities/RepositoryWorkSession.js";
+import { RepositoryWorkSessionEvent } from "../db/entities/RepositoryWorkSessionEvent.js";
+import { RepositoryWorkSessionTurn } from "../db/entities/RepositoryWorkSessionTurn.js";
+import { User } from "../db/entities/User.js";
+import { recordAttachmentBytes, discardUnboundAttachment } from "./uploads.js";
+import { closeTestDb, initTestDb, insert, resetTestDb } from "../test/dbHarness.js";
+import {
+  activeModelOf,
+  detachAllModels,
+  insertEmployeeModel,
+  updateModelsOf,
+  type EmployeeModelFixture,
+} from "../test/modelFixtures.js";
+import { repositoryWorkSessionCandidates } from "./repositoryWorkSessionModels.js";
+import { workSessionCommandAvailability } from "./repositoryCommandRun.js";
+import {
+  CHAT_HARD_TIMEOUT_MS,
+  type ChatResult,
+  type ChatTurn,
+  type chatWithEmployee,
+} from "./chat.js";
+import {
+  checkoutRepositoryBranch,
+  createRepositoryBranch,
+  ensureRepositoryWorkspace,
+  readRepositoryFile,
+  repositoryBranches,
+  repositoryLog,
+  repositoryStatus,
+  writeRepositoryFile,
+  commitRepositoryChanges,
+} from "./repositoryWorkspace.js";
+import {
+  MAX_AGENTS_GUIDE_BYTES,
+  MAX_REPLAYED_TURNS,
+  composeTurnHistory,
+  CHECKPOINT_COMMIT_MESSAGE,
+  composeWorkSystemPrompt,
+  createRepositoryWorkSession,
+  createToolRepositoryWorkSession,
+  deriveWorkSessionTitle,
+  ensureSessionWorktree,
+  liveRepositoryWorkSession,
+  prepareWorkSessionRevision,
+  readAgentsGuide,
+  renameRepositoryWorkSession,
+  REPOSITORY_SESSION_TOOLS,
+  repositorySessionResidentTools,
+  repositoryWorkSessionTurns,
+  reviseRepositoryWorkSession,
+  discardRepositoryWorkSession,
+  publishRepositoryWorkSession,
+  repositoryWorkSessionDiff,
+  resolveSessionCheckout,
+  runRepositoryWorkSession,
+  sessionBranchName,
+  sessionCommit,
+  sessionDeleteFile,
+  sessionListFiles,
+  sessionReadFile,
+  sessionSearch,
+  sessionWriteFile,
+  sessionWorktreePath,
+  startRepositoryWorkSession,
+} from "./repositoryWorkSessions.js";
+
+/**
+ * AI work sessions, end to end, with the model turn stubbed.
+ *
+ * The model is the one part that cannot run in a test, so `runChat` is
+ * injected. Everything else is real: a real worktree, real Git, real commits,
+ * and the real publish path. That is deliberate — the valuable behaviour here
+ * is what happens to the *repository*, not what the model says.
+ */
+
+let dataDir: string;
+const originalDataDir = config.dataDir;
+const codingTools = config.agent.codingTools as {
+  enabled: boolean;
+  executionMode: "host" | "disabled";
+  allowUnsafeHostExecution: boolean;
+};
+const originalCodingTools = { ...codingTools };
+
+before(async () => {
+  await initTestDb();
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "genosyn-repo-sessions-"));
+  (config as { dataDir: string }).dataDir = dataDir;
+  // Sessions must work on an install with command execution switched off.
+  codingTools.enabled = true;
+  codingTools.executionMode = "disabled";
+  codingTools.allowUnsafeHostExecution = false;
+});
+
+after(async () => {
+  await closeTestDb();
+  (config as { dataDir: string }).dataDir = originalDataDir;
+  Object.assign(codingTools, originalCodingTools);
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+let company: Company;
+let requester: User;
+let employee: AIEmployee;
+let repository: Repository;
+
+beforeEach(async () => {
+  await resetTestDb();
+  requester = await insert(User, {
+    email: "member@example.com",
+    name: "Member",
+    passwordHash: "x",
+    sessionVersion: 1,
+  });
+  company = await insert(Company, { name: "Acme", slug: "acme", ownerId: requester.id });
+  employee = await insert(AIEmployee, {
+    companyId: company.id,
+    name: "Ada",
+    slug: "ada",
+    role: "Engineer",
+  });
+  await insertEmployeeModel({
+    employeeId: employee.id,
+    provider: "anthropic",
+    model: "claude-test",
+    authMode: "apikey",
+    configJson: '{"apiKeyEncrypted":"test-placeholder"}',
+    isActive: true,
+  });
+  repository = await insert(Repository, {
+    companyId: company.id,
+    name: "Strategy",
+    slug: "strategy",
+    description: "",
+    origin: "local",
+    kind: "documents",
+    gitUrl: "",
+    defaultBranch: "main",
+    authMode: "none",
+    committerName: "Genosyn",
+    committerEmail: "repositories@genosyn.local",
+    lastSyncStatus: "unknown",
+    lastSyncError: "",
+  });
+});
+
+async function grantAccess(level: "read" | "write" = "write"): Promise<void> {
+  await insert(EmployeeRepositoryGrant, {
+    employeeId: employee.id,
+    repositoryId: repository.id,
+    accessLevel: level,
+  });
+}
+
+/**
+ * A stand-in for the model turn. `work` runs with the session's own worktree,
+ * exactly where the real `repository_*` tools would operate.
+ */
+function stubChat(
+  work: (directory: string) => Promise<void> | void,
+  result: Partial<ChatResult> = {},
+): typeof chatWithEmployee {
+  return (async (_companyId, _employeeId, _message, _history, options) => {
+    const sessionId = (options as { repositoryWorkSessionId?: string })?.repositoryWorkSessionId;
+    assert.ok(sessionId, "the turn must carry its work-session id");
+    const checkout = await resolveSessionCheckout(company.id, sessionId);
+    await work(checkout.directory);
+    return {
+      status: "ok",
+      reply: "Done.",
+      attachmentIds: [],
+      sidecars: {},
+      ...result,
+    } as ChatResult;
+  }) as typeof chatWithEmployee;
+}
+
+async function start(runChat: typeof chatWithEmployee, instruction = "Update the plan") {
+  return startRepositoryWorkSession({
+    companyId: company.id,
+    repositoryId: repository.id,
+    employeeId: employee.id,
+    instruction,
+    requesterUserId: requester.id,
+    requesterSessionVersion: 1,
+    runChat,
+  });
+}
+
+describe("work-session AI Model selection", () => {
+  beforeEach(() => grantAccess());
+
+  const openingArgs = (modelId?: string) => ({
+    companyId: company.id,
+    repositoryId: repository.id,
+    employeeId: employee.id,
+    modelId,
+    instruction: "Update the plan",
+    requesterUserId: requester.id,
+    requesterSessionVersion: 1,
+  });
+  const revisionArgs = (sessionId: string) => ({
+    companyId: company.id,
+    sessionId,
+    instruction: "Make another pass",
+    requesterUserId: requester.id,
+    requesterSessionVersion: 1,
+  });
+  const addModel = (overrides: Partial<EmployeeModelFixture> = {}) =>
+    insertEmployeeModel({
+      employeeId: employee.id,
+      provider: "openai",
+      model: "gpt-second",
+      authMode: "apikey",
+      configJson: '{"apiKeyEncrypted":"second-placeholder"}',
+      isActive: false,
+      ...overrides,
+    });
+
+  test("uses and persists the active model when the picker is omitted", async () => {
+    const active = await activeModelOf(employee.id);
+    await addModel();
+    const prepared = await createRepositoryWorkSession(openingArgs());
+    assert.equal(prepared.session.modelId, active.id);
+    const stored = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: prepared.session.id,
+    });
+    assert.equal(stored.modelId, active.id);
+    assert.equal(stored.effort, null);
+  });
+
+  test("selecting another model leaves the employee's active default unchanged", async () => {
+    const active = await activeModelOf(employee.id);
+    const chosen = await addModel();
+    await createRepositoryWorkSession(openingArgs(chosen.id));
+    const attachments = await AppDataSource.getRepository(EmployeeModel).find({
+      where: { employeeId: employee.id },
+    });
+    assert.deepEqual(
+      attachments.filter((row) => row.isActive).map((row) => row.modelId),
+      [active.id],
+    );
+    assert.equal(attachments.find((row) => row.modelId === chosen.id)?.isActive, false);
+  });
+
+  test("a non-active model reaches the runtime and stays selected on a follow-up", async () => {
+    const chosen = await addModel({ model: "gpt-5.6-sol" });
+    const used: Array<string | null | undefined> = [];
+    const efforts: Array<string | null | undefined> = [];
+    const runChat: typeof chatWithEmployee = async (...args) => {
+      used.push(args[4]?.modelId);
+      efforts.push(args[4]?.effort);
+      return stubChat(() => {})(...args);
+    };
+    const started = await startRepositoryWorkSession({
+      ...openingArgs(chosen.id),
+      effort: "high",
+      runChat,
+    });
+    assert.equal(started.status, "empty");
+    assert.equal(started.modelId, chosen.id);
+    await AppDataSource.getRepository(EmployeeModel).update(
+      { employeeId: employee.id },
+      { isActive: false },
+    );
+    await addModel({ isActive: true });
+    const revised = await reviseRepositoryWorkSession({ ...revisionArgs(started.id), runChat });
+    assert.equal(revised.status, "empty");
+    assert.equal(revised.turnCount, 2);
+    assert.equal(revised.modelId, chosen.id);
+    assert.deepEqual(used, [chosen.id, chosen.id]);
+    assert.deepEqual(efforts, ["high", "high"]);
+    assert.equal(revised.effort, "high");
+    const stored = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: started.id,
+    });
+    assert.equal(stored.effort, "high");
+  });
+
+  test("rejects unsupported effort before creating a session or turn", async () => {
+    const chosen = await addModel({ model: "gpt-4o" });
+    await assert.rejects(
+      () => createRepositoryWorkSession({ ...openingArgs(chosen.id), effort: "high" }),
+      /does not support this effort/,
+    );
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 0);
+  });
+
+  test("revalidates saved effort if the model is edited before a follow-up", async () => {
+    const chosen = await addModel({ model: "gpt-5.6-sol" });
+    const started = await startRepositoryWorkSession({
+      ...openingArgs(chosen.id),
+      effort: "max",
+      runChat: stubChat(() => {}),
+    });
+    await AppDataSource.getRepository(AIModel).update(chosen.id, { model: "gpt-4o" });
+    await assert.rejects(
+      () => prepareWorkSessionRevision(revisionArgs(started.id)),
+      /does not support this effort/,
+    );
+    const stored = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: started.id,
+    });
+    assert.equal(stored.status, "empty");
+    assert.equal(stored.turnCount, 1);
+    assert.equal(stored.effort, "max");
+  });
+
+  test("revalidates effort between preparing and running before work starts", async () => {
+    const chosen = await addModel({ model: "gpt-5.6-sol" });
+    let called = false;
+    const prepared = await createRepositoryWorkSession({
+      ...openingArgs(chosen.id),
+      effort: "max",
+      runChat: async (...args) => {
+        called = true;
+        return stubChat(() => {})(...args);
+      },
+    });
+    await AppDataSource.getRepository(AIModel).update(chosen.id, { model: "gpt-5.4" });
+    const failed = await runRepositoryWorkSession(prepared);
+    assert.equal(called, false);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error, /does not support this effort/);
+    assert.equal(failed.branch, null);
+  });
+
+  test("the only model reaches the runtime when no model id is supplied", async () => {
+    const model = await activeModelOf(employee.id);
+    const started = await startRepositoryWorkSession({
+      ...openingArgs(),
+      runChat: async (...args) => {
+        assert.equal(args[4]?.modelId, model.id);
+        return stubChat(() => {})(...args);
+      },
+    });
+    assert.equal(started.status, "empty");
+    assert.equal(started.modelId, model.id);
+  });
+
+  test("an explicit connected model can run when the active model is disconnected", async () => {
+    await updateModelsOf(employee.id, { configJson: "{}" });
+    const chosen = await addModel();
+    const prepared = await createRepositoryWorkSession(openingArgs(chosen.id));
+    assert.equal(prepared.session.modelId, chosen.id);
+  });
+
+  for (const kind of ["missing", "same-company employee", "foreign-company employee"] as const) {
+    test(`rejects a ${kind} model before writing a session or turn`, async () => {
+      const other = await insert(AIEmployee, {
+        companyId: kind === "foreign-company employee" ? "foreign-company" : company.id,
+        name: "Grace",
+        slug: "grace",
+        role: "Engineer",
+      });
+      const model = await addModel({ employeeId: other.id });
+      if (kind === "missing") await AppDataSource.getRepository(AIModel).delete(model.id);
+      await assert.rejects(
+        () => createRepositoryWorkSession(openingArgs(model.id)),
+        /no longer available for this employee/,
+      );
+      assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+      assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 0);
+    });
+  }
+
+  test("rejects disconnected explicit and default models before writing rows", async () => {
+    const model = await activeModelOf(employee.id);
+    await AppDataSource.getRepository(AIModel).update(model.id, { configJson: "{}" });
+    for (const id of [model.id, undefined]) {
+      await assert.rejects(
+        () => createRepositoryWorkSession(openingArgs(id)),
+        /AI Model is not connected/,
+      );
+    }
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 0);
+  });
+
+  test("falls back to the newest model when no active flag exists", async () => {
+    await AppDataSource.getRepository(EmployeeModel).update(
+      { employeeId: employee.id },
+      { isActive: false, createdAt: new Date("2024-01-01") },
+    );
+    const newest = await addModel({ createdAt: new Date("2025-01-01") });
+    const prepared = await createRepositoryWorkSession(openingArgs());
+    assert.equal(prepared.session.modelId, newest.id);
+    const candidates = await repositoryWorkSessionCandidates(repository);
+    assert.deepEqual(
+      candidates[0].models.filter((model) => model.isActive).map((model) => model.id),
+      [newest.id],
+    );
+  });
+
+  for (const change of ["disconnected", "deleted", "reassigned"] as const) {
+    test(`refuses a revision when the selected model was ${change} and keeps the transcript`, async () => {
+      const chosen = await addModel();
+      const started = await startRepositoryWorkSession({
+        ...openingArgs(chosen.id),
+        runChat: stubChat(() => {}),
+      });
+      const models = AppDataSource.getRepository(AIModel);
+      if (change === "deleted") await models.delete(chosen.id);
+      else if (change === "disconnected") await models.update(chosen.id, { configJson: "{}" });
+      // Reassigned: detached from this employee, attached to another.
+      else
+        await AppDataSource.getRepository(EmployeeModel).update(
+          { modelId: chosen.id },
+          { employeeId: "other-employee" },
+        );
+      await assert.rejects(
+        () => prepareWorkSessionRevision(revisionArgs(started.id)),
+        change === "disconnected" ? /not connected/ : /no longer available/,
+      );
+      const stored = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+        id: started.id,
+      });
+      assert.equal(stored.status, "empty");
+      assert.equal(stored.turnCount, 1);
+      assert.equal(stored.modelId, chosen.id);
+      assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 1);
+    });
+  }
+
+  test("revalidates a model removed between preparing and running without invoking chat", async () => {
+    const chosen = await addModel();
+    let called = false;
+    const prepared = await createRepositoryWorkSession({
+      ...openingArgs(chosen.id),
+      runChat: async (...args) => {
+        called = true;
+        return stubChat(() => {})(...args);
+      },
+    });
+    await AppDataSource.getRepository(AIModel).delete(chosen.id);
+    const failed = await runRepositoryWorkSession(prepared);
+    assert.equal(called, false);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error, /no longer available/);
+    assert.equal(failed.branch, null);
+    const turns = await repositoryWorkSessionTurns(failed.id);
+    assert.equal(turns[0].status, "failed");
+  });
+
+  test("older sessions with a null model id still follow the current active model", async () => {
+    const started = await startRepositoryWorkSession({
+      ...openingArgs(),
+      runChat: stubChat(() => {}),
+    });
+    await AppDataSource.getRepository(RepositoryWorkSession).update(started.id, { modelId: null });
+    await AppDataSource.getRepository(EmployeeModel).update(
+      { employeeId: employee.id },
+      { isActive: false },
+    );
+    const active = await addModel({ isActive: true });
+    const revised = await reviseRepositoryWorkSession({
+      ...revisionArgs(started.id),
+      runChat: async (...args) => {
+        assert.equal(args[4]?.modelId, active.id);
+        return stubChat(() => {})(...args);
+      },
+    });
+    assert.equal(revised.status, "empty");
+    assert.equal(revised.modelId, null);
+  });
+});
+
+describe("work-session attachments", () => {
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+    "base64",
+  );
+  async function upload(overrides: Partial<Parameters<typeof recordAttachmentBytes>[0]> = {}) {
+    return recordAttachmentBytes({
+      companyId: company.id,
+      companySlug: company.slug,
+      uploadedByUserId: requester.id,
+      filename: "screenshot.png",
+      mimeType: "image/png",
+      bytes: png,
+      ...overrides,
+    });
+  }
+  async function prepare(attachmentIds: string[], instruction = "Use this reference") {
+    return createRepositoryWorkSession({
+      companyId: company.id,
+      repositoryId: repository.id,
+      employeeId: employee.id,
+      instruction,
+      attachmentIds,
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+    });
+  }
+
+  beforeEach(() => grantAccess());
+
+  test("binds an image-only first instruction and returns safe transcript metadata", async () => {
+    const attachment = await upload();
+    const prepared = await prepare([attachment.id], "  ");
+    assert.equal(prepared.turn.instruction, "");
+    assert.equal(prepared.session.title, "Shared attachments");
+    assert.equal(
+      (await AppDataSource.getRepository(Attachment).findOneByOrFail({ id: attachment.id }))
+        .messageId,
+      prepared.turn.id,
+    );
+    const turns = await repositoryWorkSessionTurns(prepared.session.id);
+    assert.deepEqual(turns[0].attachments, [
+      {
+        id: attachment.id,
+        filename: "screenshot.png",
+        mimeType: "image/png",
+        sizeBytes: png.length,
+        isImage: true,
+      },
+    ]);
+    assert.equal(
+      await discardUnboundAttachment({
+        attachmentId: attachment.id,
+        companyId: company.id,
+        companySlug: company.slug,
+      }),
+      false,
+    );
+  });
+
+  test("duplicate attachment IDs bind once", async () => {
+    const attachment = await upload();
+    const prepared = await prepare([attachment.id, attachment.id]);
+    assert.equal((await repositoryWorkSessionTurns(prepared.session.id))[0].attachments.length, 1);
+  });
+
+  test("concurrent starts keep each request's attachments on its own turn", async () => {
+    const first = await upload();
+    const second = await upload({ filename: "second.png" });
+    const prepared = await Promise.all([prepare([first.id]), prepare([second.id])]);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 2);
+    const turns = await Promise.all(
+      prepared.map((row) => repositoryWorkSessionTurns(row.session.id)),
+    );
+    assert.deepEqual(
+      turns.map((rows) => rows[0].attachments[0].id),
+      [first.id, second.id],
+    );
+  });
+
+  test("one upload can be claimed by only one concurrent request", async () => {
+    const attachment = await upload();
+    const outcomes = await Promise.allSettled([prepare([attachment.id]), prepare([attachment.id])]);
+    assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 1);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 1);
+  });
+
+  test("concurrent revisions preserve the losing request's upload for retry", async () => {
+    const prepared = await prepare([], "Start the work");
+    await AppDataSource.getRepository(RepositoryWorkSession).update(
+      { id: prepared.session.id },
+      { status: "empty" },
+    );
+    const first = await upload();
+    const second = await upload({ filename: "second.png" });
+    const outcomes = await Promise.allSettled(
+      [first, second].map((attachment) =>
+        prepareWorkSessionRevision({
+          companyId: company.id,
+          sessionId: prepared.session.id,
+          instruction: "Continue",
+          attachmentIds: [attachment.id],
+          requesterUserId: requester.id,
+          requesterSessionVersion: 1,
+        }),
+      ),
+    );
+    assert.equal(outcomes[0].status, "fulfilled");
+    assert.equal(outcomes[1].status, "rejected");
+    assert.equal((await repositoryWorkSessionTurns(prepared.session.id)).length, 2);
+    assert.equal(
+      (await AppDataSource.getRepository(Attachment).findOneByOrFail({ id: second.id })).messageId,
+      null,
+    );
+  });
+
+  for (const invalid of ["missing", "company", "member", "ai", "bound"] as const) {
+    test(`refuses ${invalid} uploads and rolls back the entire instruction`, async () => {
+      const valid = await upload();
+      const attachment = await upload({
+        ...(invalid === "company" ? { companyId: "another-company" } : {}),
+        ...(invalid === "member" ? { uploadedByUserId: "another-member" } : {}),
+        ...(invalid === "ai" ? { uploadedByUserId: null } : {}),
+      });
+      if (invalid === "bound")
+        await AppDataSource.getRepository(Attachment).update(
+          { id: attachment.id },
+          { messageId: "existing-message" },
+        );
+      await assert.rejects(
+        prepare([valid.id, invalid === "missing" ? "missing" : attachment.id]),
+        /attachment is unavailable/,
+      );
+      assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+      assert.equal(await AppDataSource.getRepository(RepositoryWorkSessionTurn).count(), 0);
+      assert.equal(
+        (await AppDataSource.getRepository(Attachment).findOneByOrFail({ id: valid.id })).messageId,
+        null,
+      );
+    });
+  }
+
+  test("refuses an empty request and too many attachments before creating a row", async () => {
+    await assert.rejects(prepare([], " \n"), /instruction or attach/);
+    await assert.rejects(prepare(Array.from({ length: 11 }, (_, n) => String(n))), /at most 10/);
+    await assert.rejects(prepare([], "x".repeat(20_001)), /20,000/);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+  });
+
+  test("current image bytes and file context reach the model seam", async () => {
+    const attachment = await upload();
+    const text = await upload({
+      filename: "spec.txt",
+      mimeType: "text/plain",
+      bytes: Buffer.from("The button says Save"),
+    });
+    const prepared = await prepare([attachment.id, text.id]);
+    prepared.runChat = (async (_company, _employee, message, history, options) => {
+      assert.match(message, /Use this reference/);
+      assert.match(message, /screenshot\.png/);
+      assert.match(message, /The button says Save/);
+      assert.deepEqual(history, []);
+      assert.deepEqual(
+        options?.images?.map(({ mimeType, data }) => ({ mimeType, data })),
+        [{ mimeType: "image/png", data: png.toString("base64") }],
+      );
+      assert.match(options?.images?.[0].sourceLabel ?? "", new RegExp(attachment.id));
+      return { status: "ok", reply: "Reviewed the image.", attachmentIds: [], sidecars: {} };
+    }) as typeof chatWithEmployee;
+    const result = await runRepositoryWorkSession(prepared);
+    assert.equal(result.status, "empty", result.error);
+  });
+
+  test("a revision retains previous images and attaches the new image to its own turn", async () => {
+    const original = await upload();
+    const first = await prepare([original.id], "Match this screenshot");
+    first.runChat = stubChat(() => {});
+    await runRepositoryWorkSession(first);
+    const followup = await upload({ filename: "revised.png" });
+    const second = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: first.session.id,
+      instruction: "",
+      attachmentIds: [followup.id],
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: (async (_company, _employee, message, history, options) => {
+        assert.match(message, /revised\.png/);
+        assert.match(history[0].content, /Match this screenshot/);
+        assert.match(history[0].content, new RegExp(original.id));
+        assert.deepEqual(
+          history[0].images?.map(({ mimeType, data }) => ({ mimeType, data })),
+          [{ mimeType: "image/png", data: png.toString("base64") }],
+        );
+        assert.deepEqual(
+          options?.images?.map(({ mimeType, data }) => ({ mimeType, data })),
+          [{ mimeType: "image/png", data: png.toString("base64") }],
+        );
+        return { status: "ok", reply: "Updated.", attachmentIds: [], sidecars: {} };
+      }) as typeof chatWithEmployee,
+    });
+    const result = await runRepositoryWorkSession(second);
+    assert.equal(result.status, "empty", result.error);
+    const turns = await repositoryWorkSessionTurns(first.session.id);
+    assert.deepEqual(
+      turns.map((turn) => turn.attachments.map((a) => a.id)),
+      [[original.id], [followup.id]],
+    );
+  });
+
+  test("a refused revision preserves session status, archive state and existing attachments", async () => {
+    const original = await upload();
+    const first = await prepare([original.id]);
+    first.runChat = stubChat(() => {});
+    await runRepositoryWorkSession(first);
+    const archivedAt = new Date("2026-01-01T00:00:00.000Z");
+    await AppDataSource.getRepository(RepositoryWorkSession).update(
+      { id: first.session.id },
+      { archivedAt },
+    );
+    const unused = await upload();
+    await assert.rejects(
+      prepareWorkSessionRevision({
+        companyId: company.id,
+        sessionId: first.session.id,
+        instruction: "Use these",
+        attachmentIds: [unused.id, original.id],
+        requesterUserId: requester.id,
+        requesterSessionVersion: 1,
+      }),
+      /attachment is unavailable/,
+    );
+    const stored = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: first.session.id,
+    });
+    assert.equal(stored.status, "empty");
+    assert.equal(stored.turnCount, 1);
+    assert.deepEqual(stored.archivedAt, archivedAt);
+    assert.equal(
+      (await AppDataSource.getRepository(Attachment).findOneByOrFail({ id: unused.id })).messageId,
+      null,
+    );
+    assert.equal((await repositoryWorkSessionTurns(first.session.id)).length, 1);
+  });
+
+  test("missing image bytes preserve the attachment reference without failing a turn", async () => {
+    const attachment = await upload();
+    const prepared = await prepare([attachment.id]);
+    fs.rmSync(path.join(dataDir, "companies", company.slug, "attachments", attachment.storageKey));
+    prepared.runChat = (async (_company, _employee, message, _history, options) => {
+      assert.match(message, /File missing/);
+      assert.equal(options?.images?.length ?? 0, 0);
+      return { status: "ok", reply: "Please resend it.", attachmentIds: [], sidecars: {} };
+    }) as typeof chatWithEmployee;
+    assert.equal((await runRepositoryWorkSession(prepared)).status, "empty");
+  });
+
+  test("transcript metadata excludes a foreign-company attachment with a matching turn id", async () => {
+    const prepared = await prepare([], "Read the plan");
+    const attachment = await upload({ companyId: "other-company" });
+    await AppDataSource.getRepository(Attachment).update(
+      { id: attachment.id },
+      { messageId: prepared.turn.id },
+    );
+    assert.deepEqual((await repositoryWorkSessionTurns(prepared.session.id))[0].attachments, []);
+    await AppDataSource.getRepository(RepositoryWorkSessionTurn).update(
+      { id: prepared.turn.id },
+      { status: "ok" },
+    );
+    const history = await composeTurnHistory(prepared.session.id, 2);
+    assert.equal(history[0].content, "Read the plan");
+    assert.equal(history[0].images, undefined);
+  });
+});
+
+// ────────────────────────────── guards ──────────────────────────────────
+
+describe("starting a session", () => {
+  test("refuses an employee with no grant on the repository", async () => {
+    await assert.rejects(() => start(stubChat(() => {})), /not been granted access/);
+  });
+
+  test("accepts a read grant — a session works on its own branch, not the trunk", async () => {
+    await grantAccess("read");
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "hello\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(session.status, "ready");
+  });
+
+  test("refuses an unknown repository or employee", async () => {
+    await assert.rejects(
+      () =>
+        startRepositoryWorkSession({
+          companyId: company.id,
+          repositoryId: "00000000-0000-4000-8000-000000000000",
+          employeeId: employee.id,
+          instruction: "x",
+          requesterUserId: requester.id,
+          requesterSessionVersion: 1,
+          runChat: stubChat(() => {}),
+        }),
+      /Repository not found/,
+    );
+  });
+
+  test("refuses an employee with no AI Model connected", async () => {
+    await grantAccess();
+    await detachAllModels(employee.id);
+    await assert.rejects(() => start(stubChat(() => {})), /no AI Model/);
+  });
+
+  test("refuses on shared SaaS, where repositories are read-only", async () => {
+    await grantAccess();
+    const security = config.security as { multiTenant: boolean };
+    const wasMultiTenant = security.multiTenant;
+    security.multiTenant = true;
+    try {
+      await assert.rejects(() => start(stubChat(() => {})), /read-only in shared SaaS mode/);
+      assert.equal(
+        await AppDataSource.getRepository(RepositoryWorkSession).count(),
+        0,
+        "a refused session must not leave a row behind",
+      );
+    } finally {
+      security.multiTenant = wasMultiTenant;
+    }
+  });
+});
+
+// ───────────────────── starting without waiting for it ──────────────────
+
+/**
+ * The split that lets a chat turn start a session.
+ *
+ * A chat turn cannot sit and wait for work allowed to take hours, so
+ * `start_repository_work_session` awaits only the first half and hands the
+ * Member a session id. Two properties make that honest: the id is real before
+ * the model turn begins, and everything that could refuse the request has
+ * already refused it.
+ */
+describe("creating a session without running it", () => {
+  test("hands back a running row before the employee's turn starts", async () => {
+    await grantAccess();
+    const prepared = await createRepositoryWorkSession({
+      companyId: company.id,
+      repositoryId: repository.id,
+      employeeId: employee.id,
+      instruction: "Update the plan",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+    });
+
+    assert.ok(prepared.session.id);
+    assert.equal(prepared.session.status, "running");
+    assert.equal(prepared.session.instruction, "Update the plan");
+    assert.equal(prepared.session.requestedByUserId, requester.id);
+    assert.equal(prepared.repo.id, repository.id);
+    assert.equal(prepared.employee.id, employee.id);
+    // Nothing has run yet, so there is no branch to point at.
+    assert.equal(prepared.session.branch, null);
+  });
+
+  test("every refusal happens before a row exists, so there is none to explain", async () => {
+    await assert.rejects(
+      () =>
+        createRepositoryWorkSession({
+          companyId: company.id,
+          repositoryId: repository.id,
+          employeeId: employee.id,
+          instruction: "Update the plan",
+          requesterUserId: requester.id,
+          requesterSessionVersion: 1,
+        }),
+      /not been granted access/,
+    );
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+  });
+
+  test("running the prepared session finishes the same row it handed back", async () => {
+    await grantAccess();
+    const prepared = await createRepositoryWorkSession({
+      companyId: company.id,
+      repositoryId: repository.id,
+      employeeId: employee.id,
+      instruction: "Update the plan",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "hello\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    });
+
+    const finished = await runRepositoryWorkSession(prepared);
+
+    assert.equal(finished.id, prepared.session.id);
+    assert.equal(finished.status, "ready");
+    assert.equal(finished.branch, sessionBranchName("ada", prepared.session.id));
+    assert.equal(
+      await AppDataSource.getRepository(RepositoryWorkSession).count(),
+      1,
+      "the two halves must share one row, not create a second",
+    );
+  });
+});
+
+// ──────────────────────────── the work itself ───────────────────────────
+
+describe("a session that does work", () => {
+  beforeEach(async () => {
+    await grantAccess();
+  });
+
+  test("commits on its own branch and reports what changed", async () => {
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nGrow revenue.\n");
+        await sessionCommit(repository, directory, "Add the plan");
+      }),
+    );
+
+    assert.equal(session.status, "ready");
+    assert.equal(session.branch, sessionBranchName("ada", session.id));
+    assert.ok(session.baseCommit);
+    assert.ok(session.headCommit);
+    assert.notEqual(session.headCommit, session.baseCommit);
+    assert.equal(session.filesChanged, 1);
+    assert.equal(session.insertions, 3);
+    assert.equal(session.reply, "Done.");
+    assert.ok(session.finishedAt);
+  });
+
+  test("leaves the Member's checkout untouched until it is published", async () => {
+    await ensureRepositoryWorkspace(repository);
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n");
+        await sessionCommit(repository, directory, "Add the plan");
+      }),
+    );
+    assert.equal(session.status, "ready");
+    await assert.rejects(() => readRepositoryFile(repository, "docs/plan.md"), /not found/);
+    assert.deepEqual((await repositoryStatus(repository)).changes, []);
+  });
+
+  // 2026-10-02: restarting the self-hosted model server ended every turn
+  // working on it. A session's turn now waits for the server and says so.
+  test("waits out a model server restart and records the wait in its feed", async () => {
+    let waitForModel: boolean | undefined;
+    const session = await start((async (...args: Parameters<typeof chatWithEmployee>) => {
+      waitForModel = args[4]?.waitForModel;
+      args[4]?.activity?.onModelOutage?.({ state: "waiting", waitedMs: 0 });
+      args[4]?.activity?.onModelOutage?.({ state: "answered", waitedMs: 330_000 });
+      return stubChat(() => {})(...args);
+    }) as typeof chatWithEmployee);
+    assert.equal(waitForModel, true);
+    const events = await AppDataSource.getRepository(RepositoryWorkSessionEvent).find({
+      where: { sessionId: session.id, kind: "retry" },
+      order: { ordinal: "ASC" },
+    });
+    assert.deepEqual(
+      events.map((event) => event.summary),
+      [
+        "The AI Model's server stopped answering; the session waits for it",
+        "The AI Model's server answered again after 6 min; continuing",
+      ],
+    );
+  });
+
+  test("records an empty outcome when the employee commits nothing", async () => {
+    const session = await start(stubChat(() => {}));
+    assert.equal(session.status, "empty");
+    assert.equal(session.filesChanged, 0);
+    assert.equal(
+      fs.existsSync(sessionWorktreePath(repository, session.id)),
+      false,
+      "an empty session leaves no worktree behind",
+    );
+  });
+
+  test("keeps uncommitted work as a checkpoint commit rather than discarding it", async () => {
+    const session = await start(
+      stubChat((directory) => {
+        sessionWriteFile(directory, "forgotten.md", "never committed\n");
+      }),
+    );
+    // The employee forgot to commit; the App did it for it, under a name that
+    // says so, and the work is reviewable like any other.
+    assert.equal(session.status, "ready");
+    const diff = await repositoryWorkSessionDiff(session);
+    assert.equal(diff.commits.length, 1);
+    assert.equal(diff.commits[0].subject, CHECKPOINT_COMMIT_MESSAGE);
+    assert.match(diff.patch, /never committed/);
+  });
+
+  test("records a turn that changed nothing as empty", async () => {
+    const session = await start(stubChat(() => {}));
+    assert.equal(session.status, "empty");
+  });
+
+  test("records a failed turn with the model's own explanation", async () => {
+    const session = await start(
+      stubChat(() => {}, { status: "error", reply: "The model is unavailable." }),
+    );
+    assert.equal(session.status, "failed");
+    assert.match(session.error, /model is unavailable/);
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), false);
+  });
+
+  test("records a thrown error rather than leaving the session running forever", async () => {
+    const session = await start((() => {
+      throw new Error("boom");
+    }) as typeof chatWithEmployee);
+    assert.equal(session.status, "failed");
+    assert.match(session.error, /boom/);
+  });
+
+  test("gives two concurrent sessions separate branches and worktrees", async () => {
+    const [first, second] = await Promise.all([
+      start(
+        stubChat(async (directory) => {
+          sessionWriteFile(directory, "one.md", "one\n");
+          await sessionCommit(repository, directory, "Add one");
+        }),
+      ),
+      start(
+        stubChat(async (directory) => {
+          sessionWriteFile(directory, "two.md", "two\n");
+          await sessionCommit(repository, directory, "Add two");
+        }),
+      ),
+    ]);
+    assert.notEqual(first.branch, second.branch);
+    assert.equal(first.status, "ready");
+    assert.equal(second.status, "ready");
+  });
+});
+
+// ──────────────────────────── review and publish ────────────────────────
+
+describe("reviewing and publishing", () => {
+  beforeEach(async () => {
+    await grantAccess();
+  });
+
+  async function readySession() {
+    return start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nShip it.\n");
+        await sessionCommit(repository, directory, "Add the plan");
+      }),
+    );
+  }
+
+  test("shows the Member the diff before they decide", async () => {
+    const session = await readySession();
+    const diff = await repositoryWorkSessionDiff(session);
+    assert.match(diff.patch, /docs\/plan\.md/);
+    assert.match(diff.patch, /\+# Plan/);
+    assert.equal(diff.filesChanged, 1);
+    assert.deepEqual(
+      diff.commits.map((c) => c.subject),
+      ["Add the plan"],
+    );
+  });
+
+  test("merges the work into the Member's checkout on publish", async () => {
+    const session = await readySession();
+    const published = await publishRepositoryWorkSession(session.id, { push: false });
+
+    assert.equal(published.status, "published");
+    const file = await readRepositoryFile(repository, "docs/plan.md");
+    assert.equal(file.content, "# Plan\n\nShip it.\n");
+    const commits = await repositoryLog(repository);
+    assert.ok(commits.some((c) => c.subject === "Add the plan"));
+    assert.equal(
+      fs.existsSync(sessionWorktreePath(repository, session.id)),
+      false,
+      "the worktree is cleaned up once the work has landed",
+    );
+  });
+
+  test("does not try to push a repository with no remote", async () => {
+    const session = await readySession();
+    const published = await publishRepositoryWorkSession(session.id, { push: true });
+    assert.equal(published.status, "published");
+    assert.equal(published.publishedBranch, null);
+  });
+
+  test("refuses to publish twice", async () => {
+    const session = await readySession();
+    await publishRepositoryWorkSession(session.id, { push: false });
+    await assert.rejects(
+      () => publishRepositoryWorkSession(session.id, { push: false }),
+      /no reviewed work/,
+    );
+  });
+
+  test("refuses to publish a session that produced nothing", async () => {
+    const session = await start(stubChat(() => {}));
+    await assert.rejects(
+      () => publishRepositoryWorkSession(session.id, { push: false }),
+      /no reviewed work/,
+    );
+  });
+
+  test("refuses to publish over the Member's own uncommitted edits", async () => {
+    const session = await readySession();
+    await writeRepositoryFile(repository, "mine.md", "unsaved\n");
+    await assert.rejects(
+      () => publishRepositoryWorkSession(session.id, { push: false }),
+      /Commit or discard/,
+    );
+  });
+
+  test("discarding removes the branch and the worktree", async () => {
+    const session = await readySession();
+    const { session: discarded } = await discardRepositoryWorkSession(session.id);
+    assert.equal(discarded.status, "discarded");
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), false);
+    assert.equal(
+      (await repositoryBranches(repository)).some((branch) => branch.name === session.branch),
+      false,
+      "the local session branch is gone too",
+    );
+    await assert.rejects(() => readRepositoryFile(repository, "docs/plan.md"), /not found/);
+  });
+
+  test("publishing wins when publish and discard are requested together", async () => {
+    const session = await readySession();
+
+    const publishing = publishRepositoryWorkSession(session.id, { push: false });
+    const discarding = discardRepositoryWorkSession(session.id);
+
+    assert.equal((await publishing).status, "published");
+    await assert.rejects(() => discarding, /already been accepted/);
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "published",
+    );
+    assert.equal(
+      (await readRepositoryFile(repository, "docs/plan.md")).content,
+      "# Plan\n\nShip it.\n",
+    );
+  });
+
+  test("discarding wins when discard and publish are requested together", async () => {
+    const session = await readySession();
+
+    const discarding = discardRepositoryWorkSession(session.id);
+    const publishing = publishRepositoryWorkSession(session.id, { push: false });
+
+    assert.equal((await discarding).session.status, "discarded");
+    await assert.rejects(() => publishing, /no reviewed work/);
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "discarded",
+    );
+    await assert.rejects(() => readRepositoryFile(repository, "docs/plan.md"), /not found/);
+  });
+
+  test("refuses accepted work but makes a repeated discard idempotent", async () => {
+    const published = await readySession();
+    await publishRepositoryWorkSession(published.id, { push: false });
+    await assert.rejects(
+      () => discardRepositoryWorkSession(published.id),
+      /already been accepted/,
+    );
+
+    const discarded = await readySession();
+    await discardRepositoryWorkSession(discarded.id);
+    assert.equal((await discardRepositoryWorkSession(discarded.id)).session.status, "discarded");
+  });
+
+  test("a retry repairs Git cleanup left behind by an earlier discard", async () => {
+    const session = await readySession();
+    await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+      status: "discarded",
+    });
+
+    const retry = await discardRepositoryWorkSession(session.id);
+
+    assert.equal(retry.session.status, "discarded");
+    assert.equal(retry.discardedNow, false);
+    assert.equal(retry.cleanedNow, true);
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), false);
+    assert.equal(
+      (await repositoryBranches(repository)).some((branch) => branch.name === session.branch),
+      false,
+    );
+  });
+
+  test("reports a local cleanup failure and lets a retry repair it", async () => {
+    const session = await readySession();
+    await assert.rejects(
+      () =>
+        discardRepositoryWorkSession(session.id, {
+          removeWorktree: async () => {
+            throw new Error("simulated filesystem refusal");
+          },
+        }),
+      /simulated filesystem refusal/,
+    );
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "discarded",
+    );
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), true);
+
+    const repaired = await discardRepositoryWorkSession(session.id);
+    assert.equal(repaired.discardedNow, false);
+    assert.equal(repaired.cleanedNow, true);
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), false);
+  });
+
+  test("the discard compare-and-swap preserves work accepted by another process", async () => {
+    const session = await readySession();
+    await assert.rejects(
+      () =>
+        discardRepositoryWorkSession(session.id, {
+          beforeClaim: async () => {
+            await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+              status: "published",
+            });
+          },
+        }),
+      /accepted before it could be thrown away/,
+    );
+
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), true);
+    assert.equal(
+      (await repositoryBranches(repository)).some((branch) => branch.name === session.branch),
+      true,
+    );
+  });
+
+  test("the discard compare-and-swap preserves a revision started by another process", async () => {
+    const session = await readySession();
+    await assert.rejects(
+      () =>
+        discardRepositoryWorkSession(session.id, {
+          beforeClaim: async () => {
+            await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+              status: "running",
+            });
+          },
+        }),
+      /started working again/,
+    );
+
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), true);
+    assert.equal(
+      (await repositoryBranches(repository)).some((branch) => branch.name === session.branch),
+      true,
+    );
+  });
+
+  test("the discard compare-and-swap joins an out-of-process discard", async () => {
+    const session = await readySession();
+    const result = await discardRepositoryWorkSession(session.id, {
+      beforeClaim: async () => {
+        await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+          status: "discarded",
+        });
+      },
+    });
+
+    assert.equal(result.session.status, "discarded");
+    assert.equal(result.discardedNow, false);
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), false);
+    assert.equal(
+      (await repositoryBranches(repository)).some((branch) => branch.name === session.branch),
+      false,
+    );
+  });
+
+  test("a conflicting session is refused rather than merged badly", async () => {
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "shared.md", "base\n");
+    await commitRepositoryChanges(repository, { message: "Add the shared note" });
+
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "shared.md", "the employee's version\n");
+        await sessionCommit(repository, directory, "Rewrite the note");
+      }),
+    );
+    await writeRepositoryFile(repository, "shared.md", "the human's version\n");
+    await commitRepositoryChanges(repository, { message: "Rewrite it differently" });
+
+    await assert.rejects(
+      () => publishRepositoryWorkSession(session.id, { push: false }),
+      /conflicts/,
+    );
+    assert.equal(
+      (await readRepositoryFile(repository, "shared.md")).content,
+      "the human's version\n",
+    );
+  });
+});
+
+// ────────────────────────── revising a session ──────────────────────────
+
+/**
+ * The half that makes a session a conversation.
+ *
+ * These tests are about continuity: the same branch, the same worktree, the
+ * same employee, and a transcript it can remember. A revision that quietly
+ * started again from the trunk would still look like it worked — the diff
+ * would be plausible and the earlier work would simply be gone — so the
+ * assertions are deliberately about *where* the commits land, not only that
+ * some landed.
+ */
+describe("revising a session", () => {
+  beforeEach(async () => {
+    await grantAccess();
+  });
+
+  /** Capture what the revision's turn was handed, which is the whole point. */
+  function recordingChat(
+    seen: { message?: string; history?: ChatTurn[]; options?: Record<string, unknown> },
+    work: (directory: string) => Promise<void> | void,
+    result: Partial<ChatResult> = {},
+  ): typeof chatWithEmployee {
+    return (async (_companyId, _employeeId, message, history, options) => {
+      seen.message = message;
+      seen.history = history;
+      seen.options = options as Record<string, unknown>;
+      const sessionId = (options as { repositoryWorkSessionId?: string })?.repositoryWorkSessionId;
+      assert.ok(sessionId);
+      const checkout = await resolveSessionCheckout(company.id, sessionId);
+      await work(checkout.directory);
+      return {
+        status: "ok",
+        reply: "Revised.",
+        attachmentIds: [],
+        sidecars: {},
+        ...result,
+      } as ChatResult;
+    }) as typeof chatWithEmployee;
+  }
+
+  async function revise(
+    sessionId: string,
+    runChat: typeof chatWithEmployee,
+    instruction = "Also mention the risks",
+    requesterUserId = requester.id,
+  ) {
+    return reviseRepositoryWorkSession({
+      companyId: company.id,
+      sessionId,
+      instruction,
+      requesterUserId,
+      requesterSessionVersion: 1,
+      runChat,
+    });
+  }
+
+  async function firstTurn() {
+    return start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nShip it.\n");
+        await sessionCommit(repository, directory, "Add the plan");
+      }),
+    );
+  }
+
+  test("commits onto the same branch in the same working copy", async () => {
+    const session = await firstTurn();
+    const worktree = sessionWorktreePath(repository, session.id);
+    const revised = await revise(
+      session.id,
+      recordingChat({}, async (directory) => {
+        assert.equal(directory, worktree, "a revision must reuse the session's own worktree");
+        assert.equal(
+          sessionReadFile(directory, "docs/plan.md"),
+          "# Plan\n\nShip it.\n",
+          "the earlier turn's work is still there to build on",
+        );
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nShip it.\n\n## Risks\n");
+        await sessionCommit(repository, directory, "Note the risks");
+      }),
+    );
+
+    assert.equal(revised.id, session.id);
+    assert.equal(revised.branch, session.branch);
+    assert.equal(revised.status, "ready");
+    assert.equal(revised.baseCommit, session.baseCommit, "the branch point never moves");
+    assert.notEqual(revised.headCommit, session.headCommit);
+    assert.equal(revised.turnCount, 2);
+    assert.equal(revised.reply, "Revised.");
+
+    const diff = await repositoryWorkSessionDiff(revised);
+    assert.equal(diff.filesChanged, 1);
+    assert.deepEqual(diff.commits.map((commit) => commit.subject).sort(), [
+      "Add the plan",
+      "Note the risks",
+    ]);
+  });
+
+  test("replays the earlier turns so the employee knows what it already did", async () => {
+    const session = await firstTurn();
+    const seen: { history?: ChatTurn[]; message?: string } = {};
+    await revise(
+      session.id,
+      recordingChat(seen, async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nShip it well.\n");
+        await sessionCommit(repository, directory, "Tighten the wording");
+      }),
+    );
+
+    assert.equal(seen.history?.length, 2);
+    assert.deepEqual(seen.history?.[0], { role: "user", content: "Update the plan" });
+    assert.equal(seen.history?.[1].role, "assistant");
+    // The report it gave, then what it actually recorded — the commit list is
+    // the memory a revision needs and the reply alone never carried.
+    assert.match(seen.history?.[1].content ?? "", /^Done\./);
+    assert.match(seen.history?.[1].content ?? "", /Committed on this turn \(1 file/);
+    assert.match(seen.history?.[1].content ?? "", /Files: docs\/plan\.md/);
+    assert.match(seen.message ?? "", /Continue your work/);
+    assert.match(seen.message ?? "", /Also mention the risks/);
+  });
+
+  test("records each turn's own changes as well as the session's", async () => {
+    const session = await firstTurn();
+    await revise(
+      session.id,
+      recordingChat({}, async (directory) => {
+        sessionWriteFile(directory, "docs/risks.md", "# Risks\n");
+        await sessionCommit(repository, directory, "Add the risks");
+      }),
+    );
+
+    const turns = await repositoryWorkSessionTurns(session.id);
+    assert.deepEqual(
+      turns.map((turn) => turn.ordinal),
+      [1, 2],
+    );
+    assert.equal(turns[0].instruction, "Update the plan");
+    assert.equal(turns[0].reply, "Done.");
+    assert.equal(turns[0].status, "ok");
+    assert.equal(turns[0].filesChanged, 1);
+    assert.equal(turns[1].instruction, "Also mention the risks");
+    assert.equal(turns[1].status, "ok");
+    assert.equal(
+      turns[1].filesChanged,
+      1,
+      "the second turn touched one file, not both files the session has",
+    );
+    assert.equal(turns[1].baseCommit, turns[0].headCommit, "turns chain head to base");
+
+    const session2 = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: session.id,
+    });
+    assert.equal(session2.filesChanged, 2, "the session totals both turns");
+  });
+
+  test("tells the employee it is continuing, not starting over", async () => {
+    const prompt = composeWorkSystemPrompt(repository, "s", { revision: true });
+    assert.match(prompt, /follow-up/);
+    assert.match(prompt, /read the files again/);
+    assert.ok(!composeWorkSystemPrompt(repository, "s").includes("follow-up"));
+  });
+
+  test("rescues a session that committed nothing the first time", async () => {
+    const session = await start(stubChat(() => {}));
+    assert.equal(session.status, "empty");
+    assert.equal(
+      fs.existsSync(sessionWorktreePath(repository, session.id)),
+      false,
+      "an empty session leaves no worktree, so the revision has to rebuild one",
+    );
+
+    const revised = await revise(
+      session.id,
+      recordingChat({}, async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n");
+        await sessionCommit(repository, directory, "Write the plan after all");
+      }),
+      "There is something to change — do it",
+    );
+    assert.equal(revised.status, "ready");
+    assert.equal(revised.branch, session.branch);
+    assert.equal(revised.turnCount, 2);
+  });
+
+  test("retries on the same branch after a failed turn", async () => {
+    const session = await start(
+      stubChat(() => {}, { status: "error", reply: "The model is unavailable." }),
+    );
+    assert.equal(session.status, "failed");
+
+    const revised = await revise(
+      session.id,
+      recordingChat({}, async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n");
+        await sessionCommit(repository, directory, "Add the plan");
+      }),
+      "Try again",
+    );
+    assert.equal(revised.status, "ready");
+    assert.equal(revised.error, "", "a retry that worked must not keep the old failure on the row");
+    assert.equal(revised.branch, session.branch);
+  });
+
+  test("a failed revision keeps the work the earlier turns committed", async () => {
+    const session = await firstTurn();
+    const revised = await revise(
+      session.id,
+      recordingChat({}, () => {}, { status: "error", reply: "Ran out of context." }),
+    );
+
+    assert.equal(revised.status, "failed");
+    assert.match(revised.error, /Ran out of context/);
+    assert.equal(revised.headCommit, session.headCommit, "the branch is where it was");
+    assert.equal(
+      fs.existsSync(sessionWorktreePath(repository, session.id)),
+      true,
+      "a worktree with commits in it survives a failed follow-up",
+    );
+    const turns = await repositoryWorkSessionTurns(session.id);
+    assert.equal(turns[1].status, "failed");
+    assert.equal(turns[0].status, "ok", "the earlier turn is untouched");
+  });
+
+  test("runs on the access of whoever asked for the revision", async () => {
+    const second = await insert(User, {
+      email: "second@example.com",
+      name: "Second",
+      passwordHash: "x",
+      sessionVersion: 4,
+    });
+    const session = await firstTurn();
+    const seen: { options?: Record<string, unknown> } = {};
+    await revise(
+      session.id,
+      recordingChat(seen, async (directory) => {
+        sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nAgain.\n");
+        await sessionCommit(repository, directory, "Rewrite it");
+      }),
+      "Rewrite it",
+      second.id,
+    );
+    assert.equal(seen.options?.requesterUserId, second.id);
+    const turns = await repositoryWorkSessionTurns(session.id);
+    assert.equal(turns[1].requestedByUserId, second.id);
+  });
+
+  test("refuses while the session is still working", async () => {
+    const session = await firstTurn();
+    await AppDataSource.getRepository(RepositoryWorkSession).update(
+      { id: session.id },
+      { status: "running" },
+    );
+    await assert.rejects(
+      () =>
+        revise(
+          session.id,
+          recordingChat({}, () => {}),
+        ),
+      /still working/,
+    );
+  });
+
+  test("refuses once the work has been accepted", async () => {
+    const session = await firstTurn();
+    await publishRepositoryWorkSession(session.id, { push: false });
+    await assert.rejects(
+      () =>
+        revise(
+          session.id,
+          recordingChat({}, () => {}),
+        ),
+      /already been accepted/,
+    );
+  });
+
+  test("refuses once the work has been thrown away", async () => {
+    const session = await firstTurn();
+    await discardRepositoryWorkSession(session.id);
+    await assert.rejects(
+      () =>
+        revise(
+          session.id,
+          recordingChat({}, () => {}),
+        ),
+      /thrown away/,
+    );
+  });
+
+  test("refuses when the employee's grant was taken away mid-session", async () => {
+    const session = await firstTurn();
+    await AppDataSource.getRepository(EmployeeRepositoryGrant).delete({
+      employeeId: employee.id,
+      repositoryId: repository.id,
+    });
+    await assert.rejects(
+      () =>
+        revise(
+          session.id,
+          recordingChat({}, () => {}),
+        ),
+      /not been granted access/,
+    );
+    const unchanged = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: session.id,
+    });
+    assert.equal(unchanged.status, "ready", "a refused revision must not disturb the session");
+    assert.equal(unchanged.turnCount, 1);
+  });
+
+  test("refuses when the employee's selected model was deleted", async () => {
+    const session = await firstTurn();
+    await detachAllModels(employee.id);
+    await assert.rejects(
+      () =>
+        revise(
+          session.id,
+          recordingChat({}, () => {}),
+        ),
+      /no longer available for this employee/,
+    );
+  });
+
+  test("refuses on shared SaaS, where repositories are read-only", async () => {
+    const session = await firstTurn();
+    const security = config.security as { multiTenant: boolean };
+    security.multiTenant = true;
+    try {
+      await assert.rejects(
+        () =>
+          revise(
+            session.id,
+            recordingChat({}, () => {}),
+          ),
+        /read-only in shared SaaS/,
+      );
+    } finally {
+      security.multiTenant = false;
+    }
+  });
+
+  test("refuses a session from another company", async () => {
+    const session = await firstTurn();
+    const other = await insert(Company, { name: "Other", slug: "other", ownerId: requester.id });
+    await assert.rejects(
+      () =>
+        reviseRepositoryWorkSession({
+          companyId: other.id,
+          sessionId: session.id,
+          instruction: "Change it",
+          requesterUserId: requester.id,
+          requesterSessionVersion: 1,
+          runChat: recordingChat({}, () => {}),
+        }),
+      /not found/,
+    );
+  });
+
+  test("marks the session running while the follow-up is in flight", async () => {
+    const session = await firstTurn();
+    const prepared = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Keep going",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: recordingChat({}, () => {}),
+    });
+    const live = await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({
+      id: session.id,
+    });
+    assert.equal(live.status, "running", "the client must see the session working straight away");
+    assert.equal(prepared.turn.ordinal, 2);
+    assert.equal(prepared.turn.status, "running");
+  });
+
+  test("finds a fresh revision even when the session itself is older than the timeout", async () => {
+    const session = await start(stubChat(() => {}));
+    await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+      createdAt: new Date(Date.now() - CHAT_HARD_TIMEOUT_MS - 60_000),
+    });
+    const prepared = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Try it now",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(() => {}),
+    });
+
+    const live = await liveRepositoryWorkSession({
+      companyId: company.id,
+      repositoryId: repository.id,
+      employeeId: employee.id,
+    });
+    assert.equal(live?.id, session.id);
+
+    await runRepositoryWorkSession(prepared);
+  });
+
+  test("does not discard a fresh revision on an old session", async () => {
+    const session = await start(stubChat(() => {}));
+    await AppDataSource.getRepository(RepositoryWorkSession).update(session.id, {
+      createdAt: new Date(Date.now() - CHAT_HARD_TIMEOUT_MS - 60_000),
+    });
+    const prepared = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Try it now",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(() => {}),
+    });
+
+    await assert.rejects(() => discardRepositoryWorkSession(session.id), /still working/);
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "running",
+    );
+
+    await runRepositoryWorkSession(prepared);
+  });
+
+  test("revision wins when revision and discard are requested together", async () => {
+    const session = await firstTurn();
+    const revision = prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Keep going",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(() => {}),
+    });
+    const discarding = discardRepositoryWorkSession(session.id);
+
+    const prepared = await revision;
+    await assert.rejects(() => discarding, /still working/);
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "running",
+    );
+
+    await runRepositoryWorkSession(prepared);
+  });
+
+  test("discard wins when discard and revision are requested together", async () => {
+    const session = await firstTurn();
+    const discarding = discardRepositoryWorkSession(session.id);
+    const revision = prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Keep going",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(() => {}),
+    });
+
+    assert.equal((await discarding).session.status, "discarded");
+    await assert.rejects(() => revision, /thrown away/);
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "discarded",
+    );
+  });
+
+  test("a late successful turn cannot restore work discarded after its timeout", async () => {
+    const session = await firstTurn();
+    let entered!: () => void;
+    const turnEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prepared = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Keep going",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(async () => {
+        entered();
+        await held;
+      }),
+    });
+    const finishing = runRepositoryWorkSession(prepared);
+    await turnEntered;
+    await AppDataSource.getRepository(RepositoryWorkSessionTurn).update(prepared.turn.id, {
+      createdAt: new Date(Date.now() - CHAT_HARD_TIMEOUT_MS - 60_000),
+    });
+
+    const discarded = await discardRepositoryWorkSession(session.id).finally(release);
+    assert.equal(discarded.session.status, "discarded");
+    assert.equal((await finishing).status, "discarded");
+    assert.equal(
+      (await AppDataSource.getRepository(RepositoryWorkSession).findOneByOrFail({ id: session.id }))
+        .status,
+      "discarded",
+    );
+    const turns = await AppDataSource.getRepository(RepositoryWorkSessionTurn).find({
+      where: { sessionId: session.id },
+      order: { ordinal: "ASC" },
+    });
+    assert.equal(turns.some((turn) => turn.status === "running"), false);
+    assert.equal(turns.at(-1)?.status, "stopped");
+  });
+
+  test("publishes work that several turns built up", async () => {
+    const session = await firstTurn();
+    await revise(
+      session.id,
+      recordingChat({}, async (directory) => {
+        sessionWriteFile(directory, "docs/risks.md", "# Risks\n");
+        await sessionCommit(repository, directory, "Add the risks");
+      }),
+    );
+    const published = await publishRepositoryWorkSession(session.id, { push: false });
+    assert.equal(published.status, "published");
+    assert.equal(
+      (await readRepositoryFile(repository, "docs/plan.md")).content,
+      "# Plan\n\nShip it.\n",
+    );
+    assert.equal((await readRepositoryFile(repository, "docs/risks.md")).content, "# Risks\n");
+  });
+});
+
+// ─────────────────────── the transcript and its title ───────────────────
+
+describe("session history", () => {
+  beforeEach(async () => {
+    await grantAccess();
+  });
+
+  test("writes the opening instruction as turn one", async () => {
+    const session = await start(
+      stubChat(() => {}),
+      "Tidy the README",
+    );
+    const turns = await repositoryWorkSessionTurns(session.id);
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].ordinal, 1);
+    assert.equal(turns[0].instruction, "Tidy the README");
+    assert.equal(turns[0].sessionId, session.id);
+    assert.equal(turns[0].companyId, company.id);
+    assert.equal(session.turnCount, 1);
+  });
+
+  test("only replays turns that have finished, and only the recent ones", async () => {
+    const session = await start(
+      stubChat(() => {}),
+      "First",
+    );
+    const turnRepo = AppDataSource.getRepository(RepositoryWorkSessionTurn);
+    for (let ordinal = 2; ordinal <= MAX_REPLAYED_TURNS + 4; ordinal += 1) {
+      await turnRepo.save(
+        turnRepo.create({
+          companyId: company.id,
+          sessionId: session.id,
+          ordinal,
+          instruction: `Instruction ${ordinal}`,
+          reply: `Reply ${ordinal}`,
+          status: "ok",
+        }),
+      );
+    }
+    await turnRepo.save(
+      turnRepo.create({
+        companyId: company.id,
+        sessionId: session.id,
+        ordinal: MAX_REPLAYED_TURNS + 5,
+        instruction: "The one being run now",
+        status: "running",
+      }),
+    );
+
+    const history = await composeTurnHistory(session.id, MAX_REPLAYED_TURNS + 5);
+    assert.equal(history.length, MAX_REPLAYED_TURNS * 2);
+    assert.equal(history[0].role, "user");
+    assert.equal(
+      history.some((entry) => entry.content === "The one being run now"),
+      false,
+      "the turn being run must not be replayed to itself",
+    );
+    assert.equal(history.at(-1)?.content, `Reply ${MAX_REPLAYED_TURNS + 4}`);
+  });
+
+  test("replays a failed turn's error, so the retry knows what went wrong", async () => {
+    const session = await start(
+      stubChat(() => {}, { status: "error", reply: "Tool call failed." }),
+      "Do the thing",
+    );
+    const history = await composeTurnHistory(session.id, 2);
+    assert.deepEqual(history, [
+      { role: "user", content: "Do the thing" },
+      { role: "assistant", content: "Tool call failed." },
+    ]);
+  });
+
+  test("gives a session that predates turns the turn it always had", async () => {
+    // Exactly the row shape the old schema left behind: the whole exchange on
+    // the session, no turns, no title, no count.
+    const sessionRepo = AppDataSource.getRepository(RepositoryWorkSession);
+    const legacy = await sessionRepo.save(
+      sessionRepo.create({
+        companyId: company.id,
+        repositoryId: repository.id,
+        employeeId: employee.id,
+        requestedByUserId: requester.id,
+        title: "",
+        instruction: "Rewrite the pricing section",
+        status: "ready",
+        branch: "genosyn/ada/deadbeef",
+        baseCommit: "aaaa",
+        headCommit: "bbbb",
+        reply: "Rewrote it.",
+        turnCount: 0,
+        filesChanged: 2,
+        insertions: 9,
+        deletions: 4,
+      }),
+    );
+
+    const turns = await repositoryWorkSessionTurns(legacy.id);
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].ordinal, 1);
+    assert.equal(turns[0].instruction, "Rewrite the pricing section");
+    assert.equal(turns[0].reply, "Rewrote it.");
+    assert.equal(turns[0].status, "ok");
+    assert.equal(turns[0].filesChanged, 2);
+    assert.equal(turns[0].headCommit, "bbbb");
+
+    const migrated = await sessionRepo.findOneByOrFail({ id: legacy.id });
+    assert.equal(migrated.turnCount, 1);
+    assert.equal(migrated.title, "Rewrite the pricing section");
+
+    // Reading again must not add a second copy of the same exchange.
+    assert.equal((await repositoryWorkSessionTurns(legacy.id)).length, 1);
+  });
+
+  test("replays a legacy session's one exchange into its first revision", async () => {
+    const sessionRepo = AppDataSource.getRepository(RepositoryWorkSession);
+    const legacy = await sessionRepo.save(
+      sessionRepo.create({
+        companyId: company.id,
+        repositoryId: repository.id,
+        employeeId: employee.id,
+        requestedByUserId: requester.id,
+        title: "",
+        instruction: "Draft the plan",
+        status: "empty",
+        reply: "Nothing needed changing.",
+        turnCount: 0,
+      }),
+    );
+    const prepared = await prepareWorkSessionRevision({
+      companyId: company.id,
+      sessionId: legacy.id,
+      instruction: "It does need changing",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+    });
+    assert.equal(prepared.turn.ordinal, 2, "the old exchange takes ordinal 1");
+    assert.deepEqual(await composeTurnHistory(legacy.id, 2), [
+      { role: "user", content: "Draft the plan" },
+      { role: "assistant", content: "Nothing needed changing." },
+    ]);
+  });
+
+  test("titles a session from its opening instruction", async () => {
+    const session = await start(
+      stubChat(() => {}),
+      "  Rewrite the pricing page\nand commit it  ",
+    );
+    assert.equal(session.title, "Rewrite the pricing page and commit it");
+  });
+
+  test("truncates a long title on a word boundary", () => {
+    const long = deriveWorkSessionTitle(
+      "Refactor the billing service so invoices are generated asynchronously and the webhook handler is idempotent",
+    );
+    assert.ok(long.length <= 73, long);
+    assert.match(long, /…$/);
+    assert.ok(!long.includes("  "));
+    assert.equal(deriveWorkSessionTitle("   "), "Untitled session");
+    assert.equal(deriveWorkSessionTitle("Short one"), "Short one");
+  });
+
+  test("renames a session", async () => {
+    const session = await start(
+      stubChat(() => {}),
+      "Do a thing",
+    );
+    const renamed = await renameRepositoryWorkSession(company.id, session.id, "  Pricing page  ");
+    assert.equal(renamed.title, "Pricing page");
+    await assert.rejects(
+      () => renameRepositoryWorkSession(company.id, session.id, "   "),
+      /needs a name/,
+    );
+    const other = await insert(Company, { name: "Other", slug: "other", ownerId: requester.id });
+    await assert.rejects(
+      () => renameRepositoryWorkSession(other.id, session.id, "Theirs"),
+      /not found/,
+    );
+  });
+});
+
+// ───────────────────────── the worktree it keeps ────────────────────────
+
+describe("the session worktree", () => {
+  beforeEach(async () => {
+    await grantAccess();
+  });
+
+  test("is kept while there is committed work to build on", async () => {
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "x\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(fs.existsSync(sessionWorktreePath(repository, session.id)), true);
+  });
+
+  test("is rebuilt from the branch when it has gone missing", async () => {
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "x\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    fs.rmSync(sessionWorktreePath(repository, session.id), { recursive: true, force: true });
+
+    const directory = await ensureSessionWorktree(repository, session);
+    assert.equal(directory, sessionWorktreePath(repository, session.id));
+    assert.equal(
+      sessionReadFile(directory, "note.md"),
+      "x\n",
+      "the rebuilt worktree is the branch, so the work is all there",
+    );
+  });
+
+  test("is a no-op when it is already there", async () => {
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "x\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    const directory = await ensureSessionWorktree(repository, session);
+    // An uncommitted edit is the evidence: recreating the worktree would have
+    // thrown it away, and a follow-up turn must not lose the tree it is in.
+    sessionWriteFile(directory, "scratch.md", "in progress\n");
+    const again = await ensureSessionWorktree(repository, session);
+    assert.equal(sessionReadFile(again, "scratch.md"), "in progress\n");
+  });
+
+  test("refuses to rebuild a session that never had a branch", async () => {
+    await assert.rejects(
+      () => ensureSessionWorktree(repository, { id: "nope", branch: null, baseCommit: null }),
+      /no branch/,
+    );
+  });
+});
+
+// ─────────────────────────── the tool surface ───────────────────────────
+
+describe("the tools an employee is given", () => {
+  let directory: string;
+
+  beforeEach(async () => {
+    await grantAccess();
+    const session = await start(
+      stubChat(async (dir) => {
+        directory = dir;
+        sessionWriteFile(dir, "README.md", "# Read me\n");
+        sessionWriteFile(dir, "docs/plan.md", "# Plan\n\nGrow revenue in Q3.\n");
+        // Commit, so the session ends `ready` and keeps its worktree — an
+        // empty session's worktree is cleaned up, by design.
+        await sessionCommit(repository, dir, "Add the first documents");
+      }),
+    );
+    assert.equal(session.status, "ready");
+  });
+
+  test("lists, reads, writes, and deletes within the worktree", () => {
+    assert.deepEqual(
+      sessionListFiles(directory, "").map((e) => `${e.type}:${e.name}`),
+      ["directory:docs", "file:README.md"],
+    );
+    assert.equal(sessionReadFile(directory, "docs/plan.md"), "# Plan\n\nGrow revenue in Q3.\n");
+
+    sessionWriteFile(directory, "docs/plan.md", "# Plan\n\nRewritten.\n");
+    assert.equal(sessionReadFile(directory, "docs/plan.md"), "# Plan\n\nRewritten.\n");
+
+    sessionDeleteFile(directory, "README.md");
+    assert.throws(() => sessionReadFile(directory, "README.md"));
+  });
+
+  test("searches case-insensitively and reports where the match is", () => {
+    const hits = sessionSearch(directory, "grow REVENUE");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].path, "docs/plan.md");
+    assert.equal(hits[0].line, 3);
+    assert.match(hits[0].text, /Grow revenue in Q3\./);
+  });
+
+  test("search never looks inside .git", () => {
+    // "ref:" appears in .git/HEAD of every repository.
+    const hits = sessionSearch(directory, "ref:");
+    assert.deepEqual(hits, []);
+  });
+
+  test("refuses an empty search", () => {
+    assert.throws(() => sessionSearch(directory, "   "), /search for/);
+  });
+
+  test("cannot write into .git and so cannot make the checkout hostile to Git", () => {
+    for (const bad of [".git/config", ".git/hooks/pre-commit", "docs/../.git/config"]) {
+      assert.throws(() => sessionWriteFile(directory, bad, "x"), /\.git|relative segments/, bad);
+    }
+    assert.equal(
+      fs.readFileSync(path.join(directory, ".git"), "utf8").startsWith("gitdir:"),
+      true,
+      "the worktree's .git pointer is untouched",
+    );
+  });
+
+  test("cannot escape the worktree", () => {
+    for (const bad of ["../../escape.md", "docs/../../../escape.md"]) {
+      assert.throws(() => sessionWriteFile(directory, bad, "x"), /relative segments/, bad);
+      assert.throws(() => sessionReadFile(directory, bad), /relative segments/, bad);
+      assert.throws(() => sessionDeleteFile(directory, bad), /relative segments/, bad);
+    }
+  });
+
+  test("cannot be redirected by a symlink a command planted in the worktree", () => {
+    // A command can create symlinks; the file tools must not follow one. Two
+    // shapes matter and they fail for different reasons: a link pointing back
+    // *inside* the worktree reaches `.git` under a name the path check allows,
+    // and a *dangling* link resolves to nothing, so a containment check on the
+    // realpath falls back to a parent that is legitimately contained.
+    const pointerBefore = fs.readFileSync(path.join(directory, ".git"), "utf8");
+    const outside = path.join(directory, "..", "planted.txt");
+
+    fs.symlinkSync(".git", path.join(directory, "gitlink"));
+    fs.symlinkSync("../planted.txt", path.join(directory, "outlink"));
+    fs.symlinkSync("/etc/hosts", path.join(directory, "abslink"));
+
+    for (const bad of ["gitlink", "outlink", "abslink"]) {
+      assert.throws(() => sessionWriteFile(directory, bad, "pwned\n"), /symlink|escapes/, bad);
+    }
+    assert.equal(
+      fs.readFileSync(path.join(directory, ".git"), "utf8"),
+      pointerBefore,
+      "the worktree's .git pointer is untouched",
+    );
+    assert.equal(fs.existsSync(outside), false, "nothing was created outside the worktree");
+  });
+
+  test("refuses to write more than the cap", () => {
+    assert.throws(
+      () => sessionWriteFile(directory, "huge.md", "x".repeat(300 * 1024)),
+      /too large/,
+    );
+  });
+
+  test("refuses to read a binary file as text", () => {
+    fs.writeFileSync(path.join(directory, "logo.png"), Buffer.from([0x89, 0x00, 0x01]));
+    assert.throws(() => sessionReadFile(directory, "logo.png"), /binary/);
+  });
+});
+
+describe("session authority", () => {
+  test("a finished session stops answering its tools", async () => {
+    await grantAccess();
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "x\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    await assert.rejects(() => resolveSessionCheckout(company.id, session.id), /already finished/);
+  });
+
+  test("a session cannot be reached from another company", async () => {
+    await grantAccess();
+    const other = await insert(Company, { name: "Other", slug: "other", ownerId: requester.id });
+    let sessionId = "";
+    await start(
+      stubChat(async (_directory) => {
+        const row = await AppDataSource.getRepository(RepositoryWorkSession).findOne({
+          where: { repositoryId: repository.id },
+          order: { createdAt: "DESC" },
+        });
+        sessionId = row?.id ?? "";
+        await assert.rejects(
+          () => resolveSessionCheckout(other.id, sessionId),
+          /not found/,
+          "another company must not resolve this session",
+        );
+      }),
+    );
+    assert.ok(sessionId);
+  });
+});
+
+describe("the briefing an employee receives", () => {
+  test("says how to run a newer Node the repository needs, when commands can run", () => {
+    const nodeRequirement = {
+      major: 26,
+      spec: ">=26",
+      source: "package.json engines.node" as const,
+    };
+    const withCommands = composeWorkSystemPrompt(
+      { ...repository, kind: "code", commandMode: "allowlist" },
+      "s",
+      { nodeRequirement },
+    );
+    if (workSessionCommandAvailability({ commandMode: "allowlist" }).available) {
+      assert.match(withCommands, /### Node version/);
+      assert.match(withCommands, /npx -y -p node@26 -- npm test/);
+    }
+    const withoutCommands = composeWorkSystemPrompt(
+      { ...repository, kind: "code", commandMode: "off" },
+      "s",
+      { nodeRequirement },
+    );
+    assert.doesNotMatch(withoutCommands, /### Node version/);
+    assert.doesNotMatch(composeWorkSystemPrompt(repository, "s"), /### Node version/);
+  });
+
+  test("names the session and tells the employee it must commit", () => {
+    const prompt = composeWorkSystemPrompt(repository, "session-123");
+    assert.match(prompt, /session-123/);
+    assert.match(prompt, /You must commit/);
+    assert.match(prompt, /repository_write_file/);
+    // The edit tool is the one that makes a diff reviewable; the briefing
+    // must steer the employee to it for every file that already exists.
+    assert.match(prompt, /repository_edit_file/);
+    assert.match(prompt, /repository_diff/);
+    assert.match(prompt, /repository_update_steps/);
+    // The craft guidance is for code; a documents repository is briefed
+    // about its prose instead.
+    const code = composeWorkSystemPrompt({ ...repository, kind: "code" }, "session-123");
+    assert.match(code, /no unrequested refactors/);
+    assert.match(code, /Review your own diff/);
+    assert.ok(!prompt.includes("no unrequested refactors"));
+  });
+
+  test("briefs a documents repository differently from a code one", () => {
+    const documents = composeWorkSystemPrompt({ ...repository, kind: "documents" }, "s");
+    const code = composeWorkSystemPrompt({ ...repository, kind: "code" }, "s");
+    assert.match(documents, /documents rather than software/);
+    assert.match(code, /conventions of the surrounding code/);
+    assert.match(documents, /Identify each applicable guide command you could not run/);
+  });
+
+  test("says there is no shell where the install cannot give it one", () => {
+    // The suite runs with execution disabled, which is the case this covers.
+    const prompt = composeWorkSystemPrompt(
+      { ...repository, kind: "code", commandMode: "all" },
+      "s",
+    );
+    assert.match(prompt, /no shell and cannot run tests/);
+    assert.ok(!prompt.includes("repository_run_command"));
+  });
+});
+
+/**
+ * What changes once commands are available.
+ *
+ * Both halves matter and for the same reason: an employee acts on what the
+ * briefing says. Told it has no shell it will not reach for one, and told it
+ * has one where it does not it spends the turn discovering otherwise.
+ */
+describe("a session that can run commands", () => {
+  beforeEach(() => {
+    codingTools.executionMode = "host";
+    codingTools.allowUnsafeHostExecution = true;
+  });
+  after(() => {
+    codingTools.executionMode = "disabled";
+    codingTools.allowUnsafeHostExecution = false;
+  });
+
+  test("tells the employee to verify its own work before committing", () => {
+    const prompt = composeWorkSystemPrompt({ ...repository, kind: "code" }, "s");
+    assert.match(prompt, /repository_run_command/);
+    assert.match(prompt, /Verify your own work before you commit/);
+    assert.ok(!prompt.includes("no shell and cannot run tests"));
+  });
+
+  test("still says nothing about commands on a repository that forbids them", () => {
+    const prompt = composeWorkSystemPrompt(
+      { ...repository, kind: "code", commandMode: "off" },
+      "s",
+    );
+    assert.ok(!prompt.includes("repository_run_command"));
+    assert.match(prompt, /no shell and cannot run tests/);
+  });
+
+  test("a documents repository is briefed about its prose, commands or not", () => {
+    const prompt = composeWorkSystemPrompt({ ...repository, kind: "documents" }, "s");
+    assert.match(prompt, /documents rather than software/);
+    assert.match(prompt, /repository_run_command/);
+  });
+
+  test("honours guide verification scope and package directories for code and documents", () => {
+    for (const kind of ["code", "documents"] as const) {
+      const prompt = composeWorkSystemPrompt({ ...repository, kind }, "s", {
+        agentsGuide: "Run npm run lint in App/ and Home/. Only run the tests you changed.",
+      });
+      assert.match(prompt, /Set `cwd` to a repository-relative directory/);
+      assert.match(prompt, /cwd `App`/);
+      assert.match(prompt, /cwd `Home`/);
+      assert.match(prompt, /do not replace a required targeted test with a broad suite/);
+      assert.ok(!prompt.includes("the broad one before you finish"));
+      assert.match(prompt, /including checks required for documents/);
+      assert.match(prompt, /account for each applicable guide command/);
+      assert.match(prompt, /recorded exit status/);
+    }
+  });
+
+  test("explains unavailable commands while retaining the guide requirements", () => {
+    const prompt = composeWorkSystemPrompt({ ...repository, commandMode: "off" }, "s", {
+      agentsGuide: "Run the document link checker before committing.",
+    });
+    assert.match(prompt, /This repository does not let AI employees run commands/);
+    assert.match(prompt, /Run the document link checker before committing/);
+    assert.match(prompt, /never mark it as passed/);
+    assert.ok(!prompt.includes("repository_run_command"));
+  });
+
+  test("loads the command tool up front only where it would work", () => {
+    assert.ok(repositorySessionResidentTools(repository).includes("repository_run_command"));
+    assert.ok(
+      !repositorySessionResidentTools({ ...repository, commandMode: "off" }).includes(
+        "repository_run_command",
+      ),
+    );
+    codingTools.executionMode = "disabled";
+    assert.ok(!repositorySessionResidentTools(repository).includes("repository_run_command"));
+  });
+
+  test("the MCP allowlist keeps the tool whatever one repository decided", () => {
+    // A repository that forbids commands answers with a refusal that names who
+    // can change it. Dropping the tool from the seam would answer instead with
+    // "you may only use the repository_* tools", which is both wrong and useless.
+    assert.ok(REPOSITORY_SESSION_TOOLS.includes("repository_run_command"));
+  });
+});
+
+describe("branch naming", () => {
+  test("namespaces the branch by employee and session", () => {
+    const name = sessionBranchName("ada", "abcdef12-3456-7890-abcd-ef1234567890");
+    assert.equal(name, "genosyn/ada/abcdef12");
+  });
+
+  test("survives an employee slug that is not branch-safe", () => {
+    assert.equal(
+      sessionBranchName("Ada Lovelace!", "abcdef12-3456"),
+      "genosyn/ada-lovelace/abcdef12",
+    );
+    assert.equal(sessionBranchName("", "abcdef12-3456"), "genosyn/employee/abcdef12");
+  });
+});
+
+// ────────────── the trunk a session branches from ───────────────────────
+
+/**
+ * A session used to branch from the Member checkout's `HEAD` — whatever branch
+ * somebody last switched to, however far behind it had been left. These pin
+ * the replacement: work starts from the repository's *default branch*, brought
+ * up to date first, and a session already under way is never re-based out from
+ * under the human reading its diff.
+ */
+describe("the trunk a session branches from", () => {
+  test("is the default branch, not whatever the Member last checked out", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "trunk.md", "the plan of record\n");
+    const trunk = await commitRepositoryChanges(repository, { message: "Set the plan" });
+    assert.ok(trunk);
+
+    // A Member wanders off to a side branch and leaves the checkout there.
+    await createRepositoryBranch(repository, "member-side");
+    await checkoutRepositoryBranch(repository, "member-side");
+    await writeRepositoryFile(repository, "side.md", "half-finished\n");
+    const side = await commitRepositoryChanges(repository, { message: "Side work" });
+    assert.ok(side);
+    assert.equal((await repositoryStatus(repository)).branch, "member-side");
+
+    let sawSideFile = true;
+    const session = await start(
+      stubChat(async (directory) => {
+        sawSideFile = fs.existsSync(path.join(directory, "side.md"));
+        sessionWriteFile(directory, "note.md", "from the trunk\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+
+    assert.equal(session.baseCommit, trunk.sha, "the session must start from the trunk");
+    assert.notEqual(session.baseCommit, side.sha);
+    assert.equal(sawSideFile, false, "the employee must not inherit unrelated side-branch work");
+    // The Member's checkout is exactly where they left it.
+    assert.equal((await repositoryStatus(repository)).branch, "member-side");
+  });
+
+  test("picks up a commit made on the trunk since the last session", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "plan.md", "v1\n");
+    await commitRepositoryChanges(repository, { message: "Plan v1" });
+
+    const first = await start(
+      stubChat(() => {}),
+      "Look around",
+    );
+    await writeRepositoryFile(repository, "plan.md", "v2\n");
+    const moved = await commitRepositoryChanges(repository, { message: "Plan v2" });
+    assert.ok(moved);
+
+    let seen = "";
+    const second = await start(
+      stubChat((directory) => {
+        seen = sessionReadFile(directory, "plan.md");
+      }),
+      "Now update it",
+    );
+
+    assert.notEqual(second.baseCommit, first.baseCommit);
+    assert.equal(second.baseCommit, moved.sha);
+    assert.equal(seen, "v2\n", "a session started after a change must see the change");
+  });
+
+  test("does not re-base a session that is already under way", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "draft.md", "first pass\n");
+        await sessionCommit(repository, directory, "First pass");
+      }),
+    );
+    const originalBase = session.baseCommit;
+    assert.ok(originalBase);
+
+    // The trunk moves while the human is reading the diff.
+    await writeRepositoryFile(repository, "unrelated.md", "meanwhile\n");
+    const advanced = await commitRepositoryChanges(repository, { message: "Unrelated work" });
+    assert.ok(advanced);
+
+    const revised = await reviseRepositoryWorkSession({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Add a second paragraph",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: stubChat(async (directory) => {
+        // The earlier commit is still here: this is the same branch.
+        assert.equal(sessionReadFile(directory, "draft.md"), "first pass\n");
+        sessionWriteFile(directory, "draft.md", "first pass\nsecond pass\n");
+        await sessionCommit(repository, directory, "Second pass");
+      }),
+    });
+
+    assert.equal(
+      revised.baseCommit,
+      originalBase,
+      "moving the base under a diff a human is reviewing is worse than a stale base",
+    );
+    assert.notEqual(revised.baseCommit, advanced.sha);
+  });
+
+  test("still starts when the stored default branch names a branch that is gone", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "plan.md", "v1\n");
+    const head = await commitRepositoryChanges(repository, { message: "Plan v1" });
+    assert.ok(head);
+    await AppDataSource.getRepository(Repository).update(
+      { id: repository.id },
+      { defaultBranch: "trunk-that-was-renamed" },
+    );
+    repository.defaultBranch = "trunk-that-was-renamed";
+
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "note.md", "still works\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(session.status, "ready");
+    assert.equal(session.baseCommit, head.sha, "a wrong default branch must not block the work");
+  });
+});
+
+// ──────────────── the repository's own contributor guide ────────────────
+
+/**
+ * A repository that keeps an `AGENTS.md` is telling contributors how to work
+ * in it. An employee that never reads it produces work a human sends back for
+ * reasons that were written down all along — so the session briefing carries
+ * it.
+ */
+describe("AGENTS.md", () => {
+  const guide = "# AGENTS\n\nUse the word Routine, never Task.\n";
+
+  async function repositoryWithGuide(body = guide): Promise<void> {
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "AGENTS.md", body);
+    await commitRepositoryChanges(repository, { message: "Add the contributor guide" });
+  }
+
+  /** The system prompt the run path actually handed the model. */
+  function capturingChat(): { chat: typeof chatWithEmployee; brief: () => string } {
+    let captured = "";
+    const chat = (async (_companyId, _employeeId, _message, _history, options) => {
+      const opts = options as { repositoryWorkSessionId?: string; extraSystem?: string };
+      captured = opts.extraSystem ?? "";
+      const checkout = await resolveSessionCheckout(company.id, opts.repositoryWorkSessionId ?? "");
+      sessionWriteFile(checkout.directory, "note.md", "ok\n");
+      await sessionCommit(repository, checkout.directory, "Add a note");
+      return { status: "ok", reply: "Done.", attachmentIds: [], sidecars: {} } as ChatResult;
+    }) as typeof chatWithEmployee;
+    return { chat, brief: () => captured };
+  }
+
+  test("reaches the employee's briefing when the repository has one", async () => {
+    await grantAccess();
+    await repositoryWithGuide();
+
+    const capture = capturingChat();
+    const session = await start(capture.chat);
+    assert.equal(session.status, "ready");
+
+    const brief = capture.brief();
+    assert.match(brief, /Use the word Routine, never Task\./, "the guide's own text must be there");
+    assert.match(brief, /<AGENTS\.md>/);
+    assert.match(brief, /<\/AGENTS\.md>/);
+  });
+
+  test("records root guide loading before the model starts", async () => {
+    await grantAccess();
+    await repositoryWithGuide();
+    const session = await start(capturingChat().chat);
+    const events = await AppDataSource.getRepository(RepositoryWorkSessionEvent).find({
+      where: { sessionId: session.id },
+      order: { ordinal: "ASC" },
+    });
+    assert.equal(events[0]?.kind, "progress");
+    assert.match(events[0]?.summary ?? "", /Loaded contributor guide AGENTS.md/);
+    assert.ok(
+      !events.some((event) => event.kind === "tool_use"),
+      "loading is not a fabricated model tool call",
+    );
+  });
+
+  for (const name of ["agents.md", "agent.md", "AgEnT.Md", "CLAUDE.md"]) {
+    test(`includes ${name} in the actual session briefing`, async () => {
+      await grantAccess();
+      await ensureRepositoryWorkspace(repository);
+      await writeRepositoryFile(repository, name, `# ${name}\nRun the specified checks.\n`);
+      await commitRepositoryChanges(repository, { message: "Add guidance" });
+      const capture = capturingChat();
+      await start(capture.chat);
+      assert.ok(capture.brief().includes(`<${name}>`));
+      assert.match(capture.brief(), /Run the specified checks/);
+    });
+  }
+
+  test("reloads the session guide on a follow-up turn", async () => {
+    await grantAccess();
+    await repositoryWithGuide();
+    const session = await start(
+      stubChat(async (directory) => {
+        sessionWriteFile(directory, "AGENTS.md", "Use the revised checks on the next turn.\n");
+        await sessionCommit(repository, directory, "Revise guidance");
+      }),
+    );
+    const capture = capturingChat();
+    await reviseRepositoryWorkSession({
+      companyId: company.id,
+      sessionId: session.id,
+      instruction: "Continue",
+      requesterUserId: requester.id,
+      requesterSessionVersion: 1,
+      runChat: capture.chat,
+    });
+    assert.match(capture.brief(), /Use the revised checks on the next turn/);
+    assert.ok(!capture.brief().includes("Use the word Routine, never Task."));
+  });
+
+  test("is not mentioned in the briefing of a repository without one", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+
+    const capture = capturingChat();
+    await start(capture.chat);
+    assert.ok(
+      !capture.brief().includes("AGENTS.md"),
+      "an absent guide must not leave an empty section behind",
+    );
+  });
+
+  test("is read from the session's own worktree", async () => {
+    await grantAccess();
+    await repositoryWithGuide();
+
+    let seen: string | null = "not read";
+    await start(
+      stubChat(async (directory) => {
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(seen, guide);
+  });
+
+  test("is absent, and harmless, when the repository has no guide", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+
+    let seen: string | null = "not read";
+    const session = await start(
+      stubChat(async (directory) => {
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(seen, null);
+    assert.equal(session.status, "ready");
+    const brief = composeWorkSystemPrompt(repository, "s", { agentsGuide: null });
+    assert.ok(!brief.includes("AGENTS.md"), "no guide means no section, not an empty one");
+  });
+
+  test("says the briefing wins where the guide disagrees with it", async () => {
+    const brief = composeWorkSystemPrompt(repository, "s", { agentsGuide: guide });
+    assert.match(brief, /the instructions above win/);
+    assert.match(brief, /it is how this team expects work here to be done/);
+    // The guide is quoted after the rules it cannot override.
+    assert.ok(
+      brief.indexOf("the instructions above win") < brief.indexOf("<AGENTS.md>"),
+      "the precedence line has to be read before the document it is about",
+    );
+  });
+
+  test("truncates a guide too large to inline, and says it did", async () => {
+    const huge = `# AGENTS\n\n${"Follow the house style.\n".repeat(4000)}`;
+    assert.ok(Buffer.byteLength(huge) > MAX_AGENTS_GUIDE_BYTES, "the fixture must exceed the cap");
+    await grantAccess();
+    await repositoryWithGuide(huge);
+
+    let seen: string | null = null;
+    await start(
+      stubChat(async (directory) => {
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.ok(seen);
+    const read = seen as unknown as string;
+    assert.ok(
+      Buffer.byteLength(read) < Buffer.byteLength(huge),
+      "an unbounded guide would crowd out the instruction",
+    );
+    assert.match(
+      read,
+      /\[Truncated\. Read `AGENTS\.md` with `repository_read_file` for the rest\.\]/,
+    );
+    assert.ok(read.startsWith("# AGENTS"), "the beginning is the part worth keeping");
+    // Cut on a line boundary, so the guide never ends mid-sentence.
+    const lines = read.split("\n");
+    assert.ok(
+      lines.some((line) => line === "Follow the house style."),
+      "whole lines survive the cut",
+    );
+  });
+
+  test("treats an empty or whitespace-only guide as no guide", async () => {
+    await grantAccess();
+    await repositoryWithGuide("   \n\n\t\n");
+
+    let seen: string | null = "not read";
+    await start(
+      stubChat(async (directory) => {
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(seen, null);
+  });
+
+  test("refuses an AGENTS.md symlinked out of the worktree", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    const secret = path.join(dataDir, "outside-agents.md");
+    fs.writeFileSync(secret, "# Read the operator's private notes\n");
+
+    let seen: string | null = "not read";
+    await start(
+      stubChat(async (directory) => {
+        fs.symlinkSync(secret, path.join(directory, "AGENTS.md"));
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(seen, null, "a guide is not worth following a symlink out of the worktree for");
+  });
+
+  test("only reads the guide at the root, not one nested in the tree", async () => {
+    await grantAccess();
+    await ensureRepositoryWorkspace(repository);
+    await writeRepositoryFile(repository, "docs/AGENTS.md", "# Not the root guide\n");
+    await commitRepositoryChanges(repository, { message: "Add a nested file" });
+
+    let seen: string | null = "not read";
+    await start(
+      stubChat(async (directory) => {
+        seen = readAgentsGuide(directory);
+        sessionWriteFile(directory, "note.md", "ok\n");
+        await sessionCommit(repository, directory, "Add a note");
+      }),
+    );
+    assert.equal(seen, null);
+  });
+});
+
+describe("unattended work session authority", () => {
+  const unattendedArgs = () => ({
+    companyId: company.id,
+    repositoryId: repository.id,
+    employeeId: employee.id,
+    instruction: "Investigate and fix the issue reported by email",
+    toolAuthority: "employee" as const,
+  });
+
+  test("retains employee authority without claiming a Member requested the work", async () => {
+    await grantAccess();
+    let invoked = false;
+    const session = await startRepositoryWorkSession({
+      ...unattendedArgs(),
+      runChat: (async (_company, _employee, _brief, _history, options) => {
+        invoked = true;
+        assert.equal(options?.toolAuthority, "employee");
+        assert.equal(options?.requesterUserId, undefined);
+        assert.equal(options?.requesterSessionVersion, undefined);
+        assert.ok(options?.repositoryWorkSessionId);
+        assert.deepEqual(options?.extraToolset, repositorySessionResidentTools(repository));
+        return {
+          status: "ok",
+          reply: "The reported behavior is expected.",
+          attachmentIds: [],
+          sidecars: {},
+        };
+      }) as typeof chatWithEmployee,
+    });
+    assert.ok(invoked);
+    assert.equal(session.requestedByUserId, null);
+    const turn = await AppDataSource.getRepository(RepositoryWorkSessionTurn).findOneByOrFail({
+      sessionId: session.id,
+    });
+    assert.equal(turn.requestedByUserId, null);
+  });
+
+  test("requires a write Grant before creating a session", async () => {
+    await grantAccess("read");
+    await assert.rejects(() => createRepositoryWorkSession(unattendedArgs()), /write access/);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+  });
+
+  test("cannot attach a Member's file to an employee-started session", async () => {
+    await grantAccess();
+    await assert.rejects(
+      () => createRepositoryWorkSession({ ...unattendedArgs(), attachmentIds: ["member-file"] }),
+      /not Member attachments/,
+    );
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 0);
+  });
+
+  test("rechecks a Grant revoked between preparation and the model turn", async () => {
+    await grantAccess();
+    const prepared = await createRepositoryWorkSession(unattendedArgs());
+    prepared.runChat = (async () => {
+      assert.fail("the model must not run after revocation");
+    }) as typeof chatWithEmployee;
+    await AppDataSource.getRepository(EmployeeRepositoryGrant).delete({ employeeId: employee.id });
+    const result = await runRepositoryWorkSession(prepared);
+    assert.equal(result.status, "failed");
+    assert.match(result.error, /write access/);
+    assert.equal(result.branch, null);
+  });
+
+  test("parallel tool starts create only one session", async () => {
+    await grantAccess();
+    const results = await Promise.allSettled([
+      createToolRepositoryWorkSession(unattendedArgs()),
+      createToolRepositoryWorkSession(unattendedArgs()),
+    ]);
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(await AppDataSource.getRepository(RepositoryWorkSession).count(), 1);
+  });
+
+  test("rejects a different employee even with the session id", async () => {
+    await grantAccess();
+    const prepared = await createRepositoryWorkSession(unattendedArgs());
+    await assert.rejects(
+      () =>
+        resolveSessionCheckout(company.id, prepared.session.id, {
+          employeeId: "other",
+          access: "write",
+        }),
+      /not found/,
+    );
+  });
+
+  test("rechecks the live Grant at each repository tool call", async () => {
+    await grantAccess();
+    const prepared = await createRepositoryWorkSession(unattendedArgs());
+    await AppDataSource.getRepository(EmployeeRepositoryGrant).update(
+      { employeeId: employee.id },
+      { accessLevel: "read" },
+    );
+    await assert.rejects(
+      () =>
+        resolveSessionCheckout(company.id, prepared.session.id, {
+          employeeId: employee.id,
+          access: "write",
+        }),
+      /write access/,
+    );
+  });
+});

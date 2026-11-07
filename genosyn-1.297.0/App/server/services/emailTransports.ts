@@ -1,0 +1,854 @@
+import nodemailer from "nodemailer";
+import { config } from "../../config.js";
+import { parseAddressList } from "../lib/emailAddress.js";
+import { assertPublicOutboundHost } from "../lib/outboundUrl.js";
+import type { EmailProviderKind } from "../db/entities/EmailProvider.js";
+import {
+  formatGlobalSmtpSender,
+  getEffectiveGlobalSmtp,
+} from "./globalEmailTransport.js";
+import { splitAddressList } from "./mail/mime.js";
+
+/**
+ * Transport adapters for every supported email provider kind. Each adapter
+ * accepts a decrypted, validated config blob and a normalized message; it
+ * returns a `messageId` on success or throws with a user-friendly string
+ * (the message is shown in the Email Logs UI and on the Test button).
+ *
+ * Adding a new provider:
+ *   1. Extend `EmailProviderKind` in the entity.
+ *   2. Define its config shape + `validateConfig<Kind>` here.
+ *   3. Implement `send<Kind>` and register it in `TRANSPORTS` below.
+ *   4. Add the kind to `PROVIDER_CATALOG` so the UI knows how to render
+ *      the connect form.
+ */
+
+export type EmailAttachment = {
+  /** Display filename, e.g. "INV-0001.pdf". */
+  filename: string;
+  /** Raw file bytes. */
+  content: Buffer;
+  /** MIME type, e.g. "application/pdf". */
+  contentType: string;
+};
+
+export type EmailMessage = {
+  to: string;
+  cc?: string;
+  subject: string;
+  text: string;
+  html?: string;
+  fromAddress: string;
+  replyTo?: string;
+  /** Optional file attachments (e.g. an invoice / estimate PDF). */
+  attachments?: EmailAttachment[];
+};
+
+export type EmailSendResult = {
+  messageId: string;
+};
+
+export type SmtpConfig = {
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  pass: string;
+};
+
+export type SendGridConfig = {
+  apiKey: string;
+};
+
+export type MailgunRegion = "us" | "eu";
+export type MailgunConfig = {
+  apiKey: string;
+  domain: string;
+  region: MailgunRegion;
+};
+
+export type ResendConfig = {
+  apiKey: string;
+};
+
+export type PostmarkConfig = {
+  serverToken: string;
+};
+
+export type EmailProviderConfig =
+  | { kind: "smtp"; config: SmtpConfig }
+  | { kind: "sendgrid"; config: SendGridConfig }
+  | { kind: "mailgun"; config: MailgunConfig }
+  | { kind: "resend"; config: ResendConfig }
+  | { kind: "postmark"; config: PostmarkConfig };
+
+/**
+ * Catalog metadata for the UI — describes the form fields each provider
+ * needs and a short pitch for the picker. Pure data so the React client
+ * can render forms generically without per-provider components.
+ */
+export type EmailProviderField = {
+  key: string;
+  label: string;
+  type: "text" | "password" | "number" | "checkbox" | "select";
+  required: boolean;
+  placeholder?: string;
+  hint?: string;
+  options?: { value: string; label: string }[];
+  defaultValue?: string | number | boolean;
+};
+
+export type EmailProviderCatalogEntry = {
+  kind: EmailProviderKind;
+  name: string;
+  tagline: string;
+  description: string;
+  /** Lucide icon name. */
+  icon: string;
+  fields: EmailProviderField[];
+  /**
+   * Optional non-secret prefill for the connect form, applied only when
+   * adding a *new* provider. Used to seed the SMTP form from the install-wide
+   * global SMTP transport so operators don't retype host / port / user.
+   * Secrets (the password) are never included here.
+   */
+  prefill?: {
+    from?: string;
+    fields?: Record<string, string | number | boolean>;
+  };
+};
+
+export const PROVIDER_CATALOG: EmailProviderCatalogEntry[] = [
+  {
+    kind: "smtp",
+    name: "SMTP",
+    tagline: "Any SMTP server — Gmail, Office 365, Postfix, or your provider.",
+    description:
+      "Generic SMTP transport. Works with Gmail (use an App Password), Office 365, Amazon SES SMTP, or any RFC-compliant server.",
+    icon: "Server",
+    fields: [
+      {
+        key: "host",
+        label: "Host",
+        type: "text",
+        required: true,
+        placeholder: "smtp.example.com",
+      },
+      {
+        key: "port",
+        label: "Port",
+        type: "number",
+        required: true,
+        defaultValue: 587,
+        hint: "Common: 587 (STARTTLS), 465 (implicit TLS), 25 (plaintext relay). TLS mode is auto-detected for these ports.",
+      },
+      {
+        key: "secure",
+        label: "Use implicit TLS",
+        type: "checkbox",
+        required: false,
+        defaultValue: false,
+        hint: "Auto-detected for standard ports (465 on, 587/25 off). Only tick this for a non-standard port that needs implicit TLS.",
+      },
+      {
+        key: "user",
+        label: "Username",
+        type: "text",
+        required: false,
+        placeholder: "no-reply@example.com",
+      },
+      {
+        key: "pass",
+        label: "Password",
+        type: "password",
+        required: false,
+        hint: "App password for Gmail / Workspace; leave blank for unauthenticated relays.",
+      },
+    ],
+  },
+  {
+    kind: "sendgrid",
+    name: "SendGrid",
+    tagline: "Twilio SendGrid — high-volume transactional email API.",
+    description:
+      "Send via SendGrid's v3 Mail Send API. Create a restricted API key with Mail Send permission at app.sendgrid.com/settings/api_keys.",
+    icon: "Send",
+    fields: [
+      {
+        key: "apiKey",
+        label: "API key",
+        type: "password",
+        required: true,
+        placeholder: "SG.xxxxxxxx",
+      },
+    ],
+  },
+  {
+    kind: "mailgun",
+    name: "Mailgun",
+    tagline: "Mailgun by Sinch — domain-based transactional API.",
+    description:
+      "Send via Mailgun's HTTP API. You need a verified sending domain and a Mailgun API key (Settings → API security).",
+    icon: "Mail",
+    fields: [
+      {
+        key: "apiKey",
+        label: "API key",
+        type: "password",
+        required: true,
+        placeholder: "key-xxxxxxxx",
+      },
+      {
+        key: "domain",
+        label: "Sending domain",
+        type: "text",
+        required: true,
+        placeholder: "mg.example.com",
+      },
+      {
+        key: "region",
+        label: "Region",
+        type: "select",
+        required: true,
+        defaultValue: "us",
+        options: [
+          { value: "us", label: "US (api.mailgun.net)" },
+          { value: "eu", label: "EU (api.eu.mailgun.net)" },
+        ],
+      },
+    ],
+  },
+  {
+    kind: "resend",
+    name: "Resend",
+    tagline: "Resend.com — modern transactional email API.",
+    description:
+      "Send via the Resend HTTP API. Create an API key at resend.com/api-keys; the From address must use a verified domain.",
+    icon: "AtSign",
+    fields: [
+      {
+        key: "apiKey",
+        label: "API key",
+        type: "password",
+        required: true,
+        placeholder: "re_xxxxxxxx",
+      },
+    ],
+  },
+  {
+    kind: "postmark",
+    name: "Postmark",
+    tagline: "Postmark by ActiveCampaign — fast transactional delivery.",
+    description:
+      "Send via Postmark's Email API. Create a Server token at account.postmarkapp.com — the token is per server, not per account.",
+    icon: "Mailbox",
+    fields: [
+      {
+        key: "serverToken",
+        label: "Server token",
+        type: "password",
+        required: true,
+        placeholder: "POSTMARK_SERVER_TOKEN",
+      },
+    ],
+  },
+];
+
+export function getProviderCatalogEntry(
+  kind: EmailProviderKind,
+): EmailProviderCatalogEntry | null {
+  return PROVIDER_CATALOG.find((p) => p.kind === kind) ?? null;
+}
+
+/**
+ * The connect-form catalog, with the SMTP entry pre-seeded from the effective
+ * global SMTP transport when the operator has configured one at Admin →
+ * Email transport. Only non-secret
+ * fields are seeded — the password is never exposed, so the form leaves it
+ * blank for the user to enter. When no global SMTP host is configured the
+ * catalog is returned unchanged.
+ */
+export async function buildProviderCatalog(): Promise<
+  EmailProviderCatalogEntry[]
+> {
+  const eff = await getEffectiveGlobalSmtp();
+  if (!eff.configured || !eff.settings.host) return PROVIDER_CATALOG;
+  const s = eff.settings;
+  const fields: Record<string, string | number | boolean> = {
+    host: s.host,
+    port: s.port,
+    secure: s.secure,
+  };
+  if (s.user) fields.user = s.user;
+  return PROVIDER_CATALOG.map((entry) =>
+    entry.kind === "smtp"
+      ? {
+          ...entry,
+          prefill: { from: formatGlobalSmtpSender(s) || undefined, fields },
+        }
+      : entry,
+  );
+}
+
+// ───────────────────────── validation ──────────────────────────────────────
+
+function asString(v: unknown, label: string, required: boolean): string {
+  if (v === undefined || v === null || v === "") {
+    if (required) throw new Error(`${label} is required`);
+    return "";
+  }
+  if (typeof v !== "string") throw new Error(`${label} must be a string`);
+  return v.trim();
+}
+
+function asInt(v: unknown, label: string, def: number): number {
+  if (v === undefined || v === null || v === "") return def;
+  const n = typeof v === "number" ? v : parseInt(String(v), 10);
+  if (!Number.isFinite(n)) throw new Error(`${label} must be a number`);
+  return n;
+}
+
+function asBool(v: unknown): boolean {
+  if (v === undefined || v === null) return false;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") return v === "true" || v === "1";
+  return Boolean(v);
+}
+
+/**
+ * Parse + validate an arbitrary form payload into a discriminated config.
+ * Throws with a user-friendly message on the first invalid field.
+ */
+export function validateProviderConfig(
+  kind: EmailProviderKind,
+  raw: Record<string, unknown>,
+): EmailProviderConfig {
+  switch (kind) {
+    case "smtp": {
+      const host = asString(raw["host"], "Host", true);
+      const port = asInt(raw["port"], "Port", 587);
+      const secure = asBool(raw["secure"]);
+      const user = asString(raw["user"], "Username", false);
+      const pass = asString(raw["pass"], "Password", false);
+      return { kind, config: { host, port, secure, user, pass } };
+    }
+    case "sendgrid": {
+      const apiKey = asString(raw["apiKey"], "API key", true);
+      return { kind, config: { apiKey } };
+    }
+    case "mailgun": {
+      const apiKey = asString(raw["apiKey"], "API key", true);
+      const domain = asString(raw["domain"], "Sending domain", true);
+      const regionRaw = asString(raw["region"], "Region", true).toLowerCase();
+      if (regionRaw !== "us" && regionRaw !== "eu") {
+        throw new Error("Region must be 'us' or 'eu'");
+      }
+      return {
+        kind,
+        config: { apiKey, domain, region: regionRaw as MailgunRegion },
+      };
+    }
+    case "resend": {
+      const apiKey = asString(raw["apiKey"], "API key", true);
+      return { kind, config: { apiKey } };
+    }
+    case "postmark": {
+      const serverToken = asString(raw["serverToken"], "Server token", true);
+      return { kind, config: { serverToken } };
+    }
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unknown email provider kind: ${exhaustive as string}`);
+    }
+  }
+}
+
+/**
+ * Mask sensitive fields so the UI can render existing config without leaking
+ * passwords. Used by the GET endpoint when returning a provider summary.
+ */
+export function maskedProviderSummary(
+  kind: EmailProviderKind,
+  config: EmailProviderConfig["config"],
+): Record<string, string> {
+  switch (kind) {
+    case "smtp": {
+      const c = config as SmtpConfig;
+      return {
+        host: c.host,
+        port: String(c.port),
+        secure: c.secure ? "true" : "false",
+        user: c.user,
+      };
+    }
+    case "sendgrid":
+    case "resend": {
+      return { apiKey: maskKey((config as { apiKey: string }).apiKey) };
+    }
+    case "mailgun": {
+      const c = config as MailgunConfig;
+      return {
+        apiKey: maskKey(c.apiKey),
+        domain: c.domain,
+        region: c.region,
+      };
+    }
+    case "postmark": {
+      const c = config as PostmarkConfig;
+      return { serverToken: maskKey(c.serverToken) };
+    }
+  }
+}
+
+function maskKey(s: string): string {
+  if (!s) return "";
+  if (s.length <= 8) return "••••";
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
+}
+
+// ───────────────────────── smtp helpers ─────────────────────────────────────
+
+/**
+ * Reconcile the TLS mode with the port so a mis-ticked "secure" checkbox
+ * can't produce the opaque OpenSSL error `wrong version number`.
+ *
+ * That error is what you get when nodemailer runs an *implicit* TLS handshake
+ * (`secure: true`) against a port that actually speaks plaintext first: the
+ * server's `220 …` greeting is read as a TLS record header and OpenSSL rejects
+ * the version bytes. The inverse (`secure: false` against an implicit-TLS
+ * port) hangs waiting for a plaintext greeting.
+ *
+ * Implicit TLS is standard only on 465. Port 587 (submission) and 25 speak
+ * plaintext and upgrade via STARTTLS. Deriving the mode from these well-known
+ * ports makes the Test button forgiving; non-standard ports keep whatever the
+ * operator explicitly chose.
+ */
+/**
+ * Ports an SMTP submission or relay endpoint may legitimately listen on.
+ *
+ * The point is not that other ports never serve mail — it is that a free
+ * integer here lets a tenant admin aim a TCP connection at any port on the
+ * operator's private network. 2525 is included because several hosted
+ * providers publish it as a fallback where 587 is blocked upstream.
+ */
+export const ALLOWED_SMTP_PORTS = new Set([25, 465, 587, 2525]);
+
+/**
+ * Refuse an SMTP target that a hosted tenant must not be able to reach.
+ *
+ * `installOutboundNetworkPolicy` patches the global http/https agents and the
+ * undici dispatcher, and nodemailer uses none of them — it opens a raw TCP
+ * socket. So the one field on this form that takes a hostname was the one
+ * outbound path with no destination check at all: a tenant admin could point a
+ * provider at `10.0.0.5:6379` and read the connection outcome back off the
+ * Test button, which is a working port scanner of the operator's cluster
+ * network. The non-standard-port branch of {@link resolveSmtpTransportSecurity}
+ * makes it a plaintext one, which is the protocol-smuggling primitive against
+ * anything line-tolerant listening there.
+ *
+ * Multi-tenant only, and deliberately so. A single-tenant install pointing at
+ * `smtp.internal:25` or a sidecar relay is an ordinary, correct configuration,
+ * and the admin already owns the network they would be scanning. Shared SaaS
+ * boots with an empty `outboundPrivateHostAllowlist` — `validateRuntimeSecurity`
+ * refuses otherwise — so there is no hosted escape hatch through that list.
+ */
+export async function assertSmtpTargetAllowed(host: string, port: number): Promise<void> {
+  if (!config.security.multiTenant) return;
+  if (!ALLOWED_SMTP_PORTS.has(port)) {
+    throw new Error(
+      `SMTP port ${port} is not allowed. Use 25, 465, 587 or 2525.`,
+    );
+  }
+  // Resolves the name and rejects every non-public answer, so a hostname that
+  // maps to link-local, RFC1918 or loopback fails here rather than at connect.
+  await assertPublicOutboundHost(host);
+}
+
+export function resolveSmtpTransportSecurity(
+  port: number,
+  secure: boolean,
+): { secure: boolean; requireTLS: boolean } {
+  switch (port) {
+    case 465:
+      return { secure: true, requireTLS: false };
+    case 587:
+      // Submission port: never implicit TLS, but require the STARTTLS upgrade
+      // so we don't silently fall back to sending credentials in the clear.
+      return { secure: false, requireTLS: true };
+    case 25:
+      // Relay port: opportunistic STARTTLS, but tolerate plaintext-only relays.
+      return { secure: false, requireTLS: false };
+    default:
+      return { secure, requireTLS: false };
+  }
+}
+
+/**
+ * Turn a raw nodemailer/OpenSSL SMTP failure into a message an operator can
+ * act on. The TLS-handshake mismatch surfaces as `wrong version number`
+ * (wrapped by nodemailer as an `ESOCKET` error) — cryptic unless you already
+ * know it means "your port and encryption mode disagree".
+ */
+export function explainSmtpError(err: unknown, port: number): string {
+  const raw = (err instanceof Error ? err.message : String(err)).trim();
+  const code = (err as { code?: string })?.code ?? "";
+  if (/wrong version number/i.test(raw) || /ERR_SSL/i.test(raw)) {
+    return (
+      `TLS handshake failed on port ${port} (${raw}). The port and encryption ` +
+      `mode disagree — use port 465 for implicit TLS, or port 587 for ` +
+      `STARTTLS. Check the host and port and try again.`
+    );
+  }
+  if (code === "ETIMEDOUT" || /greeting never received/i.test(raw)) {
+    return (
+      `The SMTP server at port ${port} did not respond (${raw}). If this is an ` +
+      `implicit-TLS server use port 465; otherwise check the host, port, and ` +
+      `that the server is reachable from Genosyn.`
+    );
+  }
+  return raw;
+}
+
+// ───────────────────────── senders ─────────────────────────────────────────
+
+async function sendSmtp(
+  cfg: SmtpConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  await assertSmtpTargetAllowed(cfg.host, cfg.port);
+  const { secure, requireTLS } = resolveSmtpTransportSecurity(
+    cfg.port,
+    cfg.secure,
+  );
+  const transport = nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure,
+    requireTLS,
+    // Bound the pathological hang (e.g. plaintext client against an implicit
+    // TLS port) so the Test button fails fast instead of spinning forever.
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    auth: cfg.user ? { user: cfg.user, pass: cfg.pass } : undefined,
+  });
+  try {
+    const info = await transport.sendMail({
+      from: msg.fromAddress,
+      to: msg.to,
+      cc: msg.cc || undefined,
+      subject: msg.subject,
+      text: msg.text,
+      html: msg.html,
+      replyTo: msg.replyTo || undefined,
+      attachments: msg.attachments?.map((a) => ({
+        filename: a.filename,
+        content: a.content,
+        contentType: a.contentType,
+      })),
+    });
+    return { messageId: info.messageId ?? "" };
+  } catch (err) {
+    throw new Error(explainSmtpError(err, cfg.port));
+  }
+}
+
+async function sendSendGrid(
+  cfg: SendGridConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  const { name, email } = parseAddress(msg.fromAddress);
+  const to = sendGridRecipients("To", msg.to);
+  // SendGrid refuses an address named in both To and Cc. Whoever is already
+  // in To still receives the message.
+  const cc = sendGridRecipients("Cc", msg.cc).filter(
+    (recipient) => !to.some((toRecipient) => toRecipient.email === recipient.email),
+  );
+  const body: Record<string, unknown> = {
+    personalizations: [{ to, ...(cc.length > 0 ? { cc } : {}) }],
+    from: name ? { email, name } : { email },
+    reply_to: msg.replyTo
+      ? { email: parseAddress(msg.replyTo).email }
+      : undefined,
+    subject: msg.subject,
+    content: [
+      { type: "text/plain", value: msg.text },
+      ...(msg.html ? [{ type: "text/html", value: msg.html }] : []),
+    ],
+  };
+  if (msg.attachments && msg.attachments.length > 0) {
+    body["attachments"] = msg.attachments.map((a) => ({
+      content: a.content.toString("base64"),
+      filename: a.filename,
+      type: a.contentType,
+      disposition: "attachment",
+    }));
+  }
+  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`SendGrid ${res.status}: ${detail || res.statusText}`);
+  }
+  // SendGrid returns the message id in this header on success.
+  const messageId = res.headers.get("x-message-id") ?? "";
+  return { messageId };
+}
+
+async function sendMailgun(
+  cfg: MailgunConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  const base =
+    cfg.region === "eu"
+      ? "https://api.eu.mailgun.net/v3"
+      : "https://api.mailgun.net/v3";
+  const url = `${base}/${encodeURIComponent(cfg.domain)}/messages`;
+  const auth = "Basic " + Buffer.from(`api:${cfg.apiKey}`).toString("base64");
+  // Attachments require multipart/form-data; without them we keep the
+  // lighter urlencoded body. In the multipart branch we let fetch derive
+  // the Content-Type header (with its boundary) from the FormData instance.
+  let res: Awaited<ReturnType<typeof fetch>>;
+  if (msg.attachments && msg.attachments.length > 0) {
+    const form = new FormData();
+    form.append("from", msg.fromAddress);
+    form.append("to", msg.to);
+    if (msg.cc) form.append("cc", msg.cc);
+    form.append("subject", msg.subject);
+    form.append("text", msg.text);
+    if (msg.html) form.append("html", msg.html);
+    if (msg.replyTo) form.append("h:Reply-To", msg.replyTo);
+    for (const a of msg.attachments) {
+      form.append(
+        "attachment",
+        new Blob([new Uint8Array(a.content)], { type: a.contentType }),
+        a.filename,
+      );
+    }
+    res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: auth },
+      body: form,
+    });
+  } else {
+    const form = new URLSearchParams();
+    form.set("from", msg.fromAddress);
+    form.set("to", msg.to);
+    if (msg.cc) form.set("cc", msg.cc);
+    form.set("subject", msg.subject);
+    form.set("text", msg.text);
+    if (msg.html) form.set("html", msg.html);
+    if (msg.replyTo) form.set("h:Reply-To", msg.replyTo);
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form.toString(),
+    });
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    let msgText = text || res.statusText;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.message === "string")
+        msgText = parsed.message;
+    } catch {
+      // not JSON — keep raw text
+    }
+    throw new Error(`Mailgun ${res.status}: ${msgText}`);
+  }
+  let messageId = "";
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.id === "string") messageId = parsed.id;
+  } catch {
+    // Mailgun normally returns JSON; if not, leave id empty
+  }
+  return { messageId };
+}
+
+async function sendResend(
+  cfg: ResendConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  const body: Record<string, unknown> = {
+    from: msg.fromAddress,
+    // One string per recipient, as written: Resend reads `Name <address>`
+    // itself, so a name still shows beside its address. Not a plain split on
+    // commas — a quoted name such as `"Doe, Zoë"` holds one.
+    to: splitAddressList(msg.to),
+    subject: msg.subject,
+    text: msg.text,
+  };
+  if (msg.cc) body["cc"] = splitAddressList(msg.cc);
+  if (msg.html) body["html"] = msg.html;
+  if (msg.replyTo) body["reply_to"] = msg.replyTo;
+  if (msg.attachments && msg.attachments.length > 0) {
+    body["attachments"] = msg.attachments.map((a) => ({
+      filename: a.filename,
+      content: a.content.toString("base64"),
+    }));
+  }
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = null;
+  }
+  if (!res.ok) {
+    const errMsg =
+      (parsed &&
+      typeof parsed === "object" &&
+      "message" in parsed &&
+      typeof (parsed as { message?: unknown }).message === "string"
+        ? (parsed as { message: string }).message
+        : null) ??
+      text ??
+      res.statusText;
+    throw new Error(`Resend ${res.status}: ${errMsg}`);
+  }
+  const messageId =
+    parsed &&
+    typeof parsed === "object" &&
+    "id" in parsed &&
+    typeof (parsed as { id?: unknown }).id === "string"
+      ? (parsed as { id: string }).id
+      : "";
+  return { messageId };
+}
+
+async function sendPostmark(
+  cfg: PostmarkConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  const body: Record<string, unknown> = {
+    From: msg.fromAddress,
+    To: msg.to,
+    Subject: msg.subject,
+    TextBody: msg.text,
+    MessageStream: "outbound",
+  };
+  if (msg.cc) body["Cc"] = msg.cc;
+  if (msg.html) body["HtmlBody"] = msg.html;
+  if (msg.replyTo) body["ReplyTo"] = msg.replyTo;
+  if (msg.attachments && msg.attachments.length > 0) {
+    body["Attachments"] = msg.attachments.map((a) => ({
+      Name: a.filename,
+      Content: a.content.toString("base64"),
+      ContentType: a.contentType,
+    }));
+  }
+  const res = await fetch("https://api.postmarkapp.com/email", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Postmark-Server-Token": cfg.serverToken,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = null;
+  }
+  if (!res.ok) {
+    const errMsg =
+      (parsed &&
+      typeof parsed === "object" &&
+      "Message" in parsed &&
+      typeof (parsed as { Message?: unknown }).Message === "string"
+        ? (parsed as { Message: string }).Message
+        : null) ??
+      text ??
+      res.statusText;
+    throw new Error(`Postmark ${res.status}: ${errMsg}`);
+  }
+  const messageId =
+    parsed &&
+    typeof parsed === "object" &&
+    "MessageID" in parsed &&
+    typeof (parsed as { MessageID?: unknown }).MessageID === "string"
+      ? (parsed as { MessageID: string }).MessageID
+      : "";
+  return { messageId };
+}
+
+/**
+ * Single dispatch entry point. Routes to the right adapter based on the
+ * discriminated `kind` so callers don't need to know about provider types.
+ */
+export async function sendViaProvider(
+  provider: EmailProviderConfig,
+  msg: EmailMessage,
+): Promise<EmailSendResult> {
+  switch (provider.kind) {
+    case "smtp":
+      return sendSmtp(provider.config, msg);
+    case "sendgrid":
+      return sendSendGrid(provider.config, msg);
+    case "mailgun":
+      return sendMailgun(provider.config, msg);
+    case "resend":
+      return sendResend(provider.config, msg);
+    case "postmark":
+      return sendPostmark(provider.config, msg);
+    default: {
+      const exhaustive: never = provider;
+      throw new Error(
+        `Unknown provider: ${(exhaustive as { kind: string }).kind}`,
+      );
+    }
+  }
+}
+
+/** `Acme <no-reply@acme.com>` → `{name: "Acme", email: "no-reply@acme.com"}`. */
+export function parseAddress(addr: string): { name: string; email: string } {
+  const trimmed = addr.trim();
+  const match = /^(.*)<([^>]+)>\s*$/.exec(trimmed);
+  if (match) {
+    return {
+      name: match[1].trim().replace(/^"|"$/g, ""),
+      email: match[2].trim(),
+    };
+  }
+  return { name: "", email: trimmed };
+}
+
+/**
+ * The `{ email }` objects SendGrid's personalizations take for a To or Cc list.
+ *
+ * SendGrid wants a bare address there (a name has its own field, which these
+ * sends have never filled) and refuses a personalization that names the same
+ * address twice, so the list is read by `parseAddressList`: a quoted name
+ * holding a comma stays one recipient, each address is lowercased, and a
+ * repeat is dropped. An entry that does not read as an address fails the send
+ * rather than being left out, so nobody the message was addressed to is
+ * quietly skipped.
+ */
+function sendGridRecipients(label: "To" | "Cc", value: string | undefined): { email: string }[] {
+  const { addresses, invalid } = parseAddressList(value);
+  if (invalid.length > 0) {
+    throw new Error(`${label} contains an invalid email address: ${invalid[0]}`);
+  }
+  return addresses.map((email) => ({ email }));
+}

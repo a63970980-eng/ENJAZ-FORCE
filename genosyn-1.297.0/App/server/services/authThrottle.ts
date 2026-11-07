@@ -1,0 +1,199 @@
+import crypto from "node:crypto";
+import type { Request } from "express";
+import { LessThan } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { AuthRateLimit } from "../db/entities/AuthRateLimit.js";
+import { config } from "../../config.js";
+
+export class AuthRateLimitError extends Error {
+  constructor(public readonly retryAfterSeconds: number) {
+    super("Too many attempts. Try again later.");
+    this.name = "AuthRateLimitError";
+  }
+}
+
+function idFor(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+/** A bucket for one identity alone: a company, or a visitor a token already proved. */
+export function throttleKeyFor(scope: string, identity: string): string {
+  return idFor(`${scope}:identity:${identity.trim().toLowerCase()}`);
+}
+
+export function authThrottleKeys(req: Request, scope: string, identity?: string): string[] {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const keys = [idFor(`${scope}:ip:${ip}`)];
+  if (identity) keys.push(idFor(`${scope}:identity:${identity.trim().toLowerCase()}`));
+  return keys;
+}
+
+async function ensureRow(id: string, now: Date): Promise<void> {
+  await AppDataSource.getRepository(AuthRateLimit)
+    .createQueryBuilder()
+    .insert()
+    .values({ id, attempts: 0, windowStartedAt: now, blockedUntil: null })
+    .orIgnore()
+    .execute();
+}
+
+async function mutate(
+  id: string,
+  fn: (row: AuthRateLimit, now: Date) => void,
+): Promise<AuthRateLimit> {
+  const now = new Date();
+  await ensureRow(id, now);
+  if (config.db.driver !== "postgres") {
+    const repo = AppDataSource.getRepository(AuthRateLimit);
+    const row = await repo.findOneByOrFail({ id });
+    fn(row, now);
+    return repo.save(row);
+  }
+  return AppDataSource.transaction(async (manager) => {
+    const repo = manager.getRepository(AuthRateLimit);
+    const row = await repo.findOneOrFail({
+      where: { id },
+      lock: { mode: "pessimistic_write" },
+    });
+    fn(row, now);
+    return repo.save(row);
+  });
+}
+
+/** How many attempts a bucket admits per window, and how long it then stays shut. */
+export type AuthRateLimitPolicy = {
+  windowMinutes: number;
+  maxAttempts: number;
+  blockMinutes: number;
+};
+
+function resetExpiredWindow(
+  row: AuthRateLimit,
+  now: Date,
+  policy: AuthRateLimitPolicy = config.security.authRateLimit,
+): void {
+  const windowMs = policy.windowMinutes * 60_000;
+  if (now.getTime() - row.windowStartedAt.getTime() >= windowMs) {
+    row.windowStartedAt = now;
+    row.attempts = 0;
+    row.blockedUntil = null;
+  }
+  if (row.blockedUntil && row.blockedUntil <= now) {
+    row.windowStartedAt = now;
+    row.attempts = 0;
+    row.blockedUntil = null;
+  }
+}
+
+const sqliteBucketTails = new Map<string, Promise<void>>();
+
+/** Serialize one SQLite bucket without making unrelated identities wait. */
+async function withSqliteBucketLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const previous = sqliteBucketTails.get(id) ?? Promise.resolve();
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sqliteBucketTails.set(id, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (sqliteBucketTails.get(id) === tail) sqliteBucketTails.delete(id);
+  }
+}
+
+function consumeRow(row: AuthRateLimit, now: Date, policy: AuthRateLimitPolicy): void {
+  resetExpiredWindow(row, now, policy);
+  if (row.blockedUntil && row.blockedUntil > now) {
+    throw new AuthRateLimitError(
+      Math.max(1, Math.ceil((row.blockedUntil.getTime() - now.getTime()) / 1000)),
+    );
+  }
+  row.attempts += 1;
+  if (row.attempts >= policy.maxAttempts) {
+    row.blockedUntil = new Date(now.getTime() + policy.blockMinutes * 60_000);
+  }
+}
+
+/** Atomically admit and count one attempt against one persistent bucket. */
+async function consumeBucket(id: string, policy: AuthRateLimitPolicy): Promise<void> {
+  await ensureRow(id, new Date());
+  if (config.db.driver === "postgres") {
+    await AppDataSource.transaction(async (manager) => {
+      const repo = manager.getRepository(AuthRateLimit);
+      const row = await repo.findOneOrFail({
+        where: { id },
+        lock: { mode: "pessimistic_write" },
+      });
+      consumeRow(row, new Date(), policy);
+      await repo.save(row);
+    });
+    return;
+  }
+
+  await withSqliteBucketLock(id, async () => {
+    const repo = AppDataSource.getRepository(AuthRateLimit);
+    const row = await repo.findOneByOrFail({ id });
+    consumeRow(row, new Date(), policy);
+    await repo.save(row);
+  });
+}
+
+export async function assertAuthAllowed(keys: string[]): Promise<void> {
+  const now = new Date();
+  for (const id of keys) {
+    // Only reads: no row is a clean record, and asking must not leave one. Public
+    // pages ask on every visit, and a visitor's address is not ours to keep.
+    const row = await AppDataSource.getRepository(AuthRateLimit).findOneBy({ id });
+    if (row?.blockedUntil && row.blockedUntil > now) {
+      throw new AuthRateLimitError(
+        Math.max(1, Math.ceil((row.blockedUntil.getTime() - now.getTime()) / 1000)),
+      );
+    }
+  }
+}
+
+export async function recordAuthFailure(keys: string[]): Promise<void> {
+  for (const id of keys) {
+    await mutate(id, (row, now) => {
+      resetExpiredWindow(row, now);
+      row.attempts += 1;
+      if (row.attempts >= config.security.authRateLimit.maxAttempts) {
+        row.blockedUntil = new Date(
+          now.getTime() + config.security.authRateLimit.blockMinutes * 60_000,
+        );
+      }
+    });
+  }
+}
+
+export async function clearAuthFailures(keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  await AppDataSource.getRepository(AuthRateLimit).delete(keys);
+}
+
+/** How many attempts a bucket has admitted in its window, without counting another. */
+export async function peekAuthAttempts(id: string, windowMinutes: number): Promise<number> {
+  const row = await AppDataSource.getRepository(AuthRateLimit).findOneBy({ id });
+  if (!row) return 0;
+  return Date.now() - row.windowStartedAt.getTime() >= windowMinutes * 60_000 ? 0 : row.attempts;
+}
+
+/** Forget buckets nobody has touched since `before`. Their windows are long over. */
+export async function pruneAuthRateLimits(before: Date): Promise<void> {
+  await AppDataSource.getRepository(AuthRateLimit).delete({ updatedAt: LessThan(before) });
+}
+
+/**
+ * Count every request for endpoints that intentionally hide account existence,
+ * or that anyone may call but that write a row. `policy` defaults to the sign-in
+ * limits at `security.authRateLimit`.
+ */
+export async function consumeAuthAttempt(
+  keys: string[],
+  policy: AuthRateLimitPolicy = config.security.authRateLimit,
+): Promise<void> {
+  for (const id of keys) await consumeBucket(id, policy);
+}

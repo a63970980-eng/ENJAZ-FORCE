@@ -1,0 +1,353 @@
+import {
+  Callout,
+  Code,
+  DocLink,
+  H2,
+  H3,
+  KeyList,
+  LI,
+  OL,
+  P,
+  PageHeader,
+  Strong,
+  UL,
+} from "@/docs/Prose";
+
+export function RevenueOperations() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Revenue"
+        title="Revenue operations"
+        lead={
+          <>
+            Run the daily follow-up queue, keep prospect accounts structured, manage partnerships
+            and formal documents, and migrate Base, CSV, JSON, or NDJSON records safely. These
+            workflows live under <Code>Revenue</Code> and use the same services whether a Member or
+            an AI Employee does the work.
+          </>
+        }
+      />
+
+      <H2 id="follow-ups">Follow-ups</H2>
+      <P>
+        Open <Code>Revenue → Follow-ups</Code> for one chronological queue across deal follow-up
+        dates, partnership follow-up dates, and task activities. Switch between{" "}
+        <Strong>Overdue</Strong>, <Strong>Today</Strong>, and <Strong>Upcoming</Strong> rather than
+        opening every deal to find what needs attention.
+      </P>
+      <P>
+        A deal carries a dedicated <Strong>Next follow-up</Strong> and optional reminder alongside
+        its plain-language <Strong>Next step</Strong>. A follow-up task adds the task controls: due
+        date, open/completed/cancelled status, Member or AI Employee assignee, priority, reminder,
+        and daily, weekly, or monthly recurrence. Completing a recurring task creates the next
+        occurrence automatically.
+      </P>
+      <P>
+        Every row has a <Strong>Done</Strong> check. On a task it completes the task; on a deal or
+        partnership row it clears that record&apos;s next follow-up date and reminder, which is what
+        the bulk <Strong>Complete</Strong> does to the same rows, and leaves the deal or
+        partnership itself alone. The row leaves the queue and keyboard focus moves to the next
+        row&apos;s Done, so working down the list is Enter, Enter, Enter. A task about an account
+        alone links to that account.
+      </P>
+      <P>
+        <Strong>New follow-up</Strong> opens due at 09:00 on the next working day (a follow-up made
+        on Friday is due Monday), so a subject and Enter create one; change <Strong>Due</Strong>{" "}
+        for any other time. The deal page&apos;s <Strong>Follow-up task</Strong> starts on the
+        deal&apos;s own follow-up date, or the same next working morning when it has none. Times
+        are saved as the moment you picked in your own time zone.
+      </P>
+      <P>
+        A follow-up task saved without a due date is still work to pick up, so the queue lists it
+        after every dated row, oldest first, marked <Strong>No due date</Strong>. The{" "}
+        <Strong>No due date</Strong> filter shows them alone or leaves them out; Overdue, Today,
+        Upcoming and any due-date range leave them out on their own, since an undated task is never
+        due in a window.
+      </P>
+      <P>
+        Filter by arbitrary assignee or unassigned, priority, resource type and ID, status, due-date
+        range, age, Deal Stage/status, or closed Deals. Select rows to complete, cancel, reassign,
+        reprioritize, or reschedule them together. For filter-wide dry runs and rollback, use{" "}
+        <DocLink to="/docs/revenue-data-quality#bulk">Data quality → Bulk operations</DocLink>.
+      </P>
+      <Callout kind="tip" title="Use the queue as the daily sales home.">
+        Deal close dates forecast revenue. Follow-up dates decide what you do today. Keep both; they
+        answer different questions.
+      </Callout>
+
+      <H2 id="accounts">Prospect and customer accounts</H2>
+      <P>
+        <Code>Revenue → Accounts</Code> is the company record from first prospect conversation
+        through billing and renewal. Create a prospect without creating an invoice, then keep the
+        same record when it becomes a customer. Issuing its first invoice promotes a prospect to{" "}
+        <Strong>Customer</Strong> automatically.
+      </P>
+      <KeyList
+        rows={[
+          {
+            term: "Firmographics",
+            def: "Domain, website, industry, employee count, headquarters, parent company, and account status.",
+          },
+          {
+            term: "Relationship",
+            def: "A Member or AI Employee owner, account notes, contacts, and open deals.",
+          },
+          {
+            term: "Finance",
+            def: "Billing details, ACV, invoices, contracts, and statements on the same Customer row.",
+          },
+        ]}
+      />
+      <P>
+        Domain is normalized and used for duplicate protection. Contacts keep their free-text
+        company name too, because a person&apos;s employer and the legal billing entity can differ.
+        Accounts with linked Revenue or finance history cannot be hard-deleted; archive them so
+        their timeline remains intact.
+      </P>
+      <P>
+        Creating an account opens it, ready for its contacts and deals. <Strong>Archive</Strong>{" "}
+        on an account&apos;s page takes one click: nothing is lost, the archived banner appears at
+        once, and the same button becomes <Strong>Restore</Strong> — the undo.
+      </P>
+
+      <H2 id="custom-fields">Typed custom fields</H2>
+      <P>
+        Open <Code>Revenue → Advanced → Setup</Code> to add company-specific fields to contacts, accounts,
+        deals, or partnerships. Fields can be text, number, date, yes/no, URL, single select, or
+        multi-select. Mark a field required when every record must carry it.
+      </P>
+      <P>
+        Values are stored separately from notes and normalized for exact filtering, so product
+        interest, current stack, company size, geographic requirements, competitor, procurement
+        status, Stripe IDs, qualification signals, and custom tags stay reportable. AI Employees
+        read and write the same typed values through Revenue tools.
+      </P>
+      <P>
+        Each current value also shows field-level provenance: source type and label, extraction
+        method and observed date, confidence, verification state, verifying Member or AI Employee,
+        and the number of earlier evidence records. Direct Member edits are verified writes. Imports
+        and bulk updates carry stable batch or operation sources; unverified proposals must pass
+        through the review queue before they can replace a current value.
+      </P>
+      <P>
+        Use <Strong>Install Base migration fields</Strong> in Setup or Imports to add the
+        recommended definitions for current monitoring stack, competitor/current provider, product
+        interest, infrastructure size, geographic/compliance requirements, Stripe customer ID,
+        qualification score and signals, procurement/security status, and original Base row ID. The
+        action is idempotent, so running it again does not duplicate definitions. Definitions can be
+        renamed, reordered, required, or archived from Setup; their stable keys do not change.
+      </P>
+
+      <H2 id="controlled-values">Controlled classifications</H2>
+      <P>
+        <Code>Revenue → Advanced → Setup</Code> also owns the controlled lists for deal source, buying
+        committee role, partnership type, and partnership status. Each option has a stable machine
+        value and an editable label. Deal source includes <Strong>Self-Serve Upgrade</Strong> by
+        default. Archive an option to remove it from pickers without changing historical records.
+      </P>
+      <P>
+        Use these lists instead of free typing classifications. One <Code>inbound</Code> value with
+        an <Code>Inbound</Code> label keeps reports whole; separate <Code>Inbound</Code>,{" "}
+        <Code>inbound</Code>, and <Code>website</Code> strings do not.
+      </P>
+      <P>
+        Add, relabel, reorder, archive, or restore classifications in Setup. Deal Stages are managed
+        there too: add and edit stages, change their forecast probability, reorder the board, and
+        archive an unused stage. A stage with an open Deal cannot be archived until those Deals move
+        elsewhere.
+      </P>
+
+      <H2 id="documents">Formal document links</H2>
+      <P>
+        Contact, account, deal, and partnership pages carry a <Strong>Documents</Strong> panel. Link
+        a proposal, RFP, security questionnaire, contract, email attachment, or other formal
+        document as an uploaded file or external URL. The relationship is structured, so Members and
+        AI Employees can find the right document without parsing a description field.
+      </P>
+      <P>
+        Signed customer contracts still have their dedicated{" "}
+        <DocLink to="/docs/customers#contracts">Customers workflow</DocLink>. Revenue document links
+        cover the wider pre-signature and relationship context.
+      </P>
+      <P>
+        Use the pencil action to change a document&apos;s kind, title, notes, or external URL. A
+        linked file can be downloaded directly. Removing the document unlinks the Revenue record; it
+        does not rewrite the source mail message or Base record the file originally came from.
+      </P>
+      <P>
+        Mail sync can also classify relevant attachments and queue reviewed links with source and
+        hash provenance. See{" "}
+        <DocLink to="/docs/revenue-data-quality#document-capture">Revenue document capture</DocLink>
+        .
+      </P>
+
+      <H2 id="activity-audit">Company-wide activity audit</H2>
+      <P>
+        Open <Code>Revenue → Advanced → Activities</Code> to search activity subjects and bodies across the
+        company, filter by kind and date range, inspect a row by its ID, or export the filtered
+        history as CSV. Contact and Deal pages remain the fastest way to understand one
+        relationship; Activities is the audit and cleanup surface.
+      </P>
+      <P>
+        <Strong>Export CSV</Strong> saves every activity the filters match, newest first, in one
+        file with one header row. A large export is read in parts of 10,000; the line under the
+        button counts how many are in so far (&ldquo;Exported 20,000 of 54,321 activities…&rdquo;)
+        and <Strong>Cancel</Strong> stops it. Nothing is saved until every part has arrived. If a
+        part fails, the export stops with the reason beside the button and keeps what it read, and{" "}
+        <Strong>Try again</Strong> carries on from the part that failed. Each part starts after the
+        last activity of the one before, so activities logged while the export runs never shift or
+        repeat anything; they belong to the next export.
+      </P>
+      <P>
+        Through the API, one export file holds at most 10,000 activities. When more match, the{" "}
+        <Code>X-Export-Next-Cursor</Code> response header carries on: send it back as{" "}
+        <Code>cursor</Code> with the same filters for the next file. An AI Employee exports the
+        same way in smaller parts, each one a CSV with its header row that fits what it can read
+        and attach.
+      </P>
+      <P>
+        Notes, calls, meetings, and task activities can be corrected or deleted. Mail, Deal Stage,
+        Sequence, suppression, and Signal activities are immutable because reports and compliance
+        use them as evidence of what the system did. Correcting a manual activity recalculates the
+        linked record&apos;s latest-activity date.
+      </P>
+
+      <H2 id="partnerships">Partnerships</H2>
+      <P>
+        Partnerships are not deals. Open <Code>Revenue → Partnerships</Code> for a partner-specific
+        record with controlled type and status, a separate follow-up date, integration and channel
+        context, notes, custom fields, documents, and its own activity timeline. Creating a
+        partnership opens it.
+      </P>
+      <P>
+        Add multiple Revenue contacts, choose one primary contact, and mark every address that
+        belongs on Reply-All. Those explicit rules stop a partner conversation from silently
+        dropping the technical, channel, or commercial stakeholder.
+      </P>
+      <P>
+        The list puts the soonest follow-up first and partnerships with none last. An archived
+        partnership is not a status: it is hidden until you include archived records, which an AI
+        Employee does too, and it can filter partnerships by a custom field like any other record.
+      </P>
+
+      <H2 id="imports">Base and file migration</H2>
+      <P>
+        Open <Code>Revenue → Advanced → Imports</Code> to move data from a Genosyn Base or upload a{" "}
+        <Code>.csv</Code>, <Code>.json</Code>, <Code>.jsonl</Code>, or <Code>.ndjson</Code> file
+        directly. Genosyn inspects the source first and shows its fields and row count before any
+        mapping or write. Use <Strong>Linked Account + Contact + Deal</Strong> when each legacy row
+        contains all three:
+      </P>
+      <OL>
+        <LI>
+          Install the recommended migration fields, then choose the source Base table or upload a
+          CSV, JSON, or NDJSON file.
+        </LI>
+        <LI>
+          Map the Account, Contact, and Deal fields from the same source row, including Deal Stage
+          and Source when they exist.
+        </LI>
+        <LI>
+          Run a <Strong>dry run</Strong> to see creates, duplicate matches, skipped rows, and the
+          result for each of the three resources. Every Deal decision shows the resolved target Deal
+          Stage and Source. Changing the source, resource type, table, file, or field mapping clears
+          that preview, so the committed rows always match what was reviewed.
+        </LI>
+        <LI>
+          Commit only after reviewing the preview. All three resources and their links are written
+          in one database transaction.
+        </LI>
+      </OL>
+      <P>
+        The importer reuses an Account by normalized domain or name and a Contact by normalized
+        email, then links the Deal to both. Rows from the same batch also reconcile with each other,
+        so ten people from Acme create one Acme Account. The original Base row ID is written into
+        the recommended custom field automatically. Choose Contacts, Accounts, Deals, or
+        Partnerships instead when a source table genuinely contains one resource only.
+      </P>
+      <P>
+        Base select and multi-select cells are resolved from their stored option IDs to the labels
+        shown in the Base before Revenue validates them. Deal Stage accepts an existing Deal Stage
+        name; the common legacy labels <Code>Lead</Code>, <Code>Demo Scheduled</Code>, and{" "}
+        <Code>Proposal Sent</Code> resolve to <Code>New</Code>, <Code>Demo</Code>, and{" "}
+        <Code>Proposal</Code>. If Deal Stage is not mapped, the preview explicitly shows the default
+        Deal Stage that will be used.
+      </P>
+      <P>
+        Every committed batch stores the field mapping, duplicate decisions, and source-row to
+        native-ID map for reconciliation. Source IDs remain stable across retry and replay, whether
+        they came from a source field, JSON object, NDJSON line, or CSV row. Open{" "}
+        <Strong>Report</Strong> to page through decisions without loading the whole batch. For a
+        Base import, <Strong>Migrate attachments</Strong> copies the source row attachments into
+        Revenue Documents after the structured records exist; the pass is idempotent and reports
+        failures separately. Rollback deletes the linked Deals, Contacts, then Accounts only when
+        they are still safe to remove; anything that gained activities, documents, or finance
+        history is kept and reported as blocked. The <Strong>Roll back</Strong> action always asks
+        for destructive confirmation and records the outcome in the reconciliation report.
+      </P>
+      <P>
+        The history list loads summaries rather than every source decision. Open one Import ID for
+        its mapping, page and filter the row-level decisions, or download reconciliation CSV/JSON.
+        Historical Deal timestamps use the separate{" "}
+        <DocLink to="/docs/revenue-data-quality#deal-history">Historical Deal import</DocLink>.
+      </P>
+      <Callout kind="warn" title="Controlled values must exist before import.">
+        Deal sources and partnership type/status are validated through the lists in{" "}
+        <Code>Revenue → Advanced → Setup</Code>. Source labels such as <Code>Inbound</Code> and{" "}
+        <Code>Self-Serve Upgrade</Code> resolve to those native classifications. Add any other
+        values first or the dry run will tell you which rows cannot be created.
+      </Callout>
+
+      <H2 id="ai-native">AI-native operation</H2>
+      <P>
+        Grant an AI Employee Revenue access from{" "}
+        <DocLink to="/docs/revenue#ai-access">Revenue → Advanced → AI access</DocLink>. Its granular tools can
+        administer custom-field definitions, classifications and Deal Stages; own and update
+        Accounts, Contacts, Deals, and Partnerships; preview and merge every core record type with
+        explicit conflict choices; resolve tombstone redirects; archive, restore, bulk triage,
+        audit, reconcile, and undo; search and correct manual activity; manage Sequences and Signal
+        definitions; inspect Deal-history coverage and the commercial-value backlog; review
+        duplicate, domain, commercial-value, and Gmail document evidence; export native and
+        immutable Revenue datasets; and preview, run, reconcile, attach, or roll back Base, CSV,
+        JSON, NDJSON, linked, and historical Deal migrations.
+      </P>
+      <P>
+        Long lists reach every row. Listing or searching contacts answers a page at a time with
+        the total and a cursor to the next page, in the contact list&apos;s own order (most
+        recently touched first, never-touched last); logging an activity between pages moves a
+        contact to the top without making the employee skip anyone else. The follow-up queue
+        includes tasks with no due date, the activity export continues past 10,000 rows, and a
+        custom-field filter matching thousands of records is answered by the database rather than
+        a list of every match.
+      </P>
+      <UL>
+        <LI>
+          <Strong>Read</Strong> exposes the queue, records, classifications, custom fields,
+          documents, activities, and reports.
+        </LI>
+        <LI>
+          <Strong>Write</Strong> allows the employee to perform the same service-backed updates as a
+          Member. Every write is audited and journalled.
+        </LI>
+        <LI>
+          A Base migration also requires access to the source Base, so a Revenue grant cannot be
+          used to read an unrelated Base.
+        </LI>
+        <LI>
+          Finance-derived proposals additionally require a Finance Grant; Stripe evidence requires a
+          Grant to the chosen Stripe Connection; Gmail capture requires the relevant Mail Grant.
+          Exporting Gmail document candidates also requires the source Mail Account ID and a read
+          Grant to that exact mailbox. Revenue access never bypasses those boundaries.
+        </LI>
+      </UL>
+      <H3 id="suggested-routine">A useful sales Routine</H3>
+      <P>
+        Give a sales AI Employee a morning Routine that reads overdue and today&apos;s follow-ups,
+        checks the latest mail and deal activity, updates the next step, drafts the recommended
+        outreach, and creates the next assigned follow-up. Sending still follows the Revenue and
+        mailbox grant levels described in <DocLink to="/docs/sequences">Sequences</DocLink>.
+      </P>
+    </>
+  );
+}

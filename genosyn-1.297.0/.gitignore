@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# Runtime data (SQLite db + per-company filesystem tree)
+data/
+
+# Private SaaS deployment values (keep the chart defaults tracked)
+/Helm/Values/*.yaml
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.claude/
+*.swp
+*.swo
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Misc
+.cache/
+.tmp/
+
+# Browser-check artifacts (screenshots, page snapshots from verification runs)
+output/
+.playwright-cli/

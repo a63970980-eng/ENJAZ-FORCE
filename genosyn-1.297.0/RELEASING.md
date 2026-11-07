@@ -1,0 +1,390 @@
+# Releasing
+
+How to ship a new Genosyn release. Driven by three GitHub Actions workflows
+([`.github/workflows/release.yml`](.github/workflows/release.yml),
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml) and
+[`.github/workflows/site.yml`](.github/workflows/site.yml)) plus the
+single-source-of-truth [`VERSION`](VERSION) file at the repo root.
+
+## TL;DR
+
+```bash
+# from a clean main with the work you want to ship already merged
+echo "<version>" > VERSION                       # bump (semver) — see Versioning
+git add VERSION && git commit -m "chore: bump VERSION to <version>"
+git push origin main                             # ship code to main
+git push origin main:release                     # fast-forward release → fires release.yml
+```
+
+The release workflow then:
+
+1. Reads `VERSION`, validates semver.
+2. Creates a `v<version>` GitHub release with auto-generated notes (skipped
+   if a release with that tag already exists — bump `VERSION` to ship a new
+   one).
+3. Dispatches [`docker.yml`](.github/workflows/docker.yml) against the new
+   tag so semver-tagged images land on GHCR
+   (`ghcr.io/genosyn/app:<version>` etc. — see [Images and tags](#images-and-tags)).
+4. Dispatches [`chart.yml`](.github/workflows/chart.yml) against the same tag
+   so the Helm chart is packaged and pushed to
+   `oci://ghcr.io/genosyn/charts/genosyn` at the same version.
+
+The same push to `release` independently fires
+[`site.yml`](.github/workflows/site.yml), which builds `Home/` and publishes
+genosyn.com. That is the *only* thing that updates the marketing site — see
+[The marketing site](#the-marketing-site).
+
+## Versioning
+
+Since 1.0 we bump **minor** for features and **patch** for fixes — one bump per
+release, chosen by the heaviest commit in it. A release containing any `feat:`
+is a minor even if it also carries fixes. (Pre-1.0 the rule was patch for both,
+which is why the 0.3.x line ran all the way to 0.3.88.)
+The `VERSION` file is the single source of truth — do not maintain version
+numbers in `package.json` files; the build scripts read `VERSION`.
+
+The release workflow refuses to run if `VERSION` isn't valid semver
+(`MAJOR.MINOR.PATCH` with optional `-pre.release` suffix).
+
+## Branches
+
+- **`main`** — where work lands. Merging to main does *not* publish a release.
+- **`release`** — release tracker. Pushing to release fires
+  [`release.yml`](.github/workflows/release.yml). In normal operation
+  `release` is a fast-forward of `main`.
+
+## Step by step
+
+### 1. Make sure `main` is shippable
+
+- CI green on the commit you're about to release.
+- The dev image (`docker.yml`'s `main`-trigger run) successfully built — if
+  the `main`-tagged image is broken, the same image tagged `v<version>` will
+  also break.
+- Skim `git log --oneline origin/release..main` to confirm the commits look
+  right for a release.
+
+### 2. Bump `VERSION`
+
+```bash
+# Pick the next semver — minor for features, patch for fixes (see Versioning):
+echo "<version>" > VERSION
+git add VERSION
+git commit -m "chore: bump VERSION to <version>"
+git push origin main
+```
+
+If you forget this step, the release workflow runs but does nothing — it
+emits a `::notice::` saying the tag already exists. Re-run after bumping.
+
+### When main keeps moving during validation
+
+Main's CI and image builds cancel superseded runs. If frequent pushes prevent
+the full test suite from finishing, pin the chosen main commit, including its
+version bump, to a unique candidate branch and dispatch the same checks there:
+
+```bash
+release_candidate="codex/release-$(cat VERSION)"
+git branch "$release_candidate" main
+git push origin "$release_candidate"
+gh workflow run lint.yml --ref "$release_candidate"
+gh workflow run docker.yml --ref "$release_candidate"
+```
+
+Keep that branch fixed while both workflows run. These are the full checks;
+the separate ref prevents later main pushes from canceling them. Candidate
+images get candidate-branch and SHA tags and do not move `main` or `latest`.
+
+Once both runs are green, fetch the current branches and verify that the
+candidate remains on main and is a fast-forward of release:
+
+```bash
+git fetch origin main release
+git merge-base --is-ancestor "$release_candidate" origin/main
+git merge-base --is-ancestor origin/release "$release_candidate"
+git push origin "$release_candidate":release
+```
+
+Use that push instead of step 3 below, then watch and verify the normal release
+workflows. If release already contains the candidate, verify that newer release
+instead. Never force release backward or reuse a version already published from
+a different commit; choose and validate a new candidate when necessary.
+
+### 3. Fast-forward `release` to `main`
+
+```bash
+git push origin main:release
+```
+
+This is a fast-forward by default; if it isn't (someone pushed straight to
+`release`, or you cherry-picked something), reconcile first — never
+`--force` push `release`.
+
+### 4. Watch the workflows
+
+```bash
+gh run list --workflow=release.yml --limit 3
+gh run watch <id>                              # release.yml: ~30s
+gh run list --workflow=docker.yml --limit 3
+gh run watch <id>                              # docker.yml: ~3-5 min
+gh run list --workflow=site.yml --limit 3
+gh run watch <id>                              # site.yml: ~2 min
+```
+
+The release workflow output should report:
+- `version=<version>` and `tag=v<version>` from the "Read VERSION" step.
+- A new release at `https://github.com/Genosyn/genosyn/releases/tag/v<version>`.
+- A dispatch line for `docker.yml --ref v<version>`.
+
+The docker workflow then publishes the images described in
+[Images and tags](#images-and-tags) below, and the site workflow deploys
+genosyn.com, ending with a "Verify the live site" step that fails the run if
+the site isn't serving the version you just shipped.
+
+### 5. Verify
+
+```bash
+gh release view v<version>
+docker pull ghcr.io/genosyn/app:<version>   # note: no "v" on image tags
+curl -s https://genosyn.com/ | grep -q "<version>" && echo "site is on <version>"
+```
+
+The site check reads the version badge the hero renders from `VERSION`. It is
+the same assertion `site.yml` makes, and it is worth repeating by hand after
+any change to the Cloudflare setup.
+
+If anything looks off, the release row on GitHub can be edited in place;
+the GHCR images are immutable but you can publish a higher patch over the top.
+
+## Images and tags
+
+Three images, named after the repo folder — **not** `genosyn-app` / `genosyn-home`:
+
+- `ghcr.io/genosyn/app` (from [`App/Dockerfile`](App/Dockerfile))
+- `ghcr.io/genosyn/home` (from [`Home/Dockerfile`](Home/Dockerfile))
+- `ghcr.io/genosyn/connect` (from [`Connect/Dockerfile`](Connect/Dockerfile)) — Genosyn
+  Connect, the hosted sign-in service. The Helm chart's `connect.image.tag` defaults to the
+  chart version, so a release that changes Connect ships it with the same tag as the App.
+
+**Image tags carry no `v` prefix.** Only the git tag and the GitHub release do.
+Releasing `VERSION=<version>` gives you git tag `v<version>` but image tag
+`<version>`.
+Mixing these up is the easiest way to chase a phantom "NOT FOUND".
+
+What each trigger pushes, per the `metadata-action` config in
+[`docker.yml`](.github/workflows/docker.yml) (that config is the source of
+truth — if you change it, update this table):
+
+| Trigger | Tags pushed |
+| --- | --- |
+| push to `main` | `main`, `sha-<short>` |
+| tag `v<version>` (dispatched by `release.yml`) | `<version>`, `<major>.<minor>`, `latest`, `sha-<short>` |
+| pull request | none — images build but never push |
+
+`latest` moves **only** on a release, so it always means "newest release" —
+that's what the `genosyn` CLI pulls by default. It comes from
+`metadata-action`'s default `flavor: latest=auto` acting on the `type=semver`
+entries, not from an explicit rule, which is why you won't find it in the
+`tags:` list. A prerelease (`v<version>-rc.1`) never moves it.
+
+Main tip is `:main` or `:sha-<short>` — use those to run unreleased code.
+
+> **Don't add `flavor: latest=false`** if you're trying to stop `latest`
+> tracking something. It suppresses `latest` on *tag* builds — the opposite of
+> what you almost certainly want. Until 1.10.0 a `type=raw,value=latest,
+> enable=<ref==main>` line also tagged `latest` from main, which meant `latest`
+> was whichever build ran most recently, and the CLI shipped dev code to
+> self-hosters. Don't reintroduce it.
+
+## The genosyn-api CLI
+
+There is nothing to publish for it. `npm run build` in `App/` bundles
+`App/cli/` into `dist/cli/genosyn-api.mjs` (`npm run build:cli`), so every App
+image carries the CLI of its own release, stamped with `APP_VERSION`, and every
+install serves it at `/cli/genosyn-api.mjs`. After a release:
+
+```bash
+curl -fsSL https://<an-install>/cli/genosyn-api.mjs -o /tmp/genosyn-api
+node /tmp/genosyn-api --version     # {"cli":"<version>",…}
+```
+
+It is not on npm and not on genosyn.com; the bash `genosyn` CLI that
+genosyn.com serves is the operator's tool and unrelated. Because the CLI reads
+each server's API reference at run time, an older CLI keeps working against a
+newer server — a new operation is a new command without a new CLI.
+
+## The marketing site
+
+genosyn.com and www.genosyn.com are **custom domains on a Cloudflare Worker**,
+not a container. The Worker is named `genosyn` and serves the prerendered
+static bundle Vite writes to `Home/dist/client`. Its config is
+[`Home/wrangler.jsonc`](Home/wrangler.jsonc), which also pins the Cloudflare
+account that owns the zone, the Worker and both domains.
+
+`ghcr.io/genosyn/home` — the image `docker.yml` builds from
+[`Home/Dockerfile`](Home/Dockerfile) — is a *different* deployment of the same
+code, the one self-hosters run behind their own domain. Building that image
+does nothing for genosyn.com.
+
+### What deploys it
+
+[`site.yml`](.github/workflows/site.yml), on every push to `release` that
+touches `Home/**`, `CLI/**` or `VERSION`. It runs `npm run deploy` in `Home/`,
+which is `npm run build` followed by `wrangler deploy` — the same two commands
+you would run by hand, so a laptop deploy and a CI deploy produce the same
+bundle. Wrangler is pinned to a major in the `deploy` script rather than
+installed as a dependency, to keep `workerd` out of every `npm ci` that lint
+and the Dockerfiles run.
+
+To deploy without cutting a release:
+
+```bash
+gh workflow run site.yml --ref release
+```
+
+### The token
+
+`site.yml` needs a `CLOUDFLARE_API_TOKEN` repository secret (Settings →
+Secrets and variables → Actions). Create it in Cloudflare under **My Profile →
+API Tokens → Create Token** from the *Edit Cloudflare Workers* template, scoped
+to the account pinned in `Home/wrangler.jsonc`. If you would rather hand-pick
+permissions, deploying a Worker with static assets needs only **Workers
+Scripts: Edit** and **Account Settings: Read** on that account — the template's
+KV, R2, Tail and Routes grants are for Workers this one doesn't use.
+
+The account id is configuration, not a secret; the token is the secret, and it
+is the only thing the workflow takes from the environment. The job's first step
+fails with a pointed error if it is missing, because wrangler's own fallback is
+an interactive OAuth prompt that just hangs a runner.
+
+### Why this is written down
+
+The site spent two days serving a build sixteen minor versions old while every
+pipeline stayed green. It had no automated deploy at all: it had been published
+exactly once, by hand. That `wrangler deploy` ran with no account pinned, so it
+had also created a second `genosyn` Worker in a personal Cloudflare account
+with no domain attached — and every later deploy "succeeded" into that account
+while genosyn.com went on serving the one build that had landed in the right
+one. A deploy nobody can see in the repo is a deploy nobody notices has
+stopped. Pinning the account closes one half; deploying from CI, with a step
+that asserts the live site actually moved, closes the other.
+
+## Recovery
+
+### "I pushed to `release` but the release workflow didn't fire"
+
+Most likely the VERSION already matched an existing tag. The workflow logs
+will show the `::notice::Release v<version> already exists — bump VERSION to
+ship a new release.` line.
+Bump `VERSION` and push to main, then fast-forward release again.
+
+### "The release was created but no GHCR images appeared"
+
+The "Trigger image build for new tag" step needs `actions: write`
+permission (already in `release.yml`). If a token-permission change has
+broken it, manually dispatch:
+
+```bash
+gh workflow run docker.yml --ref v<version>
+```
+
+### "The docker.yml run for `main` failed but I want to ship anyway"
+
+Don't. The release workflow will re-build the same image off the tag. If
+the build is broken on `main`, fix it on `main` first, then bump VERSION.
+Shipping a known-broken image is worse than slipping a release.
+
+### "I bumped VERSION but something's wrong — can I un-release?"
+
+You can `gh release delete v<version>` and `git push --delete origin
+v<version>`, but the GHCR image tags will stay (registry deletes are manual).
+It is almost always cleaner to ship the next patch with the fix than to try to
+rewind.
+
+### "I shipped a release but genosyn.com still shows the old version"
+
+Look at [`site.yml`](.github/workflows/site.yml) first:
+
+```bash
+gh run list --workflow=site.yml --limit 3
+```
+
+Its last step asserts the live site reports the version that was just shipped,
+so a **green run means the site really did move** and you are looking at a
+stale browser cache — hard-reload before going further.
+
+Red on **"Check deploy credentials"**: the `CLOUDFLARE_API_TOKEN` secret is
+missing or expired. See [The token](#the-token).
+
+Red on **"Verify the live site"**: wrangler uploaded, but the bundle isn't
+reaching the domain. Check that genosyn.com and www.genosyn.com are still
+Custom Domains on the `genosyn` Worker **in the account pinned in
+[`Home/wrangler.jsonc`](Home/wrangler.jsonc)**. A deploy aimed at a different
+account creates a same-named Worker that serves nothing, and reports success
+doing it — that is the exact failure this workflow was written to end.
+
+**No run at all**: the push to `release` touched none of the paths in the
+workflow's filter. Deploy it directly:
+
+```bash
+gh workflow run site.yml --ref release
+```
+
+### "`main` or `release` has red `Workers Builds` checks"
+
+`Workers Builds: genosyn` and `Workers Builds: genosyn-test` are not this
+repo's CI, which is why `gh run list` shows nothing wrong. They are Cloudflare's
+own Git integration, attached to the *second* `genosyn` Worker described in
+[Why this is written down](#why-this-is-written-down) — the one a hand-run
+`wrangler deploy` created in a personal account. Through the **Cloudflare
+Workers and Pages** GitHub App, that account built this repository on every
+push, and failed on every commit after `da43199e` pinned `account_id` in
+[`Home/wrangler.jsonc`](Home/wrangler.jsonc): a deploy into an account the
+config does not name is precisely what the pin refuses.
+
+The app was uninstalled from the Genosyn organization on 2026-09-29, so newer
+commits carry no Workers Builds checks. Older commits keep their red ones,
+because only the app that created a check can change it. genosyn.com never
+needed the app: [`site.yml`](.github/workflows/site.yml) deploys with the
+`CLOUDFLARE_API_TOKEN` secret.
+
+If the checks come back, the app has been reinstalled. Compare the account id in
+the check's **Details** link with the one in `Home/wrangler.jsonc` — that is how
+you tell a stale build from a real one. For a stale build, uninstall the app
+again under **Organization settings → GitHub Apps → Cloudflare Workers and
+Pages → Configure**, or disconnect the Worker under **Workers & Pages → the
+Worker → Settings → Build → Git repository → Disconnect**. Never remove the pin
+to turn them green; that reintroduces the bug `da43199e` fixed.
+
+To see every check on a commit, not just the Actions ones:
+
+```bash
+gh api repos/Genosyn/genosyn/commits/main/check-runs --jq '.check_runs[] | "\(.conclusion)\t\(.name)"'
+```
+
+## Files involved
+
+- [`VERSION`](VERSION) — semver string, no leading `v`.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) —
+  reads `VERSION` and creates the GitHub release.
+- [`.github/workflows/docker.yml`](.github/workflows/docker.yml) —
+  builds and publishes GHCR images for `main` (dev tag) and `v*.*.*` tags
+  (semver tags). Its `metadata-action` config decides the tag list — see
+  [Images and tags](#images-and-tags).
+- [`.github/workflows/chart.yml`](.github/workflows/chart.yml) —
+  lints the Helm chart on PRs/pushes touching `Helm/**`, and on a release tag
+  packages `Helm/genosyn` at the `VERSION` value and pushes it to
+  `oci://ghcr.io/genosyn/charts/genosyn`. Dispatched by `release.yml` for the
+  same recursion-guard reason as `docker.yml`.
+- [`.github/workflows/site.yml`](.github/workflows/site.yml) —
+  builds `Home/` and deploys genosyn.com on every push to `release`. Needs the
+  `CLOUDFLARE_API_TOKEN` secret — see
+  [The marketing site](#the-marketing-site).
+- [`Home/wrangler.jsonc`](Home/wrangler.jsonc) — the Worker's name, the
+  Cloudflare account it deploys into, and how the prerendered assets are
+  served.
+- [`App/Dockerfile`](App/Dockerfile) /
+  [`Home/Dockerfile`](Home/Dockerfile) — what gets built.
+- [`App/cli/build.ts`](App/cli/build.ts) — bundles the `genosyn-api` CLI into
+  the App image; [`App/server/routes/cli.ts`](App/server/routes/cli.ts) serves
+  it. See [The genosyn-api CLI](#the-genosyn-api-cli).

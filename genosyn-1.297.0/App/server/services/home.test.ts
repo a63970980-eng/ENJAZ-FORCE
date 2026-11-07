@@ -1,0 +1,687 @@
+import assert from "node:assert/strict";
+import { after, before, beforeEach, describe, test } from "node:test";
+
+import { AppDataSource } from "../db/datasource.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Approval } from "../db/entities/Approval.js";
+import { BoardLetter } from "../db/entities/BoardLetter.js";
+import { Company } from "../db/entities/Company.js";
+import { EmployeeMailAccountGrant } from "../db/entities/EmployeeMailAccountGrant.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { MailAccount } from "../db/entities/MailAccount.js";
+import { Membership } from "../db/entities/Membership.js";
+import { Notification } from "../db/entities/Notification.js";
+import { Repository } from "../db/entities/Repository.js";
+import { RepositoryWorkSession } from "../db/entities/RepositoryWorkSession.js";
+import { Routine } from "../db/entities/Routine.js";
+import { Run } from "../db/entities/Run.js";
+import { Tldr } from "../db/entities/Tldr.js";
+import { TldrDismissal } from "../db/entities/TldrDismissal.js";
+import { User } from "../db/entities/User.js";
+import { closeTestDb, initTestDb, insert, resetTestDb } from "../test/dbHarness.js";
+import { getHomeData } from "./home.js";
+import { deliverBoardLetter } from "./boardLetterNotice.js";
+import { createDecision } from "./decisions.js";
+import { listHomeRepositoryWork } from "./homeRepositoryWork.js";
+import { createMailReviewApproval } from "./mail/reviewApprovals.js";
+import { createProactiveWorkApproval } from "./proactive/approvals.js";
+import { repositoryCheckoutExists } from "./repositoryWorkspace.js";
+
+/**
+ * Home is an aggregation, not a named lookup, so it is the surface where a
+ * visibility rule enforced on a dedicated route is easiest to forget. These
+ * tests pin the ones that matter: approval copy is redacted here exactly as the
+ * approvals inbox redacts it, and Vault capture rows and letters to the board
+ * stay owner/admin-only.
+ */
+
+before(initTestDb);
+after(closeTestDb);
+beforeEach(resetTestDb);
+
+let company: Company;
+let owner: User;
+let member: User;
+let employee: AIEmployee;
+let sourceRoutine: Routine;
+
+beforeEach(async () => {
+  owner = await insert(User, { email: "owner@example.test", name: "Owner", passwordHash: "x" });
+  member = await insert(User, { email: "member@example.test", name: "Member", passwordHash: "x" });
+  company = await insert(Company, { name: "Acme", slug: "acme", ownerId: owner.id });
+  await insert(Membership, { companyId: company.id, userId: owner.id, role: "owner" });
+  await insert(Membership, { companyId: company.id, userId: member.id, role: "member" });
+  employee = await insert(AIEmployee, {
+    companyId: company.id,
+    name: "Rey",
+    slug: "rey",
+    role: "Support",
+    soulBody: "",
+  });
+  sourceRoutine = await insert(Routine, {
+    employeeId: employee.id,
+    name: "Review customer reports",
+    slug: "review-customer-reports",
+    cronExpr: "0 9 * * *",
+    body: "Review new customer reports and propose useful work.",
+  });
+});
+
+test("Home provides explicit childless metadata for resumable failures and links an existing retry", async () => {
+  const source = await insert(Run, {
+    routineId: sourceRoutine.id,
+    status: "failed",
+    startedAt: new Date(Date.now() - 60_000),
+    finishedAt: new Date(),
+    checkpointJson: JSON.stringify({
+      state: "continue",
+      completed: "First page",
+      remaining: "Second page",
+      resume: "private-source-anchor",
+      progressKey: "page-1",
+    }),
+  });
+  const load = () => getHomeData({ companyId: company.id, userId: owner.id, role: "owner" });
+  const childless = (await load()).failedRuns.find((row) => row.runId === source.id)!;
+  assert.equal(childless.hasUnfinishedWork, true);
+  assert.equal(childless.followUpRun, null);
+  const child = await insert(Run, {
+    routineId: sourceRoutine.id,
+    parentRunId: source.id,
+    triggerKind: "retry",
+    status: "running",
+    startedAt: new Date(),
+  });
+  const linked = (await load()).failedRuns.find((row) => row.runId === source.id)!;
+  assert.equal(linked.followUpRun?.id, child.id);
+  assert.equal(linked.followUpRun?.status, "running");
+  assert.doesNotMatch(JSON.stringify(linked), /private-source-anchor|checkpointJson/);
+  await AppDataSource.getRepository(Run).update(child.id, { triggerKind: "continuation" });
+  assert.equal(
+    (await load()).failedRuns.some((row) => row.runId === source.id),
+    false,
+  );
+});
+
+async function approval(overrides: Partial<Approval> = {}): Promise<Approval> {
+  const kind = overrides.kind ?? "browser_action";
+  if (
+    kind === "proactive_work" &&
+    (overrides.companyId === undefined || overrides.companyId === company.id) &&
+    overrides.payloadJson === undefined
+  ) {
+    const title = overrides.title ?? "Investigate customer report";
+    const created = await createProactiveWorkApproval({
+      companyId: company.id,
+      employeeId: employee.id,
+      title,
+      context: "A customer reported a problem.",
+      plan: "Investigate the report and verify the result.",
+      origin: { routineId: sourceRoutine.id },
+    });
+    created.summary = overrides.summary ?? created.summary;
+    created.requestedAt = overrides.requestedAt ?? created.requestedAt;
+    return AppDataSource.getRepository(Approval).save(created);
+  }
+  const payloadJson =
+    overrides.payloadJson ??
+    (kind === "proactive_work"
+      ? JSON.stringify({
+          version: 1,
+          title: overrides.title ?? "Investigate customer report",
+          context: "A customer reported a problem.",
+          plan: "Investigate the report and verify the result.",
+          origin: { routineId: "routine-source" },
+          sourceFingerprint: "source-fingerprint",
+          dedupeKey: "dedupe-key",
+        })
+      : "{}");
+  return insert(Approval, {
+    companyId: company.id,
+    kind,
+    routineId: "",
+    employeeId: employee.id,
+    title: "Submit the form",
+    summary: "Send reviewed data",
+    payloadJson,
+    resultJson: null,
+    errorMessage: null,
+    status: "pending",
+    decidedAt: null,
+    decidedByUserId: null,
+    ...overrides,
+  });
+}
+
+describe("Home approval visibility", () => {
+  test("puts proactive plans in the admin review stack without duplicating other approvals", async () => {
+    for (let index = 0; index < 7; index++) {
+      await approval({
+        kind: "proactive_work",
+        title: `Investigate customer report ${index}`,
+        summary: "Read the reported failure. token=secret-review-token must stay private.",
+        requestedAt: new Date(2026, 8, 10, 10, index),
+      });
+    }
+    await approval();
+    const data = await getHomeData({ companyId: company.id, userId: owner.id, role: "owner" });
+    assert.equal(data.pendingDecisionApprovalCount, 7);
+    assert.equal(data.decisionApprovals.length, 5);
+    assert.equal(data.decisionApprovals[0].title, "Investigate customer report 0");
+    assert.equal(data.decisionApprovals[0].employee?.id, employee.id);
+    assert.ok(!data.decisionApprovals[0].summary?.includes("secret-review-token"));
+    assert.equal(data.pendingApprovalCount, 1);
+    assert.equal(data.approvals[0].kind, "browser_action");
+  });
+
+  test("never exposes Decision-stack Approvals to ordinary Members or another company", async () => {
+    await approval({ kind: "proactive_work", summary: "Sensitive customer work" });
+    await approval({ kind: "proactive_work", companyId: "another-company" });
+    const data = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.deepEqual(data.decisionApprovals, []);
+    assert.equal(data.pendingDecisionApprovalCount, 0);
+    assert.equal(data.pendingApprovalCount, 0);
+    assert.deepEqual(data.approvals, []);
+    const ownerData = await getHomeData({ companyId: company.id, userId: owner.id, role: "owner" });
+    assert.equal(ownerData.pendingDecisionApprovalCount, 1);
+    const apiKeyData = await getHomeData({
+      companyId: company.id,
+      userId: owner.id,
+      role: "owner",
+      canReadWorkReviews: false,
+    });
+    assert.deepEqual(apiKeyData.decisionApprovals, []);
+    assert.equal(apiKeyData.pendingDecisionApprovalCount, 0);
+  });
+
+  test("puts an exact email review in the Decision stack, not ordinary Approvals", async () => {
+    const connection = await insert(IntegrationConnection, {
+      companyId: company.id,
+      provider: "imap",
+      label: "Support inbox",
+      authMode: "apikey",
+      encryptedConfig: "unused-in-this-test",
+      accountHint: "support@example.test",
+      status: "connected",
+    });
+    const account = await insert(MailAccount, {
+      companyId: company.id,
+      connectionId: connection.id,
+      provider: "imap",
+      address: "support@example.test",
+      status: "active",
+    });
+    await insert(EmployeeMailAccountGrant, {
+      employeeId: employee.id,
+      accountId: account.id,
+      accessLevel: "draft",
+    });
+    await createMailReviewApproval({
+      companyId: company.id,
+      employeeId: employee.id,
+      accountId: account.id,
+      to: "customer@example.test",
+      subject: "Shipping date",
+      context: "A customer asked when the fix will ship.",
+      bodyText: "The fix is scheduled for Tuesday.",
+    });
+
+    const data = await getHomeData({
+      companyId: company.id,
+      userId: owner.id,
+      role: "owner",
+    });
+    assert.equal(data.pendingDecisionApprovalCount, 1);
+    assert.equal(data.decisionApprovals[0].review?.kind, "mail");
+    assert.equal(data.pendingApprovalCount, 0);
+    assert.deepEqual(data.approvals, []);
+
+    connection.status = "error";
+    await AppDataSource.getRepository(IntegrationConnection).save(connection);
+    const stale = await getHomeData({
+      companyId: company.id,
+      userId: owner.id,
+      role: "owner",
+    });
+    assert.equal(stale.pendingDecisionApprovalCount, 0);
+    assert.deepEqual(stale.decisionApprovals, []);
+  });
+
+  test("redacts credential material out of approval copy for everyone", async () => {
+    await approval({
+      title: "Replay POST with Authorization: Bearer sk-live-abc123",
+      summary: "token=hunter2 was in the query string",
+    });
+    for (const [user, role] of [
+      [owner, "owner"],
+      [member, "member"],
+    ] as const) {
+      const data = await getHomeData({ companyId: company.id, userId: user.id, role });
+      assert.equal(data.approvals.length, 1);
+      assert.ok(
+        !data.approvals[0].title?.includes("sk-live-abc123"),
+        data.approvals[0].title ?? "",
+      );
+      assert.ok(!data.approvals[0].summary?.includes("hunter2"), data.approvals[0].summary ?? "");
+    }
+  });
+
+  test("hides Vault capture rows from a Member, as GET /approvals does", async () => {
+    await approval({
+      title: "Save the login for shop.example.test",
+      payloadJson: JSON.stringify({ action: "vault_capture" }),
+    });
+    await approval({ title: "Ordinary submit", payloadJson: JSON.stringify({ action: "submit" }) });
+
+    const asMember = await getHomeData({
+      companyId: company.id,
+      userId: member.id,
+      role: "member",
+    });
+    assert.deepEqual(
+      asMember.approvals.map((a) => a.title),
+      ["Ordinary submit"],
+    );
+
+    const asOwner = await getHomeData({ companyId: company.id, userId: owner.id, role: "owner" });
+    assert.equal(asOwner.approvals.length, 2);
+  });
+});
+
+describe("Home decision stack", () => {
+  test("carries the pending stack, urgency first, with its true total", async () => {
+    for (const [title, urgency] of [
+      ["Normal", "normal"],
+      ["Urgent", "high"],
+      ["Whenever", "low"],
+    ] as const) {
+      await createDecision({
+        companyId: company.id,
+        employeeId: employee.id,
+        title,
+        options: [{ label: "Yes" }, { label: "No" }],
+        urgency,
+      });
+    }
+
+    const data = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.equal(data.pendingDecisionCount, 3);
+    assert.deepEqual(
+      data.decisions.map((d) => d.title),
+      ["Urgent", "Normal", "Whenever"],
+    );
+    assert.equal(data.decisions[0].employee?.name, "Rey");
+    assert.deepEqual(
+      data.decisions[0].options.map((o) => o.label),
+      ["Yes", "No"],
+    );
+  });
+
+  test("is empty for a company whose employees are unblocked", async () => {
+    const data = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.deepEqual(data.decisions, []);
+    assert.equal(data.pendingDecisionCount, 0);
+  });
+});
+
+describe("Home TLDR briefings", () => {
+  test("returns up to three undismissed briefings and a per-Member unread count", async () => {
+    const rows: Tldr[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const periodEnd = new Date(Date.UTC(2026, 7, 20, 8 + index));
+      rows.push(
+        await insert(Tldr, {
+          companyId: company.id,
+          employeeId: employee.id,
+          employeeName: employee.name,
+          employeeSlug: employee.slug,
+          employeeRole: employee.role,
+          employeeAvatarKey: null,
+          status: "ready",
+          triggerKind: "schedule",
+          periodStart: new Date(periodEnd.getTime() - 60 * 60_000),
+          periodEnd,
+          title: `Brief ${index}`,
+          summary: `Summary ${index}`,
+          body: `Body ${index}`,
+          sourceStatsJson: JSON.stringify({
+            journalEntries: 1,
+            routineRuns: 0,
+            channelMessages: 0,
+            channels: 0,
+          }),
+          errorMessage: "",
+          finishedAt: periodEnd,
+          createdAt: periodEnd,
+        }),
+      );
+    }
+    await insert(TldrDismissal, {
+      companyId: company.id,
+      tldrId: rows[3].id,
+      userId: member.id,
+    });
+
+    const memberHome = await getHomeData({
+      companyId: company.id,
+      userId: member.id,
+      role: "member",
+    });
+    assert.equal(memberHome.unreadTldrCount, 3);
+    assert.deepEqual(
+      memberHome.tldrs.map((tldr) => tldr.title),
+      ["Brief 2", "Brief 1", "Brief 0"],
+    );
+
+    const ownerHome = await getHomeData({
+      companyId: company.id,
+      userId: owner.id,
+      role: "owner",
+    });
+    assert.equal(ownerHome.unreadTldrCount, 4);
+    assert.equal(ownerHome.tldrs.length, 3);
+    assert.equal(ownerHome.tldrs[0].title, "Brief 3");
+  });
+});
+
+describe("Home letters to the board", () => {
+  const originalLog = console.log;
+
+  /** A finished letter, told to the board the way the scheduler tells it. */
+  async function deliveredLetter(number: number, month: string, summary: string) {
+    const periodStart = new Date(`${month}-01T00:00:00Z`);
+    const letter = await insert(BoardLetter, {
+      companyId: company.id,
+      number,
+      month,
+      periodStart,
+      periodEnd: new Date(Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + 1)),
+      status: "ready",
+      startedAt: periodStart,
+      writtenAt: periodStart,
+      figuresJson: JSON.stringify({ figures: [], goals: [] }),
+      writerEmployeeId: employee.id,
+      writerName: employee.name,
+      writerRole: employee.role,
+      auditStatus: "exceptions",
+      auditorName: "Otto",
+      auditFindingsJson: JSON.stringify([{ quote: summary, problem: "Unsupported." }]),
+      untracedCount: 1,
+      summary,
+      body: `${summary} The rest of the letter.`,
+    });
+    // The email goes to the console when no transport is set up.
+    console.log = () => undefined;
+    try {
+      assert.equal(await deliverBoardLetter(letter.id), true);
+    } finally {
+      console.log = originalLog;
+    }
+    return letter;
+  }
+
+  async function boardMember(email: string, role: "admin" | "member"): Promise<User> {
+    const user = await insert(User, { email, name: email, passwordHash: "x" });
+    await insert(Membership, { companyId: company.id, userId: user.id, role });
+    return user;
+  }
+
+  test("shows each owner and admin the newest letter they have not read, and how many wait", async () => {
+    const admin = await boardMember("admin@example.test", "admin");
+    await deliveredLetter(1, "2026-08", "August held steady.");
+    await deliveredLetter(2, "2026-09", "September grew 41%.");
+
+    for (const [user, role] of [
+      [owner, "owner"],
+      [admin, "admin"],
+    ] as const) {
+      const data = await getHomeData({ companyId: company.id, userId: user.id, role });
+      assert.equal(data.unreadBoardLetterCount, 2, role);
+      assert.equal(data.boardLetter?.number, 2, role);
+      assert.equal(data.boardLetter?.monthLabel, "September 2026");
+      assert.equal(data.boardLetter?.summary, "September grew 41%.");
+      assert.equal(data.boardLetter?.auditStatus, "exceptions");
+      assert.equal(data.boardLetter?.findingsCount, 1);
+      assert.equal(data.boardLetter?.untracedCount, 1);
+      // A summary, never the letter itself or what its writer was given.
+      assert.equal("body" in (data.boardLetter ?? {}), false);
+      assert.equal("figures" in (data.boardLetter ?? {}), false);
+      // The bell rows stay where they are for the board.
+      assert.equal(
+        data.notifications.filter((row) => row.kind === "board_letter_ready").length,
+        2,
+        role,
+      );
+    }
+  });
+
+  test("never gives a Member a letter, not even the bell row a former admin kept", async () => {
+    const formerAdmin = await boardMember("former-admin@example.test", "admin");
+    await deliveredLetter(1, "2026-09", "September grew 41%.");
+    await AppDataSource.getRepository(Membership).update(
+      { companyId: company.id, userId: formerAdmin.id },
+      { role: "member" },
+    );
+    // The row is still theirs and still unread: Home leaves it out, it is not absent.
+    assert.equal(
+      await AppDataSource.getRepository(Notification).countBy({
+        companyId: company.id,
+        userId: formerAdmin.id,
+        kind: "board_letter_ready",
+      }),
+      1,
+    );
+
+    for (const user of [member, formerAdmin]) {
+      const data = await getHomeData({ companyId: company.id, userId: user.id, role: "member" });
+      assert.equal(data.boardLetter, null);
+      assert.equal(data.unreadBoardLetterCount, 0);
+      assert.deepEqual(data.notifications, []);
+      assert.equal(data.unreadNotificationCount, 0);
+      assert.doesNotMatch(JSON.stringify(data), /to the board|September grew|board_letter/);
+    }
+  });
+});
+
+async function repository(overrides: Partial<Repository> = {}): Promise<Repository> {
+  return insert(Repository, {
+    companyId: company.id,
+    name: "Strategy",
+    slug: "strategy",
+    origin: "local",
+    kind: "documents",
+    gitUrl: "",
+    ...overrides,
+  });
+}
+
+async function workSession(
+  repo: Repository,
+  overrides: Partial<RepositoryWorkSession> = {},
+): Promise<RepositoryWorkSession> {
+  return insert(RepositoryWorkSession, {
+    companyId: repo.companyId,
+    repositoryId: repo.id,
+    employeeId: employee.id,
+    requestedByUserId: owner.id,
+    title: "Review the strategy",
+    instruction: "Rewrite the company strategy",
+    status: "ready",
+    ...overrides,
+  });
+}
+
+describe("Home Repository AI work", () => {
+  test("lists every unarchived state needing a Member and excludes running or decided work", async () => {
+    const repo = await repository();
+    for (const status of [
+      "ready",
+      "empty",
+      "proposed",
+      "failed",
+      "running",
+      "published",
+      "discarded",
+    ] as const) {
+      await workSession(repo, { status, title: status });
+      await workSession(repo, { status, title: `Archived ${status}`, archivedAt: new Date() });
+    }
+
+    const data = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.equal(data.repositoryWorkCount, 4);
+    assert.deepEqual(data.repositoryWork.map((session) => session.title).sort(), [
+      "empty",
+      "failed",
+      "proposed",
+      "ready",
+    ]);
+    assert.equal(data.repositoryWork[0].employee?.name, "Rey");
+  });
+
+  test("combines repositories and employee-initiated work without depending on a reachable checkout", async () => {
+    const local = await repository();
+    const remote = await repository({
+      name: "Product",
+      slug: "product",
+      origin: "remote",
+      kind: "code",
+      gitUrl: "https://genosyn.invalid/acme/product.git",
+      encryptedToken: "not-for-home",
+    });
+    const localSession = await workSession(local);
+    const autonomous = await workSession(remote, {
+      status: "proposed",
+      requestedByUserId: null,
+      pullRequestUrl: "https://forge.invalid/acme/product/pulls/42",
+      filesChanged: 3,
+      insertions: 20,
+      deletions: 2,
+      reply: "A long private transcript",
+      error: "A long failure trace",
+    });
+    const failedRevision = await workSession(remote, {
+      status: "failed",
+      title: "A failed revision with an existing pull request",
+      pullRequestUrl: "https://forge.invalid/acme/product/pulls/43",
+    });
+
+    const result = await listHomeRepositoryWork({ companyId: company.id });
+    assert.equal(result.total, 3);
+    assert.deepEqual(result.items.map((row) => row.repository.slug).sort(), [
+      "product",
+      "product",
+      "strategy",
+    ]);
+    const row = result.items.find((item) => item.id === autonomous.id)!;
+    assert.deepEqual(row.repository, {
+      id: remote.id,
+      name: "Product",
+      slug: "product",
+      kind: "code",
+    });
+    assert.equal(row.filesChanged, 3);
+    assert.equal(row.insertions, 20);
+    assert.equal(row.deletions, 2);
+    assert.equal(row.hasPullRequest, true);
+    assert.equal(
+      result.items.find((item) => item.id === localSession.id)?.hasPullRequest,
+      false,
+      "ordinary local work must not receive a pull request warning",
+    );
+    assert.equal(
+      result.items.find((item) => item.id === failedRevision.id)?.hasPullRequest,
+      true,
+      "a later failed revision must not hide the pull request warning",
+    );
+    const serialized = JSON.stringify(result);
+    assert.ok(!serialized.includes("not-for-home"));
+    assert.ok(!serialized.includes("A long private transcript"));
+    assert.ok(!serialized.includes("A long failure trace"));
+    assert.ok(!serialized.includes("forge.invalid"));
+    assert.equal(repositoryCheckoutExists(remote), false);
+  });
+
+  test("scopes both sessions and their repositories to this company and never hydrates another company's employee", async () => {
+    const local = await repository();
+    const otherCompany = await insert(Company, { name: "Other", slug: "other", ownerId: owner.id });
+    const foreign = await repository({ companyId: otherCompany.id, slug: "foreign" });
+    const otherEmployee = await insert(AIEmployee, {
+      companyId: otherCompany.id,
+      name: "Private employee",
+      slug: "private",
+      role: "Engineer",
+    });
+    await workSession(foreign, { employeeId: otherEmployee.id });
+    await workSession(foreign, { companyId: company.id });
+    await workSession(local, { companyId: otherCompany.id });
+    await workSession(local, { repositoryId: "deleted-repository" });
+    const visible = await workSession(local, { employeeId: otherEmployee.id });
+
+    const result = await listHomeRepositoryWork({ companyId: company.id });
+    assert.equal(result.total, 1);
+    assert.deepEqual(
+      result.items.map((row) => row.id),
+      [visible.id],
+    );
+    assert.equal(result.items[0].employee, null);
+    assert.ok(!JSON.stringify(result).includes("Private employee"));
+  });
+
+  test("keeps the true backlog count and stable paging beyond the Home preview", async () => {
+    const repo = await repository();
+    const at = new Date("2026-09-09T09:00:00.000Z");
+    const sessions: RepositoryWorkSession[] = [];
+    for (let index = 9; index >= 0; index -= 1) {
+      sessions.push(
+        await workSession(repo, {
+          id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          updatedAt: at,
+        }),
+      );
+    }
+    const expected = sessions.map((session) => session.id).sort();
+    const home = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.equal(home.repositoryWorkCount, 10);
+    assert.deepEqual(
+      home.repositoryWork.map((row) => row.id),
+      expected.slice(0, 8),
+    );
+
+    const next = await listHomeRepositoryWork({ companyId: company.id, offset: 8, limit: 8 });
+    assert.equal(next.total, 10);
+    assert.deepEqual(
+      next.items.map((row) => row.id),
+      expected.slice(8),
+    );
+    assert.deepEqual(
+      await listHomeRepositoryWork({ companyId: company.id, offset: 10, limit: 8 }),
+      { items: [], total: 10 },
+    );
+
+    const newest = await workSession(repo, { updatedAt: new Date(at.getTime() + 1000) });
+    const refreshed = await listHomeRepositoryWork({ companyId: company.id, limit: 1 });
+    assert.deepEqual(
+      refreshed.items.map((row) => row.id),
+      [newest.id],
+    );
+  });
+
+  test("uses a bounded readable instruction when an older session has no title", async () => {
+    const repo = await repository();
+    await workSession(repo, {
+      title: "  ",
+      instruction: `Review\n\n${"the strategy ".repeat(100)}`,
+    });
+    const result = await listHomeRepositoryWork({ companyId: company.id });
+    assert.equal(result.items[0].title.length, 200);
+    assert.match(result.items[0].title, /^Review the strategy/);
+    assert.ok(result.items[0].title.endsWith("…"));
+    assert.ok(!("instruction" in result.items[0]));
+  });
+
+  test("returns an empty attention queue when no Repository AI work needs a Member", async () => {
+    const data = await getHomeData({ companyId: company.id, userId: member.id, role: "member" });
+    assert.deepEqual(data.repositoryWork, []);
+    assert.equal(data.repositoryWorkCount, 0);
+  });
+});

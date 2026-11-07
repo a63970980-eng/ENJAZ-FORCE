@@ -1,0 +1,141 @@
+/**
+ * Money helpers shared by the finance services. We store all amounts as
+ * integer minor units (cents) plus a 3-letter ISO 4217 currency code on
+ * the row. Phase A treats every currency as 2-decimal — Phase E (multi-
+ * currency) will handle 0/3-decimal currencies (JPY, JOD, BHD …) properly.
+ *
+ * Keep these helpers dependency-free — `services/finance.ts` and the
+ * route layer both import them, and the printable invoice HTML uses
+ * `formatMoney` to render line totals.
+ */
+
+export const DEFAULT_CURRENCY = "USD";
+
+/** Round half-away-from-zero. JS `Math.round` rounds half-to-+inf, which
+ *  rounds negative values incorrectly for accounting (e.g. -0.5 → 0 not -1).
+ *  Cents-only math means we land on `.5` exactly when prices end in
+ *  half-cents — rare in practice but worth getting right. */
+export function roundHalfAway(value: number): number {
+  return value >= 0
+    ? Math.floor(value + 0.5)
+    : -Math.floor(-value + 0.5);
+}
+
+export type LineInput = {
+  quantity: number;
+  unitPriceCents: number;
+  taxPercent: number;
+  taxInclusive: boolean;
+};
+
+export type LineTotals = {
+  /** Ex-tax amount (subtotal). For inclusive-tax lines, this is the
+   *  derived ex-tax portion of the gross. */
+  lineSubtotalCents: number;
+  lineTaxCents: number;
+  /** Customer-facing total for the line (subtotal + tax for exclusive,
+   *  or the gross for inclusive). */
+  lineTotalCents: number;
+};
+
+/**
+ * Compute the three cent-amount columns we persist on `InvoiceLineItem`.
+ * Inclusive-tax math derives the tax portion from the gross
+ * (`gross × rate / (100 + rate)`) so totals stay consistent regardless
+ * of the inclusive/exclusive choice.
+ */
+export function computeLineTotals(input: LineInput): LineTotals {
+  const gross = roundHalfAway(input.quantity * input.unitPriceCents);
+  const rate = Number.isFinite(input.taxPercent) ? input.taxPercent : 0;
+  if (rate <= 0) {
+    return { lineSubtotalCents: gross, lineTaxCents: 0, lineTotalCents: gross };
+  }
+  if (input.taxInclusive) {
+    const tax = roundHalfAway((gross * rate) / (100 + rate));
+    return {
+      lineSubtotalCents: gross - tax,
+      lineTaxCents: tax,
+      lineTotalCents: gross,
+    };
+  }
+  const tax = roundHalfAway((gross * rate) / 100);
+  return {
+    lineSubtotalCents: gross,
+    lineTaxCents: tax,
+    lineTotalCents: gross + tax,
+  };
+}
+
+/**
+ * Adjust a set of already-rounded integer `parts` so they sum *exactly*
+ * to `target`, returning a new array (input is not mutated).
+ *
+ * Why this exists: when a foreign-currency invoice or bill is posted to
+ * the ledger, each cent column is converted to the home currency and
+ * rounded on its own. Because `round(a) + round(b)` need not equal
+ * `round(a + b)`, the converted parts can miss the converted total by a
+ * cent or two — and the double-entry ledger then rejects the whole
+ * transaction as unbalanced (`postLedgerEntry`). We anchor on the
+ * converted total and absorb the residual into the largest-magnitude
+ * part, which both minimizes the relative distortion and leaves smaller
+ * parts (a tax line especially) exact whenever they aren't the largest.
+ *
+ * Returns `parts` unchanged when it is empty (the residual has nowhere to
+ * land — callers that can pass an empty set must anchor the total
+ * elsewhere) or already on target.
+ */
+export function reconcilePartsToTotal(target: number, parts: number[]): number[] {
+  if (parts.length === 0) return [];
+  const sum = parts.reduce((s, p) => s + p, 0);
+  const residual = target - sum;
+  if (residual === 0) return [...parts];
+  let largest = 0;
+  for (let i = 1; i < parts.length; i += 1) {
+    if (Math.abs(parts[i]) > Math.abs(parts[largest])) largest = i;
+  }
+  const out = [...parts];
+  out[largest] += residual;
+  return out;
+}
+
+/**
+ * Format a cent amount for display. Browser formatting via Intl is fine
+ * for both the React UI and the server-rendered printable invoice (Node
+ * 22 has full Intl).
+ */
+export function formatMoney(cents: number, currency: string): string {
+  const c = currency || DEFAULT_CURRENCY;
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: c,
+      currencyDisplay: "symbol",
+    }).format(cents / 100);
+  } catch {
+    // Unknown currency code — fall back to plain numeric with the code suffix.
+    return `${(cents / 100).toFixed(2)} ${c}`;
+  }
+}
+
+/**
+ * Display string for an invoice number — optional per-customer prefix,
+ * `INV-` infix, zero-padded sequence. Callers pass the customer slug as
+ * the prefix and it is uppercased here, so two customers issuing their
+ * first invoice see `ACME-CORP-INV-0001` and `GLOBEX-INV-0001` rather
+ * than two identical `INV-0001`s. Padding to 4 keeps small businesses
+ * tidy without forcing 5-digit numbers on day one.
+ */
+export function formatInvoiceNumber(seq: number, prefix?: string): string {
+  const p = prefix ? `${prefix.toUpperCase()}-` : "";
+  return `${p}INV-${String(seq).padStart(4, "0")}`;
+}
+
+/**
+ * Display string for an estimate number — `EST-` infix. Mirrors
+ * `formatInvoiceNumber` so the two documents look like a family across
+ * the UI and the printable PDFs.
+ */
+export function formatEstimateNumber(seq: number, prefix?: string): string {
+  const p = prefix ? `${prefix.toUpperCase()}-` : "";
+  return `${p}EST-${String(seq).padStart(4, "0")}`;
+}

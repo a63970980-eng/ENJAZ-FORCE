@@ -1,0 +1,62 @@
+import { dateTimeColumnType } from "./columnTypes.js";
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from "typeorm";
+
+/**
+ * `paused`: stopped at a step whose AI Employee's AI Model is unavailable,
+ * with its outputs so far; it carries on from that step by itself when the
+ * model is back (`services/pipelines/executor.ts`).
+ */
+export type PipelineRunStatus = "running" | "paused" | "completed" | "failed" | "skipped";
+export type PipelineTriggerKind = "manual" | "schedule" | "webhook" | "event";
+
+/**
+ * One execution of a Pipeline. Mirrors the Run entity's shape (status +
+ * captured log capped at 256KB). `triggerKind` + `triggerNodeId` record
+ * which trigger fired when a pipeline has more than one. `inputJson` carries
+ * the trigger payload (event data, webhook body, manual fire payload) and `outputJson`
+ * holds the per-node outputs map at end of run for inspection.
+ */
+@Entity("pipeline_runs")
+// A Pipeline's Run history pages newest first by (startedAt, id) — all of it,
+// or one status ("when did this start failing?") counted and paged without
+// reading every Run.
+@Index(["pipelineId", "startedAt", "id"])
+@Index(["pipelineId", "status", "startedAt", "id"])
+export class PipelineRun {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  pipelineId!: string;
+
+  @Column({ type: dateTimeColumnType })
+  startedAt!: Date;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  finishedAt!: Date | null;
+
+  @Column({ type: "varchar", default: "running" })
+  status!: PipelineRunStatus;
+
+  @Column({ type: "varchar", default: "manual" })
+  triggerKind!: PipelineTriggerKind;
+
+  @Column({ type: "varchar", nullable: true })
+  triggerNodeId!: string | null;
+
+  @Column({ type: "text", default: "{}" })
+  inputJson!: string;
+
+  @Column({ type: "text", default: "{}" })
+  outputJson!: string;
+
+  /** Captured per-node execution log. Capped — see RUN_LOG_MAX_BYTES. */
+  @Column({ type: "text", default: "" })
+  logContent!: string;
+
+  @Column({ type: "varchar", nullable: true })
+  errorMessage!: string | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+}

@@ -1,0 +1,792 @@
+import {
+  BarChart3,
+  Briefcase,
+  CalendarClock,
+  CircleHelp,
+  CircleUser,
+  Contact2,
+  FolderGit2,
+  FolderLock,
+  LifeBuoy,
+  FileSignature,
+  GitBranch,
+  Home,
+  KeyRound,
+  Library,
+  type LucideIcon,
+  ListChecks,
+  Mail,
+  Megaphone,
+  MessageSquare,
+  NotebookText,
+  ServerCog,
+  Sparkles,
+  Target,
+  Video,
+  Settings as SettingsIcon,
+  Table2,
+  TrendingUp,
+  Users,
+  Wallet,
+  Wrench,
+} from "lucide-react";
+import {
+  MATCH_SCORE,
+  type TextMatch,
+  foldSearchText,
+  isSubsequence,
+  matchKeywords,
+  matchLabelText,
+  matchesInitials,
+  queryTokens,
+} from "./searchText";
+
+/**
+ * The catalog of top-level sections, and how a URL maps back to one.
+ *
+ * Lives in `lib/` rather than next to the top nav because several surfaces read
+ * it — the nav pill (`AppShell`), the command palette (`CommandPalette`), the
+ * `G` chord and shortcut guide (`KeyboardShortcuts`), and the section rails —
+ * and the palette is itself rendered by the shell. Importing it from
+ * `AppShell` would put a cycle between the two.
+ *
+ * Not every section is listed from the first day: the palette's browse view
+ * shows the core and the sections a company has started using
+ * (`shared/navigation.ts`, `lib/sectionVisibility.ts`). Search covers all.
+ */
+
+export type SectionKey =
+  | "home"
+  | "tldrs"
+  | "mail"
+  | "meetings"
+  | "workspace"
+  | "employees"
+  | "skills"
+  | "routines"
+  | "proactive"
+  | "goals"
+  | "tasks"
+  | "vault"
+  | "bases"
+  | "notes"
+  | "resources"
+  | "explore"
+  | "repositories"
+  | "revenue"
+  | "marketing"
+  | "customers"
+  | "signatures"
+  | "dataRooms"
+  | "support"
+  | "finance"
+  | "recruiting"
+  | "pipelines"
+  | "decisions"
+  | "settings"
+  | "help"
+  | "account"
+  | "admin";
+
+export type SectionItem = {
+  key: SectionKey;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+  /** Second key in the global `G`, then key navigation chord. */
+  shortcut: string;
+  /** Path under `/c/<slug>/…` — empty string for the company root. */
+  path: string;
+  iconBg: string;
+  /**
+   * Extra search terms for the command palette. Never rendered — this is a
+   * synonym index, not product copy, so it deliberately carries the words we
+   * *don't* use (§3 of AGENTS.md): someone who types "cron" or "slack" should
+   * land on Routines or Workspace and learn the real name from the result.
+   */
+  keywords?: string[];
+};
+
+export type SectionGroup = { label: string; items: SectionItem[] };
+
+export const SECTION_GROUPS: SectionGroup[] = [
+  {
+    label: "Essentials",
+    items: [
+      {
+        key: "home",
+        label: "Home",
+        description: "Everything that needs your attention.",
+        icon: Home,
+        shortcut: "H",
+        path: "",
+        iconBg: "bg-slate-100 text-slate-600 dark:bg-slate-700/40 dark:text-slate-200",
+        keywords: ["dashboard", "overview", "start"],
+      },
+      {
+        key: "decisions",
+        label: "Decision stack",
+        description: "Everything waiting on you: questions, reviews, and approvals.",
+        icon: GitBranch,
+        // Not "D": Marketing already holds it, and the chord map is keyed by
+        // letter, so a third claim would shadow one of them.
+        shortcut: "I",
+        path: "/decisions",
+        iconBg: "bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
+        keywords: [
+          "decision",
+          "stack",
+          "choose",
+          "blocked",
+          "waiting on me",
+          "ask",
+          "email review",
+          "draft reply",
+          // Approvals, Revisions, and Initiatives are pages of the stack now;
+          // their old section names still find it.
+          "approvals",
+          "approve",
+          "sign off",
+          "pending",
+          "revisions",
+          "proposals",
+          "initiatives",
+          "needs you",
+        ],
+      },
+      {
+        key: "tldrs",
+        label: "What happened",
+        description: "Briefings on what your company did, and each AI Employee's journal.",
+        icon: Sparkles,
+        shortcut: "Z",
+        path: "/tldrs",
+        iconBg: "bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
+        keywords: [
+          "tldr",
+          "tldrs",
+          "summary",
+          "digest",
+          "briefing",
+          "recap",
+          "channel updates",
+          "journal",
+          "diary",
+          "activity",
+          "today",
+        ],
+      },
+      {
+        key: "workspace",
+        label: "Workspace",
+        description: "Slack-style channels and DMs.",
+        icon: MessageSquare,
+        shortcut: "W",
+        path: "/workspace",
+        iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+        keywords: ["chat", "channels", "dms", "slack", "messages"],
+      },
+      {
+        key: "mail",
+        label: "Email",
+        description: "Your Gmail inbox, with AI triage and drafts.",
+        icon: Mail,
+        shortcut: "M",
+        path: "/mail",
+        iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+        keywords: ["gmail", "inbox", "mail", "threads", "triage"],
+      },
+      {
+        key: "meetings",
+        label: "Meetings",
+        description: "Your calendar, recorded calls, and their transcripts.",
+        icon: Video,
+        // Not "M" or "C": Email and Repositories hold those, and the chord map
+        // is keyed by letter, so a third claim would shadow one of them.
+        shortcut: "Y",
+        path: "/meetings",
+        iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+        keywords: [
+          "calendar",
+          "meeting",
+          "meetings",
+          "call",
+          "calls",
+          "zoom",
+          "google meet",
+          "teams",
+          "recording",
+          "notetaker",
+          "transcript",
+          "minutes",
+          "agenda",
+          "schedule",
+        ],
+      },
+      {
+        key: "tasks",
+        label: "Tasks",
+        description: "Projects, todos, review queue.",
+        icon: ListChecks,
+        shortcut: "T",
+        path: "/tasks",
+        iconBg: "bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300",
+        keywords: ["projects", "todos", "kanban", "backlog", "issues"],
+      },
+      {
+        key: "vault",
+        label: "Vault",
+        description: "Passwords and secrets, shared safely.",
+        icon: KeyRound,
+        shortcut: "K",
+        path: "/vault",
+        iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+        keywords: [
+          "password",
+          "password manager",
+          "credentials",
+          "secrets",
+          "api keys",
+          "secure notes",
+          "autofill",
+        ],
+      },
+    ],
+  },
+  {
+    // The three parts of an AI employee's working life: who they are, what
+    // they know, and what they do on a schedule. Skills and Routines used to
+    // be reachable only by opening an employee first, which made the
+    // company's playbook library and its schedule invisible.
+    label: "AI",
+    items: [
+      {
+        key: "employees",
+        label: "AI Employees",
+        description: "AI teammates and their souls.",
+        icon: Users,
+        shortcut: "E",
+        path: "/employees",
+        iconBg: "bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
+        keywords: ["team", "roster", "staff", "people", "hire", "agent", "bot"],
+      },
+      {
+        key: "goals",
+        label: "Goals",
+        description: "Measurable objectives your AI employees steer toward.",
+        icon: Target,
+        // Punctuation, like Settings (","): "." is the closest thing on a
+        // keyboard to a bullseye.
+        shortcut: ".",
+        path: "/goals",
+        iconBg: "bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300",
+        keywords: ["goal", "kpi", "okr", "objective", "target", "metric"],
+      },
+      {
+        key: "routines",
+        label: "Routines",
+        description: "Scheduled work, and how every run went.",
+        icon: CalendarClock,
+        shortcut: "R",
+        path: "/routines",
+        iconBg: "bg-purple-100 text-purple-600 dark:bg-purple-500/15 dark:text-purple-300",
+        keywords: ["schedule", "cron", "job", "recurring", "runs", "logs"],
+      },
+      {
+        key: "skills",
+        label: "Skills",
+        description: "Playbooks your AI employees follow.",
+        icon: Wrench,
+        shortcut: "S",
+        path: "/skills",
+        iconBg: "bg-green-100 text-green-600 dark:bg-green-500/15 dark:text-green-300",
+        keywords: ["playbook", "capability", "instructions"],
+      },
+      {
+        key: "proactive",
+        label: "Proactive",
+        description: "Standing work that moves your company forward.",
+        icon: Sparkles,
+        shortcut: "-",
+        path: "/proactive",
+        iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+        keywords: [
+          "proactive",
+          "standing work",
+          "responsibility",
+          "routine",
+          "initiative",
+          "automation",
+          "quote",
+          "inbox",
+          "follow-up",
+        ],
+      },
+    ],
+  },
+  {
+    label: "Knowledge",
+    items: [
+      {
+        key: "bases",
+        label: "Bases",
+        description: "Airtable-style structured data.",
+        icon: Table2,
+        shortcut: "B",
+        path: "/bases",
+        iconBg: "bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300",
+        keywords: ["airtable", "tables", "records", "spreadsheet", "database"],
+      },
+      {
+        key: "notes",
+        label: "Notes",
+        description: "Notion-style markdown pages.",
+        icon: NotebookText,
+        shortcut: "N",
+        path: "/notes",
+        iconBg: "bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300",
+        keywords: ["notion", "docs", "pages", "markdown", "wiki"],
+      },
+      {
+        key: "resources",
+        label: "Resources",
+        description: "URLs, ebooks, transcripts AI employees can study.",
+        icon: Library,
+        shortcut: "L",
+        path: "/resources",
+        iconBg: "bg-fuchsia-100 text-fuchsia-600 dark:bg-fuchsia-500/15 dark:text-fuchsia-300",
+        keywords: ["ebooks", "transcripts", "urls", "knowledge", "library"],
+      },
+      {
+        key: "explore",
+        label: "Explore",
+        description: "Saved SQL charts and dashboards.",
+        icon: BarChart3,
+        shortcut: "X",
+        path: "/explore",
+        iconBg: "bg-blue-100 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300",
+        keywords: ["bi", "sql", "charts", "dashboards", "analytics", "queries"],
+      },
+    ],
+  },
+  {
+    label: "Engineering",
+    items: [
+      {
+        key: "repositories",
+        label: "Repositories",
+        description: "Version-controlled repositories — code, strategy, plans, anything.",
+        icon: FolderGit2,
+        shortcut: "C",
+        path: "/repositories",
+        iconBg: "bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+        keywords: ["git", "repos", "repositories", "branches", "engineering", "docs", "versions"],
+      },
+      {
+        key: "pipelines",
+        label: "Pipelines",
+        description: "Predictable, step-by-step automation.",
+        icon: GitBranch,
+        shortcut: "P",
+        path: "/pipelines",
+        iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+        keywords: ["n8n", "automation", "flows", "workflows", "nodes"],
+      },
+    ],
+  },
+  {
+    label: "Money",
+    items: [
+      {
+        key: "marketing",
+        label: "Marketing",
+        description: "Campaigns, Creative, Experiments, and performance.",
+        icon: Megaphone,
+        shortcut: "D",
+        path: "/marketing",
+        iconBg: "bg-orange-100 text-orange-600 dark:bg-orange-500/15 dark:text-orange-300",
+        keywords: [
+          "ads",
+          "advertising",
+          "paid media",
+          "campaigns",
+          "creative",
+          "experiments",
+          "roas",
+          "agency",
+          "acquisition",
+        ],
+      },
+      {
+        key: "revenue",
+        label: "Revenue",
+        description: "Deals, contacts, outbound, and signals.",
+        icon: TrendingUp,
+        shortcut: "V",
+        path: "/revenue",
+        iconBg: "bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300",
+        // "crm", "pipeline" and "leads" are here precisely because they are
+        // words we do NOT use in product copy — somebody typing them should
+        // land here and learn the real names. "pipeline" especially: it means
+        // the DAG primitive everywhere else, so the palette has to carry the
+        // sales-pipeline reading without the nav ever printing it.
+        keywords: [
+          "crm",
+          "pipeline",
+          "sales",
+          "deals",
+          "leads",
+          "prospects",
+          "contacts",
+          "outbound",
+          "sequences",
+          "signals",
+          "mrr",
+          "arr",
+          "churn",
+          "forecast",
+          "gtm",
+          // Not "dashboard": ⌘K lists sections above records, so the word
+          // would put Revenue above the Explore Dashboard someone named in
+          // "revenue dashboard". Search offers Revenue below it as a product
+          // area (`server/services/chatReferences.ts`).
+        ],
+      },
+      {
+        key: "customers",
+        label: "Customers",
+        description: "Accounts and signed contracts.",
+        icon: Contact2,
+        shortcut: "U",
+        path: "/customers",
+        iconBg: "bg-pink-100 text-pink-600 dark:bg-pink-500/15 dark:text-pink-300",
+        keywords: ["accounts", "contacts", "crm", "contracts", "acv"],
+      },
+      {
+        key: "signatures",
+        label: "Signatures",
+        description: "Send documents and collect signatures.",
+        icon: FileSignature,
+        shortcut: "G",
+        path: "/signatures",
+        iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+        keywords: [
+          "esign",
+          "e-signature",
+          "docusign",
+          "agreements",
+          "contracts",
+          "envelopes",
+          "signing",
+        ],
+      },
+      {
+        key: "support",
+        label: "Support",
+        description: "Customer email becomes tickets an AI Employee answers.",
+        icon: LifeBuoy,
+        // The one letter no other section holds that says something about it.
+        shortcut: "/",
+        path: "/support",
+        iconBg: "bg-sky-100 text-sky-600 dark:bg-sky-500/15 dark:text-sky-300",
+        // What people call this product elsewhere; it says Support, Tickets, Articles.
+        keywords: [
+          "support",
+          "tickets",
+          "ticketing",
+          "helpdesk",
+          "help desk",
+          "customer service",
+          "customer support",
+          "support inbox",
+          "shared inbox",
+          "sla",
+          "csat",
+          "knowledge base",
+          "zendesk",
+          "intercom",
+          "freshdesk",
+          "front",
+        ],
+      },
+      {
+        key: "dataRooms",
+        label: "Data rooms",
+        description: "Share documents with investors, buyers, and auditors.",
+        icon: FolderLock,
+        // The one letter no other section holds.
+        shortcut: "A",
+        path: "/data-rooms",
+        iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+        // "vdr", "deal room" and "diligence" are what people type; the product
+        // says Data rooms, Guests and Questions.
+        keywords: [
+          "data room",
+          "vdr",
+          "virtual data room",
+          "deal room",
+          "due diligence",
+          "diligence",
+          "fundraising",
+          "investors",
+          "acquisition",
+          "m&a",
+          "audit",
+          "share documents",
+          "docsend",
+        ],
+      },
+      {
+        key: "finance",
+        label: "Finance",
+        description: "Invoices, bills, and revenue.",
+        icon: Wallet,
+        shortcut: "F",
+        path: "/finance",
+        iconBg: "bg-teal-100 text-teal-600 dark:bg-teal-500/15 dark:text-teal-300",
+        keywords: [
+          "invoices",
+          "bills",
+          "revenue",
+          "accounting",
+          "ledger",
+          "money",
+          "billing",
+          "estimates",
+          "customer statements",
+          "statements",
+        ],
+      },
+    ],
+  },
+  {
+    label: "People",
+    items: [
+      {
+        key: "recruiting",
+        label: "Recruiting",
+        description: "Openings, applicants, and your careers site.",
+        icon: Briefcase,
+        shortcut: "J",
+        path: "/recruiting",
+        iconBg: "bg-cyan-100 text-cyan-600 dark:bg-cyan-500/15 dark:text-cyan-300",
+        // "jobs", "ats" and "hire" are words people type for this section;
+        // the product says Openings, Applicants and Recruiting.
+        keywords: [
+          "hiring",
+          "jobs",
+          "job board",
+          "careers",
+          "careers page",
+          "openings",
+          "applicants",
+          "candidates",
+          "resumes",
+          "ats",
+          "applicant tracking",
+          "talent",
+          "contractors",
+          "recruit",
+        ],
+      },
+    ],
+  },
+  {
+    label: "System",
+    items: [
+      {
+        key: "settings",
+        label: "Settings",
+        description: "Members, integrations, email, environment secrets.",
+        icon: SettingsIcon,
+        shortcut: ",",
+        path: "/settings",
+        iconBg: "bg-slate-200 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200",
+        keywords: [
+          "members",
+          "integrations",
+          "connections",
+          "environment secrets",
+          "models",
+          "config",
+          "api keys",
+        ],
+      },
+    ],
+  },
+];
+
+// ────────────────── Sections outside the company groups ──────────────────
+// Account and Admin are NOT part of `SECTION_GROUPS`: everything in that list
+// is scoped to the company you're currently viewing, and these two are not.
+// The palette and the shortcut guide list them in their own "You" group.
+//
+// Account still shows up in the command palette — a palette is a
+// search-everything surface, and typing "password" finding nothing is worse
+// than the tidy distinction is worth. Admin does not: it's an
+// instance-operator surface rather than a place you navigate between, so its
+// entry points are the avatar menu and the `G =` chord.
+
+/** Settings for the signed-in person, global across every company they belong to. */
+export const ACCOUNT_SECTION: SectionItem = {
+  key: "account",
+  label: "Account",
+  description: "Your profile, password, and notifications.",
+  icon: CircleUser,
+  shortcut: "O",
+  path: "/account",
+  iconBg: "bg-violet-100 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
+  keywords: ["profile", "password", "avatar", "notifications", "me", "push"],
+};
+
+/** Product-aware support, answered by any AI Employee in the current company. */
+export const HELP_SECTION: SectionItem = {
+  key: "help",
+  label: "Help",
+  description: "Ask an AI Employee how Genosyn works.",
+  icon: CircleHelp,
+  shortcut: "Q",
+  path: "/help",
+  iconBg: "bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300",
+  keywords: ["support", "docs", "questions", "codebase", "troubleshooting"],
+};
+
+/**
+ * Instance-operator surface, restricted to master admins. Its chord key is
+ * punctuation because every letter already opens a section, and the chord
+ * keeps one destination per key — Admin on `D` took Marketing's key from the
+ * people who could see both.
+ */
+export const ADMIN_SECTION: SectionItem = {
+  key: "admin",
+  label: "Admin",
+  description: "Users, companies, health, and backups.",
+  icon: ServerCog,
+  shortcut: "=",
+  path: "/admin",
+  iconBg: "bg-slate-800 text-slate-100 dark:bg-slate-200/20 dark:text-slate-100",
+  keywords: ["users", "companies", "health", "backups", "instance", "operator"],
+};
+
+export const SECTION_BY_KEY: Record<SectionKey, SectionItem> = Object.fromEntries(
+  [...SECTION_GROUPS.flatMap((g) => g.items), HELP_SECTION, ACCOUNT_SECTION, ADMIN_SECTION].map(
+    (i) => [i.key, i],
+  ),
+) as Record<SectionKey, SectionItem>;
+
+/**
+ * Resolve the active top-level section from the URL path. Order matters
+ * because some routes nest (e.g. `/employees/:slug/settings`); the `/settings`
+ * check has to come AFTER more specific section checks fail.
+ */
+export function activeSection(pathname: string): SectionKey {
+  if (/\/c\/[^/]+\/tldrs(\/|$)/.test(pathname)) return "tldrs";
+  if (/\/c\/[^/]+\/mail(\/|$)/.test(pathname)) return "mail";
+  if (/\/c\/[^/]+\/meetings(\/|$)/.test(pathname)) return "meetings";
+  if (/\/c\/[^/]+\/workspace(\/|$)/.test(pathname)) return "workspace";
+  if (/\/c\/[^/]+\/employees(\/|$)/.test(pathname)) return "employees";
+  if (/\/c\/[^/]+\/skills(\/|$)/.test(pathname)) return "skills";
+  if (/\/c\/[^/]+\/routines(\/|$)/.test(pathname)) return "routines";
+  if (/\/c\/[^/]+\/proactive(\/|$)/.test(pathname)) return "proactive";
+  if (/\/c\/[^/]+\/goals(\/|$)/.test(pathname)) return "goals";
+  if (/\/c\/[^/]+\/tasks(\/|$)/.test(pathname)) return "tasks";
+  if (/\/c\/[^/]+\/vault(\/|$)/.test(pathname)) return "vault";
+  if (/\/c\/[^/]+\/bases(\/|$)/.test(pathname)) return "bases";
+  if (/\/c\/[^/]+\/notes(\/|$)/.test(pathname)) return "notes";
+  if (/\/c\/[^/]+\/resources(\/|$)/.test(pathname)) return "resources";
+  if (/\/c\/[^/]+\/explore(\/|$)/.test(pathname)) return "explore";
+  if (/\/c\/[^/]+\/repositories(\/|$)/.test(pathname)) return "repositories";
+  if (/\/c\/[^/]+\/marketing(\/|$)/.test(pathname)) return "marketing";
+  if (/\/c\/[^/]+\/revenue(\/|$)/.test(pathname)) return "revenue";
+  if (/\/c\/[^/]+\/customers(\/|$)/.test(pathname)) return "customers";
+  if (/\/c\/[^/]+\/signatures(\/|$)/.test(pathname)) return "signatures";
+  if (/\/c\/[^/]+\/data-rooms(\/|$)/.test(pathname)) return "dataRooms";
+  if (/\/c\/[^/]+\/support(\/|$)/.test(pathname)) return "support";
+  if (/\/c\/[^/]+\/finance(\/|$)/.test(pathname)) return "finance";
+  if (/\/c\/[^/]+\/recruiting(\/|$)/.test(pathname)) return "recruiting";
+  if (/\/c\/[^/]+\/pipelines(\/|$)/.test(pathname)) return "pipelines";
+  if (/\/c\/[^/]+\/decisions(\/|$)/.test(pathname)) return "decisions";
+  if (/\/c\/[^/]+\/help(\/|$)/.test(pathname)) return "help";
+  if (/\/c\/[^/]+\/account(\/|$)/.test(pathname)) return "account";
+  if (/\/c\/[^/]+\/admin(\/|$)/.test(pathname)) return "admin";
+  if (/\/c\/[^/]+\/settings(\/|$)/.test(pathname)) return "settings";
+  return "home";
+}
+
+// ───────────────────────────── palette search ─────────────────────────────
+
+/** A section that matched a query, with the label range to highlight. */
+export type SectionMatch = {
+  item: SectionItem;
+  /** `[start, end)` offsets into `item.label`, or null when the hit was
+   *  elsewhere (a keyword, the description, or a fuzzy skip-match). */
+  hit: [number, number] | null;
+  /** How well it matched, on the shared `MATCH_SCORE` scale; 0 when browsing. */
+  score: number;
+};
+
+/**
+ * Rank one section against one folded token. Higher is better; null means
+ * "no match, hide it". The tiers exist so that typing "not" puts Notes above
+ * Notifications-in-a-description, and so an exact word always wins.
+ */
+function scoreToken(item: SectionItem, q: string): TextMatch | null {
+  const label = matchLabelText(item.label, q);
+  if (label) return label;
+
+  // Initials — "ae" reaches "AI Employees" without spelling either word.
+  if (matchesInitials(item.label, q)) return { score: MATCH_SCORE.initials, hit: null };
+
+  const keyword = matchKeywords(item.keywords, q);
+  if (keyword !== null) return { score: keyword, hit: null };
+
+  if (foldSearchText(item.description).includes(q)) {
+    return { score: MATCH_SCORE.description, hit: null };
+  }
+
+  if (isSubsequence(foldSearchText(item.label), q)) return { score: MATCH_SCORE.fuzzy, hit: null };
+
+  return null;
+}
+
+/**
+ * Rank one section against a folded query. Multi-word queries AND their
+ * tokens ("ai emp" must hit on every word, in any order) and score as the
+ * weakest token, so each extra word narrows rather than widens.
+ */
+function scoreSection(item: SectionItem, q: string): TextMatch | null {
+  const whole = scoreToken(item, q);
+  const tokens = queryTokens(q);
+  if (tokens.length < 2) return whole;
+
+  let min = Infinity;
+  let hit: [number, number] | null = null;
+  for (const tok of tokens) {
+    const r = scoreToken(item, tok);
+    if (!r) return whole;
+    min = Math.min(min, r.score);
+    hit = hit ?? r.hit;
+  }
+  // The whole-string match keeps priority when it's the stronger signal
+  // (e.g. a keyword contains the query verbatim, spaces and all).
+  if (whole && whole.score >= min) return whole;
+  return { score: min, hit };
+}
+
+/**
+ * Flat, ranked results for the palette's search mode. Ties keep catalog order
+ * (`Array.sort` is stable), so equally-good matches stay in the order the user
+ * already learned from the grouped browse view. Case, accents, and extra
+ * spaces in the query don't matter.
+ */
+export function searchSections(items: SectionItem[], query: string): SectionMatch[] {
+  const q = foldSearchText(query);
+  if (!q) return items.map((item) => ({ item, hit: null, score: 0 }));
+
+  const scored: SectionMatch[] = [];
+  for (const item of items) {
+    const r = scoreSection(item, q);
+    if (r) scored.push({ item, hit: r.hit, score: r.score });
+  }
+  return scored.sort((a, b) => b.score - a.score);
+}

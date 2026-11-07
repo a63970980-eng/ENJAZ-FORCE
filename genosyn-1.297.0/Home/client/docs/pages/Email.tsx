@@ -1,0 +1,1003 @@
+import { Callout, Code, DocLink, H2, H3, LI, OL, P, PageHeader, Strong, UL } from "@/docs/Prose";
+
+export function Email() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Operations"
+        title="Email"
+        lead={
+          <>
+            Connect a mailbox and work your inbox inside Genosyn — read threads, reply, and file
+            mail like a normal client. Gmail, Outlook, Fastmail, iCloud, Zoho, your company&apos;s
+            Exchange server, or a mail server you run yourself. Then put your{" "}
+            <DocLink to="/docs/employees">AI Employees</DocLink> on it: chat with them right beside
+            the inbox, hand them threads to draft answers, write <Strong>instructions</Strong> in
+            your own words for every new email, and set <Strong>rules</Strong> that use static
+            filters or AI judgment to act on new mail. Everything syncs both ways.
+          </>
+        }
+      />
+
+      <H2 id="what">What this is</H2>
+      <P>
+        The <Strong>Email</Strong> section is a real mail client backed by your own mailbox. Genosyn
+        imports your <Strong>whole mailbox</Strong> into a local index and keeps it in step with the
+        mail server in both directions: mail that arrives shows up here within about a minute, and
+        anything you do here — read, star, archive, label, draft, send, forward — is written
+        straight back. The goal is that you never need to open your other mail client; read it there
+        or here, act on it here, and neither drifts. To turn mail to an address such as{" "}
+        <Code>support@</Code> into Tickets instead, see <DocLink to="/docs/support">Support</DocLink>.
+      </P>
+
+      <Callout kind="info" title="Different from the email that Genosyn sends.">
+        This is your inbox. It is unrelated to the transactional email Genosyn sends for password
+        resets and invoices (Settings → Notification email), which stays exactly as it was.
+      </Callout>
+
+      <H2 id="connect">Connecting a mailbox</H2>
+      <P>
+        Open <Strong>Email</Strong> and type the address. That is the whole first step — Genosyn
+        works out the sign-in method from the domain. Gmail and Google Workspace use Google sign-in.
+        Other supported mailboxes use a password, with server settings filled in for you.
+        Only an owner or admin can connect or disconnect a mailbox, because its credential and its
+        AI access serve the whole company. Once it is connected, any member can read and answer its
+        mail.
+      </P>
+      <OL>
+        <LI>
+          <Strong>Type your email address</Strong> and press Continue.
+        </LI>
+        <LI>
+          <Strong>Connect your mailbox.</Strong> For Gmail and Google Workspace, choose{" "}
+          <Strong>Continue with Google</Strong> and follow Google&apos;s consent screen — the
+          mailbox is created the moment you approve, with nothing to come back and click. For other
+          supported services it is a password field, with the servers already filled in and a line
+          telling you what kind of password your provider wants, plus an optional{" "}
+          <a href="#sender-name">sender name</a>.
+        </LI>
+        <LI>
+          The first sync imports your <Strong>entire mailbox</Strong>, newest first, so everything
+          is searchable here. A big account fills in over a few minutes in the background (the
+          sidebar shows the running count); after that, sync is incremental. The import checkpoints
+          as it goes, so a restart, a rate limit, or a dropped connection resumes at the exact
+          remaining email instead of replaying a whole page. Temporary failures are retried with
+          backoff, and unusually large conversations fall back to smaller per-message reads. Mail
+          that arrives <em>while</em> the import is still running shows up (and triggers your rules)
+          within a minute, without waiting for it to finish. You can connect more than one mailbox —
+          on different providers, if you like — and switch between them from the account picker at
+          the top of the sidebar.
+        </LI>
+      </OL>
+      <P>
+        Gmail needs no Google Cloud project, even on a self-hosted installation:{" "}
+        <DocLink to="/docs/connect">Genosyn Connect</DocLink> handles the sign-in. Choose{" "}
+        <Strong>Continue with Google</Strong>, pick your account, and approve Google&apos;s consent
+        screen in the window that opens; the mailbox appears as soon as you do. Connect handles
+        sign-in and token renewal; your installation reads and sends email directly through Google,
+        and email content never passes through Connect. Google&apos;s tokens stay encrypted in your
+        installation, which sends the refresh token to Connect only to renew access.
+      </P>
+      <P>
+        If Google sign-in is unavailable, an instance admin can see why at{" "}
+        <Strong>Admin → Runtime → Hosted sign-in</Strong>: turned off, unreachable from your
+        network, or not offering Gmail. To use your own Google OAuth app instead, register it at{" "}
+        <Strong>Admin → Integrations</Strong>; a registered app always takes precedence. See{" "}
+        <DocLink to="/docs/integrations">Integrations</DocLink> for setup. You can skip connecting
+        email during onboarding and add it later.
+      </P>
+
+      <H3 id="app-passwords">App passwords</H3>
+      <P>
+        For mailboxes connected with a password, most providers will not accept your ordinary
+        sign-in password, and want an <Strong>app password</Strong> instead: a long random string
+        you generate once, scoped to one application, revocable on its own without changing the
+        password you actually remember. Genosyn tells you which kind your provider wants and links
+        straight to the page that issues it. Gmail and Google Workspace use Google sign-in instead.
+      </P>
+      <P>
+        The password is stored encrypted with the instance key, exactly like every other Connection
+        credential, and is only ever decrypted in memory to open a connection. It is never written
+        to an AI Employee&apos;s working tree, a log, or a support bundle. TLS is always verified,
+        with no switch to turn that off — if your mail server uses an internal CA, point{" "}
+        <Code>NODE_EXTRA_CA_CERTS</Code> at it so Genosyn trusts that CA rather than trusting
+        nothing.
+      </P>
+
+      <H3 id="sender-name">Sender name</H3>
+      <P>
+        A mailbox connected with a password sends from its bare address unless you give it a{" "}
+        <Strong>Sender name</Strong> — the name recipients see beside the address, as in{" "}
+        <Code>Avery Monroe &lt;avery@example.com&gt;</Code>. Fill it in when you connect, or set it
+        any time under <Strong>Email → Settings</Strong>. Any name works, commas, quotes and
+        non-Latin letters included.
+      </P>
+      <P>
+        The name applies to everything sent from the mailbox, by Members and AI Employees alike —
+        drafts already waiting in the review queue included, since each one goes out under the name
+        the mailbox has when it is sent. Only the name changes: the address, which is what SPF, DKIM
+        and DMARC check, stays exactly as it was. Gmail and Google Workspace mailboxes use the name
+        set in Gmail instead, under <Strong>Settings → Accounts → Send mail as</Strong>.
+      </P>
+
+      <H3 id="providers">What works</H3>
+      <P>
+        <Strong>Gmail and Google Workspace</Strong> connect through Google sign-in. Other mailboxes
+        connect through IMAP and SMTP: <Strong>Fastmail</Strong>, <Strong>iCloud</Strong>,{" "}
+        <Strong>Yahoo</Strong>, <Strong>Zoho</Strong>, <Strong>GMX</Strong>, <Strong>Yandex</Strong>
+        , <Strong>mailbox.org</Strong>, <Strong>Migadu</Strong>, <Strong>Titan</Strong>, a company
+        Exchange or Dovecot server, or a mailbox on a domain you host yourself.
+      </P>
+      <P>
+        Two caveats worth knowing before you start. <Strong>Microsoft</Strong> has retired ordinary
+        passwords for IMAP on both Outlook.com and Microsoft 365, so an Outlook mailbox needs an app
+        password that your account or your 365 admin has to allow. <Strong>Proton Mail</Strong> has
+        no public IMAP at all — it works only through Proton Mail Bridge running next to Genosyn.{" "}
+        <Strong>Tuta</Strong> and <Strong>HEY</Strong> expose no IMAP whatsoever and cannot be
+        connected by any mail client, Genosyn included; the connect dialog says so rather than
+        letting you fail at a password prompt.
+      </P>
+      <Callout kind="info" title="Subjects and names in any language.">
+        A subject or a name outside plain ASCII reaches an IMAP server encoded. Genosyn shows,
+        searches and hands AI Employees the decoded text, the way Gmail does. Mail that an earlier
+        version of Genosyn mirrored from an IMAP mailbox is decoded in place over the next few
+        syncs, with nothing downloaded again. A pending email or work review on one of those
+        conversations expires once and has to be prepared again, while a reply already sent or
+        discarded, or work already approved or declined, stays handled.
+      </Callout>
+
+      <H3 id="folders-labels">Folders and labels</H3>
+      <P>
+        Gmail lets a conversation carry several labels at once; every other IMAP server puts a
+        message in exactly one folder. Genosyn keeps one model and translates: on an IMAP mailbox a{" "}
+        <Strong>label is a folder</Strong>, so applying one <em>moves</em> the conversation there,
+        removing one moves it back to the Inbox, and creating a label creates a folder. Archive,
+        Trash, Spam, Sent and Drafts map to the server&apos;s own special folders (or, on an older
+        server that flags none, to folders with the usual names). One difference is worth stating
+        plainly: Gmail remembers which labels a message had before it was trashed and restores them;
+        IMAP remembers nothing, so <Strong>Untrash</Strong> puts the conversation back in the Inbox.
+      </P>
+      <Callout kind="info" title="One-click unsubscribe is Gmail-only.">
+        The <Strong>Unsubscribe</Strong> button trusts the receiving mail server&apos;s own DKIM
+        verdict on the sender, and Genosyn only knows which server that is for a Gmail mailbox. On
+        an IMAP mailbox the button is not offered — trusting a <Code>dkim=pass</Code> line the
+        sender may have written about themselves would be worse than not offering it.
+      </Callout>
+
+      <Callout kind="info" title="No push endpoint to expose.">
+        Sync is poll-based on a short interval, so there is no Google Cloud Pub/Sub topic and no
+        inbound webhook. Gmail uses Genosyn Connect or a locally registered Google OAuth app; other
+        supported mailboxes use their password and server settings. (On a very large account a master admin can cap the
+        first import to recent mail with <Strong>Backfill days</Strong> at{" "}
+        <Code>Admin → Runtime</Code>; the default imports everything.)
+      </Callout>
+
+      <H2 id="using">Reading and answering mail</H2>
+      <P>
+        The folder rail carries the usual views — Inbox, Starred, Sent, Drafts, All mail, Spam,
+        Trash — plus your own labels or folders. Open a thread to read it, then{" "}
+        <Strong>Reply</Strong>, <Strong>Reply all</Strong>, <Strong>Forward</Strong>, or{" "}
+        <Strong>Compose</Strong> a new message — with file attachments if you need them, added from
+        the Attach button or by pasting a screenshot straight into the message box. Star, archive,
+        trash, mark read/unread, and apply labels all act on the whole thread and land on the mail
+        server immediately. <Strong>Archive</Strong>, <Strong>Move to trash</Strong> and{" "}
+        <Strong>Mark unread</Strong> finish with the thread, so they take you straight back to the
+        list you opened it from — the same folder, label or search, with your place kept — and a
+        thread you mark unread stays unread. <Strong>Back</Strong> on a thread you opened from a
+        link goes to the Inbox.
+      </P>
+      <H3 id="writing">Writing a reply, a forward, or a new email</H3>
+      <P>
+        <Strong>Reply</Strong>, <Strong>Reply all</Strong> and <Strong>Forward</Strong> open an
+        editor right under the conversation — from the buttons below it, from the same three
+        buttons under any one message to answer <em>that</em> message, or with <Code>r</Code>,{" "}
+        <Code>a</Code> and <Code>f</Code>. Switch between them from the menu at the top of the
+        editor without losing what you wrote.
+      </P>
+      <P>
+        Recipients are <Strong>chips</Strong> on <Strong>To</Strong>, <Strong>Cc</Strong> and{" "}
+        <Strong>Bcc</Strong> lines, shown by name. Take anyone off with their ×, type or paste to
+        add more, and click a chip to fix it. As you type, people on the conversation are offered
+        first, then everyone this mailbox has mailed with, most frequent first. Cc and Bcc stay
+        folded behind two small buttons until you need them. Putting someone on a line takes them
+        off the others, so moving a person to Bcc is just adding them there. The same lines are in{" "}
+        <Strong>Compose</Strong>, in a saved draft&apos;s editor, and in an AI Employee&apos;s email
+        under review in the Decision stack.
+      </P>
+      <P>
+        A reply carries the message it answers as a quote, folded behind <Strong>•••</Strong>, so
+        people reading it in another mail client see what you are answering; turn that off with{" "}
+        <Strong>Don&apos;t include the earlier message</Strong>. A forward keeps the original&apos;s
+        attachments — remove any you don&apos;t want to pass on. <Code>⌘↵</Code> (
+        <Code>Ctrl+Enter</Code>) sends. While you write, the conversation&apos;s one-key shortcuts
+        are off, so a stray <Code>e</Code> never archives it.
+      </P>
+      <P>
+        What you write is kept in this browser until you send it, save it as a draft, or press{" "}
+        <Strong>Discard</Strong>. Leave the conversation half-way through and it offers{" "}
+        <Strong>Resume</Strong> when you come back.
+      </P>
+      <P>
+        A conversation reads as one card. Its header says how many messages it holds and who is on
+        it, and in a long one the closed messages in the middle fold into{" "}
+        <Strong>N earlier messages</Strong> between the first and the two newest, so the latest
+        reply is never a long scroll away. In a message you read, the quoted history at the bottom —
+        the earlier emails other clients paste under a reply — is folded behind{" "}
+        <Strong>•••</Strong> too, so the conversation reads as the new words in each message.
+        Forwarded messages are never folded.
+      </P>
+      <P>
+        Click an attachment on a saved draft to download it, including while editing the draft.
+        Downloads preserve filenames in any language. The separate × button removes it from the
+        draft when you save or send.
+      </P>
+      <P>
+        The Inbox header shows when the mailbox last synced <Strong>successfully</Strong>. Click{" "}
+        <Strong>Sync now</Strong> to check for new mail immediately. Genosyn records that pass
+        before it starts, so the button follows a real queued, running, succeeded, or failed state
+        even if you reload the page or miss a live update. A temporary timeout is retried
+        automatically; if the retry budget is exhausted, the button stops, the mailbox shows a
+        useful explanation, and <Strong>Retry sync</Strong> starts another resumable pass.
+        Background sync also retries an errored mailbox on a slower cadence.
+      </P>
+      <P>
+        If the credential stops working — Google asks you to authorize again, or your provider
+        rotates the app password — an owner or admin can open <Strong>Email → Settings</Strong> and
+        reconnect. This refreshes the existing Connection in place, so your imported mail, rules, AI
+        access, and mailbox settings stay intact. Afterwards, return to Email and click{" "}
+        <Strong>Retry sync</Strong> if the mailbox was showing an error. Reconnect with the{" "}
+        <em>same</em> address (and, on Google, keep the Gmail product selected); to replace the
+        mailbox with a different address, disconnect this mailbox first.
+      </P>
+      <P>
+        Search (press <Code>/</Code> to jump to the box) covers <Strong>all mail</Strong> — every
+        folder except Spam and Trash — and matches subjects, participants, and the{" "}
+        <Strong>full text of every message</Strong> in the index. A term matches whole words and
+        the start of words, ignoring case and accents: <Code>invo</Code> finds &ldquo;invoice&rdquo;
+        and <Code>cafe</Code> finds &ldquo;Café&rdquo;, but <Code>voice</Code> does not find
+        &ldquo;invoice&rdquo;. (On an install that uses Postgres, and for the minute or so after a
+        restart while the search index rebuilds, a term matches anywhere in the text instead.)
+        Terms combine, quotes match words in that order, and the familiar
+        operators narrow things down: <Code>from:</Code>, <Code>to:</Code>
+        , <Code>subject:</Code>, <Code>label:</Code>, <Code>has:attachment</Code>,{" "}
+        <Code>is:unread</Code>, <Code>is:starred</Code>, <Code>before:</Code>/<Code>after:</Code>{" "}
+        with a date, and <Code>in:</Code> to pick a folder (<Code>in:archive</Code>,{" "}
+        <Code>in:trash</Code>, …). So <Code>from:acme has:attachment after:2026-01-01 invoice</Code>{" "}
+        finds the attachment-carrying Acme invoice threads from this year, wherever they were filed.
+        AI Employees get the exact same grammar through their mail search tool.
+      </P>
+      <P>
+        Message bodies are rendered safely — scripts are stripped and remote images stay blocked
+        behind a <Strong>Show images</Strong> click, so a tracking pixel can&apos;t phone home just
+        because you opened a message.
+      </P>
+      <H2 id="drafts">The Drafts review queue</H2>
+      <P>
+        If the server loses ownership or restarts during a paced send, the interrupted draft is
+        marked failed. Check <Strong>Sent</Strong> before sending that draft again: the mailbox may
+        already have accepted it. Drafts that had not started sending keep their existing pace.
+      </P>
+      <P>
+        AI Employees write drafts; you decide what actually goes out. <Strong>Drafts</Strong> opens
+        as a review queue built for that job — one row per draft rather than one per thread, so a
+        night&apos;s work is a single scannable list instead of a folder to click through.
+      </P>
+      <Callout kind="info" title="Automatic replies stay in the Decision stack.">
+        When a rule or proactive email responsibility prepares a customer reply, the exact message
+        appears in the <DocLink to="/docs/decisions#reviewing-email">Decision stack</DocLink>
+        instead. It is not saved to Gmail Drafts or an IMAP Drafts folder. Review it there, use{" "}
+        <Strong>Edit email</Strong> or <Strong>Ask employee to edit</Strong> if needed, then select{" "}
+        <Strong>Send now</Strong> or <Strong>Discard</Strong>.
+      </Callout>
+      <P>
+        <Strong>Home → Emails</Strong> keeps <Strong>Drafts</Strong> and <Strong>Starred</Strong>{" "}
+        together. Their totals cover every company mailbox; select either count to open that view in
+        a mailbox that has matching items. Below them, up to five recent drafts show the subject,
+        recipients, and mailbox so you can open the thread to review, edit, and send. Mailbox rows
+        link to each mailbox&apos;s own Drafts and Starred views. Drafts already queued for sending
+        leave the Drafts count; failed sends return for review. The section follows mail changes
+        live, refreshes when you return to the browser tab, and disappears when both totals are
+        zero.
+      </P>
+      <P>
+        Every row shows who wrote it: the <Strong>AI Employee</Strong> and the{" "}
+        <Strong>Routine</Strong> that produced it, next to the recipient, subject, and a preview.
+        Filter the queue <Strong>by AI Employee</Strong> or <Strong>by routine</Strong> from the
+        toolbar — each option carries its own count — and group the list the same way to review one
+        routine&apos;s output as a batch. Drafts you wrote yourself show you instead; anything
+        written before this shipped, or synced in from the mail server, reads as{" "}
+        <Strong>Unattributed</Strong> rather than guessing at an author.
+      </P>
+      <P>
+        Press <Code>Enter</Code> to peek at a draft inline, or open it for full review: the whole
+        message, its attachments, the message it is replying to, and the Run that produced it — all
+        in one panel, without leaving the queue. Its <Strong>Ask AI</Strong> button hands that draft
+        to <DocLink to="/docs/email#assistant">Ask AI</DocLink>, and <Strong>Edit</Strong> opens the
+        thread with that draft&apos;s editor already open and the cursor in the message. A
+        row&apos;s quick actions appear when you hover it or Tab to it.
+      </P>
+
+      <H3 id="sending-in-bulk">Marking drafts to send, and sending everything</H3>
+      <P>
+        Tick the drafts you want and press <Strong>Send selected</Strong>, or take the whole
+        filtered queue with <Strong>Send all</Strong>. The header checkbox selects every draft
+        matching the current filter — not only the ones on screen — so a 300-draft queue is two
+        clicks rather than 300.
+      </P>
+      <P>
+        Because sending cannot be undone, every batch stops at a confirmation that shows what a
+        count alone hides: <Strong>who is about to receive mail</Strong> — a sample of the real
+        addresses — a breakdown per routine, and the mailbox it goes out from. Past 25 drafts, or
+        whenever you selected everything matching a filter, the confirm button stays disabled until
+        you acknowledge the size explicitly.
+      </P>
+      <P>
+        Confirming adds the drafts to a durable send queue instead of releasing them together. The
+        first email waits a random one to two minutes; after every attempt, Genosyn chooses a fresh
+        one-to-two minute pause before the next. A progress bar stays at the top of{" "}
+        <Strong>Drafts</Strong> with sent, failed, and remaining counts, the next-send countdown,
+        and an approximate finish time for the whole queue. You can leave the page or restart the
+        app without collapsing the remaining mail into a burst.
+      </P>
+      <P>
+        A draft with no recipient can never be selected: its checkbox is disabled rather than being
+        silently dropped at send time. Those drafts collect in a pinned{" "}
+        <Strong>Needs attention</Strong> group along with anything the mail server refused, so
+        nothing vanishes without being accounted for. Drafts disappear from the review list as soon
+        as they enter the send queue, leaving the page ready for more review. You can add newly
+        approved drafts while sending is in progress; they join the same paced queue and its finish
+        estimate updates automatically. The progress bar disappears when the queue finishes. A
+        failed attempt returns to <Strong>Needs attention</Strong> with the server&apos;s reason
+        while the rest of the queue continues.
+      </P>
+
+      <H2 id="schedule-meeting">Scheduling a meeting from an email</H2>
+      <P>
+        When a conversation ends in &ldquo;let&apos;s get on a call&rdquo;, press{" "}
+        <Strong>Schedule</Strong> at the top of it, or <Strong>Schedule meeting</Strong> in the reply.
+        The form opens filled in: the people a Reply all would reach as guests, a title from the
+        subject, and a free slot. Meanwhile the mailbox&apos;s AI Employee — the one that{" "}
+        <DocLink to="/docs/email#analysis">reads new mail</DocLink> — reads the conversation for the
+        time people actually agreed and the time zone they agreed it in. It fills in only what you
+        have not changed yet; a time it finds after you picked one is offered with{" "}
+        <Strong>Use it</Strong> rather than forced. Under the time it shows the words it took it
+        from, checked word for word against the emails, and any other times the thread mentioned,
+        one click each.
+      </P>
+      <P>
+        Times are kept in the zone they were agreed in. &ldquo;Tuesday at 3pm CET&rdquo; is booked
+        as 3 PM in Berlin, whatever your own zone, and the form shows the same slot in your zone
+        beside it — &ldquo;9:00 – 9:30 AM EDT for you&rdquo;. Change the zone from the picker (type
+        a city to find it). Google applies daylight saving, and every guest sees the meeting in
+        their own zone. If your calendar already has something at that time, the form says so.
+      </P>
+      <P>
+        <Strong>Send invite</Strong> creates the event on Google Calendar with a{" "}
+        <Strong>Google Meet</Strong> link, and Google emails the invitation to every guest. Untick{" "}
+        <Strong>Add a Google Meet link</Strong> or <Strong>Email the invitation to guests</Strong>{" "}
+        to skip either. Guests on the{" "}
+        <DocLink to="/docs/email#suppressed">do-not-email list</DocLink> are flagged before
+        anything is sent, and refused if sent anyway. Afterwards, <Strong>Add details to reply</Strong>{" "}
+        puts the time and the Meet link into a Reply all, so your email and the invitation say the
+        same thing.
+      </P>
+      <P>
+        When the AI review of a new email finds a request for a call, it offers a{" "}
+        <Strong>Schedule</Strong> button of its own; pressing it opens the same form with what the
+        email proposed. Nothing is sent until you press <Strong>Send invite</Strong>.
+      </P>
+      <Callout kind="info" title="Which calendar it goes on.">
+        The event is created on a Google calendar connected under{" "}
+        <DocLink to="/docs/meetings">Meetings → Calendars</DocLink>, or on this mailbox&apos;s own
+        Google calendar when its Google sign-in includes Calendar access. With more than one, pick it
+        in the form; the mailbox&apos;s own calendar is chosen first. With none, the form says where
+        to connect one. Scheduling is open to every Member who can use the mailbox, like sending
+        mail, and each meeting is recorded in the audit log. An AI Employee books one the same way
+        with <Code>schedule_meeting</Code>, after checking free time with{" "}
+        <Code>check_calendar_availability</Code>. The invitation is an email, so it needs the
+        mailbox&apos;s <Strong>Send</Strong> Grant, and a company calendar also needs its calendar
+        Grant.
+      </Callout>
+
+      <H2 id="suppressed">Sending refuses suppressed recipients</H2>
+      <P>
+        Every send from this mailbox is checked against the company&apos;s{" "}
+        <DocLink to="/docs/deliverability">suppression list</DocLink> — the addresses that
+        unsubscribed, hard-bounced, or were marked do-not-email. The check sits at the one outbound
+        choke-point, so it covers a Member pressing Send, a bulk send from the Drafts queue, a
+        sequence step, and an AI Employee&apos;s mail tools identically, and it runs when the
+        message actually goes out rather than when the draft was written.
+      </P>
+      <P>
+        You see it before you send: a recipient on the list, or at a domain a company{" "}
+        <DocLink to="/docs/policies">Policy</DocLink> blocks, turns red the moment it is added, with
+        the reason underneath and a <Strong>Remove</Strong> button — in replies, new emails, drafts,
+        and the guests of a meeting. A single message is still refused{" "}
+        <Strong>all or nothing</Strong>: if any recipient in To, Cc or Bcc is on the list, the send
+        fails and names the addresses, rather than quietly delivering to the rest. A bulk send skips the blocked drafts and tells you which ones. Manage the list,
+        and read the unsubscribe and bounce rules, under{" "}
+        <DocLink to="/docs/deliverability">Deliverability</DocLink>.
+      </P>
+
+      <H2 id="power-user">Keyboard, bulk actions, and ⌘K</H2>
+      <P>
+        Mail is keyboard-drivable end to end. In any list, <Code>j</Code> and <Code>k</Code> move,{" "}
+        <Code>x</Code> selects, <Code>e</Code> archives — or sends, in Drafts — <Code>#</Code>{" "}
+        trashes, <Code>s</Code> stars, <Code>u</Code> toggles read, <Code>o</Code> opens a draft for
+        review, <Code>c</Code> composes from anywhere in mail, and <Code>Esc</Code> clears the
+        selection. Inside an open thread, <Code>e</Code>, <Code>#</Code>, <Code>s</Code> and{" "}
+        <Code>u</Code> do the same to that thread (archive, trash and mark unread return you to the
+        list, with the cursor on the next thread), while <Code>r</Code>, <Code>a</Code> and <Code>f</Code> open{" "}
+        <Strong>Reply</Strong>, <Strong>Reply all</Strong> and <Strong>Forward</Strong> with the
+        cursor where you start typing. Press{" "}
+        <Code>?</Code> for the full list. Shortcuts pause automatically while you are typing in a
+        field or a dialog is open.
+      </P>
+      <P>
+        The inbox has the same multi-select: tick rows — <Strong>shift-click</Strong> takes a range
+        — then archive, trash, star, or mark read across all of them in one action, instead of one
+        thread at a time.
+      </P>
+      <P>
+        <Code>⌘K</Code> runs mail actions as well as finding pages: compose, sync the mailbox, jump
+        to any folder, and — when something is selected — act on that selection. In the Drafts queue
+        it offers <Strong>Send all drafts</Strong> directly.
+      </P>
+
+      <H3 id="saved-searches">Quick filters and saved searches</H3>
+      <P>
+        Above the thread list, one-click chips narrow what you are looking at —{" "}
+        <Strong>Unread</Strong>, <Strong>Starred</Strong>, <Strong>Has attachment</Strong> — scoped
+        to the folder you are standing in. They are not a separate filtering system: each chip
+        writes the same operators you could have typed, so <Code>is:unread</Code> from a chip and{" "}
+        <Code>is:unread</Code> from the box are the same query.
+      </P>
+      <P>
+        Any search you can type, you can keep. With a query in the box, press{" "}
+        <Strong>Save search</Strong>, give it a name, and it becomes a chip you can click from then
+        on. Saved searches are <Strong>yours alone</Strong> — they are stored per person, so a
+        shared mailbox does not turn into a shared list of everybody&apos;s shortcuts — and hovering
+        one reveals an × to remove it.
+      </P>
+
+      <H2 id="analysis">Every email arrives already triaged</H2>
+      <P>
+        A small AI review indicator beside each conversation tells you whether its latest incoming
+        email is <Strong>Not reviewed</Strong>, <Strong>AI queued</Strong>,{" "}
+        <Strong>AI reviewing</Strong>, <Strong>AI reviewed</Strong>, or <Strong>Needs attention</Strong>. A new reply gets
+        its own status: an older review never makes a new customer message look handled. Reading
+        the email yourself does not mark it as reviewed by an AI Employee.
+      </P>
+      <P>
+        Open a conversation to see its <Strong>AI work timeline</Strong>: when mail arrived, who
+        reviewed it, when a handover started or finished, and the recorded work that followed.
+        Decisions, estimates, invoices, prepared replies, and other supported actions link to the
+        resulting record when your access allows it. Pending delivery or work reviews stay distinct
+        from completed work. Suggested actions below the review are suggestions until someone
+        actually uses them.
+      </P>
+      <P>
+        The timeline updates as work progresses. It uses recorded reviews and actions, so an AI
+        Employee saying it created an estimate does not by itself add an estimate event. Earlier
+        conversations can show the reviews and handovers Genosyn retained; actions without a
+        recorded link to that email are not guessed from their timing.
+      </P>
+      <P>
+        You do not have to ask. As each email lands, an AI Employee reads it once and puts a short
+        summary and a row of <Strong>action buttons</Strong> at the top of the thread — the next
+        steps that <em>this</em> email actually deserves. A customer asking to be billed gets{" "}
+        <Strong>Create the invoice</Strong>. Someone asking what it would cost gets{" "}
+        <Strong>Draft an estimate</Strong>. A newsletter you never signed up for gets{" "}
+        <Strong>Unsubscribe</Strong>. Anything that needs an answer gets{" "}
+        <Strong>Prepare a reply</Strong>, with the reply already written.
+      </P>
+      <P>
+        The buttons vary because the reasoning does. There is no fixed list per sender and no rule
+        to write: the employee reads the email, decides what a person would do next, and offers up
+        to four things. Often the honest answer is none, and then you just get the one-line summary
+        and a category chip.
+      </P>
+      <P>
+        These reviews also appear in the AI Employee&apos;s{" "}
+        <DocLink to="/docs/employees#work-timeline">work timeline</DocLink> as{" "}
+        <Strong>Email analysis</Strong>. Each card explains the review and identifies its email,
+        with the recorded summary, category, suggested next steps or failure reason when available.
+        Analysis uses the message text and attachment names; it does not inspect attachment
+        contents or carry out the suggested actions. Open the linked email to review and use them.
+        Older entries without a retained result say so instead of showing a later review&apos;s
+        findings. A step your <DocLink to="/docs/email#analysis-instructions">instructions</DocLink>{" "}
+        took shows separately, as <Strong>Followed an email instruction</Strong>.
+      </P>
+      <P>What a button does when you press it:</P>
+      <UL>
+        <LI>
+          <Strong>Prepare a reply</Strong> — puts the exact reply in <Strong>Needs you</Strong>,
+          where an owner or admin can edit, send, ask the employee to revise, or discard it. It
+          exists only in Genosyn until they press <Strong>Send now</Strong>; Gmail and IMAP Drafts
+          stay untouched.
+        </LI>
+        <LI>
+          <Strong>Create the invoice</Strong> / <Strong>Draft an estimate</Strong> — pulls the line
+          items out of the email, matches the sender to a customer (or creates one), and opens the{" "}
+          <DocLink to="/docs/finance">draft</DocLink> for you to check. Drafts carry no number and
+          post nothing to the ledger until you issue them.
+        </LI>
+        <LI>
+          <Strong>Unsubscribe</Strong> — sends the sender&apos;s own one-click unsubscribe request.
+          It is only ever offered when the email carries a verified, signed one-click header, so it
+          cannot become a link the email talked us into visiting.
+        </LI>
+        <LI>
+          <Strong>Archive</Strong>, <Strong>Star</Strong>, <Strong>Label</Strong> — ordinary triage
+          on the thread.
+        </LI>
+        <LI>
+          <Strong>Hand to an employee</Strong> — starts a{" "}
+          <DocLink to="/docs/email#hand-to-ai">handover</DocLink> with the instruction already
+          written.
+        </LI>
+        <LI>
+          <Strong>Schedule</Strong> — opens the{" "}
+          <DocLink to="/docs/email#schedule-meeting">meeting scheduler</DocLink> with the time,
+          zone and guests the email proposed. Nothing is sent until you press{" "}
+          <Strong>Send invite</Strong>.
+        </LI>
+      </UL>
+      <Callout kind="tip" title="Buttons wait for you.">
+        A button only ever <em>proposes</em>; the only thing that runs by itself is your own{" "}
+        <DocLink to="/docs/email#analysis-instructions">instructions</DocLink>. Each button is
+        checked against the pressing Member&apos;s access and the employee&apos;s Grant. An employee on <Strong>Draft</Strong>{" "}
+        can prepare a reply, but only an owner or admin can send its Decision-stack review. What you
+        see under each label is the fact the server checked, not the employee&apos;s claim about it:
+        the total an invoice adds up to or the host an unsubscribe would talk to. Buttons that
+        consume something are marked done once they run, so a reload cannot fire them twice. Acting
+        with <em>your</em> access cuts both ways: if your{" "}
+        <DocLink to="/docs/finance">finance</DocLink> access is read-only, the invoice and estimate
+        buttons appear greyed out with the reason, because they would be refused anyway — you still
+        see what the email was read as.
+      </Callout>
+      <P>
+        Email is untrusted text, and it is treated that way. The employee reading it gets one
+        submission tool and nothing else — no repositories, no secrets, no browser, no company tools
+        — so an email that tries to give instructions is evidence about its sender, not a command.
+        It also cannot choose its own affordances: whether <Strong>Unsubscribe</Strong>
+        may be offered at all is decided by Genosyn before the employee ever sees the email.
+      </P>
+      <H3 id="analysis-instructions">Instructions — what happens on its own</H3>
+      <P>
+        Under <Strong>Email → Settings → AI analysis</Strong>, the <Strong>Instructions</Strong>{" "}
+        box says, in your own words, what should happen to your mail. Every new email is checked
+        against it by the same AI Employee that reads it. A mailbox starts with these two, marked{" "}
+        <Strong>Default</Strong>:
+      </P>
+      <UL>
+        <LI>Unsubscribe me automatically from marketing emails.</LI>
+        <LI>Star emails that need my response and look important.</LI>
+      </UL>
+      <P>
+        Change them, add your own — one instruction per line, up to 30 — and press{" "}
+        <Strong>Save instructions</Strong> (or <Code>⌘ Enter</Code> / <Code>Ctrl Enter</Code>).{" "}
+        <Strong>Cancel</Strong> throws away unsaved edits, and <Strong>Restore default</Strong>{" "}
+        puts the default back; a mailbox on the default picks up any improvements to its wording.
+        Leave the box empty and new mail gets only its summary and suggested buttons.
+      </P>
+      <P>
+        On its own, the AI Employee can only do five things, and only to the email it is reading:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Star</Strong>, <Strong>mark as read</Strong>, or <Strong>archive</Strong> the
+          thread.
+        </LI>
+        <LI>
+          <Strong>Add a label</Strong> your instruction names — &ldquo;Label invoices as
+          Finance&rdquo; can add <em>Finance</em>, never a label the email suggested, and never a
+          system folder such as Inbox, Spam or Trash. On an IMAP mailbox a label is a folder, so
+          this moves the thread there.
+        </LI>
+        <LI>
+          <Strong>Unsubscribe</Strong>, through the email&apos;s own verified one-click unsubscribe
+          — the same check as the button, so only on Gmail mailboxes, and never for mail the
+          employee read as spam, because unsubscribing tells the sender your address is real.
+        </LI>
+      </UL>
+      <P>
+        It never replies, sends, forwards, deletes, files spam, raises an invoice or hands the
+        thread to anyone by itself. When an instruction asks for one of those, the employee offers
+        it as a button instead, for you to press.
+      </P>
+      <P>
+        Everything it did shows on the email, under <Strong>Your instructions</Strong>: what it
+        did, why, and which of your instructions it followed. <Strong>Undo</Strong> takes back a
+        star, a read mark, an archive or a label, with your own access; an unsubscribe cannot be
+        undone. A step that did not happen says why — for example, the email had no verified
+        unsubscribe link. Each step also appears in the{" "}
+        <DocLink to="/docs/employees#work-timeline">work timeline</DocLink> and the audit log,
+        under the employee that read the email.
+      </P>
+      <Callout kind="info" title="When the instructions run.">
+        Once, as a new email arrives — or, if its AI Model was{" "}
+        <a href="#analysis-unavailable">unavailable</a> then, once it is read — never on the mail
+        imported when you connected the mailbox,
+        on drafts, or on mail you sent, and not when you ask for an email to be read again (the
+        refresh button on its AI summary, or <Strong>Try again</Strong>), which only refreshes the
+        summary and suggestions. They run under the reading employee&apos;s own{" "}
+        <DocLink to="/docs/email#access">AI access</DocLink>, which must be <Strong>Draft</Strong>{" "}
+        or higher: on <Strong>Read</Strong>, the instructions only shape the suggestions. Nothing
+        runs while a <DocLink to="/docs/standdowns">Standdown</DocLink> covers the company or that
+        employee, while the mailbox is paused, or once you turn analysis off; a step whose
+        instruction you changed before it ran is skipped. If a{" "}
+        <DocLink to="/docs/email#rules">rule</DocLink> would unsubscribe from the same email, the
+        request is sent only once.
+      </Callout>
+      <P>
+        Mailboxes connected before instructions existed start on the default too, from the next
+        email that arrives. Clear the box, or turn AI analysis off, if you would rather they did
+        nothing on their own.
+      </P>
+      <H3 id="analysis-unavailable">When the AI Model is unavailable</H3>
+      <P>
+        If the reading employee&apos;s <DocLink to="/docs/models#unavailable">AI Model is
+        unavailable</DocLink> when an email arrives — or becomes unavailable while reading it —
+        the email is not marked as failed. Its AI summary says{" "}
+        <Strong>Waiting for the AI Model to come back</Strong>, and your rules and Pipelines run as
+        usual meanwhile. Once the model answers again the email is read by itself, once, as the
+        arrival it is: your instructions act on it then, under the reading employee&apos;s access
+        and any Standdown as they stand at that moment, and a rule that names the summary&apos;s
+        category gets its first look. An unsubscribe a rule already sent is never sent again.
+      </P>
+      <UL>
+        <LI>
+          An email that waited more than three days is still read, but its instructions are offered
+          as buttons instead of acting on their own — mail that old is not newly arrived.
+        </LI>
+        <LI>
+          A paused mailbox keeps the email waiting until you resume it. Turn AI analysis off, or
+          move the email to Spam or Trash, and it is never read.
+        </LI>
+        <LI>
+          You can&apos;t read an email again while it waits, and reading one again while the model
+          is unavailable is refused before its current summary is touched.
+        </LI>
+      </UL>
+      <H3 id="analysis-settings">Choosing who reads, and turning it off</H3>
+      <P>
+        <Strong>Email → Settings → AI analysis</Strong> is on for every mailbox. Leave the employee
+        picker on <Strong>Choose automatically</Strong> and Genosyn uses whichever employee you have
+        granted the most access to — so a mailbox works the day you connect it. Pick one explicitly
+        when you want a particular voice on your replies, and pin one of their{" "}
+        <DocLink to="/docs/models">models</DocLink> when you want a particular brain. The card
+        always tells you who would read the next email to arrive, so an on switch never means
+        nothing is happening. Turn it off and new mail simply arrives plain, and the instructions
+        stop too. Any member can change this card, instructions included. It only chooses among
+        employees an owner or admin has already given{" "}
+        <DocLink to="/docs/email#access">AI access</DocLink>, so it cannot widen what they can do.
+      </P>
+      <P>
+        Mail a <DocLink to="/docs/support">Support inbox</DocLink> takes is read once, by Support, so
+        this review skips it. Your <DocLink to="/docs/email#rules">rules</DocLink> and Pipelines still
+        run for it.
+      </P>
+      <Callout kind="info" title="Read access summarises; Draft access can act.">
+        An employee on <Strong>Read</Strong> can summarise and suggest next steps, but will not
+        offer to write a reply or carry out your instructions. Raise them to <Strong>Draft</Strong>{" "}
+        under <DocLink to="/docs/email#access">AI access</DocLink> for that.
+      </Callout>
+
+      <H2 id="assistant">Ask AI about an email</H2>
+      <P>
+        Open an email and press <Strong>Ask AI</Strong> in the top bar (or <Code>⌘J</Code> /{" "}
+        <Code>Ctrl J</Code>). The thread you are reading is already in the chat — its chip shows
+        above the message box — so type what you want directly: &ldquo;summarize this email&rdquo;,
+        &ldquo;draft a reply&rdquo;, &ldquo;make this draft shorter and friendlier&rdquo;, or
+        &ldquo;label and archive this&rdquo;. Type <Code>@</Code> to choose an AI Employee, or tag
+        two or three to hear from each of them in turn. Reviewing a draft from the Drafts queue? The
+        draft under your cursor is what &ldquo;this draft&rdquo; means. Everything about the panel
+        itself — conversations, queued follow-ups, model choice, files — is on the{" "}
+        <DocLink to="/docs/ask-ai">Ask AI</DocLink> page.
+      </P>
+      <P>
+        What an employee can see follows its mailbox Grant. With <Strong>Read</Strong> access or
+        above it gets the thread transcript, the files on it, and the unsent drafts; with{" "}
+        <Strong>Draft</Strong> access it can rewrite the actual draft in place. An employee without a
+        Grant on that mailbox is told only that an email is open — not its subject, not its
+        contents — and the composer warns you before you send that it won&apos;t be shown. Earlier
+        answers that quoted the email are withheld from it too.
+      </P>
+      <P>
+        Replies can carry <Strong>action buttons</Strong> — concrete next steps the employee
+        proposes that run with <em>your</em> authority when you click them: open a pre-filled reply,
+        send a draft it just wrote, archive or label the thread, start a handover, or create an
+        inbox rule it spotted a pattern for. That is the human-in-the-loop sweet spot: an employee
+        on the default <Strong>Draft</Strong> level can prepare and propose a send, and the send
+        happens only when you press the button. Buttons that consume something (send, triage,
+        handover, rule) are marked done after they run, so a reload can&apos;t re-arm them. A{" "}
+        <Strong>Reply</Strong> button opens the Email composer, switching to Email first if you
+        asked from elsewhere.
+      </P>
+      <P>
+        <Strong>Files go both ways.</Strong> An employee can open anything attached to the email
+        itself — a supplier form, a signed order, a statement — without you downloading and
+        re-uploading it. Ask it to fill in a PDF form that arrived on the thread and it reads the
+        form&apos;s fields, completes them from what your company already knows, and hands the
+        finished file back as a download on its reply. It can attach that same file to a real draft,
+        so the reply leaves with the paperwork on it. If the blank form isn&apos;t on the thread at
+        all, the employee can search the web for the current version, check the page, and download
+        it to work on.
+      </P>
+
+      <H2 id="create-task">Creating a task from an email</H2>
+      <P>
+        Open any thread and click <Strong>Create task</Strong>. Pick a{" "}
+        <DocLink to="/docs/tasks">Project</DocLink>, adjust the title (it starts as the subject) and
+        choose who it goes to. The thread then lists the todo under <Strong>Tasks</Strong>, and the
+        todo says <Strong>From email</Strong> with a link back. Assigning an AI Employee starts it
+        straight away within your access and its Grants; it needs Mail access to this mailbox to read
+        the email itself. A todo an AI Employee files while working a thread is linked the same way,
+        without anyone having to ask.
+      </P>
+      <P>
+        A Project can also take email by itself. Under <Strong>Email → Settings</Strong>, a
+        mailbox&apos;s AI analysis card lists the Projects filing its mail as tasks, and the
+        analysis on each email says what it was filed as, or why it wasn&apos;t. Mailbox instructions
+        can&apos;t do this, because any Member can write those and this starts work. An owner or
+        admin sets it on the Project: see <DocLink to="/docs/tasks#email-intake">Email that becomes
+        work</DocLink> and <DocLink to="/docs/tasks#email-to-done">From email to done</DocLink>.
+      </P>
+
+      <H2 id="hand-to-ai">Handing a thread to an AI Employee</H2>
+      <P>
+        Open any thread and click <Strong>Hand to AI</Strong>. Pick an employee — the dialog starts
+        on one whose access lets it draft, not one that can only read — write a short instruction,
+        and choose what it should do:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Do the work and prepare a reply.</Strong> The employee handles the underlying
+          request through its Grants, such as preparing a Customer and quote or starting a
+          Repository Work session, then puts the resulting reply in the Decision stack. It creates
+          no mailbox draft and cannot send from this handover, even with a Send Grant.
+        </LI>
+        <LI>
+          <Strong>Prepare a reply for review.</Strong> The employee writes the exact reply inside
+          Genosyn&apos;s Decision stack. Nothing is saved to Gmail or IMAP Drafts. Review and edit
+          it there, then select <Strong>Send now</Strong> or <Strong>Discard</Strong>. This is the
+          default and the safe way to put AI on your inbox.
+        </LI>
+        <LI>
+          <Strong>Reply directly.</Strong> After completing the underlying work, the employee may
+          send if its Soul and your instruction authorize that kind of reply. Otherwise it puts the
+          exact proposed reply in the Decision stack for review. Only offered to employees with{" "}
+          <Strong>Send</Strong> access.
+        </LI>
+        <LI>
+          <Strong>Triage.</Strong> No writing — the employee reads the thread and files it: applies
+          a label, archives, stars, or marks it read.
+        </LI>
+      </UL>
+      <P>
+        A handover you start runs with the employee&apos;s <DocLink to="/docs/soul">Soul</DocLink>{" "}
+        and <DocLink to="/docs/skills">Skills</DocLink>, while every action is limited by both your
+        current access and the employee&apos;s Grants. Starting or retrying one requires a logged-in
+        browser session. Progress and results appear on the thread and on the{" "}
+        <Strong>AI handovers</Strong> page, and Genosyn notifies you when the handover finishes.
+        Paused mailboxes and active Standdowns defer queued work; removed Grants or changed rules
+        are checked again before it starts.
+      </P>
+      <P>
+        A handover created automatically by a rule can research the new email and complete bounded
+        preparation within existing Grants: factual Contact details, Deal descriptions and next
+        steps, Activity notes, ordinary Follow-ups, its own Workstream tracking, and routine email
+        filing. It puts the exact reply directly in the{" "}
+        <DocLink to="/docs/decisions#reviewing-email">Decision stack</DocLink>, without a separate
+        work review for that preparation. Consequential work, such as a Repository fix, first needs
+        a work review explaining the evidence, plan and need for human authority.{" "}
+        <Strong>Approve &amp; start</Strong> authorizes that work; after it finishes, the proposed
+        customer reply returns as a separate email review. Only{" "}
+        <Strong>Send now</Strong> sends it, with no Gmail or IMAP draft created first.
+      </P>
+      <P>
+        Ready email responsibilities are assigned automatically by default as AI Employees gain a
+        connected AI Model and the required Grants, once the mailbox and its AI analysis reader are
+        ready. This covers quote requests, customer code issues, sales enquiries, confirmed spam,
+        and unwanted newsletters. Open <DocLink to="/docs/reactivity">Proactive</DocLink> to review
+        or customize those assignments. Turning <Strong>Automatic setup</Strong> off only stops
+        future automatic assignments; existing work keeps running until you pause it individually.
+        Historical mail is never replayed by setup. A consequential choice or missing information
+        that materially changes the outcome can become a Decision for a Member. For minor
+        uncertainty, the employee inspects sources and uses a conservative reversible default or
+        skips the update. A Decision answer records information; it does not approve the work or
+        perform a send.
+      </P>
+
+      <H2 id="access">Giving AI Employees mailbox access</H2>
+      <P>
+        Under <Strong>Email → Settings → AI access</Strong> — or on one employee&apos;s{" "}
+        <DocLink to="/docs/employees#access">Settings → Access</DocLink>, beside everything else it
+        can reach — an owner or admin grants the employees who should be able to act on the
+        mailbox, at one of three levels:
+      </P>
+      <UL>
+        <LI>
+          <Strong>Read.</Strong> Browse and search threads and labels — no changes.
+        </LI>
+        <LI>
+          <Strong>Draft.</Strong> Also write drafts, apply labels, archive, star, and mark read. The
+          default: an employee can triage the inbox and put a finished reply in the thread, but a
+          human still sends it.
+        </LI>
+        <LI>
+          <Strong>Send.</Strong> Also send mail on the account&apos;s behalf. Reserve this for
+          employees trusted to speak for the company unattended.
+        </LI>
+      </UL>
+      <P>
+        Every member can see who has which level, but only owners and admins can grant, change or
+        revoke access, as with AI access in <DocLink to="/docs/revenue">Revenue</DocLink> or{" "}
+        <DocLink to="/docs/meetings">Meetings</DocLink>. A Grant lets an employee act on the
+        company&apos;s mail without a person beside it, and it can make that employee eligible for
+        automatic <DocLink to="/docs/reactivity">proactive</DocLink> email work.
+      </P>
+      <P>
+        An employee used for a rule&apos;s <Strong>AI judgment</Strong> needs a connected AI Model
+        and at least <Strong>Read</Strong> access to that mailbox. The rule editor shows both beside
+        every employee and disables anyone who is not ready, so a broken AI judgment step cannot be
+        saved for future mail.
+      </P>
+      <Callout kind="warn" title="Members always have full access; grants govern AI only.">
+        Human members of the company can already use every connected mailbox. These levels only
+        decide what an AI Employee&apos;s tools and rules are allowed to do. Using the mailbox stays
+        open to every member: reading and sending, rules, handovers, pausing sync, the sender name
+        and AI analysis. None of these can give an employee more than its Grant allows.
+      </Callout>
+      <P>
+        The level covers <em>every</em> route an employee has to the mailbox, not just the mail
+        tools. The <DocLink to="/docs/integrations">Google connector</DocLink> exposes its own{" "}
+        <Code>gmail_*</Code> tools on the same account, and once you connect a mailbox here those
+        tools answer to the level you set — an employee on <Strong>Draft</Strong> is refused a send
+        whichever tool it reaches for. An employee you never granted is refused outright, even if it
+        holds a grant on the underlying Google Connection.
+      </P>
+      <Callout kind="info" title="A mailbox you haven't connected here isn't governed.">
+        These levels start applying to the <Code>gmail_*</Code> tools the moment you connect the
+        mailbox under <Strong>Email</Strong>. Before that there is no mailbox record to attach a
+        level to, so an employee granted the Google Connection can still read and send through it —
+        the Connection grant is the only thing you told Genosyn. Connect the mailbox to bring it
+        under these levels.
+      </Callout>
+
+      <H2 id="rules">Rules — automating the inbox</H2>
+      <P>
+        A <Strong>rule</Strong> runs on every new message that arrives:{" "}
+        <em>when an email matches these conditions, do these actions.</em> Static filters match on
+        sender (including an exact email address), recipient, subject, body text, and whether
+        there&apos;s an attachment. The <Strong>AI category</Strong> filter reuses the completed
+        incoming analysis without another model call; it only matches while analysis is enabled and
+        the message has a successful result. Every filled filter must match. You can then turn on{" "}
+        <Strong>AI judgment</Strong>, choose an eligible AI employee, and describe the messages that
+        count in plain language. Static filters run first; the AI Employee sees only mail that
+        passes them, and its answer must also be yes before any action runs. Each message that
+        reaches AI judgment uses the employee&apos;s active model, so narrow static filters are also
+        the simplest way to control cost on a busy mailbox.
+      </P>
+      <P>
+        For example, create a rule called <Strong>Remove marketing spam</Strong>, turn on AI
+        judgment, and write &ldquo;Legitimate marketing or newsletter email I did not ask for;
+        exclude receipts, security alerts, suspicious spam, and messages from people.&rdquo; Add{" "}
+        <Strong>Unsubscribe safely</Strong> and, if you want, <Strong>Archive</Strong>. Static
+        filters are optional, but adding one is a useful way to narrow what the AI Employee has to
+        review. Matching rules normally compose, so labelling, filing, safe unsubscribe, and
+        handovers can work together. An enabled exact-sender Spam rule takes priority and stops
+        broader proactive work on that message. The employee&apos;s <code>mail_block_sender</code>{" "}
+        tool creates this mailbox-local rule after filing confirmed spam; disable or delete it under{" "}
+        <Strong>Email → Rules</Strong> to unblock. It does not create an outbound Suppression.
+      </P>
+      <Callout kind="info" title="Major work and customer delivery still need review.">
+        A rule that hands mail to an AI Employee permits bounded internal preparation within its
+        Grants. Routine research, recordkeeping and reply wording do not need their own work
+        approval. The exact customer reply goes to the{" "}
+        <DocLink to="/docs/decisions">Decision stack</DocLink>. Consequential work, including a
+        Repository fix, needs a work review first and returns its final reply after approval and
+        completion. Automatic preparation creates no provider draft and sends no mail.
+      </Callout>
+      <Callout kind="warn" title="Safe unsubscribe never clicks a link in the email body.">
+        The action only uses one HTTPS URL advertised by RFC unsubscribe headers that the receiving
+        mail server confirms were covered by a valid DKIM signature — which Genosyn can only verify
+        for a Gmail mailbox, so the button is not offered on an IMAP one. It rejects redirects,
+        never sends browser cookies or authorization, and never follows body links. If the sender
+        did not provide that standards-based method, the action fails safely and the rule continues
+        with its other actions. Saving an enabled unsubscribe rule always asks for confirmation
+        because the external request cannot be undone. Treat suspicious or phishing mail as spam
+        instead: even a standards-shaped endpoint controlled by an attacker could confirm that your
+        address is active.
+      </Callout>
+      <Callout kind="info" title="Rules and instructions never fire on your backfill.">
+        Connecting a mailbox imports history quietly; rules and{" "}
+        <DocLink to="/docs/email#analysis-instructions">instructions</DocLink> only run on
+        genuinely new mail after that, and never on drafts or your own sent messages — so
+        connecting an account can&apos;t stampede an employee with hundreds of historical
+        handovers or unsubscribe you from years of old newsletters.
+      </Callout>
+      <P>
+        Rules or instructions? A rule is exact: these conditions, these actions, every time. The
+        AI analysis instructions are the plain-language version — one line each, read by the
+        employee as each email arrives, and limited to starring, marking read, archiving,
+        labelling and safe unsubscribe. They work together: when both would unsubscribe from the
+        same email, the request is sent only once.
+      </P>
+
+      <H3 id="routines">Rules vs. Routines</H3>
+      <P>
+        Rules are reactive — they fire when mail arrives. For scheduled email work (&ldquo;every
+        morning, summarize yesterday&apos;s unread support threads&rdquo;), give an employee a{" "}
+        <DocLink to="/docs/routines">Routine</DocLink> instead. Genosyn&apos;s automatic starter
+        Routines use the safe preparation ceiling: any reply or fresh outbound message becomes an
+        exact Decision-stack review and never a Gmail or IMAP draft. A custom unrestricted Routine
+        can still use the mailbox actions allowed by its Grants and company Policies.
+      </P>
+
+      <H2 id="ai-tools">What employees can do with mail</H2>
+      <P>
+        Granted employees get mail tools on the built-in <Code>genosyn</Code> MCP
+        surface to list accounts, search and read threads, write drafts, triage
+        (label / archive / mark read), edit existing drafts, propose Ask AI&apos;s{" "}
+        <DocLink to="/docs/email#assistant">action buttons</DocLink>, and — with{" "}
+        <Strong>send</Strong> access — send. Search runs over the same full-text index humans use
+        and takes structured filters (sender, recipient, date range, label, has-attachment), so an
+        employee can answer &ldquo;what did the vendor say about pricing last quarter?&rdquo;
+        without a human forwarding anything. Every action an employee takes is checked against its
+        grant level and recorded in the audit log and the employee&apos;s journal, so you can always
+        see what it did after the fact.
+      </P>
+      <P>
+        Email reads start small: <Code>get_mail_thread</Code> returns the newest five messages,
+        with up to 4,000 characters per body, and identifies older pages and shortened bodies.
+        Quoted history is omitted heuristically and marked as omitted. The employee can page
+        through older messages, use <Code>get_mail_message</Code> to continue a body, or explicitly
+        include quoted history. Each read reports its coverage, including when only a snippet is
+        available; the original stored email stays unchanged. If a synced body was shortened during
+        import, <Code>get_mail_message</Code> can read directly from the mailbox with{" "}
+        <Code>source: mailbox</Code>, returning bounded chunks and a body version so the employee can
+        detect changes between pages. This requires the original message to remain available and
+        does not mark it read or change its labels. Google Connection reads through{" "}
+        <Code>gmail_get_message</Code> use the same compact body view by default, with explicit
+        native Gmail formats still available.
+      </P>
+      <P>
+        Employees can open a received file with <Code>read_mail_attachment</Code> using its message
+        and attachment index. Long extracted text is returned in bounded pages: the employee
+        follows the next text offset with the first page&apos;s attachment ID and text version until
+        the complete text has been read. Pages reuse the opened file, and mailbox Read access is
+        checked again on every page. Opening a file
+        does not decrypt protected email, and unavailable text must not be treated as an empty
+        document or a completed review. The returned attachment also works with the dedicated PDF,
+        Word and Excel readers.
+      </P>
+      <P>
+        An employee with Revenue Read access can use <Code>lookup_suppression</Code> to check an
+        email address directly, even when there is no Contact. The result explicitly reports
+        suppressed, clear or unknown, with a matching Suppression (including unsubscribes and
+        bounces) and any Contact do-not-contact flag. An unavailable source means unknown unless
+        another source already proves the address is suppressed. Unknown never counts as clearance.
+        A clear result does not authorize a send:
+        mailbox Grants, company Policies and delivery reviews still apply.
+      </P>
+      <P>
+        Proactive email work has a stricter, server-owned boundary regardless of those general
+        capabilities. Its review turn uses <Code>request_mail_review</Code> to hold an exact reply
+        or fresh outbound email inside Genosyn, and approved underlying work must use the same route
+        for the final customer message. A mailbox Grant cannot turn that review into an unattended
+        send. The Connection, mailbox Grant, exact source, attachments, Suppressions, and company
+        Policies are checked again immediately before delivery.
+      </P>
+
+      <Callout kind="warn" title="Disconnecting is safe.">
+        Removing a mailbox from Genosyn deletes the local mirror, rules, AI handovers, and grants
+        here. The mail itself and the underlying Connection are never touched — nothing is deleted
+        from your provider, and other surfaces on the same Connection keep working. Only an owner
+        or admin can disconnect: without the mailbox, the Google connector&apos;s{" "}
+        <Code>gmail_*</Code> tools stop following the levels above.
+      </Callout>
+    </>
+  );
+}

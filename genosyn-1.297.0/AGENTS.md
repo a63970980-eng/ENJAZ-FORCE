@@ -1,0 +1,1739 @@
+# AGENTS.md — Guide for AI coding agents working on Genosyn
+
+> If you are Claude Code, Codex, opencode, goose, Cursor, Aider, or any
+> other AI agent touching this repo, read this file first. It is the single
+> source of truth for how to work here. For where the product is going, read
+> [`VISION.md`](./VISION.md) next.
+
+---
+
+## 1. What Genosyn is
+
+Genosyn is an **open-source, self-hostable platform for running companies
+autonomously with AI employees**.
+
+- A **Company** has human **Members** and **AI Employees**.
+- Every **AI Employee** has a **Soul** (the employee's constitution), a set of
+  **Skills** (playbooks), and **Routines** (scheduled cron-driven work). All
+  three are plain markdown stored on the employee / skill / routine DB rows —
+  there are no `SOUL.md` / `README.md` files on disk any more.
+- Each company can register multiple **AI Models**: **Anthropic** (Claude),
+  **OpenAI** (GPT), or a **custom** OpenAI-compatible endpoint (Ollama, vLLM,
+  llama.cpp, a gateway) — and assign them to employees. API-key and custom
+  models run through pinned **OpenCode 1.18.31**, managed headlessly through
+  its SDK. Genosyn owns the company context, Grants, Approvals, tool registry,
+  and persisted work; OpenCode owns the model loop, native coding tools, and
+  context management. AI Employee commands execute directly on the host
+  (inside the App container when using Docker), with no OS sandbox; the only
+  other execution mode is `disabled`. Installs are single-tenant — one
+  organization per install, which may still run several Companies — and
+  neither the Docker installer nor the Helm chart offers a shared multi-tenant
+  mode. A trusted, single-tenant OpenAI model may instead use ChatGPT
+  subscription access through the official pinned `@openai/codex` app-server.
+
+Use this guide for vocabulary and architecture, and the documentation in
+`Home/client/docs/pages/` and product source for shipped behavior.
+
+### Where Genosyn is going
+
+[`VISION.md`](./VISION.md) states plainly where Genosyn is going; the vision
+page (genosyn.com/vision, `Home/client/vision/`) tells the same vision as a
+story. Read it for the why behind the product: the people who own a company on
+Genosyn are its **board**, not its managers. The board writes the Goal, holds
+the keys to the reserves, reads an audited monthly letter, and keeps a switch
+that stops every AI Employee or changes who leads them. The company decides
+everything else on its own, and asks the board only what an owner must.
+
+- **It is direction, not shipped behavior.** Only what its Status section says
+  ships today exists. Never describe a "Next" or horizon item as shipped — in
+  docs, UI copy, or an AI Employee's prompts — and never build against one as
+  if it were already there.
+- **Use it to choose between designs.** When several approaches meet a
+  request, prefer the one that lets work start, finish, and be checked without
+  a person beside it, and that asks a person only what an owner must decide.
+- **Autonomy is earned, not assumed.** The vision is reached through the
+  primitives that already ship: Goals, Checks, Waivers, Approvals, Policies,
+  Budgets, and Standdowns. It never justifies weakening or removing a human
+  gate. That is a product decision for a human (§13), and §3–§12 bind every
+  change regardless.
+- **Keep it in step with the page.** When the vision changes (what the board
+  keeps, what the company decides, the road), update `VISION.md` and
+  `Home/client/vision/` in the same PR. Story details such as Sunwise's figures
+  live only on the page.
+- **It is Genosyn's own direction**, unrelated to `Company.vision`, the
+  statement a company on Genosyn writes about itself.
+
+---
+
+## 2. Repo layout
+
+```
+genosyn/
+├── App/         # Product app: Express + TypeORM + React + Vite + Tailwind.
+│                # App/cli/ is genosyn-api, the API's command line, which
+│                # every install serves at /cli/genosyn-api.mjs — see below.
+├── Connect/     # Genosyn Connect: the hosted OAuth sign-in service
+│                # (connect.genosyn.com, image ghcr.io/genosyn/connect).
+├── Helm/        # Official Kubernetes Helm chart (Helm/genosyn). Packaged and
+│                # published to oci://ghcr.io/genosyn/charts by
+│                # .github/workflows/chart.yml on every release tag.
+├── Home/        # Standalone marketing site (React + Vite + Tailwind).
+│                # Deployed to genosyn.com as a Cloudflare Worker by
+│                # .github/workflows/site.yml — see RELEASING.md.
+├── CLI/         # `genosyn` cluster-maintainer CLI (bash). Served from the
+│                # Home site at /install.sh and /genosyn via a sync step in
+│                # Home's predev/prebuild scripts.
+├── .oss-scanner/ # Anthropic OSS Scanner enrollment: the Dockerfile it builds
+│                 # and the threat model it reads. See below.
+├── package.json # Root npm commands for SaaS Helm deployments (no dependencies).
+├── AGENTS.md    # This file.
+├── VISION.md    # Where Genosyn is going, stated plainly. Read with this file.
+├── SECURITY.md  # How to report a vulnerability (security@genosyn.com).
+└── CLAUDE.md    # Pointer to this file.
+```
+
+Agents should never invent a new top-level folder without updating this file.
+
+### About `.oss-scanner/`
+
+Anthropic's [OSS Scanner](https://github.com/anthropics/oss-scanner) builds
+`.oss-scanner/Dockerfile` from the repo root (network on, checkout at `/src`),
+scans the image offline with `.oss-scanner/threat_model.md` as its guide, and
+emails findings to security@genosyn.com. Keep the Dockerfile building when the
+build changes (a new package, a Node bump, a native dependency) and the threat
+model current when the trust model changes (a new unauthenticated route, role,
+or by-design behavior). `App/server/ossScanner.test.ts` pins the contract.
+
+### About `CLI/`
+
+`CLI/genosyn` and `CLI/install.sh` are the canonical source. Shell is the
+right medium here — the CLI wraps `docker` on the operator's host, runs with
+no Node dependency, and ships as a single file. The TypeScript-only rule
+covers the product code in `App/` and `Home/`; it does not extend to the
+operator CLI. The command line for the *API* is a different tool for
+different people and lives in `App/cli/` (next section); do not grow API
+subcommands here.
+
+Both files are copied into `Home/client/public/` by Home's `sync-cli`
+npm script (wired into `predev` and `prebuild`), so editing `CLI/` is the
+single source of truth. Bump `CLI_VERSION` in `CLI/genosyn` when you ship a
+change users should notice.
+
+`CLI/deploy-saas.sh` is the separate operator helper behind the root
+`npm run deploy-test` / `npm run deploy-prod` commands. It applies
+the private, Git-ignored `Helm/Values/test.values.yaml` or `prod.values.yaml`
+using the existing chart and an explicitly selected Kubernetes context.
+It has no cloud-specific authentication or cluster defaults and never changes
+the operator's current context. It is not part of the downloaded self-host CLI
+and is not copied to Home.
+These operator-private files may contain deployment secrets. Keep them out of
+Git, Docker build contexts, logs, and command output. Never copy their values
+into tracked examples or CI fixtures. See `Helm/Values/README.md`.
+
+Every Docker image uses the repo root as its build context. Home needs the
+root because `sync-cli` reads from `../CLI/`; App needs it because in-app Help
+ships a read-only snapshot of App, Home, CLI, Connect, docs, and delivery
+workflows for AI Employees to inspect; Connect needs it for the license. `Home/Dockerfile` mirrors the repo
+layout inside the image at `/build/Home` + `/build/CLI` so the relative path
+resolves the same way as local dev. If you rename `CLI/`, update **all three**:
+the sync script, the Dockerfile, and the workflow matrix.
+
+### About `App/cli/`
+
+`genosyn-api` is the REST API's command line, for people, scripts and AI
+agents on their own machines — not the server's host, which is `CLI/`'s job.
+It is TypeScript like the rest of the product, imports nothing but Node's
+built-ins and its own files, and `npm run build` bundles it with the App's
+Vite into one `dist/cli/genosyn-api.mjs` that every install serves at
+`/cli/genosyn-api.mjs` (`server/routes/cli.ts`) — the way the Member-browser
+bridge agent ships — so the CLI a person downloads always matches its server
+and a self-hosted install needs nothing from genosyn.com.
+
+- **It is generated from the API reference at run time.** Areas come from
+  tags, commands from operation ids, flags from parameters, and who may call
+  what from `x-genosyn-access`, all read from `/api/openapi.json` and cached
+  under `~/.genosyn/cache`. Never hand-write a command for one operation: a
+  route documented by §7 is already a command.
+- **Its contracts are stable.** The exit codes in `cli/errors.ts` (also in
+  `help exit-codes` and the docs) never change meaning; add a kind instead.
+  An error is one JSON line on stderr for programs. Operation ids are the
+  names scripts use.
+- **The key stays private.** It is read from a hidden prompt, stdin
+  (`--with-token`) or `GENOSYN_API_KEY` — never a flag — stored mode 0600 in
+  `~/.genosyn/genosyn-api.json`, sent only to the install it was saved for,
+  and never printed: output and `--verbose` show `gen_` and its first
+  characters. Redirects are not followed.
+- **Its options win the `--name` spelling.** A parameter named like one of
+  them (`url`, `data`, `format`, `raw`, `dryRun` today) is written
+  `name=value`, and help says so. A new option takes its name from every
+  parameter that has it, so pick one no operation uses.
+- **Tests:** unit tests beside each module, `cli/e2e.test.ts` against the real
+  `createApp()` with real keys, and `cli/bundle.test.ts` on the built file,
+  which also fails if a source file imports a package. Document it in
+  `Home/client/docs/pages/ApiCli.tsx`.
+
+### About `Connect/`
+
+**Genosyn Connect** is a separate, small service: one registered OAuth app per
+provider, so a self-hosted installation can connect Gmail (and whatever else
+the service offers) without registering its own. It brokers consent and token
+renewal and never sees mailbox or file content; installations reach it, it
+never reaches them. Its operator guide is [`Connect/README.md`](./Connect/README.md).
+
+- **The App is only a client.** `services/hostedOauth.ts` signs in through it,
+  `services/hostedOauthApps.ts` lists which Integration OAuth apps can, and each
+  provider's token lifecycle renews through `services/hostedOauthTokens.ts`.
+  An app registered at Admin → Integrations, or a client supplied on a
+  Connection, always wins over Connect. The App no longer hosts sign-in for
+  other installations; do not add those routes back to it.
+- **It keeps no state.** A sign-in's context travels sealed with it (the
+  request id, then the provider's `state`), and the credential returns through
+  the browser to the installation's own page, encrypted to a one-time key only
+  that installation's server holds. Replicas share nothing but `CONNECT_SECRET`.
+  Do not add a database, a cache, or anything a later step must look up.
+- **Its wire protocol is versioned and released.** `status` reports the
+  version; an installation treats any other as "not offered here". Connections
+  renew on the path that issued them for their whole life — including Gmail's
+  original `/api/google-sign-in/refresh`. Extend a version compatibly (a new
+  optional field, a new provider) and keep `Connect/tests/compat.test.ts`
+  green; a breaking change is a new version that releases understand.
+- **Same stack, different container.** TypeScript, Express and zod as in the
+  App. Configuration is environment variables read once by
+  `Connect/src/config.ts`: it is a separate image an operator runs with
+  `docker run`, and §5's "no env, AppSetting for everything" rule binds the App.
+- **Provider names, endpoints and scopes come from code**, never a request.
+  Adding a provider means an adapter in `Connect/src/providers/`, its entry in
+  `hostedOauthApps.ts`, and tests on both sides.
+
+---
+
+## 3. Naming — get this right
+
+This project has a **deliberate vocabulary**. Use these words consistently in
+code, UI copy, commits, and docs.
+
+| ✅ Use | ❌ Do not use |
+| --- | --- |
+| **Routine** (scheduled recurring AI work) | Task, Job, Cron, Workflow |
+| **Soul** (employee constitution — `AIEmployee.soulBody` in the DB) | Persona, Prompt, System prompt |
+| **Skill** (playbook — `Skill.body` in the DB) | Tool, Capability, Function |
+| **AI Employee** | Agent, Bot, Assistant (in product copy) |
+| **AI Model** (backend brain record) | Provider, LLM config |
+| **Thinking level** (how hard an AI Model thinks before it answers — a conversation's `Conversation.effort`, a model's `AIModel.defaultEffort` / `effortCeiling`; code and the wire keep the name `effort`) | Effort (in product copy), Reasoning budget, Thinking mode, Think budget |
+| **Member** (human user in a company) | User (in product copy; `User` is fine as the DB entity name) |
+| **Run** (one execution of a Routine) | Execution, Invocation |
+| **Folder** (the exclusive, nestable filing tree for Routines and for Resources — `RoutineFolder`, `ResourceFolder`) | Category, Group, Collection, Tag |
+| **Integration** (a connector type: Stripe, Gmail, …; static in code) | Provider, Plugin, Service (in product copy) |
+| **Connection** (one authenticated account inside an Integration; DB row) | Account, Instance, Integration (of the DB row) |
+| **Connected app** (an OAuth client — claude.ai, ChatGPT — a Member approved to use the Genosyn MCP server as them in one company — `ConnectedApp`) | Connection, Integration, OAuth grant, Authorization |
+| **Genosyn Connect** (the hosted sign-in service in `Connect/`; "Connect" for short) | Broker, Proxy, Sign-in provider (in product copy) |
+| **Member browser** (a Chrome a human connected from their own computer — `MemberBrowser`) | Connection, Browser Connection, Device |
+| **Vault source** (an external password manager a company mirrors into its Vault — `VaultSource`) | Integration, Connection, Provider, Backend |
+| **Phone number** (a Twilio number the company reserved and gave to one AI Employee — `PhoneNumber`; its texts are `PhoneMessage`, its calls `PhoneCall`) | Line, DID, Connection, Integration (of the number) |
+| **Customer channel** (a Slack channel — usually a Slack Connect one — linked to one Customer, where an AI Employee keeps notes on that Customer's timeline and answers from Member-written instructions — `CustomerChannel`; the messages it keeps are `CustomerChannelMessage`) | Shared channel, Customer room, Connection (of the row); never a Workspace `Channel` |
+| **Decision** (a consequential choice an AI Employee stacked for the company to answer — a human, or the AI decider a `DecisionPolicy` rule names — `Decision`) | Approval, Question, Ask, Escalation |
+| **Waiver** (an earned, revocable exemption from one human gate — `AutonomyWaiver`) | Tier, Level, Trust score |
+| **Check** (a machine-verifiable assertion a Run must pass before it finalizes green — `RoutineCheck`, result `RunCheckResult`) | Test, Assertion, Gate, Validation |
+| **Standdown** (a revocable stop on all AI work at one scope — `Standdown`) | Pause, Hold, Suspend, Freeze, Kill switch |
+| **Unavailable** (an AI Model whose service can't be reached, is failing or overloaded, or keeps every key rate-limited; its work waits and carries on by itself — one `AIModelOutage` row per spell, `services/modelAvailability.ts`; work with no queue of its own waits as an `AIModelWait`, `services/modelWaits.ts`) | Down, Offline, Broken, Tripped, Circuit breaker (in product copy); never a Standdown |
+| **Effects** (what a Run actually changed, read back from the audit rows its own token wrote — `services/runEffects.ts`) | Trace, Log, Activity, History |
+| **Pulse** (what an AI Model is doing right now, read off its own stream — `ModelPulse`, `services/agent/modelStream.ts`; live only, holds no words) | Heartbeat, Activity, Liveness, Status |
+| **Budget** (a monthly ad-spend envelope — `Budget`) | Cap, Limit, Allowance (as product nouns) |
+| **Trigger** (an event subscription that fires a Routine — `RoutineTrigger`; a Revenue **Signal** stays a cron-evaluated query, never a Trigger) | Subscription, Listener, Hook |
+| **Wakeup** (a timed follow-up session an employee schedules for itself — `EmployeeWakeup`) | Reminder, Timer, Snooze |
+| **Workstream** (a persistent state document for work spanning many Runs — `Workstream`) | Project (reserved for the task manager), Thread, Epic |
+| **Group chat** (a private Workspace conversation between Members and the AI Employees they bring in — a `Channel` of kind `group`) | Group DM, Room, Huddle |
+| **Group discussion** (several AI Employees working one Member's question out together in a channel, in bounded read-only rounds, ending in one outcome — `GroupDiscussion`) | Meeting (reserved for Meetings), Debate, Swarm, Council |
+| **Initiative** (standing work an employee proposes and a human accepts — `Initiative`) | Proposal (Revision proposals own that word), Suggestion, Idea |
+| **Work timeline** (one AI Employee's work over a window, assembled at read time from the rows the server wrote — `services/employeeWorkTimeline.ts`) | Activity feed, Journal (the employee's own diary), Audit trail, History, Shift |
+| **Policy** (a company-wide rule binding every employee — `CompanyPolicy`; a decision-routing rule is a `DecisionPolicy`, always said as "decision policy") | Rule, Guideline, Guardrail |
+| **Standing question** (a question configured once at TLDR settings that every briefing answers — `TldrStandingQuestion`) | Preset, Template question, Default question |
+| **Suggested action** (a one-click next step an AI Employee attached to its own answer — `TldrQuestionAction`) | Quick action, Command, Shortcut |
+| **Repository** (a version-controlled workspace — code, strategy docs, policies; `Repository`) | Code Repository, Repo, Codebase |
+| **Work session** (one request to an AI Employee to do work in a Repository — `RepositoryWorkSession`) | Job, Task, Agent run |
+| **Grant** (an AI employee's access to a resource — a Connection, Note, Chart, Repo, …) | Permission, Attachment, Binding |
+| **Project member** (a human Member *or* an AI Employee authorized on a Project — `ProjectMember`) | Grant, Permission, Collaborator |
+| **Pickup** (one session an AI Employee spends on one Todo — `TodoPickup`) | Run (a Routine's), Work session (a Repository's), Job, Attempt, Kickoff |
+| **Waiting** (an `in_progress` Todo paused for a customer's reply, a person, a Decision, a review or a date — `Todo.waitingOn`; never a Todo status of its own) | Blocked, Snoozed, Paused, On hold |
+| **Email intake** (a Project's setting for which email becomes its Todos and how far they may go — `ProjectIntake`) | Inbox rule, Routing rule, Auto-triage |
+| **Trusted sender** (an address or `@domain` on an Email intake whose receiving-server-verified mail may use the employee's tools and browser) | Allowlist, Safe sender, VIP |
+| **Work queue** (an AI Employee's queued Runs and Pickups; for Pickups, the `todo_pickups` table itself, which the scheduler's heartbeat starts) | Backlog (a Todo status), Inbox, Scheduler |
+| **Todo link** (a Todo's link to the record it came from or is about — an email thread, Customer, Contact, Deal, Decision, Meeting or Run; `TodoLink`, one of which may be its **source**) | Relation, Reference, Attachment |
+| **Goal** (a measurable objective — `Goal`, linked from `Routine.goalId`) | Objective, OKR, KPI, Target (as a noun) |
+| **Lesson** (a graded Run's structured takeaway — `RunLesson`) | Learning (Resources' old name), Insight, Retro |
+| **Letter** (the monthly letter to the board — `BoardLetter`; owners and admins read it) | Report, Digest, Newsletter, Recap (a TLDR is the recap) |
+| **Auditor** (the AI Employee owners and admins appoint to read each letter — `BoardLetterSettings.auditorEmployeeId`) | Reviewer, Checker (the outcome checker owns that), Verifier; never the audit log |
+| **Revision proposal** (a staged Soul/Skill/Routine edit awaiting a human — `RevisionProposal`) | Self-modification, Patch, Suggestion |
+| **Opening** (a job or a contract the company is hiring for, posted on its careers site — `RecruitingOpening`) | Job posting, Vacancy, Requisition, Position; never "Job" as a record's name |
+| **Application** (one person applying to one Opening — `RecruitingApplication`; the person is the candidate, and where it stands is its **Stage**) | Submission, Lead, Candidate record; never "pipeline" for its stages |
+| **Scorecard** (one judgment of an Application against its Opening's criteria, by a person or an AI Employee — `RecruitingScorecard`) | Evaluation, Assessment, Rating, Review |
+| **Careers site** (where a company's Openings are listed and applications taken — on the install at `/careers/<company-slug>`, on a verified custom domain, or internal to Members) | Job board, Portal, ATS (in product copy) |
+| **Data room** (a private, tracked set of documents shared with people outside the company — investors, a buyer, auditors, a partner — `DataRoom`) | Deal room, VDR, Space, Portal, Share (in product copy) |
+| **Guest** (one person outside the company invited to one Data room through their own private link — `DataRoomGuest`) | Visitor, Viewer, User, Member (Members are the company's own people) |
+| **Ticket** (one customer's request to the company, handled in Support — `SupportTicket`; the customer who wrote is its **requester**) | Case, Issue, Conversation, Inquiry; never "Task" |
+| **Support inbox** (a mailbox and the addresses on it that count as support — `SupportInbox`, holding no credential of its own) | Queue, Channel, Connection, Shared inbox |
+| **Chat widget** (the web chat a company embeds on its own site, one per Support inbox — `SupportChatWidget`; whoever writes through it is a **visitor** — `SupportChatVisitor` — and the words open and continue a Ticket) | Live chat, Messenger, Chat surface (Slack, Teams and the like own that), Bot, Conversation |
+| **Article** (one piece of what the company knows, written for answering customers; published ones are the only company knowledge an AI reply reads — `SupportArticle`) | Doc, FAQ, KB entry, Resource |
+| **Help center** (a company's published Articles, readable by anyone at `/help/<company-slug>` once an owner or admin turns it on — `SupportSettings.helpCenterEnabled`) | Knowledge base, KB, FAQ site, Docs site, Portal |
+| **Saved reply** (a reply a Member writes once and inserts into the composer, with blanks — `SupportSavedReply`) | Macro, Canned response, Template, Snippet |
+| **Topic** (what a Ticket is about, and what follows from that: who holds it, whether a reply may go out on its own — a `SupportTopic` in Support's settings) | Category, Tag, Label, Queue |
+| **Contact** (a person in the Revenue section) | Lead, Person, Prospect |
+| **Deal** (one revenue opportunity) | Opportunity, Pipeline item |
+| **Deal Stage** (a step in the sales process) | Pipeline stage — see the warning below |
+| **Sequence** (multi-step outbound outreach) | Campaign, Drip, Cadence |
+| **Signal** (a product-usage trigger) | Alert, Trigger, Event |
+| **Activity** (one event on a Contact / Deal timeline) | Event, Log, Interaction |
+| **Suppression** (an address we must never email) | Blocklist, Blacklist |
+
+**"Tasks" is reserved** for the task-manager feature (Projects + Todos), which
+has shipped. Do not use "Task" for scheduled AI work, ever.
+
+**A Todo link grants nothing.** It records that a Todo and a record belong
+together and reads both ways (`services/todoLinks.ts`). Every read asks the
+reader's own bar on the record: an AI Employee reads a link's name only with the
+Grant that record's tools ask for, a Member a Customer's only with Finance
+access, and a record lists only Todos in Projects its reader can open, filtered
+inside the query. A link keeps a copy of the record's name, so a Todo still says
+which email it came from once that thread is gone; for an email that name is
+words a stranger wrote, and it reaches a model only as data. Where the server
+knows a Todo's provenance it writes the link itself: a Todo created in a turn
+working an email links that thread as its source, so the model never names it.
+
+**A Pickup carries what it may do, and handing work over can't shed it.** Handing
+a Todo to an AI Employee queues a `TodoPickup` (`services/todoPickups.ts`), built
+like a `ChannelTurn`: claimed with a renewed lease, handed on after a restart, its
+steps the shared activity feed keyed by its id and scoped to the Todo. A person's
+assignment runs under that person (browser session only, as ever). An AI
+Employee's runs with what its own turn had: Member-delegated stays that Member,
+employee stays employee, and `mailDeliveryMode`, `proactiveReview`, `mailThreadId`
+and taint are copied onto the row, so a restricted or tainted turn can't widen
+itself by assigning a colleague. A request can only narrow a queued Pickup, except
+a person's own, which is theirs to make. The heartbeat is a query, one Pickup per
+employee at a time: nothing due costs no model turn, which is why this is not a
+Routine. A Standdown and an unavailable AI Model hold it queued and record no
+failure. No AI Model means no Pickup at all, so connecting a model later never
+starts a backlog, and no existing Todo starts on upgrade. Chains stop at
+`MAX_TODO_CHAIN_DEPTH` and each Todo has `MAX_AUTOMATIC_PICKUPS_PER_DAY`; a person
+pressing Start now passes both. Only a Member's words are instructions:
+`Todo.untrustedText` marks a Todo an AI Employee or a Pipeline wrote, and its title
+and description reach the session as bounded JSON, called data
+(`services/todoPickupBrief.ts`). `Todo.tainted` keeps a tainted turn's words on the
+thread from losing their taint. Do not start a Todo outside `requestTodoPickup`,
+run its session without a row, let an event widen a Pickup, or read
+`untrustedText` content as a brief.
+
+**A Todo waits, and an email can't lend the session it wakes any authority.**
+`services/todoWaits.ts` holds what a Todo waits on and what ends the wait. A wait
+is a state of `in_progress`, and its check-back is a queued Pickup with a future
+`notBeforeAt`, so the work queue stays the only scheduler. A new inbound email on
+a linked thread sends the AI assignee back, in preparation scope with review-only
+replies whoever started the work, because a stranger wrote it; its words reach the
+session as bounded JSON, and the note on the Todo's thread names only the sender's
+address. An auto-responder doesn't count. A finished Todo stays finished. A Member
+answering on the thread runs under that Member, from a browser only. A question
+raised from a Pickup (`request_decision`, `request_mail_review`,
+`request_work_review`) makes its Todo wait, starts no separate session, and comes
+back to that Todo with the ceiling it had, because answering authorizes nothing.
+Three checks with no reply and the employee must close the Todo or ask a person.
+Do not add a Todo status for waiting, wake a session above preparation on an
+inbound email without an owner having asked for it in advance, or schedule a
+check-back any way but a Pickup. What an employee has on its plate is read from the
+same table in the same order (`services/todoWorkQueue.ts`, `inDispatchOrder`), for a
+Member's Work queue and the employee's `list_my_todos` alike, and the daily starter
+leaves out what it owns. Do not keep a second list of it.
+
+**An email grants nothing; an owner moves the gate ahead of time.** A
+`ProjectIntake` (`services/todoIntake.ts`) is the only thing that widens what an
+email can start, one per Project, off by default, written by an owner or admin from
+a browser session, and by no AI tool, for the same reason none writes a Check. It
+rides the arrival read: the model picks a number from the closed list of Projects
+with intake on, and the server resolves it, files the Todo through
+`services/todos.ts`, links the thread and queues the Pickup, once, on arrival only.
+`eventPickupCeiling` is the whole policy and it is pure: by default preparation
+scope with review-only replies; `replyMode: send` lets `send_mail` answer the source
+thread only, to its existing participants worked out by the server, with no
+attachments, at most 3 a day, under a Send Grant; a trusted sender verified by the
+receiving server (`services/mail/senderVerification.ts`, topmost
+`Authentication-Results` only, with a sender's own words taken out of it, and only
+for a mailbox whose server can be named) gets preparation plus the browser and its
+granted Vault logins. Both are additions to the preparation allowlist, because every
+broader reading leaked: a denylist misses the next tool that reaches outside. Every
+ceiling only narrows for a Todo: `Todo.ceilingJson` holds the narrowest it has been
+held to, and `requestTodoPickup` applies it to every request, so a stranger's Todo
+stays held when a trusted sender writes on its thread. A Member's comment, assignment,
+@-mention or Stop waiting isn't a grant, and stays within it too. The only way past it
+is **Use my access** on the Todo's panel (`overLimits`): one session, tainted, asked
+first (`TodoPickup.overLimits`). What a session may do is decided when it starts, because
+a row can sit queued for a month. New outside words end a lend for any session that
+hasn't started, wake or no wake, and that includes spam, a blocked sender and mail forging
+this mailbox's own address, because a session can read them all (`holdTodosForNewMail`). A turn working a particular email holds any Todo it comments on or edits
+(`holdTodoToTurn`), since its words replay there, and an unlimited session that reads a
+held Todo becomes tainted. A Routine that could only prepare doesn't hold a person's Todo
+by posting a status: its comment just replays as information (`fromLimitedTurn`). A
+plain Member's answer runs under them, and an owner's or admin's as the last session
+ran. A session held to preparing changes
+only its own Todo and thread, can file subtasks of it but start nothing on them, and
+can't mark anything urgent. A held Todo starts no Pipelines (`dispatchTodoCreated`), its
+next recurrence inherits its limits without the trust, and what a Pipeline files from
+an email or a webhook starts held. A trusted sender only counts on a thread nobody else
+has written on, closed Todos included, and this mailbox's own address only counts on what
+it really sent. Trust stays with the employee it started. Filing starts no Pipelines. Do
+not widen a mailbox's instructions list
+(`mail/analysisAutomation.ts`) to do this, let the model name a target, give an AI
+tool a way to read or write an intake, treat `From:` as evidence, let an email's
+Pickup send any other way, or file from anything but the arrival read. A browser
+action a Pickup queues for approval ends the session with its Todo waiting; the
+decision starts it again on the same page (`browserSessionKey`), held open for 2
+hours, because approving only lets the session fire it.
+
+**What a Todo's work creates is linked by the server.** A Work session, estimate,
+invoice, bill, Customer, Contact, Deal or ticket started in a Pickup, or in a turn that
+has filed itself a Todo or moved one to in progress, links to that Todo with no argument
+naming the link (`workingTodoIdOf`, `linkToWorkingTodo`, one call in each creator). The
+model doesn't get a way to say which Todo. Reading a Finance link takes Finance access,
+for a Member and an AI Employee alike (`FINANCE_KINDS`). An employee links and waits on its own Work sessions only, as `get_repository_work_session`
+reads them, and a tainted turn can't start or revise one without an Approval. The Todo can
+wait on a Work session (`work_session`), and its turn ending wakes the Todo through
+`runRepositoryWorkSession`, with the report as data, under what the last session had. A
+check-back after a day is there for a session lost to a restart. A person's **Start
+work session** runs under that person and is refused for a Todo with outside words on it, since
+a Work session runs commands. Do not add another way to start a Work session from a
+Todo, or make the link grant anything.
+
+**"Connection" stays reserved** for one authenticated account inside an
+Integration. An app a Member approved through OAuth to use the Genosyn MCP
+server is a **Connected app** (`ConnectedApp`), and a Chrome someone connects
+from their own machine is a **Member browser** (`MemberBrowser`, granted to employees through
+`EmployeeMemberBrowserGrant` like every other resource) — never a "Connection",
+not least because `IntegrationAuthMode` already has a `"browser"` mode meaning
+"a Connection whose credentials the headless browser replays". Two unrelated
+meanings on one word is what this table exists to prevent.
+
+**A Vault source is not an Integration either.** A **Vault source**
+(`VaultSource`) is a company's connection to Bitwarden or Vaultwarden, and the
+items it holds appear as ordinary `VaultItem` rows carrying no secret of their
+own — a mirror, marked by `vaultSourceId`, whose password is fetched from the
+source at the moment it is used. Modelling it as an Integration Connection was
+considered and rejected: a Connection is granted to an AI Employee wholesale and
+must declare model-callable tools, whereas a Vault item's whole point is
+per-item `use < manage` Grants and a plaintext path that never reaches the
+model. 1.132.0 spent a milestone moving credentials *out* of connector configs
+and into the Vault; a credentials connector would push that arrow backwards.
+
+The Vault section's own rail entry is nonetheless called **Integrations**
+(`/c/<slug>/vault/integrations`), because that is the word someone hunting for
+"connect our password manager" reaches for. It is a nav label and nothing more:
+the rows behind it are `VaultSource`s, the page is not
+`ProductIntegrationsPage`, and `vault` is deliberately absent from
+`PRODUCT_INTEGRATION_SCOPES`. Do not "fix" the inconsistency by adding it
+there — that would swap the page for the company Integration catalog and put
+Bitwarden back where the paragraph above says it must not go.
+
+**A Phone number's assignment is its Grant, and its callers are strangers.**
+The Twilio Connection only carries the account credential and exposes no tools
+(the IMAP rule: a Grant on the Connection would reach every number on the
+account). An AI Employee texts and calls through the built-in phone tools, from
+the numbers assigned to it right now, under each number's daily limits, and it
+reads only texts and calls from while a number was its own or had nobody. Anyone
+can call or text a number and caller ID is spoofable, so a call or an automatic
+text reply runs as a restricted, tool-less turn on the number's Member-written
+instructions (plus the employee's own brief on a call it placed) — never its
+Soul, Memory, Skills or company tools — exactly as an unlinked chat surface
+sender is answered (`services/phone/conversation.ts`). While the number's AI
+Model is unavailable a call takes a message with no turn at all, and the text
+that follows it up (only on a number that replies to texts) is the same
+restricted turn, under the same limits, once the model is back. Do not add a path that
+treats a caller as a Member, give those turns company tools, or hang texting
+tools off the Twilio Connection. Texting and calling are delivery: they sit
+beside `send_mail` in the taint sinks and the mail-delivery send ceiling.
+
+**A meeting can create a Customer; nothing creates a Contact on its own.** As soon
+as a meeting has someone from outside the company on it, `services/meetings/customerLink.ts`
+links it to one Customer, the account most of those attendees belong to, and creates
+a `prospect` when nobody is known: one row, for the largest group. A Contact stays
+something a person, an import or a Signal makes (`revenue/mailLink.ts` rule 1). The
+company itself never becomes a Customer, and neither do machines. Anyone can put an
+address on a calendar invite, so a new Customer's name comes from the domain, or the
+address for free mail, never from an event title or display name. Archiving an account
+is how a Member stops the next meeting recreating it, so a meeting links to an archived
+row rather than starting another. `Meeting.customerChosen` makes a Member's choice
+final, a removed link included. The link grants nothing: a Member reads a meeting's
+Customer only with Finance access. Do not create a Contact from an attendee, name a
+Customer from anything a stranger wrote, let an automatic pass change a chosen link,
+or backfill old meetings on upgrade.
+
+**A customer channel is read for the customer and answered for the
+customer.** Linking a Slack channel to a Customer (`services/customerChannels/`)
+is the only thing that makes the Slack app read a whole channel: every human
+message there is kept as a `CustomerChannelMessage`, and a message overheard in
+an unlinked channel is dropped unread before any identity sighting. Everyone in
+the room is a stranger — a customer is not a Member, and Slack proves nothing —
+so every reply there is a restricted turn on the channel's Member-written
+instructions whose one tool skips the reply, never the employee's Soul, Memory,
+Skills or company tools, even when a linked Member asked: the audience, not the
+asker, sets the authority. Notes come from a restricted one-tool turn whose
+submission the server files as a `note` Activity on the linked Customer, plus
+Follow-ups only under the employee's own Revenue write; the model never chooses
+the record or reaches a tool. The audience rule reaches shared channels nobody
+linked as well: `groupAudience` (`services/chatSurfaces/inbound.ts`) drops a
+linked Member's authority from any group turn the platform says another
+organization can read (Slack's `is_ext_shared_channel`), asks the platform
+when the delivery did not say, and treats a channel it cannot check as shared.
+Do not route a customer channel's turns through `chatWithEmployee`, offer a bind
+link in one, give either turn a company tool, let an unprompted reply go to the
+company's own people, or let a Member's authority into a reply that people
+outside the company read.
+
+**A Check is not a health check, and a Standdown is not `Routine.enabled`.**
+The word "check" had a second meaning in this codebase — one named condition on
+the System Health page — so M58 renamed those to **probes** (`HealthProbe`,
+`InstanceProbe`) rather than let two unrelated things share a noun. A **Check**
+is now exactly one thing: a machine-verifiable assertion a Run must pass, which
+the graded party cannot author. That last clause is the whole primitive — there
+is deliberately no MCP tool that creates, edits, or deletes one, because a bar
+the graded party can write is not a bar. It may *read* its Checks, and does, in
+its Run brief.
+
+**A Standdown** is likewise not a rename of `Routine.enabled`, which stays the
+ordinary per-routine switch and is untouched. A Standdown is the emergency
+instrument: it names a scope (company / employee / routine), records who
+stopped the work and why, aborts Runs already in flight, defers rather than
+cancels what was queued, and is placed by a human. Repeated Run failures do not
+automatically place a Standdown. Existing Standdowns remain effective until a
+human lifts them. Current server state determines whether work is stood down;
+historical Journal entries and saved progress checkpoints do not keep a lifted
+Standdown in force. Scope matters: stopping one Routine does not stop its AI
+Employee, and lifting one Standdown does not lift another that still covers it.
+It is the exact inverse of a **Waiver** — a Waiver is earned,
+narrow, and widens what an AI may do without a human; a Standdown is imposed,
+broad, and stops it. Neither direction has an MCP tool: the roster must not be able to
+stand itself down and, far more importantly, must not be able to lift one.
+
+**A Run paused for a restart is not stood down.** An upgrade (`genosyn upgrade`'s
+pause step), `SIGTERM`, or recovery after a restart cut a Run off (its stopping
+process marked it, or an upgrade held the queue) puts it back in the queue as the
+same Run (`status: "queued"`, `pauseCount` > 0) with its transcript, tokens,
+checkpoint and Effects, and the queue resumes it first with the time it had left
+(`services/runPause.ts`). Nobody decided the work
+should stop, so a pause records no verdict, journal entry, alert, autonomy
+change or retry, and must never be counted as a failure. A Standdown placed
+while a Run is paused still defers it; a Standdown that lands while a Run is
+pausing wins, and the Run ends interrupted. Do not reuse the pause to stop work
+on purpose — that is what a Standdown is for.
+
+**An unavailable AI Model is not a failure, and not a Standdown.** When an AI
+Model's service can't be reached, fails, is overloaded, or keeps every key
+rate-limited, the model is **unavailable** for every AI Employee it is attached
+to (`services/modelAvailability.ts`). `services/agent/modelOutage.ts` tells that
+apart from a refused key — invalid, revoked, out of credit or quota, which the
+key ring handles (`classifyKeyRefusal`) and a person must fix — and from a
+request the model rejects, which is the work's own problem; neither makes a
+model unavailable, because no amount of waiting fixes them. While it is
+unavailable the queue starts none of its Runs; a Run that meets it pauses as
+itself (`pauseReason: "outage"`, counted in `outagePauses` and never toward the
+restart cap) and resumes first, with the time it had left, when a check or real
+work finds the model answering; a chat message stays `working`, unclaimed, and
+is answered then (waiting cause `model_unavailable`) — a Workspace reply too,
+whose turns then start one at a time on the Runs' recovery pacing
+(`keyWorkGate`); background AI work —
+grading, Wakeups, TLDRs, letters, meetings, screening, data rooms, Sequences —
+defers. AI work with no queue of its own marks its own row and waits as one
+`AIModelWait` (`services/modelWaits.ts`), carried on once, through the
+feature's own rules checked when it runs: an email's arrival read (still the
+arrival — its instructions act then, only as buttons past three days), a
+Pipeline run paused at its AI step, a Decision's pickup (under the authority it
+was given) and an AI decider (which keeps its question and pages nobody; the
+intake screen still fails open), a group discussion within its wall clock and
+each owner's share of Start the work, and answers to people outside — chat
+surfaces (acknowledged once), customer channels and text replies, each given up
+after a day (three on Slack, Teams and Telegram). A live call cannot wait: the
+employee says so and takes a message, and a number that replies to texts
+follows it up by text once the model is back. Like a restart pause, nobody
+decided it: it records no verdict, failure count, journal entry, failure
+alert, autonomy change or retry, and an outage must never be graded — a
+checker that could not run because its model was down leaves the Run
+ungraded, not `unverified`. Owners and admins hear once when a check confirms
+it and once when it ends, never once per Run. A Standdown composes both ways:
+one placed during an outage still holds the work after recovery — work that
+waited answers to the Standdowns of the moment it runs, exactly as fresh work
+would — and lifting a Standdown starts nothing on a model that is still
+unavailable. Product copy calls the state "unavailable", never "down",
+"offline" or "circuit breaker" — the retired automatic Standdown left
+`source: "breaker"` rows behind ("The failure breaker placed it"), and the word
+must not come back to mean something else.
+
+**"Unverified" is not "unclear".** `Run.outcomeVerdict` carries both and they
+are not interchangeable. `unclear` is a judgement — the checker looked at the
+evidence and could not tell. `unverified` is the absence of one — the checker
+errored, timed out, or never ran. They were one word until M58, and every
+consumer read the pair as "nothing was wrong", which meant a provider outage
+earned an employee the same credit toward unattended work as a graded success.
+Do not collapse them again, and do not let a new consumer treat a null verdict
+as a clean one.
+
+**A Run's "Error" is not "Failed".** `error` means an operational problem
+prevented the Run from finishing: a model request error, timeout, or interrupted
+server. `errorKind` preserves that cause for retry and recovery policy. `failed`
+means the intended work was not completed: the employee reported a blocker with
+`mark_run_failed`, failed a required Check, or was graded
+off-goal. The employee can report only its own active Run, with a durable
+`failureReason`; it cannot change Checks, grading, or another Run. Check and
+outcome verdicts remain separate evidence, and an unverified assessment never
+becomes success. Legacy `timeout` and `interrupted` statuses display as Error.
+
+**"Continued" is not "Failed" either.** A Run that saved a continue checkpoint
+and handed its unfinished work to an automatic continuation ends `continued`
+(the batch hand-off past two million tokens is the common case). It is the
+planned hand-off, not a failure: the last Run in the chain carries the outcome,
+so alerts, failure counts, Usage completion, earned autonomy and the letter to
+the board never count a `continued` Run against anyone. Only a continuation
+that is actually queued earns the status, and a Run whose employee reported a
+failure (`mark_run_failed`) keeps `failed` while its work continues. One
+cancelled, stopped at dispatch
+or skipped before it starts returns its parent to `failed` with the reason
+(`revertUnstartedContinuation`), so unfinished work nothing will continue stays
+visible. Do not reuse `failed` as the "resumable" marker again.
+
+**"Decision" and "Approval" are not synonyms**, and the split is the whole
+point of both. An **Approval** is the *system* interposing on an action an
+employee already attempted — a gated routine tick, a payment over a threshold,
+a guarded tool call — and the server replays that exact action once a human
+ticks it. A proactive work Approval instead holds a concrete plan the employee
+proposed before acting. Both are binary, and because approving starts work or
+fires a privileged side effect they are admin-gated and their payload is redacted
+at every boundary. A **Decision** is the employee choosing to stop for a
+consequential choice that exceeds its own judgement or authority: it writes
+the question and the options itself, answering one performs no side effect,
+and an ordinary Member can answer it. Research, routine wording, recordkeeping,
+deduplication, and reversible housekeeping do not belong in the stack. For
+low-stakes uncertainty, inspect the sources, choose a conservative reversible
+default, and record assumptions or skip quietly. Never label a Decision "approve /
+reject". The Decision stack also displays **Work awaiting approval**: distinct
+`Approval` rows of kind `proactive_work`, using the admin-gated Approval routes,
+never the Member-level Decision-answer route. Proactive starter Routines,
+event-triggered work, and automatic email handovers can do bounded, reversible
+preparation within current Grants: maintain their own Workstreams, factual
+Contact details and ordinary Follow-ups, update Deal descriptions and next
+steps, add Activity notes, file and update their own Todos, and mark, star or
+archive email. Routine research,
+preparation and housekeeping do not need a work Approval. A major work proposal
+must explain the concrete need for human judgement or authority. The server-owned
+preparation scope still excludes protected business fields, spending, security
+changes, coding, browser, external
+Connections, delegation, and new automation. Repository work needs an approved
+plan. Exact email reviews remain required under the original delivery limits;
+preparation creates no provider draft and sends no mail. A human approves one
+major work plan; current Grants and delivery limits still apply. Neither an AI
+decision policy nor a Waiver can authorize that plan.
+
+**The Decision stack can be switched off, and it screens what it takes.**
+Owners and admins set both at Decision stack → Settings
+(`Company.decisionStackEnabled`, `Company.decisionStackInstructions`;
+`services/decisionStackSettings.ts`): whether AI Employees may raise new
+Decisions (on by default), and plain-language instructions every new Decision
+is checked against (null means the default text in
+`shared/decisionStackInstructions.ts`; `""` means none). Every Decision comes
+through one door, `services/decisionIntake.ts` — do not add another path that
+creates a `Decision` row. Off, `request_decision` is hidden from every tool
+list and refused with what to do instead, and briefings stop promising it. On,
+the asking employee's own AI Model checks the question in a restricted
+one-tool turn (`services/decisionScreening.ts`); a question kept off is never
+created, is audited as `decision.screen_out`, and the employee is told to stay
+within its existing authority. A keep-off must cite one of the company's own
+instructions, and the screen fails open — no instructions, no connected model,
+a busy subscription model, an error or a timeout lets the question through.
+The switch and the screen only remove noise: they never answer a question,
+grant authority, or touch an Approval, an email or work review, or a Decision
+already waiting, which stays answerable.
+
+**An employee asks few Decisions, and each one is a short row.** Before the
+screen, the intake refuses a question the same employee already has waiting —
+the same wording, the same Run, email thread or chat, or the same Routine's
+subject — and points it at the one waiting, and it caps each employee at three
+waiting at once (`services/decisionDuplicates.ts`); neither costs a model call
+or pages anyone. `request_decision` takes the question as a plain title plus a
+short `summary` and `recommendation` written for a busy owner
+(`shared/decisionSummary.ts` holds the limits and derives the same lines from
+older rows). The stack, its History and Home show one compact row per item,
+with everything else behind a single Details disclosure; a pickup stores its
+final message as `Decision.pickupReport` apart from the step log, so an
+answered row collapses to one status line. Dismiss, Snooze, Discard and Don't
+do this take a row off the active stack in the same click; answers, sends and
+approvals are followed while the work runs, and a row that finished cleanly
+leaves on the next visit once its line has been on screen
+(`stackItemPhase`, `useDecisionFollowUps().markSeen`) — only a row that ended
+with a problem waits for Close. None of this touches an Approval: every
+email and work review still gets its own human answer, and grouping them under
+one heading never batches that answer. The stack's bulk bar (`useStackBulk`,
+`POST /decisions/bulk`, `POST /approvals/bulk`) only takes ticked rows off
+without acting — Dismiss or Snooze for a Decision, Discard or Don't do this
+for a review — each under its own row's rules, with a changed review skipped.
+Never add a bulk answer, Send now or Approve & start: each is a gate a person
+passes one row at a time.
+
+**A mailbox's AI analysis instructions act; its suggested buttons do not.** The
+AI Employee that reads each newly-arrived email (`services/mail/analysis.ts`)
+proposes one-click buttons that run only when a Member presses them, with that
+Member's authority. It also applies the mailbox's **instructions** — plain
+language a Member writes on Email → Settings → AI analysis
+(`MailAccount.aiAnalysisInstructions`; null means the default text in
+`shared/mailAnalysisInstructions.ts`, which unsubscribes from marketing mail
+and stars mail that needs a response). Those run on their own, but only through
+the server-owned list in `services/mail/analysisAutomation.ts`: star, mark
+read, archive, a label the cited instruction names, and the email's own
+verified RFC 8058 one-click unsubscribe — on that one thread, once, on arrival
+(never backfill, drafts, self-sent mail or a re-read), under the reader's own
+Draft Grant, and not while a Standdown covers the company or the reader. An
+arrival read whose AI Model is unavailable waits (`status: "waiting"`) and is
+still the arrival when it runs: the steps act then, under the Grant and the
+Standdowns of that moment, only as buttons once it waited three days, and never
+repeat an unsubscribe a rule sent meanwhile; a person cannot re-read it while it
+waits. Every step records the instruction it followed on the analysis row and
+in the audit log, and a Member can undo the reversible ones. Do not widen that list, let
+the email or the model choose a target, or add a step that sends, replies,
+forwards, deletes, files spam, spends, or starts other work.
+
+**"Repository" is not a synonym for "codebase."** A Repository is any
+version-controlled workspace the company keeps: a service's source, a
+quarter's strategy, a set of operating policies. The section used to be called
+"Code", which told people it was for engineers and nothing else. `kind` on the
+row (`code` / `documents`) only changes copy, editor defaults, and how an AI
+Employee is briefed — every Repository is a plain git repository underneath.
+Note that the physical tables are still `code_repositories` and
+`employee_code_repository_grants`: renaming a table means either a generated
+migration that drops and recreates it or a hand-written one, and §7 forbids
+the second. The product noun is what matters.
+
+**On an IMAP mailbox a Label is a folder, and applying one moves the
+conversation.** Gmail lets a message carry several labels at once; every other
+IMAP server puts it in exactly one folder. Rather than teach the sidebar, the
+search grammar, the rule engine and the MCP tools a second dialect, every
+mailbox adapter normalizes into **one canonical label set** — Gmail's own
+system ids, chosen because no live data had to migrate — and the IMAP adapter
+derives them from the message's folder and flags (`services/mail/imapModel.ts`).
+So `applyLabel` on an IMAP mailbox is a `UID MOVE`, `createLabel` is a folder,
+and Archive maps to *no* label because that is what "archived" already means on
+Gmail. Do not add a second label vocabulary, and do not make shared code branch
+on `MailAccount.provider` to decide what a label is.
+
+**A Folder is not a Tag, and neither replaces the other.** A **Folder** answers
+*where does this routine live* — one per routine, nestable, navigable in the
+sidebar. A **Tag** answers *what is this about* — many per resource, spanning
+every section of the app. M27 shipped tags saying they grouped resources
+"without forcing a folder hierarchy"; M48 added the hierarchy for Routines
+because a chip that narrows a flat list is not somewhere to put things, and
+the Resources library got the same files-and-folders tree (`ResourceFolder`,
+its own table with Routine folders' rules) when people asked to organise it
+that way. Do not add a `folderId` to a resource that only ever needed a tag,
+and do not model a folder as a reserved tag name.
+
+**A work timeline is not a Journal, and it is not the audit log.** All three
+answer "what did this employee do", and the differences are the whole reason
+there are three. A **Journal** entry is written *by the employee*, through an
+MCP tool, and is its own narration. The **audit log** is the company's whole
+history — every actor, all of time, raw metadata — which is why reading it is
+admin-gated. A **work timeline** is neither: it is assembled at read time over
+one employee and a bounded window from rows the server wrote itself (`runs`,
+`audit_events` as the effect ledger, and five tables audit provably misses), it
+stores nothing, and it is readable by any Member — for the same reason a Run's
+own **Effects** are, which `routes/routineChecks.ts` states at length. A Routine
+entry may preview a bounded, redacted final report from its persisted
+transcript, with the outcome assessment as a fallback. That preview is reported
+work, never independent verification: status, outcome and Check badges retain
+their own meaning, and the Run log retains the transcript and Effects. Do not
+give the timeline an entity, add Journal entries to its sources, or route it
+through `GET /audit`.
+
+**A letter to the board has three authors, and only one of them is an AI
+Employee.** The server computes every figure (`services/boardLetterFigures.ts`)
+from rows the roster cannot narrate — the ledger through the same report
+functions as Finance → Reports, the Goals, Run statuses and verdicts, the
+Decision stack — and links each to where it can be seen. The writer, an AI
+Employee owners and admins choose, writes only the prose, in a restricted turn
+whose one tool submits it (`services/boardLetterWriting.ts`). The trace
+(`services/boardLetterTrace.ts`) then matches every number in the prose to a
+figure, as written or honestly rounded, and the auditor gives its opinion in
+another one-tool turn (`services/boardLetterAudit.ts`). Owners and admins
+appoint the auditor, it is never the writer, and an auditor that could not
+give an opinion leaves the letter `unverified`, never clean — the same rule as
+a Run's verdict. Keep it so: no MCP tool writes a letter, changes its figures,
+trace or audit, or appoints, replaces or instructs the auditor; no route edits
+or deletes a letter; and letters are announced to open pages with
+`trigger: false` rather than registered in the resource-change subscriber,
+because every registered kind is one a Routine Trigger can subscribe to. The
+board in Genosyn today is a company's owners and admins, who write its Goals
+and place its Standdowns; a letter is theirs, and Members never read one. There
+is no AI CEO yet: the writer is chosen, not seated.
+
+**An application is written by a stranger, and Recruiting is built around
+that.** Everything an applicant sends is untrusted: the AI screener
+(`services/recruiting/screening.ts`) reads it only as bounded JSON in the user
+turn of a restricted one-tool turn, with the candidate's name, email address
+and phone number blinded and a fairness rule the company's hiring principles
+cannot override, and the server — not the model — computes every score
+(`computeScore` in `shared/recruiting.ts`) and checks every evidence quote
+against what the applicant actually wrote. A screen that fails is retried and
+then marked failed, never scored low. For AI Employees, `list_applications`
+and `get_application` are taint sources (`services/taintPolicy.ts`),
+Recruiting access is its own Grant (`EmployeeRecruitingGrant`,
+`read < screen < hire`), taking an application back from Offer, Hired,
+Rejected or Withdrawn needs `hire` like moving it there, and no tool rejects an
+Application nobody has scored. The careers site needs no sign-in: its pages
+and `/api/careers` serve public DTOs from `services/recruiting/site.ts` and
+never criteria, instructions or another applicant's data; a verified custom
+domain is answered by `careersHostGuard` with the careers site and nothing
+else; resumes stay App-private under `.private/recruiting/` and reach only
+signed-in Members. Keep those boundaries when extending it.
+
+**A data room's guest is a stranger, and its AI answers only from what that
+guest can open.** A Guest's private link is their only credential: its token
+is hashed for lookup and encrypted so owners and admins can copy it again, and
+it reaches that guest's folders and their own questions and nothing else
+(`services/dataRooms/portal.ts`). Rooms are owners' and admins' alone, reads
+included, on the human routes and under Member delegation alike. The room's
+appointed AI Employee (`DataRoom.aiEmployeeId`, an appointment like the AI
+screener's, not a Grant) works in restricted one-tool turns
+(`services/dataRooms/ai.ts`): a brief per document, a readiness review against
+the purpose's server-owned checklist (`shared/dataRooms.ts` — the model only
+says which documents cover each item, and `readinessScore` does the
+arithmetic), a reading of activity the server counted, and an answer to each
+question. An answer turn is shown only the documents the asking guest can
+open, as bounded passages (`services/dataRooms/retrieval.ts`), with the
+question as untrusted JSON in the user turn; every quote it cites is checked
+against those passages, and in `auto` mode it reaches the guest only when the
+model says the documents answer it, it cites at least one passage, every quote
+holds and the question did not try to instruct it — otherwise it waits as a
+draft. An AI Employee's own tools answer to `EmployeeDataRoomGrant`
+(`read < prepare < share`); `list_data_room_questions` is a taint source and
+`invite_data_room_guest` and `answer_data_room_question` are taint sinks and
+delivery tools, and no tool ever returns a guest's link. Keep those
+boundaries: do not let an answer read beyond its guest's folders, publish an
+unchecked quote, or hand a link to a model.
+
+**A customer is a stranger, and a reply reads only what it may repeat.** Anyone
+can email a support address and From is spoofable, so everything a customer writes
+is untrusted. A mailbox stays a `MailAccount` and keeps syncing as it always has; a
+**Support inbox** only says which mail on it counts (`services/support/`), told
+about arrivals by the mail automation outbox and about the rest of a conversation
+after each sync pass, and capturing an email once however often it is told. Bodies
+are copied onto `SupportMessage`, so a disconnected mailbox costs no ticket its
+history. The AI Employee appointed to an inbox (an appointment, not a Grant) works
+in restricted one-tool turns (`services/support/ai.ts`): no Soul, Memory, Skills,
+company tools or MCP servers. A customer's words reach it only as bounded JSON in
+the user turn, and a turn is shown only that ticket's conversation and the published
+Articles, never a note, a draft Article, another customer's ticket or their account.
+Every quote it cites is checked word for word, and whether a reply may go out with
+nobody looking is decided by the server (`autoReplyHolds`, `services/support/holds.ts`):
+an inbox set to `auto`, answerable, every quote holding, at least one, no injection,
+high confidence, a Topic that allows it, not urgent or angry, no Member holding it,
+under the per-ticket, per-customer and per-inbox limits, not automated mail, and no
+older than a day. Anything less waits as a draft with its reasons shown. Mail no
+person wrote never earns an answer (`mailSignals.ts`: bounces, auto-replies, bulk),
+which is what stops two autoresponders looping, and every automatic email carries
+RFC 3834's headers. A send is at most once: a draft is claimed before it goes, a
+crash leaves it for a person, and every reply goes through `sendMailMessage`, so the
+do-not-email list and Policies apply. A Member's choice of priority or Topic is never
+overridden, and only a stranger's first email can be filed as spam on a model's word.
+An AI Employee's own tools answer to `EmployeeSupportGrant` (`read < prepare <
+reply`); `list_support_tickets` and `get_support_ticket` are taint sources, and
+`reply_to_support_ticket` is a taint sink and delivery tool, so the restricted turn
+is the only way a reply goes out unreviewed. A rating link is a bearer credential
+whose token is kept only as a hash, it reaches one ticket's subject and a rating box,
+and a rating needs a person pressing a button, since mail scanners follow links. A
+Trigger on `support_ticket` fires when a customer writes, never on the updates a
+Routine's own work makes. Keep those boundaries: do not show a reply turn anything
+it could not safely repeat to whoever wrote the email, give it a tool, let a model
+decide a send, retry a send on a guess, or create a Contact from an email.
+
+**A Chat widget visitor is a stranger with a token, and an address they type is a
+claim.** The widget (`services/support/chat*.ts`, `routes/publicSupportChat.ts`) is the
+one Support surface a browser nobody signed in to can post to. A company's page runs a
+loader that opens a frame on the install, so the API is same-origin and sends no CORS
+headers, and the visitor's token stays in that frame's storage, out of the page's
+reach, in a header and never a URL. Off by default, and owners and admins alone turn it
+on, per inbox, with exact origins that become the frame's `frame-ancestors`; a request
+saying it is a top-level document gets a 404, or a popup would walk around that list.
+That list is a fence for browsers and says nothing to `curl`, so the throttles
+(`chatThrottle.ts`) are the real cost control: per visitor, address and company, with an
+AI-turn budget spent inside the job, before the model, on every setting. A token is kept
+only as a hash, is bound to its widget and lapses after a month; it reads rows stamped
+`SupportMessage.chatVisitorId` and nothing else, which is the whole boundary: no ticket
+number, status, note, draft or Member's name reaches a browser, and a chat merges only
+with another of the same visitor's. A typed address earns one email in fixed words and
+nothing more until a person presses Confirm on the page it links to (mail scanners open
+links): it is not `requesterEmail`, matches no Customer or Contact and receives no
+reply, and the visitor's answer is the same whatever becomes of it, so the endpoint
+says nothing about the do-not-email list. Replies are written to the conversation, with
+the AI's disclosure in the stored body; what a confirmed visitor has not read goes by
+email through `sendAutomatedMessage`. The AI works the same restricted turn, and
+`autoReplyHolds` still decides: `delivery: "chat"` drops only the checks about an address
+a chat reply does not go to, adds that somebody must be able to read it, and counts the
+per-customer limit per visitor. A chat row wakes no Routine through the subscriber; its
+own path wakes one only when a ticket becomes owed. No AI tool reads or writes a widget.
+Do not read a visitor's rows by following a ticket, add CORS or a cookie to the API, let
+an unconfirmed address reach a requester or a reply, start a model turn before the
+budget, or put a token in a URL. Keep `/support-chat/` out of the service worker: its
+headers only hold if the server is the one answering.
+
+**A help center shows what was published, to anyone, and nothing else.** It is off
+until an owner or admin turns it on, from Support → Settings and by no AI tool, and
+off answers exactly like a company that never existed: a draft, another company's
+Article and a malformed slug or id all give the one 404 (`routes/publicHelpCenter.ts`),
+counted against the address. Everything reads through `published()`
+(`services/support/helpCenter.ts`) and answers field by field, so an Article's source
+Ticket, authors and citation counts cannot reach a stranger, and a Topic shows only
+its name, only once it has a published Article. A public request writes nothing to a
+company: not `getSupportSettings`, which makes the row. A read leaves no throttle row
+either. A paging cursor is not signed, so one is checked before it reaches a query:
+on Postgres a non-uuid id raises 22P02 and a NUL raises 22021, each a 500 anyone could
+ask for, and SQLite shows neither, so `scripts/testSaasPostgres.ts` runs them for real.
+Search is throttled by address and answers no `total`. Its pages are `noindex` and
+never cached on purpose: search engines keep a copy after the switch goes off or an
+Article is taken back, so indexing would be its own switch with its own server-rendered
+pages. Because publishing now reaches the public, a turn that read a Ticket has its
+publish held as an Approval (`CONDITIONAL_TAINT_SINK_TOOLS`, decided in the tool since
+a draft reaches nobody). Do not read an Article's other columns into an answer, drop
+the `noindex`, cache a page, or start AI work from one.
+
+**A group discussion talks; it does not act.** Several AI Employees take turns
+on one Member's question in a Workspace channel — in a group chat every Member
+message is one — and the lead writes the outcome (summary, recommendation, open
+questions, who does what) in a restricted turn whose one tool submits it
+(`services/groupDiscussions.ts`). Every discussion turn, and every answer to
+`ask_colleague` (one employee asking another mid-work, `services/colleagueConsult.ts`),
+is a *collaboration turn*: read tools from the explicit allowlist in
+`services/collaborationScope.ts` and nothing else, narrowed where the tool list
+is built and refused again at the MCP seam, with no coding, browser, configured
+MCP servers, secrets or delegation. So talk is never a path around an Approval,
+a Decision or a delivery limit: the work an outcome assigns starts only when a
+Member presses Start the work, as ordinary chat turns under that Member's
+authority. Each turn runs as the speaking employee with its own Grants,
+intersected with the starting Member's access and re-checked before every turn;
+a company Standdown ends the discussion, an employee Standdown sits that
+employee out. Bounds live in `GROUP_DISCUSSION_LIMITS` (roster, rounds, turns,
+provider-reported tokens, wall clock), and passes, agreement and repetition end
+a discussion early (`groupDiscussionPlan.ts`). Taint travels with the words: a
+message a tainted turn wrote carries `ChannelMessage.tainted`, and any AI turn
+that replays one — a mention reply, the next speaker, the work started from an
+outcome — starts tainted. Keep it so: do not give collaboration turns a write
+tool, let `ask_colleague` chain (it is absent from the allowlist on purpose),
+start follow-through work without a Member, or let AI Employees rename, archive
+or post into group chats they are not in. Outside discussions, AI-to-AI
+@mention replies pause after `AI_MENTION_CHAIN_LIMIT` messages with no Member
+writing (`services/workspaceChat.ts`): a paused chain starts no turn at all.
+
+**"Pipeline" is reserved** for the DAG automation primitive (M10). The sales
+pipeline is a flat, ordered list of **Deal Stages** — there is no container
+entity, and no UI label anywhere says "pipeline" to mean the sales process. The
+word survives only as prose inside metric names ("pipeline coverage", "open
+pipeline value"). Introducing a `DealPipeline` entity would put two unrelated
+meanings on one word in the same codebase, which is exactly what this table
+exists to prevent.
+
+---
+
+## 4. Tech stack — non-negotiables
+
+- **Language:** TypeScript everywhere. No plain JS files.
+- **Backend:** Express. Do **not** introduce Nest, Fastify, tRPC, etc.
+- **ORM:** **TypeORM**. SQLite is the Docker default; Postgres (the Helm
+  chart's default) uses config and the dedicated Postgres migration stream.
+  Do not add a second ORM or raw SQL query builder.
+- **Frontend:** React 18 + Vite + TailwindCSS + React Router + lucide-react.
+  Do **not** introduce Next.js, Remix, Redux, MUI, Chakra, shadcn-as-a-dep
+  (copying a few primitives is fine), or CSS-in-JS.
+- **Auth:** bcrypt + `cookie-session`. No JWT libraries, no Auth0/Clerk.
+- **Email (transactional):** per-company `EmailProvider` rows pick the
+  transport (SMTP via `nodemailer`, or SendGrid / Mailgun / Resend / Postmark
+  via REST). Falls back to the install-wide global SMTP transport — configured
+  at **Admin → Email transport**, stored encrypted in `AppSetting` — for
+  system-level sends, then to the console. Every transactional send appends an
+  `EmailLog` row; company-scoped rows are visible at Settings → Notification email → Logs
+  (system sends — welcome, password reset, global SMTP test — carry a null
+  `companyId` and are logged but not surfaced anywhere yet).
+- **Email (the company's inbox):** the `Mail*` subsystem is **separate** and
+  speaks to the company's own mailbox through the `Mailbox` interface in
+  `services/mail/mailbox/` — the Gmail API on a `google` Connection, or
+  IMAP/SMTP on an `imap` Connection. It does **not** write `EmailLog` — there
+  is no `gmail` or `imap` transport, and adding one would drag a mailbox
+  credential into `EmailProviderConfig`. Sent mail is recorded as a
+  `MailMessage` on the thread instead. Keep the two apart.
+  Note the direction of travel: `EmailProvider` is *how the product emails
+  people*; a MailAccount is *the company's inbox*. A change that makes one
+  reach for the other is going the wrong way.
+- **Cron:** `node-cron`.
+- **Validation:** `zod` at the API boundary.
+- **No Next.js.** Listed twice because agents keep reaching for it.
+
+Before adding any new dependency, check whether the existing stack can meet
+the need. Explain any addition in the PR description.
+
+---
+
+## 5. Config
+
+`App/config.ts` is **boot configuration only** — the short list of things that
+must be settled before the process can accept a request. It keeps exactly:
+`dataDir`, `db`, `port`, `sessionSecret`, the whole `security` block, and
+`agent.codingTools` + `agent.browserEnabledInMultiTenant`. That is secrets,
+database coordinates, and the fail-closed security posture, and nothing else.
+It is a single exported object with **commented JSON-shape**. There is **no
+`.env` file** in this project — do not introduce `dotenv`, `config-yaml`,
+`.env.*`, or per-environment config files.
+
+**Everything an operator can safely change while the app is running lives in
+the `AppSetting` table and is edited by a master admin in the dashboard.** Do
+not add an operational knob to `config.ts`; an operator should never edit a
+file and restart a container to change how often a mailbox polls.
+
+| What | Where it is edited | Key |
+| --- | --- | --- |
+| Web tools, mail sync, meetings, Banking's bank sync, browser, agent knobs, containment, the outbound private-host allowlist | **Admin → Runtime** | `runtime.*` (`server/services/runtimeSettings.ts`) |
+| Global SMTP transport | **Admin → Email transport** | `smtp.global` |
+| Browser-facing public URL and custom JavaScript | **Admin → General** | `instance.publicUrl`, `instance.customJavaScript` |
+| OAuth app credentials | **Admin → Integrations** | `oauth.apps` |
+| Genosyn Connect on/off and its URL | **Admin → Runtime → Hosted sign-in** | `runtime.oauth` |
+
+`services/runtimeSettings.ts` owns every `runtime.*` group: types, defaults,
+tolerant per-field parsing, synchronous cached getters on a shared 30s refresh
+(the `services/publicUrl.ts` pattern), and the group writers. New runtime
+settings go in that module, not in a new one and not in `config.ts`.
+
+An install upgrading from the old, fatter `config.ts` — including a Kubernetes
+ConfigMap still rendering it — keeps its behavior: `importLegacyConfigOverrides()`
+copies any surviving block into its `AppSetting` row once at boot and never
+clobbers a row an operator has already saved.
+
+Users flip `config.db.driver` from `"sqlite"` to `"postgres"` to upgrade.
+Entities and migrations must work on both.
+
+---
+
+## 6. Data on disk
+
+Everything user-generated lives under `config.dataDir` (default `./data`):
+
+```
+data/
+├── .instance-secrets.json  # generated cookie + encryption roots (mode 0600)
+├── .instance-secrets.required # non-secret loss-detection marker (mode 0600)
+├── .private/
+│   ├── browser-state/<company-id>/
+│   │   ├── <employee-id>.profile/ # the employee's persistent Chrome profile (mode 0700)
+│   │   └── <employee-id>.json     # exported cookie/local-storage snapshot
+│   ├── browser-recordings/<company-id>/<run-id>/ # silent per-session Routine MP4s
+│   ├── code-repository-ssh/<company-id>/<employee-id>.known_hosts
+│   ├── recruiting/<company-id>/
+│   │   ├── resumes/        # applicants' resume files, named by a random key on the Application
+│   │   └── site/           # the careers site logo
+│   └── data-rooms/<company-id>/documents/  # data room files, named by a random key on the document
+├── app.sqlite              # WAL mode: app.sqlite-wal / -shm beside it while running
+└── companies/<company-slug>/employees/<emp-slug>/
+    ├── repos/  code-repos/    # git working trees the coding tools operate on
+    └── …                      # artifacts the agent's tools write into cwd
+```
+
+Default self-host installs create `.instance-secrets.json` and its non-secret
+loss-detection marker atomically when the public placeholders remain in
+`config.ts`. Back both up with the database: losing the managed encryption key
+makes ciphertext unreadable, and the marker makes a missing key fail closed
+instead of silently creating a new identity. A matching non-secret key ID in
+the database also detects loss or replacement of both files after database
+initialization. Never copy secret values into logs, employee working trees,
+support bundles, or source control. Explicit strong config values remain
+supported and take precedence.
+
+Browser authentication state, Routine browser recordings, and repository SSH
+host-key caches are App-private. Every session an AI Employee opens in
+Genosyn's browser shares one Chrome on a persistent profile at
+`.private/browser-state/<company-id>/<employee-id>.profile/`, which holds its
+cookies, IndexedDB, cache, and history and is deleted with the employee or the
+company. The `<employee-id>.json` beside it is a one-way export of cookies and
+local storage, written on a debounce after navigation and whenever Chrome
+closes, `SIGTERM` included. It is read only to seed a brand-new profile once and
+as the cookie jar for the ephemeral fallback when the profile cannot be used.
+Never pass it back into a working profile: a stale export would overwrite the
+jar Chrome already loaded. Silent visual recordings live under
+`.private/browser-recordings/<company-id>/<run-id>/`, one MP4 per
+`BrowserSession`, and are linked from the Run log rather than exposed in an AI
+Employee's working tree. Their video is deleted once older than the window at
+Admin → Runtime → Browser (`runtime.browser.recordingRetentionDays`: 7 days by
+default, 0 keeps them; `services/browserRecordingRetention.ts`). The Run and
+its `BrowserSession` row stay, and the recording reads as `expired`, which
+neither the Run log nor recovery may treat as a failure. A recording from
+Genosyn's browser is admin-only; a
+recording from a Member browser is visible only to that browser's exact owner.
+Recordings contain the unfiltered viewport; their authorization boundary, not
+pixel redaction, controls who can see them. Repository tokens and SSH private
+keys are decrypted only for short-lived, server-owned Git or forge API operations;
+they are never written into an employee working tree or injected into model
+coding tools.
+
+An authorized employee can publish its completed Work session branch through
+`push_repository_work_session`, using the Repository's stored SSH key or HTTPS
+token only on the server. A stored Repository HTTPS personal access token
+supplies both Git and pull request API access, with a Repository write Grant
+and no separate Connection Grant. GitHub's API endpoint is known and needs no
+Connection. Forgejo / Gitea endpoints come only from a matching connected
+Connection's configured server, never a guessed host; its token is unused.
+SSH repositories still need the Repository's exact pinned and granted
+GitHub or Forgejo Connection for the pull request API. Connection-backed Git
+also requires that exact Connection Grant. Both paths recheck live Grants and
+permit only the session's generated branch, never merging or publishing the
+default branch.
+General employee checkouts remain credential-free; start publishable changes
+in a Work session instead of leaving them stranded as local commits.
+
+- **The database is the source of truth** for Soul, Skill, and Routine prose
+  (`AIEmployee.soulBody`, `Skill.body`, `Routine.body`), for captured Run
+  transcripts (`Run.logContent`), and for **model credentials** — API keys,
+  custom-endpoint URLs, and OpenAI subscription credentials live encrypted in
+  `AIModel.configJson`. Browser recording bytes are the file-backed Run-artifact
+  exception: the `Run` → `BrowserSession` rows carry their identity and access
+  scope, while silent MP4s stay App-private under the recording path above. Do
+  not
+  reintroduce `SOUL.md` / `skills/<slug>/README.md` / `routines/<slug>/README.md`
+  on disk, and never write model credentials into an employee working tree or
+  a persistent provider directory. The OpenAI subscription path is the only
+  file-backed model-auth exception: each device login and Run gets a locked
+  temporary `CODEX_HOME`. A managed ChatGPT session is materialized there; a
+  Business / Enterprise access token is injected only into the child process
+  environment. The directory is removed afterward.
+- **OpenCode is the default runtime** for API-key and custom models. Keep the
+  binary and SDK pinned together. There is no Genosyn-owned model/tool loop or
+  history-compaction harness alongside it. Genosyn supplies each turn's
+  company context and scoped tool registry to a managed OpenCode process;
+  credentials and runtime state must not become persistent employee files.
+  A per-turn model proxy keeps API keys in Genosyn and gives OpenCode only a
+  disposable access token and endpoint. An Anthropic or OpenAI API-key model
+  holds a pool of equal keys — no primary, no backups (`services/modelApiKeys.ts`
+  keeps the old storage shape, so stored configs need no step). Each session —
+  one OpenCode session against the proxy: a chat reply, a Run's work, a Check
+  fix, a work-session turn, a delegated copy, a restricted turn, and a meeting's
+  transcription — opens on the next key in turn and keeps it to the end
+  (`services/agent/apiKeyRing.ts`); a connection test takes no turn. The turn
+  order is round-robin over the keys not resting, kept in process memory per
+  model row from a random start (`services/modelKeyPool.ts`) — never a DB write
+  per session. When the provider refuses the key itself, the proxy resends the
+  request on the next key before any reply reaches OpenCode and the session
+  stays there; anything about the request or the service goes back unchanged.
+  Each key's health and its sessions in the last day are an `AIModelKeyHealth`
+  row — never written into `configJson`, which key edits save only if nobody
+  changed it meanwhile.
+  OpenAI subscription models use the official pinned `@openai/codex`
+  app-server with the same Genosyn-owned domain tool registry:
+    * **Coding tools.** Ordinary, unrestricted API-key and custom-model work uses
+      OpenCode's native coding tools in the default host mode. Subscription
+      turns use Genosyn's coding wrappers through the official Codex runtime.
+      Commands run with the App process user's filesystem and network
+      authority: a working directory, tool permission, or Grant is not an OS
+      sandbox, and there is no optional one. Disabled mode exposes no coding
+      tools and materializes no repositories; a config that still selects the
+      retired `bubblewrap` mode boots as disabled rather than widening to host.
+      Restricted turns also disable native coding. A **Repository work
+      session** uses `repository_run_command` rooted at its worktree, applying
+      the Repository's `commandMode` and `allowedCommands`. Its worktree keeps
+      changes separate from the Member checkout, but host execution does not
+      isolate the process. A session turn
+      receives **only** the `repository_*` tools (`ToolScope` in
+      `agent/tools/index.ts`, set by `ChatOptions.workSurface`): no employee-cwd
+      `bash`, no browser, no company MCP servers, no delegation, no discovery
+      catalogue — the MCP seam refuses everything else anyway, and the tool
+      list must not promise what the seam refuses. Its activity (every tool
+      call, result, narration and step-list update) is recorded as
+      `RepositoryWorkSessionEvent` rows and shown live; a Member can stop a
+      running turn, keeping whatever it had committed;
+    * the built-in **genosyn** tools, dispatched in-process to the loopback
+      internal API (`server/mcp/toolManifest.ts` + `routes/mcpInternal.ts`)
+      with a short-lived MCP token. The model is shown a **working set** of
+      ~20 tools and reaches the rest through `find_tools` / `call_tool` — see
+      `server/services/agent/tools/`;
+    * the built-in **browser** tools — a stdio MCP child at
+      `server/mcp-browser/` that the agent connects to as an MCP client — when
+      `AIEmployee.browserEnabled` is true. The same tools drive a **Member
+      browser** when the conversation or Routine selects one: the Chrome then
+      runs on a human's computer, reached through the zero-dependency bridge
+      agent in `server/browser-bridge/` (served to Members from the App, paired
+      with a one-time code) which launches a dedicated Chrome profile and
+      relays CDP back over an outbound WebSocket. Its cookies, storage state,
+      and downloads are never written under `config.dataDir`. The sole
+      persisted output is a silent visual recording when a Routine Run actually
+      uses that browser after its owner explicitly consents to unattended
+      recording: it is stored App-private alongside the Run's browser artifacts,
+      available only to the browser's exact owner. Browser snapshots,
+      screenshots, navigation metadata, and recordings are unfiltered; do not
+      add a password/TOTP taint layer, page-content redaction, or page observer.
+      Vault tools still keep stored values server-side unless the website
+      itself renders them;
+
+    * any company-configured **MCP servers** (stdio/HTTP), which the agent
+      connects to as an MCP client. User-configured stdio servers run only in
+      host mode and are omitted in disabled mode; HTTP servers remain
+      available.
+  The agent runtime lives in `server/services/agent/`. What stays on disk under
+  the employee dir is only the working tree the coding tools operate on:
+  materialized git repos and whatever the tools write into cwd. Browser state
+  and Run recordings remain in the App-private paths above.
+- OpenAI subscription device sessions and managed refresh-token locks are
+  process-local. The supported topology for this auth mode is one trusted,
+  single-tenant App process. The standard Docker installer and the Helm chart
+  use host execution without Linux namespaces or extra security options.
+  Subscription auth remains available in this trusted deployment. Horizontally
+  scaled installs must use API-key models until the coordination primitives are
+  ready. Subscription turns serialize on the per-model lock — across every AI
+  Employee the model is attached to — and do not expose
+  `delegate_parallel_work`; a delegated copy would otherwise wait on the lock
+  held by its parent. A subscription model admits one Routine Run at a time by
+  default (`services/modelRunCapacity.ts`), so a Run waits in the queue rather
+  than on the lock.
+- **AI Models belong to the company** (`AIModel.companyId`). An
+  `EmployeeModel` row attaches one to an AI Employee, and each employee keeps
+  exactly one attached model active. Every runtime path resolves an
+  employee's model through `services/models.ts` (`getActiveModel`,
+  `resolveChatModel`, `resolveRoutineModel`, `attachedModelsByEmployee`) —
+  never by reading `ai_models` for an employee — so a detached model stops
+  answering for that employee everywhere at once. One model shared by several
+  employees is one set of credentials, one key pool with one turn order and
+  key health, and one Run limit (`modelRunCapacity` keys by the row, or the
+  endpoint). Routes
+  keyed on a model row live in `routes/companyModels.ts` (Settings → AI
+  Models); `routes/models.ts` only lists, attaches, switches and detaches an
+  employee's. Detaching never deletes a model; removing one from the company is
+  refused while anyone uses it unless it is detached from everyone first, and
+  exact duplicates (same service, model, endpoint and keys, compared by keyed
+  fingerprints — `services/modelDuplicates.ts`) are offered for merging,
+  never merged silently. All of it is owners and admins from a signed-in
+  browser: no API key, Genosyn MCP client or AI Employee tool attaches,
+  detaches, switches or removes a model.
+- **An AI Model's availability is shared, persisted state.** Every model
+  failure is classified once (`services/agent/modelOutage.ts`): the runtime's
+  error, the per-turn proxy's view of each upstream answer (`opencodeProxy.ts`
+  `onUpstream`, including an error event inside a 200 stream and every key
+  rate-limited), a Codex error notification. `services/modelAvailability.ts`
+  is the breaker, keyed like `modelRunCapacity` within a company: in memory
+  on the hot path, and one `AIModelOutage` row per spell (a partial unique
+  index allows one open row per key) so a restart and every replica see it —
+  replicas re-read open rows every 15 seconds. Checks
+  (`services/modelAvailabilityProbe.ts`) run on the server with the model's
+  own credentials, one at a time per model (a scheduler lease on Postgres),
+  on a jittered doubling backoff from `runtime.modelAvailability`, and log
+  neither a key nor a response body. Notices are claimed on the row
+  (`notifiedAt`), so a restart or a second replica never sends one twice.
+  New AI work follows the same rule: work that starts on its own asks
+  `isModelAvailable` first and defers; work that gets
+  `{ status: "error", unavailable }` back from a turn defers rather than
+  recording a result, spending an attempt or alerting anyone. A turn helper
+  that throws on a failed turn throws `ModelUnavailableError` for an outage, so
+  its caller tells the two apart without reading words. Work with no queue of
+  its own to defer into marks its own row (what a person should see) and calls
+  `waitForModel` (`services/modelWaits.ts`): one `AIModelWait` per
+  `(kind, targetId)` — never a second queue — claimed before it resumes, the
+  claim renewed while it runs and lapsing with its process, resumed when any
+  model comes back (and on a slow sweep) through the kind's handler beside the
+  feature, which re-runs the feature's own rules at that moment. A handler may
+  bound the work's age; ten outages after resuming give it up, and the feature
+  says why. The AI Models card counts these waits with the Runs and chats.
+- **A chat turn's activity belongs to its conversation.** While an AI Employee
+  answers in direct chat or Help, every tool call and result, the AI Model's
+  thinking summary (`StreamCallbacks.onReasoning`), progress milestones and
+  the reasons the turn waits are recorded as `ConversationActivityEvent` rows
+  (`services/chatTurnActivity.ts`), handed in the same tick to the turn's
+  in-process live record (`services/chatTurnLive.ts`), and summarized on the
+  reply as `ConversationMessage.activityJson` ("Worked for 2m 14s · 9 steps").
+  The recorder redacts like an Approval preview, scrubs the exact values of
+  the company Secrets the turn's tools received, never keeps a value typed
+  into a page, and clips everything; a discussion bound to a Decision, TLDR or
+  review records its steps without payloads (`chat.ts` strips them at the
+  seam and `onPayloadsWithheld` marks them `withheld`, so the Decision's own
+  discussion shows the live card without showing what the read returned).
+  Reads go through the conversation's own access — owner only, no API
+  keys — and the entity stays out of the live-sync subscriber: a reload or
+  another tab re-attaches over the follow stream (`services/chatTurnFollow.ts`,
+  `GET …/messages/:messageId/activity/stream`), never the company socket. A
+  new reason to wait is one `recorder.waiting(cause, { label })` or
+  `onRuntimeWait({ cause, label })`; the chat words the causes it knows and
+  shows the server's label for any other. Retry runs a failed reply again in
+  place (`retryDurableChatTurn`) — never a second reply row for one request.
+- **What an AI Model is doing is read off its own stream, never guessed from a
+  timer.** Runtimes report finished pieces, and between them a model can work
+  for minutes: thinking, or writing a tool call whose argument is a whole
+  document. Only its stream can tell that from a model that stopped, so every
+  byte the OpenCode model proxy forwards, and every Codex app-server
+  notification, feeds `services/agent/modelStream.ts`. It turns them into
+  **pulses** (`ModelPulse`: waiting, thinking, writing, writing a tool call,
+  compacting, and how much and when it last heard anything) and, once a request
+  ends, one `model_call` activity event saying where its time went, which is how
+  a finished turn accounts for the time between its steps. A pulse goes to the
+  live record and the turn's stream and is never stored. It holds counts and
+  tool names and no words, so it needs no redaction and any reader who sees the
+  steps may have it (`showPulse`); keep it that way, since the words have their
+  own redacted path. A delegated worker's requests are not forwarded: they are
+  not the ones the Member is waiting on. The chat calls a model silent only when
+  its stream has been (`client/lib/chatLiveness.ts`); a reader on another replica
+  has no pulses and says only how long since the last step. Do not put back a
+  client timer that calls a working turn inactive, and do not stretch
+  `REASONING_FLUSH_MS` back into a debounce: thinking is written as it arrives.
+  The recorder holds a block's raw words and scrubs them whole on every write, so
+  a credential arriving across two writes still matches; never scrub a piece and
+  keep the result, since what arrives next lands after the marker and matches
+  nothing. It writes only up to a break in the words and short of the start of any
+  Secret, and those writes have a budget of their own so a long thought never
+  costs the turn its steps. What a running native command has printed reaches a
+  reader the same live-only way (`recorder.toolOutput`), but it is a result as it
+  forms: scrubbed like one, whole lines only, withheld with payloads, and shown
+  only to a reader with `full` access (`showToolOutput`). Rendered markdown gets
+  its code bars from DOM calls (`client/lib/chatMarkdown.ts`): do not edit
+  DOMPurify's output as a string, which cannot tell a tag from an attribute's text.
+- **A Workspace AI turn is watched by its room.** Every AI Employee turn in a
+  channel, DM or group chat — the reply to an @mention or a DM, a group
+  discussion speaker's turn, a share of the work an outcome started — is a
+  `ChannelTurn` (`services/channelTurns.ts`), and its activity is the same
+  feed: the same recorder, `ConversationActivityEvent` rows (the channel as
+  `conversationId`, the turn as `messageId`), live record and follow stream
+  (`chatTurnFollow.ts`, through a `FollowSource`), and the same client card
+  (`TurnActivity.tsx`). Do not build a second recorder, live record, stream
+  or card for a surface; give it a turn anchor and reuse these. Its reply is
+  an ordinary `ChannelMessage` linked by `ChannelTurn.replyMessageId`, which
+  carries the summary (`MessageSummary.aiTurn`). What each reader sees of the
+  steps is one rule, `shared/turnActivityAccess.ts`: the Member whose
+  authority the turn ran under sees everything, everyone else who can read
+  the room sees the steps without arguments, results, hints, error text or
+  thinking (`stepsOnlyActivityEvent`), an AI Employee's own-authority turn
+  shows in full to any Member (as its Run transcripts do), and where people
+  outside the company can read (`groupAudience`, customer channels) nothing
+  beyond the reply is kept or shown — external chat surfaces record no
+  activity. The server enforces it on every read (`routes/workspaceTurns.ts`:
+  room access, browser sessions only for steps and their stream; the list of
+  running turns and Stop take an API key); the browser only says which view
+  it got. Replies are durable like a direct chat's turns: one per AI Employee,
+  started at once, a second reply of the same employee in the same channel
+  waits (`thread_busy`), a restart hands it to the next worker with the
+  recovery note, a reply waits rather than fails on an unavailable AI Model
+  and is paced on recovery, a Standdown placed meanwhile ends it without
+  reaching the model, anyone in the room may Stop it (named in the
+  activity), and Retry starts a new turn for the same message under the
+  asker's authority — never lending a Member's authority to an AI colleague's
+  or a webhook's words. Discussion turns are driven by the discussion and
+  stopped with it; their lease only proves the driver alive. Taint stays on
+  the words: a turn that replays a tainted message is tainted and so is its
+  reply.
+- **A thinking level belongs to the conversation and is resolved per turn.**
+  A Member sets `Conversation.effort` from the composer (null is Default);
+  owners set each model's `defaultEffort` and `effortCeiling` at Settings → AI
+  Models. One set of rules (`shared/thinkingLevels.ts`) serves the composer
+  and the server: Default takes the owners' default, else the model's own; a
+  level the model does not offer moves to the nearest it does, one over the
+  ceiling to the ceiling — moved, never refused or dropped silently, and the
+  reply records what it ran at (`ConversationMessage.thinkingJson`). Which
+  levels each model offers and what it does unasked live in
+  `services/modelEffort.ts` (an explicit table — an unknown model offers
+  none, a custom endpoint none until its owners turn levels on);
+  `services/agent/thinkingParams.ts` turns a level into each runtime's real
+  parameters (Claude adaptive thinking or a budget, OpenAI reasoning effort,
+  `reasoning_effort`, Codex `effort`), always asking for the thinking summary
+  so the chat's activity can show it. A model that refuses the level is not a
+  failed turn: the model proxy resends without it (`withoutThinking`), Codex
+  reruns an untouched turn without it, and the reply says so. Durable chat,
+  Help and Repository work sessions resolve levels; Routines, chat surfaces
+  and restricted turns stay at the model's own default. A level changes how
+  hard the model thinks and nothing else — never tools, Grants or gates.
+- The `data/` directory is gitignored. Never commit anything inside it.
+- Slugs are derived once at create-time via `slugify`; renames update the
+  display name but not the slug (so URLs stay stable).
+
+---
+
+## 7. Code conventions
+
+- **Modules are small and single-purpose.** A route file handles HTTP; it
+  delegates to a service in `server/services/`.
+- **No business logic in route handlers** beyond request parsing + response
+  shaping.
+- **Every new route** gets a zod schema for body/query/params.
+- **Every route is in the API reference.** `GET /api/openapi.json` (rendered
+  at `/api/docs`) is generated from the router stack by `server/openapi/`, so
+  anything a Member can do in the UI an API key can script — and the
+  `genosyn-api` CLI can call, since it reads this document. Mount routers in
+  `server/app.ts`, validate with `validateBody` / `validateQuery` /
+  `validateParams` so the schema is what gets documented, give a new router
+  its product area in `server/openapi/areas.ts`, describe an upload's form in
+  `uploads.ts`, and list a route no API client may call (loopback, provider
+  callbacks, redirects) in `exclusions.ts` with its reason —
+  `openapi/coverage.test.ts` fails until each is done. A guard that refuses
+  API keys is `requireBrowserSession`, or is marked with
+  `describeBrowserSessionOnly` / `describeBrowserSessionCondition`
+  (`middleware/routeMetadata.ts`); `openapi/apiKeySweep.test.ts` sends a real
+  key to every operation and fails when the reference and the server disagree.
+- **The Genosyn MCP server is generated from that reference.**
+  `/api/companies/:cid/mcp` (`routes/companyMcp.ts`, `services/companyMcp/`)
+  offers every operation an API key may call to any MCP client through six
+  resident tools, so a new route reaches it with no extra step. Each call is
+  replayed in memory through the App's own router with the caller's key —
+  never reimplement an operation for it, and never let it read the session
+  cookie. It is not the per-employee `mcp/connect` endpoint, nor the
+  loopback `genosyn` tools an AI Employee runs with.
+- **Clients that sign in instead of sending a key use OAuth.** claude.ai and
+  ChatGPT reach the same endpoint through the MCP authorization spec
+  (`routes/mcpOauth.ts`, `services/mcpOauth/`): discovery, dynamic client
+  registration, PKCE (S256 only), and an owner or admin approving the app at
+  `/oauth/consent`. The result is a **Connected app** whose opaque, hashed
+  tokens are accepted at that company's MCP endpoint and on the server's own
+  in-process calls (`isInProcessRequest`) — never by the REST API from
+  outside — so it is audience-bound without a JWT. It is a bearer credential
+  like a key: a guard that refuses API keys checks `usesBearerCredential(req)`
+  (`middleware/auth.ts`), so it refuses connected apps too.
+- **Lists page; they never stop at a fixed count.** A list that can grow — an
+  AI tool or the route beside it — takes `limit` (cut to its maximum, not
+  refused) and `cursor`, and answers `total`, `hasMore`, `nextCursor` and a
+  `note`, ahead of its rows, through `services/listPaging.ts` (`keysetPage`
+  for the usual case): a keyset cursor bound to the list and its filters,
+  ending in a unique id, so work done between pages never skips a row. Prefer
+  sort keys the work does not change (`createdAt` over `updatedAt`), apply
+  Grants and visibility inside the query — never after the page is cut — and
+  have a listing preview long text its `get_` tool reads in full, redacted the
+  same way. An AI tool's page also ends early rather than overflow a tool
+  result (`TOOL_PAGE_BUDGET_CHARS`). A REST list that predates paging answers a
+  page when sent `limit` or `cursor` and keeps its old shape otherwise; it and
+  its tool call one service function, so they cannot drift. An older Skill's
+  `offset` may still place a first page (`skip`), but is never advertised.
+  Give a list the filters its domain needs (Finance dates are UTC calendar
+  days, `dateRange`) and an index that bounds the rows a page reads: keys
+  sorting one way compare as one row value, so an index over the filters, the
+  sort keys and `id` starts a deep page at its cursor. Add no plain bound on
+  the first key beside it: given two ranges on one column, SQLite skip-scans
+  the index and sorts every row past the cursor. A mailbox's lists and the
+  audit log answer no `total`, because counting them reads the whole mailbox
+  or log. Pages people use follow the same cursor — Next and Previous, Load
+  older, an infinite scroll, a download that spans export parts — never an
+  offset or a timestamp of their own; a route whose old answer is a plain
+  array gets a twin that answers the page (`GET …/channels/:id/history`).
+- **Every new entity** gets a TypeORM migration. Never mutate an existing
+  migration after it has been committed.
+- **React components**: function components + hooks only. Co-locate small
+  components with their page; promote to `components/` only when reused.
+- **Styling**: Tailwind utility classes. Extract a component before you
+  extract a class. No inline `style={}` unless truly dynamic.
+- **Icons**: `lucide-react` only.
+- **Section pages are catalogued.** Section rails and the ⌘K palette's page
+  search both read `client/lib/subpages.ts`. Add a new page there, with the
+  access it needs so neither the palette nor a rail (which passes its
+  `viewer`) offers it to someone who can't open it, rather than as a
+  hand-written rail link. A page they reach by URL anyway checks its own
+  entry (`canOpenSubpage(subpageAt(path), company)`) and shows a note
+  instead of mounting what could only answer 403.
+  `server/client/subpageRoutes.test.ts` fails on a static route that is
+  neither catalogued nor deliberately left out. A page people open only now
+  and then goes in its rail's `ADVANCED_NAV_GROUP`: the rail draws that group
+  last, closed, names its pages on hover, and opens it by itself on any of
+  them — so tucking a page away never hides it from a deep link or ⌘K.
+- **Sections are listed by use.** The ⌘K palette's browse view and the
+  keyboard guide list the core sections and the ones a company has something
+  in (`shared/navigation.ts`: `CORE_SECTIONS`, `USAGE_SECTIONS`;
+  `services/navigation.ts` probes each usage section with an indexed
+  existence check). A new section goes in one of the two lists — a usage
+  section with its probe — and `client/lib/sectionVisibility.test.ts` fails
+  until it does. Search and the `G` chords always reach every section the
+  person can open. A page that moves keeps its old address working through
+  `LegacyRedirect` in `App.tsx`, query and hash included.
+- **Imports**: absolute paths from `@/` (set up in `tsconfig.json` +
+  `vite.config.ts`).
+- **Lint/format**: project ships with ESLint + Prettier defaults. **Run
+  `npm run lint` in both `App/` and `Home/` before you commit** — CI runs
+  the same command and rejects any errors. Warnings are tolerated; errors
+  are not. Recurring traps that keep breaking CI:
+  - **JSX text with `'` or `"`** trips `react/no-unescaped-entities`. Use
+    `&apos;` / `&quot;` (or wrap the text in a `{"..."}` JS expression).
+    Applies to apostrophes in contractions (`you'll`, `don't`) and quoted
+    phrases inside JSX children.
+  - **`while (true)`** trips `no-constant-condition`. Use `for (;;)` for
+    intentional infinite loops.
+  - **Ternary used as a statement** (`cond ? a() : b();`) trips
+    `@typescript-eslint/no-unused-expressions`. Use `if (cond) a(); else b();`.
+  - **Arrays built with `.push()`** should be declared `const`, not `let`.
+    The `prefer-const` rule fires on any binding that is never reassigned.
+  - Unused imports / args — either remove them or rename to `_name` (the
+    unused-vars rule allows `^_` prefix).
+- **Required npm scripts** (both `App/` and `Home/` must implement these,
+  CI depends on them): `dev`, `build`, `lint`, `typecheck`, `start`.
+  App additionally exposes: `typeorm`, `migration:generate`,
+  `migration:run`, `migration:revert`, `migration:show`, `migration:create`.
+- **Runtime:** Node 22 (LTS). Pinned in `.nvmrc`, both `Dockerfile`s, and
+  CI. Do not downgrade.
+- **Build output layout** (Dockerfiles depend on this):
+  - App: server compiled to `dist/server/index.js`, client assets under
+    `dist/client/` (served by the Express process).
+  - Home: `dist/server.js` serving built client assets.
+- **SQLite queries run on the event loop.** better-sqlite3 is synchronous,
+  so one slow statement freezes every request, and a loop of awaited
+  queries never yields to I/O. Reach large tables (`mail_messages`,
+  `mail_threads`, `runs`, `audit_events`) through an index that bounds the
+  rows read. Never filter or sort many rows on a column stored after a large
+  text column — `MailMessage.bodyText`/`bodyHtml`, `Run.logContent` — since
+  SQLite then reads every body to get there; add an index instead. `!=` can't
+  use an index, so write a non-empty test as `> ''`. The planner relies on the
+  statistics `optimizeSqliteStatistics()` (`db/datasource.ts`) refreshes after
+  migrations and every six hours; without them it treats `companyId = ?` as
+  selective. `EXPLAIN QUERY PLAN` a new query against a realistically sized
+  database before shipping it.
+  Transactions take turns on that one connection. TypeORM shares a single
+  query runner across every request, so `db/sqliteTransactionGate.ts` makes a
+  transaction exclusive from BEGIN to COMMIT: work inside it — nested
+  transactions, global-repository calls from its callback — goes through, and
+  every other request's transaction or write waits. Keep a transaction to
+  database work. One that awaits a model turn, a fetch, or a queue holds every
+  other write in the App until it ends, and one held past a minute is logged.
+  Open transactions through `AppDataSource.transaction()`, a repository save,
+  or the migration runner, which the gate scopes; a runner's own
+  `startTransaction()` runs unscoped and is logged.
+  Mail search's full-text index is the one structure built outside
+  migrations: `services/mail/searchIndex.ts` keeps an FTS5 table and TEMP
+  triggers in the connection's `temp` schema, rebuilt after every boot and
+  never written to `app.sqlite`. Keep it that way — anything persisted needs
+  an entity and a generated migration — and keep `temp_store` on disk, since
+  the index is the size of a mailbox's text.
+- **Schema changes require a migration, and migrations are NEVER
+  hand-written.** `synchronize` is off. After editing entities, run
+  `npm run migration:generate -- server/db/migrations/<Name>` and commit
+  the generated file as-is. The CLI diffs your entity changes against the
+  current local DB and emits the SQL for you — do not write the
+  `up()` / `down()` bodies yourself, and do not "tidy up" the generated
+  output. Boot calls `AppDataSource.runMigrations()` so pending migrations
+  apply on startup. Never edit a migration that has already been
+  committed; if you got the schema wrong, write a follow-up migration.
+  - If `migration:generate` complains that the binary is stale (the
+    `NODE_MODULE_VERSION` mismatch on `better-sqlite3`), run
+    `npm rebuild better-sqlite3` once and try again.
+  - The current local DB must already be migrated to head before you
+    generate (`npm run migration:run`), otherwise the diff will include
+    work from earlier branches.
+
+---
+
+## 8. UI principles
+
+Think **Linear × Notion**. Clean, quiet, fast.
+
+- Neutral palette (slate/stone), one accent color, generous whitespace.
+- `rounded-xl`, subtle `border`, soft shadow `shadow-sm`. No heavy gradients,
+  no glassmorphism, no emoji decoration in product chrome.
+- Inter (or the system sans stack) for body; tabular-nums for numeric data.
+- Empty states always exist. Loading states always exist. So do error states —
+  but **never as a toast**. A failure belongs where the person is already
+  looking: inline in the form or section that owns it (`<FormError>`), or, when
+  there is no form to put it in, in the error modal
+  (`useDialog().error(err, { title })`). Corner popups that time out are gone
+  from this codebase; do not reintroduce a toast, a snackbar, or a
+  notification library. Optimistic writes report a failure the same way, from
+  `useBackgroundAction()`, after rolling the row back.
+- A button that starts work the person waits on shows that it is working. Pass
+  `loading` to the `<Button>` that was pressed: it disables itself and puts a
+  spinner where its icon was. The rest of the row stays plain `disabled`, and
+  a hand-rolled `<button>` swaps its icon for `<ButtonSpinner>`. A button that
+  only greys out reads as a click that was ignored.
+- Success needs no announcement. The list re-rendering, the row updating, the
+  modal closing *is* the confirmation. Only when an action changes nothing on
+  screen — a test email sent, a backup queued — does it earn a `<FormSuccess>`
+  beside the control that started it.
+- Mobile-responsive is expected, not optional.
+- Password managers stay out of fields that are not the person's own sign-in.
+  A customer's email, an SMTP password or a Vault secret is not theirs to
+  fill, so every field is marked for 1Password, LastPass, Bitwarden and
+  Dashlane to ignore (`client/lib/passwordManagers.ts`: the shared `Input` and
+  `Textarea` render the marks, and a guard adds them to every other field).
+  Only the person's own Genosyn email, password or one-time code on the
+  sign-in, sign-up, password and two-factor screens carries `data-credential`;
+  do not add it anywhere else.
+- Show the basics and put everything else behind a single **Advanced**
+  disclosure (`components/ui/Disclosure.tsx`), closed by default. A collapsed
+  disclosure says what is configured inside ("Approval required · 2 Checks"),
+  so nothing that was set is invisible. Prefer a sensible default to a visible
+  choice.
+
+### Visual system
+
+One look everywhere, built from tokens and shared primitives rather than
+per-page styling. `client/lib/designTokens.ts` is the source of truth;
+`tailwind.config.ts` builds the palette from it and `designTokens.test.ts`
+holds every text role to WCAG AA on every surface.
+
+- **Colour.** Slate plus one accent (indigo). Slate 400/500 are theme-aware,
+  so the muted pair `text-slate-500 dark:text-slate-400` and the quietest pair
+  `text-slate-400 dark:text-slate-500` pass AA in both themes; the `-600`
+  steps of emerald, amber, sky, teal, green, orange, cyan and lime are tuned to
+  pass AA as text on white. Surfaces: light — slate-50 page, white cards,
+  slate-100 wells; dark — slate-950 page, slate-900 cards, slate-800 raised.
+  Give a card `dark:bg-slate-900`, not the page's slate-950.
+- **Type.** Inter. Page titles `text-xl sm:text-2xl font-semibold
+  tracking-tight` (use `PageHeader`); section and card titles `text-sm
+  font-semibold`; body `text-sm`; meta `text-xs text-slate-500`. Nothing a
+  person must read below 12px, and no tracked-out uppercase labels — labels,
+  table headers and rail groups are sentence case at `text-xs font-medium`.
+  Numbers use `tabular-nums`.
+- **Status.** Every chip is a `Badge` (`components/ui/Badge.tsx`): 12px,
+  sentence case, a tone that means something (neutral, accent, success,
+  warning, danger, info, ai). Counts use `CountBadge`. Do not hand-roll pills.
+- **Shape.** Cards and panels `rounded-xl border shadow-sm`; controls
+  `rounded-lg`; badges `rounded-md`. Inputs share `fieldClassName()` (a
+  slate-300 edge at rest, an indigo edge on focus).
+- **Focus.** Keyboard focus is the theme's `focus` colour — `outline-focus`
+  / `ring-focus`, 3:1 or better on every surface — never a translucent ring.
+- **Touch.** On a phone everything a finger presses is at least 32×32px. Size
+  shell and toolbar controls `h-8` (`min-w-8` when icon-only); give a smaller
+  link or icon button in a dense row `touch-target relative`, an invisible
+  32px hit area on touch screens that moves nothing (it must not sit on an
+  element that clips, such as `truncate` — truncate an inner span instead).
+  `Checkbox` already has one.
+- **Layout.** Headers stack on a phone (`PageHeader` does this); forms cap at
+  `max-w-3xl`; a grid that names columns only from a breakpoint is given a
+  shrinkable single column below it (`styles/index.css`), and wide tables sit
+  in `TableCard`, which scrolls sideways instead of cutting columns off.
+- **Primitives.** Reach for `PageHeader`, `SectionHeader`, `Card`, `Badge`,
+  `TableCard`/`THead`/`TH`/`TR`/`TD`, `EmptyState` (with an icon), `Skeleton`,
+  `SectionRailHeader` and `sidebarLinkClassName()` before writing classes.
+  `npm run test:visual-system` photographs the key pages in light and dark on
+  a desktop and a phone and fails on sideways scroll, clipped content, console
+  errors, invisible focus, text below AA or phone targets under 32px.
+
+---
+
+## 9. Testing before you hand off
+
+The human explicitly asked for browser-tested flows. Before claiming a
+milestone is done, drive the happy path in a browser (via the `browse` /
+`gstack` skill or manual) and catch at least:
+
+- Signup → login → logout round-trip
+- Create company → switch company → invite member
+- Create AI employee → edit Soul → add skill → add routine → assign model
+- Forgot password flow (when SMTP unset, check that the reset link logs to
+  server console)
+
+If you write any tests, only run those tests. Do not run everything
+just to speed things up. Everything runs in CI anyway.
+
+---
+
+## 10. Documentation
+
+The marketing site at `Home/` ships the user-facing docs under
+`Home/client/docs/pages/`. When you change something a user can see —
+a new UI surface, a new auth mode, a renamed concept, a new
+`genosyn` CLI subcommand, a new `genosyn-api` command or option, a
+new MCP tool, a config knob — **update
+the docs in the same PR** as the feature. Stale docs are worse than
+no docs: users follow the steps, hit a different reality, and lose
+trust in the rest of the page.
+
+What "update the docs" looks like in practice:
+
+- Find the page the change belongs on. The current index lives in
+  [`Home/client/docs/nav.ts`](./Home/client/docs/nav.ts); add a new
+  page there only if the topic has no natural home.
+- Lead with the in-app flow. Terminals and config-file paths can stay
+  in an "Advanced" section, but the primary instructions should match
+  what a user clicking through the UI actually sees — same labels,
+  same button copy, same field names.
+- Cross-link to related pages with `<DocLink to="/docs/...">` so
+  readers can navigate without going back to the sidebar.
+- If you removed a feature, **delete** the doc for it. Don't leave a
+  page reading "this is deprecated" — that's clutter.
+- Keep each page short. If a page is creeping past 400 lines, that's
+  a signal to split, not to keep adding.
+
+For new features, document the shipped behavior in the same PR as the
+implementation.
+
+---
+
+## 11. Commits & PRs
+
+- Commit messages: imperative mood, 1–3 sentence body explaining *why* the
+  change exists, not *what* it does.
+- One logical change per commit where practical.
+- Never use `--no-verify`, `--no-gpg-sign`, or `--amend` on a commit that
+  has already been pushed.
+- Never commit anything under `data/` or `node_modules/`.
+- PR descriptions explain the problem, scope, and resulting behavior, and
+  list the manual test steps you ran.
+
+### Releases
+
+Cutting a release is a separate, tightly-scripted ritual — see
+[`RELEASING.md`](./RELEASING.md). Short version: bump `VERSION`, push
+`main` to `release`, the workflow tags + publishes GHCR images for you.
+Don't tag manually, don't edit version numbers in `package.json` files.
+
+That same push to `release` is also what publishes **genosyn.com**. The
+marketing site is a Cloudflare Worker deployed by
+[`site.yml`](./.github/workflows/site.yml) — *not* the `ghcr.io/genosyn/home`
+image, which is what self-hosters run. Nothing you merge to `main` reaches the
+public site until it reaches `release`. See
+[The marketing site](./RELEASING.md#the-marketing-site).
+
+---
+
+## 12. Things that will get your PR rejected
+
+- Introducing Next.js, JWT libraries, Prisma/Drizzle, or a component library
+  without prior discussion.
+- Using "Task" to mean a scheduled AI routine.
+- Committing files under `data/`.
+- Writing business logic inside route handlers.
+- Reintroducing on-disk `SOUL.md` / skill / routine markdown files. Soul,
+  skill, and routine bodies live on their DB rows; Run logs live on the Run
+  row. The filesystem under `data/` is for employee working trees and
+  App-private runtime artifacts such as browser state and Run recordings —
+  never model credentials, which live encrypted on the `AIModel` row.
+- Reintroducing Genosyn's internal model/tool loop or compaction harness,
+  persistent per-provider credential dirs, or Anthropic subscription/OAuth
+  routing. API-key and custom models use the pinned OpenCode runtime through
+  `server/services/agent/`; keep its temporary state outside employee working
+  trees. The only subscription exception
+  is trusted single-tenant OpenAI through the official pinned `@openai/codex`
+  app-server, with managed session files confined to a locked temporary
+  `CODEX_HOME` and access tokens confined to the child process environment for
+  a Run. Trusted single-tenant host execution supports that path. Multi-tenant
+  installs reject subscription auth.
+- Naming a user-configurable MCP server `genosyn` or `browser`. Both names are
+  reserved for built-in tools — `genosyn` runs in-process (dispatched to
+  `routes/mcpInternal.ts`); `browser` is a stdio binary at `server/mcp-browser/`.
+  User-configured servers with those names are dropped when the agent assembles
+  its tool list.
+- Adding a tool to the agent's resident working set without a reason that
+  survives `toolBudget.test.ts`, or collapsing new tools into an
+  `op`-dispatched family. Families are retired — defer the
+  granular tools instead.
+- Adding an operational knob to `App/config.ts`. That file is boot
+  configuration only (secrets, database coordinates, the fail-closed security
+  posture). Anything an operator can safely change while the app runs goes in
+  `services/runtimeSettings.ts` and gets a control at Admin → Runtime. See
+  section 5.
+- Giving an AI Employee a tool that writes a **Check** or lifts a
+  **Standdown**. A bar the graded party can author is not a bar, and a stop the
+  stopped party can lift is not a stop. Read-only exposure is fine and already
+  exists — an employee sees its Routine's Checks in its Run brief and can read
+  a Run's report — but the write side belongs to a human at an admin-gated
+  route, permanently.
+- Giving an AI Employee a tool that writes a letter to the board outside its
+  restricted turn, changes a letter's figures, trace or audit, or appoints,
+  replaces or instructs the board's auditor. An auditor the audited can appoint
+  is not an auditor. See §3.
+- Treating a null or `unverified` outcome verdict as a clean Run. See §3.
+- Skipping the zod schema on a new endpoint.
+- Hand-writing a migration file. Always run
+  `npm run migration:generate -- server/db/migrations/<Name>` and commit
+  what it emits. See section 7.
+- Adding a feature without explaining its scope and intended behavior in the
+  PR description.
+- Pushing a commit that breaks `npm run lint` or `npm run build` in either
+  `App/` or `Home/`. CI runs both on every push to `main`; run them locally
+  first. See section 7 for the ESLint rules that keep biting.
+- Shipping a user-visible change without updating the docs at
+  `Home/client/docs/pages/` in the same PR. See section 10.
+
+---
+
+## 13. When in doubt
+
+Read the relevant documentation and product source, then ask the human if
+the intended behavior is still unclear. Don't guess on product decisions.

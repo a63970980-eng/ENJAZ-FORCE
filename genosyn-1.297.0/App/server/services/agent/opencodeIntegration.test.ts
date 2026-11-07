@@ -1,0 +1,1864 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createServer, type ServerResponse } from "node:http";
+import { spawn } from "node:child_process";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
+import os from "node:os";
+import path from "node:path";
+import { config } from "../../../config.js";
+import type { AIModel } from "../../db/entities/AIModel.js";
+import type { AgentMessage, AgentTool, ModelOutage } from "./types.js";
+import { residentOnlyRegistry } from "./tools/toolRegistry.js";
+import { buildOpenCodeConfig, type OpenCodeModel } from "./opencodeConfig.js";
+import { resetKeyPoolMemory } from "../modelKeyPool.js";
+import { ApiKeyRing, type ApiKeyFailover } from "./apiKeyRing.js";
+import { serveOpenCodeTools } from "./opencodeMcp.js";
+import { serveOpenCodeModel } from "./opencodeProxy.js";
+import {
+  launchOpenCodeServer,
+  OpenCodePortTakenError,
+  startOpenCodeServer,
+  type OpenCodeServer,
+} from "./opencodeServer.js";
+import {
+  runOpenCodeSession,
+  SILENT_STOP_NUDGE,
+  SILENT_STOP_NUDGES,
+  turnThinking,
+  type OpenCodeTurnParams,
+} from "./opencodeRuntime.js";
+import { ADAPTIVE_THINKING_OUTPUT_LIMIT, THINKING_BUDGETS } from "./thinkingParams.js";
+import { OpenCodeToolGate } from "./opencodeToolGate.js";
+import { ModelTurnWatch } from "./modelStream.js";
+import type { ModelCallDetail, ModelPulse } from "../../../shared/chatActivity.js";
+
+type ToolCall = { name: string; input: Record<string, unknown>; rawArguments?: string };
+/** Text the provider stops early, the way a server ends a response at max_tokens. */
+type TruncatedReply = { truncated: string };
+/** A reply that is all reasoning, the way vLLM's reasoning parser returns a silent stop. */
+type ReasoningOnlyReply = { reasoningOnly: string };
+/** Several tool calls in one reply, as Qwen makes when it has a batch of records to write. */
+type ParallelToolCalls = { parallel: ToolCall[] };
+/** An error response, the way a provider refuses a request it will not run. */
+type Rejection = { reject: { status: number; body: Record<string, unknown> } };
+/** A reply that thinks first and shows it: a summary, Claude's thinking, or reasoning_content. */
+type ThinkingReply = { thinking: string; text: string };
+const png =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+const imageMessages: AgentMessage[] = [
+  {
+    role: "user",
+    content: [
+      { type: "text", text: "Verify this tiny PNG and the supplied tools." },
+      { type: "image", mimeType: "image/png", data: png, sourceLabel: "fixture.png" },
+    ],
+  },
+];
+function assertWireImage(body: Record<string, unknown>, provider: OpenCodeModel["provider"]) {
+  const messages = (provider === "openai" ? body.input : body.messages) as Array<{
+    content?: Array<Record<string, unknown>>;
+  }>;
+  const parts = messages.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : [],
+  );
+  if (provider === "anthropic")
+    assert.ok(
+      parts.some(
+        (part) =>
+          part.type === "image" &&
+          (part.source as { media_type?: string; data?: string })?.media_type === "image/png" &&
+          Boolean((part.source as { data?: string }).data),
+      ),
+    );
+  else if (provider === "openai")
+    assert.ok(
+      parts.some(
+        (part) =>
+          part.type === "input_image" &&
+          String(part.image_url).startsWith("data:image/png;base64,"),
+      ),
+    );
+  else
+    assert.ok(
+      parts.some(
+        (part) =>
+          part.type === "image_url" &&
+          (part.image_url as { url?: string })?.url?.startsWith("data:image/png;base64,"),
+      ),
+    );
+}
+async function fakeProvider(
+  script: (
+    request: Record<string, unknown>,
+    index: number,
+    /** The key the request was sent with. */
+    auth: string | undefined,
+  ) =>
+    | string
+    | ToolCall
+    | TruncatedReply
+    | ReasoningOnlyReply
+    | ParallelToolCalls
+    | Rejection
+    | ThinkingReply
+    | "hang",
+) {
+  const requests: { url: string; auth?: string; body: Record<string, unknown> }[] = [];
+  const server = createServer(async (req, res) => {
+    const buffers: Buffer[] = [];
+    for await (const chunk of req) buffers.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(buffers).toString()) as Record<string, unknown>;
+    requests.push({
+      url: req.url!,
+      auth: req.headers.authorization ?? req.headers["x-api-key"]?.toString(),
+      body,
+    });
+    if (requests.length > 8) {
+      res
+        .writeHead(400, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ error: { message: "Fixture exceeded request count" } }));
+      return;
+    }
+    const result = script(body, requests.length - 1, requests.at(-1)?.auth);
+    if (typeof result === "object" && "reject" in result) {
+      res
+        .writeHead(result.reject.status, { "Content-Type": "application/json" })
+        .end(JSON.stringify(result.reject.body));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (req.url?.endsWith("/chat/completions")) chatResponse(res, result);
+    else if (req.url?.endsWith("/messages"))
+      anthropicResponse(
+        res,
+        typeof result === "string" || "name" in result || "thinking" in result
+          ? result
+          : "Verified",
+      );
+    else if (req.url?.endsWith("/responses"))
+      responsesResponse(
+        res,
+        typeof result === "string" ? result : "thinking" in result ? result.text : "Verified",
+        typeof result === "object" && "thinking" in result ? result.thinking : undefined,
+      );
+    else {
+      res.end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return {
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+    requests,
+    async close() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+function chatResponse(
+  res: ServerResponse,
+  value:
+    | string
+    | ToolCall
+    | TruncatedReply
+    | ReasoningOnlyReply
+    | ParallelToolCalls
+    | ThinkingReply,
+) {
+  const send = (
+    delta: Record<string, unknown>,
+    finish: string | null = null,
+    usage?: Record<string, number>,
+  ) =>
+    res.write(
+      `data: ${JSON.stringify({ id: "chat-fixture", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta, finish_reason: finish }], ...(usage ? { usage } : {}) })}\n\n`,
+    );
+  if (typeof value === "string") {
+    send({ role: "assistant", content: value === "hang" ? "Working" : value });
+    if (value === "hang") return;
+    send({}, "stop", { prompt_tokens: 29, completion_tokens: 5, total_tokens: 34 });
+  } else if ("reasoningOnly" in value) {
+    send({ role: "assistant", reasoning_content: value.reasoningOnly });
+    send({}, "stop", { prompt_tokens: 29, completion_tokens: 18334, total_tokens: 18363 });
+  } else if ("thinking" in value) {
+    send({ role: "assistant", reasoning_content: value.thinking });
+    send({ content: value.text });
+    send({}, "stop", { prompt_tokens: 29, completion_tokens: 12, total_tokens: 41 });
+  } else if ("truncated" in value) {
+    send({ role: "assistant", content: value.truncated });
+    send({}, "length", { prompt_tokens: 29, completion_tokens: 8192, total_tokens: 8221 });
+  } else {
+    const calls = "parallel" in value ? value.parallel : [value];
+    send({
+      role: "assistant",
+      tool_calls: calls.map((call, index) => ({
+        index,
+        id: `tool-fixture-${index}`,
+        type: "function",
+        function: {
+          name: call.name,
+          arguments: call.rawArguments ?? JSON.stringify(call.input),
+        },
+      })),
+    });
+    send({}, "tool_calls", { prompt_tokens: 23, completion_tokens: 4, total_tokens: 27 });
+  }
+  res.end("data: [DONE]\n\n");
+}
+function anthropicResponse(res: ServerResponse, value: string | ToolCall | ThinkingReply) {
+  const send = (type: string, value: Record<string, unknown>) =>
+    res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+  send("message_start", {
+    message: {
+      id: "msg-fixture",
+      type: "message",
+      role: "assistant",
+      model: "fixture",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 29, output_tokens: 0 },
+    },
+  });
+  if (typeof value === "object" && "thinking" in value) {
+    // A summarized thought, signed, then the answer.
+    send("content_block_start", {
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    });
+    send("content_block_delta", {
+      index: 0,
+      delta: { type: "thinking_delta", thinking: value.thinking },
+    });
+    send("content_block_delta", {
+      index: 0,
+      delta: { type: "signature_delta", signature: "fixture-signature" },
+    });
+    send("content_block_stop", { index: 0 });
+    send("content_block_start", { index: 1, content_block: { type: "text", text: "" } });
+    send("content_block_delta", { index: 1, delta: { type: "text_delta", text: value.text } });
+    send("content_block_stop", { index: 1 });
+    send("message_delta", {
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 12 },
+    });
+  } else if (typeof value === "string") {
+    send("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+    send("content_block_delta", { index: 0, delta: { type: "text_delta", text: value } });
+    send("content_block_stop", { index: 0 });
+    send("message_delta", {
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 5 },
+    });
+  } else {
+    // Claude 4.6 and later think before a tool call, and sign what they thought.
+    send("content_block_start", {
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    });
+    send("content_block_delta", {
+      index: 0,
+      delta: { type: "signature_delta", signature: "fixture-signature" },
+    });
+    send("content_block_stop", { index: 0 });
+    send("content_block_start", {
+      index: 1,
+      content_block: { type: "tool_use", id: "toolu-fixture", name: value.name, input: {} },
+    });
+    send("content_block_delta", {
+      index: 1,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(value.input) },
+    });
+    send("content_block_stop", { index: 1 });
+    send("message_delta", {
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 20 },
+    });
+  }
+  send("message_stop", {});
+  res.end();
+}
+function responsesResponse(res: ServerResponse, text: string, summary?: string) {
+  let sequence = 0;
+  const send = (type: string, value: Record<string, unknown>) =>
+    res.write(
+      `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...value })}\n\n`,
+    );
+  // A reasoning item with a summary, the way a reasoning model shows its thinking.
+  const reasoning =
+    summary === undefined
+      ? null
+      : {
+          id: "rs-fixture",
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: summary }],
+          encrypted_content: "fixture-encrypted",
+        };
+  const outputIndex = reasoning ? 1 : 0;
+  const item = {
+    id: "msg-fixture",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  const response = {
+    id: "resp-fixture",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    model: "fixture",
+    output: reasoning ? [reasoning, item] : [item],
+    usage: {
+      input_tokens: 29,
+      output_tokens: 5,
+      total_tokens: 34,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: 2 },
+    },
+  };
+  send("response.created", { response: { ...response, status: "in_progress", output: [] } });
+  if (reasoning && summary !== undefined) {
+    send("response.output_item.added", {
+      output_index: 0,
+      item: { ...reasoning, summary: [] },
+    });
+    send("response.reasoning_summary_part.added", {
+      item_id: reasoning.id,
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    });
+    send("response.reasoning_summary_text.delta", {
+      item_id: reasoning.id,
+      output_index: 0,
+      summary_index: 0,
+      delta: summary,
+    });
+    send("response.reasoning_summary_text.done", {
+      item_id: reasoning.id,
+      output_index: 0,
+      summary_index: 0,
+      text: summary,
+    });
+    send("response.reasoning_summary_part.done", {
+      item_id: reasoning.id,
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text: summary },
+    });
+    send("response.output_item.done", { output_index: 0, item: reasoning });
+  }
+  send("response.output_item.added", {
+    output_index: outputIndex,
+    item: { ...item, status: "in_progress", content: [] },
+  });
+  send("response.content_part.added", {
+    item_id: "msg-fixture",
+    output_index: outputIndex,
+    content_index: 0,
+    part: { type: "output_text", text: "", annotations: [] },
+  });
+  send("response.output_text.delta", {
+    item_id: "msg-fixture",
+    output_index: outputIndex,
+    content_index: 0,
+    delta: text,
+  });
+  send("response.output_text.done", {
+    item_id: "msg-fixture",
+    output_index: outputIndex,
+    content_index: 0,
+    text,
+  });
+  send("response.output_item.done", { output_index: outputIndex, item });
+  send("response.completed", { response });
+  res.end();
+}
+
+async function realTurn(
+  model: OpenCodeModel,
+  tools: AgentTool[],
+  overrides: Partial<OpenCodeTurnParams> = {},
+  onServer?: (server: OpenCodeServer) => void,
+  proxyOptions?: Parameters<typeof serveOpenCodeModel>[2],
+) {
+  const params: OpenCodeTurnParams = {
+    model: {
+      provider: model.provider,
+      model: model.id,
+      contextWindow: model.contextWindow,
+    } as AIModel,
+    system: "Complete the requested work with the supplied tools.",
+    messages: [{ role: "user", content: [{ type: "text", text: "Verify the fixture" }] }],
+    registry: residentOnlyRegistry(tools),
+    maxSteps: 4,
+    signal: AbortSignal.timeout(150_000),
+    ...overrides,
+  };
+  const gate = new OpenCodeToolGate(params.signal);
+  const bridge = await serveOpenCodeTools({ ...params, beforeCall: (name) => gate.enter(name) });
+  // Wired as `runOpenCodeTurn` wires it: a refused level reaches the turn's callbacks.
+  const proxy = await serveOpenCodeModel(model, params.signal, {
+    onThinkingRefused: () =>
+      params.callbacks?.onThinkingFallback?.({ level: params.effort ?? null }),
+    ...proxyOptions,
+  });
+  let server: Awaited<ReturnType<typeof startOpenCodeServer>> | undefined;
+  try {
+    server = await startOpenCodeServer({
+      config: buildOpenCodeConfig({
+        model: proxy.model,
+        maxSteps: params.maxSteps,
+        nativeCoding: params.nativeCoding ?? false,
+        mcp: bridge,
+        thinking: turnThinking(params),
+      }),
+      cwd: params.cwd,
+      signal: params.signal,
+    });
+    onServer?.(server);
+    return await runOpenCodeSession(server, model.id, params, gate);
+  } finally {
+    gate.close();
+    await server?.close();
+    await proxy.close();
+    await bridge.close();
+  }
+}
+
+test(
+  "pinned OpenCode performs a real custom-model MCP roundtrip with streamed usage",
+  { timeout: 180_000 },
+  async () => {
+    let called = 0;
+    const usage: unknown[] = [];
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0 ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } } : "Verified",
+    );
+    try {
+      const result = await realTurn(
+        {
+          id: "fixture",
+          provider: "custom",
+          apiKey: "upstream-private-key",
+          baseURL: fixture.baseURL,
+          contextWindow: 32000,
+        },
+        [
+          {
+            name: "fixture_echo",
+            description: "Verify actual tool execution",
+            inputSchema: {
+              type: "object",
+              properties: { value: { type: "string" } },
+              required: ["value"],
+            },
+            async run(input) {
+              assert.equal(input.value, "actual tool");
+              called++;
+              return { content: "Actual tool confirmed" };
+            },
+          },
+        ],
+        { messages: imageMessages, callbacks: { onUsage: (value) => usage.push(value) } },
+      );
+      assert.equal(called, 1);
+      assert.equal(result.finalText, "Verified");
+      assert.equal(result.stopReason, "end_turn");
+      assert.equal(fixture.requests.length, 2);
+      assert.ok(
+        fixture.requests.every(
+          (request) =>
+            request.url === "/v1/chat/completions" &&
+            request.auth === "Bearer upstream-private-key",
+        ),
+      );
+      assert.ok(JSON.stringify(fixture.requests[1].body).includes("Actual tool confirmed"));
+      assertWireImage(fixture.requests[0].body, "custom");
+      assert.ok(usage.length >= 1);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+for (const provider of ["openai", "anthropic"] as const)
+  test(
+    `pinned OpenCode uses ${provider === "openai" ? "OpenAI Responses" : "Anthropic Messages"} with selected effort`,
+    { timeout: 180_000 },
+    async () => {
+      const fixture = await fakeProvider(() => "Verified");
+      const usage: Array<{ inputTokens: number; outputTokens: number }> = [];
+      try {
+        const result = await realTurn(
+          {
+            id: provider === "anthropic" ? "claude-opus-4-7" : "gpt-5.5",
+            provider,
+            apiKey: "upstream-private-key",
+            baseURL: fixture.baseURL,
+            contextWindow: 200000,
+          },
+          [],
+          {
+            effort: "high",
+            messages: imageMessages,
+            callbacks: { onUsage: (value) => usage.push(value) },
+          },
+        );
+        assert.equal(result.finalText, "Verified");
+        assertWireImage(fixture.requests[0].body, provider);
+        assert.deepEqual(usage, [{ inputTokens: 29, outputTokens: 5 }]);
+        assert.equal(
+          fixture.requests[0].url,
+          provider === "openai" ? "/v1/responses" : "/v1/messages",
+        );
+        if (provider === "openai") {
+          assert.deepEqual(fixture.requests[0].body.reasoning, {
+            effort: "high",
+            summary: "auto",
+          });
+          assert.equal(fixture.requests[0].body.store, false);
+          assert.ok(Number(fixture.requests[0].body.max_output_tokens) > 8192);
+        } else {
+          // A level turns Claude's adaptive thinking on, with room to think.
+          assert.equal(fixture.requests[0].body.max_tokens, ADAPTIVE_THINKING_OUTPUT_LIMIT);
+          assert.deepEqual(fixture.requests[0].body.thinking, {
+            type: "adaptive",
+            display: "summarized",
+          });
+          assert.deepEqual(fixture.requests[0].body.output_config, { effort: "high" });
+        }
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+for (const legacy of [
+  { id: "gpt-4o", context: 128000, output: 16384 },
+  { id: "gpt-4", context: 8192, output: 4096 },
+])
+  test(
+    `pinned OpenCode respects ${legacy.id} output metadata without repeated compaction`,
+    { timeout: 180_000 },
+    async () => {
+      const fixture = await fakeProvider(() => "Verified");
+      try {
+        const result = await realTurn(
+          {
+            id: legacy.id,
+            provider: "openai",
+            apiKey: "private",
+            baseURL: fixture.baseURL,
+            contextWindow: legacy.context,
+          },
+          [],
+        );
+        assert.equal(result.finalText, "Verified");
+        assert.equal(fixture.requests.length, 1);
+        assert.equal(fixture.requests[0].body.max_output_tokens, legacy.output);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+// ─────────────────────────── thinking levels ───────────────────────────
+//
+// A chat turn's thinking level reaches each AI Model as its own parameters
+// (`thinkingParams.ts`); these drive the pinned OpenCode against a fake
+// upstream and read what it actually sent.
+
+/** A fixture model of `provider` and `id`, against `baseURL`. */
+function thinkingModel(
+  provider: OpenCodeModel["provider"],
+  id: string,
+  baseURL: string,
+): OpenCodeModel {
+  return { id, provider, apiKey: "upstream-private-key", baseURL, contextWindow: 200_000 };
+}
+
+/** What the activity hears of a turn's thinking and of a refused level. */
+function thinkingWatch() {
+  const reasoning: string[] = [];
+  const fallbacks: Array<{ level: string | null }> = [];
+  return {
+    reasoning,
+    fallbacks,
+    callbacks: {
+      onReasoning: (delta: string) => reasoning.push(delta),
+      onThinkingFallback: (fallback: { level: string | null }) => fallbacks.push(fallback),
+    },
+  };
+}
+
+/** A watch on a turn's AI Model, collecting what it says. */
+function modelWatch(provider: OpenCodeModel["provider"], id: string) {
+  const pulses: ModelPulse[] = [];
+  const calls: ModelCallDetail[] = [];
+  const watch = new ModelTurnWatch({
+    provider,
+    model: id,
+    onPulse: (pulse) => pulses.push(pulse),
+    onCall: (call) => calls.push(call),
+  });
+  return { watch, pulses, calls, states: () => pulses.map((pulse) => pulse.state) };
+}
+
+test(
+  "a Claude turn's stream says it thought, wrote a tool call, and answered, through real OpenCode",
+  { timeout: 180_000 },
+  async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0 ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } } : "Verified",
+    );
+    const { watch, calls, pulses, states } = modelWatch("anthropic", "claude-opus-5-5");
+    try {
+      const result = await realTurn(
+        claudeFixtureModel(fixture.baseURL),
+        [echoTool(seen)],
+        { modelWatch: watch },
+        undefined,
+        { modelWatch: watch },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.equal(seen.length, 1);
+      assert.deepEqual(
+        [...new Set(states())],
+        ["waiting", "thinking", "tool_input", "finished", "writing"],
+      );
+      assert.equal(
+        pulses.find((pulse) => pulse.state === "tool_input")?.tool,
+        "genosyn_fixture_echo",
+      );
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].inputTokens, 29);
+      assert.equal(calls[0].outputTokens, 20);
+      assert.equal(calls[0].stopReason, "tool_use");
+      assert.deepEqual(
+        calls[0].phases.map((phase) => phase.kind),
+        ["waiting", "thinking", "tool_input"],
+      );
+      assert.equal(calls[1].stopReason, "end_turn");
+      assert.ok(
+        !JSON.stringify([pulses, calls]).includes("actual tool"),
+        "nothing it wrote is passed on",
+      );
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "an OpenAI turn's stream reads the same way, through real OpenCode",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({ thinking: "Checking the ledger.", text: "Verified" }));
+    const { watch, calls, states } = modelWatch("openai", "gpt-5.1");
+    try {
+      const result = await realTurn(
+        thinkingModel("openai", "gpt-5.1", fixture.baseURL),
+        [],
+        { modelWatch: watch, effort: "low" },
+        undefined,
+        { modelWatch: watch },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.deepEqual([...new Set(states())], ["waiting", "thinking", "writing", "finished"]);
+      assert.equal(calls[0].inputTokens, 29);
+      assert.equal(calls[0].outputTokens, 5);
+      assert.equal(calls[0].stopReason, "completed");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a self-hosted turn's stream reads the same way, through real OpenCode",
+  { timeout: 180_000 },
+  async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0
+        ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } }
+        : { thinking: "Reading the result.", text: "Verified" },
+    );
+    const { watch, calls, states } = modelWatch("custom", "fixture-model");
+    try {
+      const result = await realTurn(
+        thinkingModel("custom", "fixture-model", fixture.baseURL),
+        [echoTool(seen)],
+        { modelWatch: watch },
+        undefined,
+        { modelWatch: watch },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.ok(states().includes("tool_input"));
+      assert.ok(states().includes("thinking"));
+      assert.ok(states().includes("writing"));
+      assert.equal(calls.length, 2);
+      assert.deepEqual(
+        calls[1].phases.map((phase) => phase.kind).filter((kind) => kind !== "waiting"),
+        ["thinking", "writing"],
+      );
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a Claude thinking level turns adaptive thinking on and its summary reaches the activity",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({
+      thinking: "Weighing the renewal terms against last year's.",
+      text: "Verified",
+    }));
+    const watch = thinkingWatch();
+    try {
+      const result = await realTurn(thinkingModel("anthropic", "claude-opus-4-7", fixture.baseURL), [], {
+        effort: "max",
+        reasoningSummaries: true,
+        callbacks: watch.callbacks,
+      });
+      assert.equal(result.finalText, "Verified");
+      const body = fixture.requests[0].body;
+      assert.deepEqual(body.thinking, { type: "adaptive", display: "summarized" });
+      assert.deepEqual(body.output_config, { effort: "max" });
+      assert.equal(body.max_tokens, ADAPTIVE_THINKING_OUTPUT_LIMIT);
+      assert.equal(watch.reasoning.join(""), "Weighing the renewal terms against last year's.");
+      assert.deepEqual(watch.fallbacks, []);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "Off on a Claude model that thinks only when asked sends no thinking at all",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => "Verified");
+    try {
+      await realTurn(thinkingModel("anthropic", "claude-opus-4-7", fixture.baseURL), [], {
+        effort: "none",
+        reasoningSummaries: true,
+      });
+      const body = fixture.requests[0].body;
+      assert.equal(Object.hasOwn(body, "thinking"), false);
+      assert.equal(Object.hasOwn(body, "output_config"), false);
+      assert.equal(body.max_tokens, 8192);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a Claude model that always thinks is asked to show it at its own default, and nothing more",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({ thinking: "Checking the ledger.", text: "Verified" }));
+    const watch = thinkingWatch();
+    try {
+      await realTurn(thinkingModel("anthropic", "claude-opus-5-5", fixture.baseURL), [], {
+        effort: null,
+        reasoningSummaries: true,
+        callbacks: watch.callbacks,
+      });
+      const body = fixture.requests[0].body;
+      // OpenCode's own provider adds Claude 5.5's thinking-block binding; the
+      // display is Genosyn's.
+      const thinking = body.thinking as Record<string, unknown>;
+      assert.equal(thinking.type, "adaptive");
+      assert.equal(thinking.display, "summarized");
+      // The level stays the model's own: no effort is sent.
+      assert.equal(Object.hasOwn(body, "output_config"), false);
+      assert.equal(watch.reasoning.join(""), "Checking the ledger.");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a Routine-style turn at the model's default sends Claude no thinking parameters",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => "Verified");
+    try {
+      await realTurn(thinkingModel("anthropic", "claude-opus-5-5", fixture.baseURL), []);
+      const body = fixture.requests[0].body;
+      // Whatever OpenCode's provider sends by itself, nothing of Genosyn's:
+      // no display, no effort, the usual room.
+      assert.equal(Object.hasOwn((body.thinking ?? {}) as object, "display"), false);
+      assert.equal(Object.hasOwn(body, "output_config"), false);
+      assert.equal(body.max_tokens, 8192);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "an older Claude model thinks within a budget sized by the level",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({ thinking: "Budgeted thought.", text: "Verified" }));
+    try {
+      await realTurn(thinkingModel("anthropic", "claude-sonnet-4-5-20250929", fixture.baseURL), [], {
+        effort: "medium",
+      });
+      const body = fixture.requests[0].body;
+      assert.deepEqual(body.thinking, { type: "enabled", budget_tokens: THINKING_BUDGETS.medium });
+      // The AI SDK adds the budget to the reply's room, and no effort is sent:
+      // Claude Sonnet 4.5 refuses one.
+      assert.equal(body.max_tokens, 8192 + THINKING_BUDGETS.medium);
+      assert.equal(Object.hasOwn(body, "output_config"), false);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "Claude Opus 4.5 takes both its effort and a thinking budget",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => "Verified");
+    try {
+      await realTurn(thinkingModel("anthropic", "claude-opus-4-5-20251101", fixture.baseURL), [], {
+        effort: "high",
+      });
+      const body = fixture.requests[0].body;
+      assert.deepEqual(body.output_config, { effort: "high" });
+      assert.deepEqual(body.thinking, { type: "enabled", budget_tokens: THINKING_BUDGETS.high });
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "an OpenAI reasoning model gets its effort and returns a reasoning summary",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({
+      thinking: "**Comparing plans**\n\nThe annual plan is cheaper.",
+      text: "Verified",
+    }));
+    const watch = thinkingWatch();
+    try {
+      await realTurn(thinkingModel("openai", "o3", fixture.baseURL), [], {
+        effort: "high",
+        reasoningSummaries: true,
+        callbacks: watch.callbacks,
+      });
+      assert.deepEqual(fixture.requests[0].body.reasoning, { effort: "high", summary: "auto" });
+      assert.match(watch.reasoning.join(""), /The annual plan is cheaper/);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "at its own default an OpenAI reasoning model is only asked for its summary",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => "Verified");
+    try {
+      await realTurn(thinkingModel("openai", "o3", fixture.baseURL), [], {
+        effort: null,
+        reasoningSummaries: true,
+      });
+      assert.deepEqual(fixture.requests[0].body.reasoning, { summary: "auto" });
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a custom endpoint with thinking levels turned on gets reasoning_effort, and none otherwise",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({ thinking: "Local thought.", text: "Verified" }));
+    const watch = thinkingWatch();
+    try {
+      const model = customFixtureModel(fixture.baseURL);
+      await realTurn(model, [], {
+        model: {
+          provider: "custom",
+          model: model.id,
+          contextWindow: model.contextWindow,
+          customThinkingLevels: true,
+        } as AIModel,
+        effort: "low",
+        callbacks: watch.callbacks,
+      });
+      await realTurn(model, []);
+      assert.equal(fixture.requests[0].body.reasoning_effort, "low");
+      assert.equal(Object.hasOwn(fixture.requests[1].body, "reasoning_effort"), false);
+      // A server's reasoning_content reaches the activity like any thinking.
+      assert.equal(watch.reasoning.join(""), "Local thought.");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a Claude model that refuses the thinking level answers at its default, for the rest of the turn",
+  { timeout: 180_000 },
+  async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    let answered = 0;
+    const fixture = await fakeProvider((body) => {
+      if (body.thinking !== undefined || body.output_config !== undefined)
+        return {
+          reject: {
+            status: 400,
+            body: {
+              type: "error",
+              error: {
+                type: "invalid_request_error",
+                message: "thinking.type: adaptive thinking is not supported on this model",
+              },
+            },
+          },
+        };
+      return answered++ === 0
+        ? { name: "genosyn_fixture_echo", input: { value: "after the refusal" } }
+        : "Verified";
+    });
+    const watch = thinkingWatch();
+    try {
+      const result = await realTurn(
+        thinkingModel("anthropic", "claude-opus-4-7", fixture.baseURL),
+        [echoTool(calls)],
+        { effort: "high", reasoningSummaries: true, callbacks: watch.callbacks },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.deepEqual(calls, [{ value: "after the refusal" }]);
+      // Refused once, sent again without the level, and never sent with it again.
+      assert.equal(fixture.requests.length, 3);
+      assert.ok(fixture.requests[0].body.thinking);
+      for (const request of fixture.requests.slice(1)) {
+        assert.equal(Object.hasOwn(request.body, "thinking"), false);
+        assert.equal(Object.hasOwn(request.body, "output_config"), false);
+      }
+      assert.deepEqual(watch.fallbacks, [{ level: "high" }]);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "an older Claude model that refuses a thinking budget gets its reply room back",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider((body) =>
+      body.thinking !== undefined
+        ? {
+            reject: {
+              status: 400,
+              body: {
+                type: "error",
+                error: {
+                  type: "invalid_request_error",
+                  message: "thinking: budget_tokens is not supported for this model",
+                },
+              },
+            },
+          }
+        : "Verified",
+    );
+    const watch = thinkingWatch();
+    try {
+      const result = await realTurn(
+        thinkingModel("anthropic", "claude-sonnet-4-5", fixture.baseURL),
+        [],
+        { effort: "max", callbacks: watch.callbacks },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.equal(fixture.requests.length, 2);
+      assert.equal(fixture.requests[0].body.max_tokens, 8192 + THINKING_BUDGETS.max);
+      assert.equal(fixture.requests[1].body.max_tokens, 8192);
+      assert.deepEqual(watch.fallbacks, [{ level: "max" }]);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a strict server that refuses reasoning_effort as an unknown field answers without it",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider((body) =>
+      body.reasoning_effort !== undefined
+        ? {
+            reject: {
+              status: 422,
+              body: {
+                detail: [
+                  {
+                    type: "extra_forbidden",
+                    loc: ["body", "reasoning_effort"],
+                    msg: "Extra inputs are not permitted",
+                  },
+                ],
+              },
+            },
+          }
+        : "Verified",
+    );
+    const watch = thinkingWatch();
+    try {
+      const model = customFixtureModel(fixture.baseURL);
+      const result = await realTurn(model, [], {
+        model: {
+          provider: "custom",
+          model: model.id,
+          contextWindow: model.contextWindow,
+          customThinkingLevels: true,
+        } as AIModel,
+        effort: "high",
+        callbacks: watch.callbacks,
+      });
+      assert.equal(result.finalText, "Verified");
+      assert.equal(fixture.requests.length, 2);
+      assert.equal(Object.hasOwn(fixture.requests[1].body, "reasoning_effort"), false);
+      assert.deepEqual(watch.fallbacks, [{ level: "high" }]);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "a refusal that is not about thinking fails as it did, without a second request",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({
+      reject: {
+        status: 400,
+        body: {
+          type: "error",
+          error: { type: "invalid_request_error", message: "Your credit balance is too low." },
+        },
+      },
+    }));
+    const watch = thinkingWatch();
+    try {
+      await assert.rejects(
+        realTurn(thinkingModel("anthropic", "claude-opus-4-7", fixture.baseURL), [], {
+          effort: "high",
+          callbacks: watch.callbacks,
+        }),
+        /HTTP 400/,
+      );
+      assert.equal(fixture.requests.length, 1);
+      assert.deepEqual(watch.fallbacks, []);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode native coding writes a file and executes a command after live authorization",
+  { timeout: 180_000 },
+  async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "genosyn-opencode-code-test-"));
+    let authorizations = 0;
+    const calls: string[] = [];
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0
+        ? {
+            name: "write",
+            input: { filePath: path.join(cwd, "result.txt"), content: "changed by OpenCode" },
+          }
+        : index === 1
+          ? {
+              name: "bash",
+              input: { command: "cat result.txt", description: "Read the changed file" },
+            }
+          : "Verified",
+    );
+    try {
+      const result = await realTurn(
+        {
+          id: "fixture",
+          provider: "custom",
+          apiKey: "private",
+          baseURL: fixture.baseURL,
+          contextWindow: 32000,
+        },
+        [],
+        {
+          nativeCoding: true,
+          cwd,
+          authorizePrivilegedToolCall: async () => {
+            authorizations++;
+            return null;
+          },
+          callbacks: { onToolUse: (name) => calls.push(name) },
+        },
+      );
+      assert.equal(result.finalText, "Verified");
+      assert.equal(await readFile(path.join(cwd, "result.txt"), "utf8"), "changed by OpenCode");
+      assert.ok(authorizations >= 2);
+      assert.ok(calls.includes("write") && calls.includes("bash"));
+    } finally {
+      await fixture.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "pinned OpenCode cancellation stops an active stream and removes its private state",
+  { timeout: 180_000 },
+  async () => {
+    let ownedServer: OpenCodeServer | undefined;
+    const controller = new AbortController();
+    const fixture = await fakeProvider(() => "hang");
+    try {
+      const result = await realTurn(
+        {
+          id: "fixture",
+          provider: "custom",
+          apiKey: "private",
+          baseURL: fixture.baseURL,
+          contextWindow: 32000,
+        },
+        [],
+        {
+          signal: controller.signal,
+          callbacks: {
+            onText: (text) => {
+              if (text.includes("Working")) controller.abort();
+            },
+          },
+        },
+        (server) => {
+          ownedServer = server;
+        },
+      );
+      assert.equal(result.stopReason, "aborted");
+      assert.ok(ownedServer);
+      await assert.rejects(access(path.dirname(ownedServer.directory)), { code: "ENOENT" });
+      await assert.rejects(fetch(ownedServer.url, { signal: AbortSignal.timeout(2000) }));
+    } finally {
+      controller.abort();
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode exits and removes private state when its parent exits normally",
+  { timeout: 180_000 },
+  async () => {
+    const script = `
+    import { startOpenCodeServer } from './server/services/agent/opencodeServer.ts';
+    process.on('SIGTERM', () => process.exit(1));
+    const server = await startOpenCodeServer({ config: { share: 'disabled', autoupdate: false, plugin: [], permission: { '*': 'deny' } }, signal: AbortSignal.timeout(120000) });
+    process.stdout.write(JSON.stringify({ url: server.url, directory: server.directory, processId: server.processId }), () => process.exit(0));
+  `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "--eval", script],
+      {
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+        signal: AbortSignal.timeout(150_000),
+      },
+    );
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    child.stderr.resume();
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    assert.equal(code, 0);
+    const owned = JSON.parse(output) as { url: string; directory: string; processId: number };
+    // Parent exit does not wait for child reaping. Linux may retain a terminated
+    // orphan as a zombie, for which kill(pid, 0) still succeeds.
+    const stopDeadline = Date.now() + 5000;
+    for (;;) {
+      try {
+        process.kill(owned.processId, 0);
+        if (process.platform === "linux") {
+          const status = await readFile(`/proc/${owned.processId}/status`, "utf8");
+          if (/^State:\s+[ZX]\b/m.test(status)) break;
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ESRCH" || (process.platform === "linux" && code === "ENOENT")) break;
+        throw error;
+      }
+      assert.ok(Date.now() < stopDeadline, "OpenCode remained running after its parent exited.");
+      await delay(25);
+    }
+    await assert.rejects(access(path.dirname(owned.directory)), { code: "ENOENT" });
+    await assert.rejects(fetch(owned.url, { signal: AbortSignal.timeout(2000) }));
+  },
+);
+
+test(
+  "pinned OpenCode consecutive turns have isolated local transports and server ports",
+  { timeout: 300_000 },
+  async () => {
+    const fixture = await fakeProvider(() => "Verified");
+    const ports: string[] = [];
+    try {
+      for (let index = 0; index < 2; index++) {
+        const result = await realTurn(
+          {
+            id: "fixture",
+            provider: "custom",
+            apiKey: "private",
+            baseURL: fixture.baseURL,
+            contextWindow: 32000,
+          },
+          [],
+          {},
+          (server) => {
+            ports.push(new URL(server.url).port);
+          },
+        );
+        assert.equal(result.finalText, "Verified");
+      }
+      assert.equal(new Set(ports).size, 2);
+      assert.equal(fixture.requests.length, 2);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode names a port another socket already holds as taken",
+  { timeout: 180_000 },
+  async () => {
+    // A port is free when chosen but can be taken before OpenCode binds it;
+    // startOpenCodeServer retries only on this error, so it must be recognized.
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const address = holder.address();
+    assert.ok(address && typeof address !== "string");
+    try {
+      await assert.rejects(
+        launchOpenCodeServer(
+          {
+            config: {
+              share: "disabled",
+              autoupdate: false,
+              plugin: [],
+              permission: { "*": "deny" },
+            },
+            signal: AbortSignal.timeout(150_000),
+          },
+          address.port,
+        ),
+        (error) => {
+          assert.ok(error instanceof OpenCodePortTakenError);
+          assert.match(error.message, /already in use/);
+          return true;
+        },
+      );
+    } finally {
+      await new Promise<void>((resolve) => holder.close(() => resolve()));
+    }
+  },
+);
+
+const customFixtureModel = (baseURL: string): OpenCodeModel => ({
+  id: "fixture",
+  provider: "custom",
+  apiKey: "private",
+  baseURL,
+  contextWindow: 32000,
+});
+
+function echoTool(calls: Array<Record<string, unknown>>): AgentTool {
+  return {
+    name: "fixture_echo",
+    description: "Verify actual tool execution",
+    inputSchema: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+    },
+    async run(input) {
+      calls.push(input);
+      return { content: "Actual tool confirmed" };
+    },
+  };
+}
+
+// Small models get tool calls wrong in two ways OpenCode can repair: a name it
+// does not know (Genosyn's prompts say `call_tool`; OpenCode says
+// `genosyn_call_tool`) and arguments that are not JSON. Both must come back to
+// the model as an explanation it can act on.
+for (const mistake of [
+  {
+    label: "an unprefixed tool name",
+    call: { name: "fixture_echo", input: { value: "actual tool" } },
+    mentions: "unavailable tool 'fixture_echo'",
+  },
+  {
+    label: "unparseable tool arguments",
+    call: { name: "genosyn_fixture_echo", input: {}, rawArguments: '{"value": "unterminated' },
+    mentions: "genosyn_fixture_echo",
+  },
+])
+  test(
+    `pinned OpenCode explains ${mistake.label} back to the model`,
+    { timeout: 180_000 },
+    async () => {
+      const calls: Array<Record<string, unknown>> = [];
+      const fixture = await fakeProvider((_body, index) =>
+        index === 0 ? mistake.call : "Recovered",
+      );
+      try {
+        const result = await realTurn(customFixtureModel(fixture.baseURL), [echoTool(calls)]);
+        assert.equal(result.finalText, "Recovered");
+        assert.equal(calls.length, 0, "a malformed call never runs a Genosyn tool");
+        assert.equal(fixture.requests.length, 2);
+        const followUp = JSON.stringify(fixture.requests[1].body);
+        assert.match(followUp, /The arguments provided to the tool are invalid/);
+        assert.ok(followUp.includes(mistake.mentions), followUp);
+        assert.doesNotMatch(followUp, /unavailable tool 'invalid'/);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+test(
+  "pinned OpenCode shows a Run's time check beside a Genosyn tool result",
+  { timeout: 180_000 },
+  async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0 ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } } : "Verified",
+    );
+    try {
+      const registry = residentOnlyRegistry([echoTool(calls)]);
+      registry.resultNotice = () =>
+        "[Time check] Under 3 minutes remain before this Run's hard deadline (13:00 UTC).";
+      const result = await realTurn(customFixtureModel(fixture.baseURL), [], { registry });
+      assert.equal(result.finalText, "Verified");
+      assert.equal(calls.length, 1);
+      const followUp = JSON.stringify(fixture.requests[1].body);
+      assert.ok(followUp.includes("Actual tool confirmed"));
+      assert.ok(followUp.includes("[Time check] Under 3 minutes remain"));
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode reports a response cut off at its output limit as a length stop",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({ truncated: "First I will check the ledger and" }));
+    try {
+      const result = await realTurn(customFixtureModel(fixture.baseURL), []);
+      assert.equal(result.stopReason, "length");
+      assert.equal(fixture.requests.length, 1, "OpenCode does not continue a truncated reply");
+      assert.equal(fixture.requests[0].body.max_tokens, 8000, "a quarter of the 32K window");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+/** A Claude model from Opus 4.6 on, which refuses an assistant prefill. */
+function claudeFixtureModel(baseURL: string): OpenCodeModel {
+  return {
+    id: "claude-opus-5-5",
+    provider: "anthropic",
+    apiKey: "upstream-private-key",
+    baseURL,
+    contextWindow: null,
+  };
+}
+
+// 2026-10-23: connecting Claude Opus 5.5 failed with "This model is not
+// available for AI Employee work". The connection test allows two steps, and
+// OpenCode ends a turn's last step with an assistant message, which Claude Opus
+// 4.6 and every later model refuse as a prefill.
+test(
+  "pinned OpenCode ends a Claude turn's last step on the user's turn",
+  { timeout: 180_000 },
+  async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const fixture = await fakeProvider((body, index) => {
+      if ((body.messages as Array<{ role: string }>).at(-1)?.role !== "user")
+        return {
+          reject: {
+            status: 400,
+            body: {
+              type: "error",
+              error: { type: "invalid_request_error", message: "Prefill is not supported." },
+            },
+          },
+        };
+      return index === 0 ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } } : "OK";
+    });
+    try {
+      const result = await realTurn(claudeFixtureModel(fixture.baseURL), [echoTool(calls)], {
+        maxSteps: 2,
+      });
+      assert.equal(result.finalText, "OK");
+      assert.deepEqual(calls, [{ value: "actual tool" }]);
+      const last = (fixture.requests[1].body.messages as Array<{ role: string }>).at(-1);
+      assert.equal(last?.role, "user");
+      assert.match(JSON.stringify(last), /MAXIMUM STEPS REACHED/);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode reports what Claude said about a refused request, without the key",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider(() => ({
+      reject: {
+        status: 400,
+        body: {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "Your credit balance is too low for upstream-private-key.",
+          },
+          request_id: "req_fixture",
+        },
+      },
+    }));
+    try {
+      await assert.rejects(
+        realTurn(claudeFixtureModel(fixture.baseURL), []),
+        (error: Error & { status?: number; providerDetail?: string }) => {
+          assert.equal(error.message, "The AI Model request failed (HTTP 400).");
+          assert.equal(error.status, 400);
+          assert.equal(
+            error.providerDetail,
+            "HTTP 400 · invalid_request_error\nYour credit balance is too low for [redacted].\nRequest ID: req_fixture",
+          );
+          return true;
+        },
+      );
+      assert.equal(fixture.requests.length, 1, "a refused request is not retried");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+const DEAD_KEY = "sk-ant-api03-dead-pool-key-000000001";
+const LIVE_KEY = "sk-ant-api03-live-pool-key-000000002";
+
+function twoKeyModel(baseURL: string, modelId = "two-key-model"): OpenCodeModel {
+  return {
+    ...claudeFixtureModel(baseURL),
+    apiKey: DEAD_KEY,
+    keys: new ApiKeyRing(modelId, [
+      { id: "dead", apiKey: DEAD_KEY, preview: "sk-…0001" },
+      { id: "live", apiKey: LIVE_KEY, preview: "sk-…0002" },
+    ]),
+  };
+}
+
+const POOL_KEYS = [1, 2, 3].map((n) => ({
+  id: `pool-${n}`,
+  apiKey: `sk-ant-api03-pool-turn-key-00000000${n}`,
+  preview: `sk-…000${n}`,
+}));
+
+/** One turn's model as `runOpenCodeTurn` resolves it: a session on the next key in turn. */
+function poolTurnModel(baseURL: string, modelId: string): OpenCodeModel {
+  const keys = new ApiKeyRing(modelId, POOL_KEYS, { session: true });
+  return { ...claudeFixtureModel(baseURL), apiKey: keys.attemptOrder()[0].apiKey, keys };
+}
+
+test(
+  "pinned OpenCode turns are sessions spread across the pool: each sends every request on its own key",
+  { timeout: 180_000 },
+  async () => {
+    resetKeyPoolMemory({ random: () => 0 });
+    const calls: Array<Record<string, unknown>> = [];
+    // Each turn: a tool call, then the reply after its result.
+    const fixture = await fakeProvider((_body, index) =>
+      index % 2 === 0 ? { name: "genosyn_fixture_echo", input: { value: "turn" } } : "OK",
+    );
+    try {
+      for (let turn = 0; turn < 3; turn++) {
+        const result = await realTurn(poolTurnModel(fixture.baseURL, "pool-turns"), [
+          echoTool(calls),
+        ]);
+        assert.equal(result.finalText, "OK");
+      }
+      assert.equal(calls.length, 3);
+      assert.deepEqual(
+        fixture.requests.map((request) => request.auth),
+        POOL_KEYS.flatMap((key) => [key.apiKey, key.apiKey]),
+        "every request of a turn on that turn's key; the next turn on the next key",
+      );
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode moves a turn to the next key when its key is refused mid-turn, and finishes there",
+  { timeout: 180_000 },
+  async () => {
+    resetKeyPoolMemory({ random: () => 0 });
+    const failovers: ApiKeyFailover[] = [];
+    const calls: Array<Record<string, unknown>> = [];
+    const [first, second] = POOL_KEYS;
+    const fixture = await fakeProvider((_body, index, auth) => {
+      if (auth === first.apiKey && index >= 1)
+        return {
+          reject: {
+            status: 429,
+            body: { type: "error", error: { type: "rate_limit_error", message: "Slow down." } },
+          },
+        };
+      return index === 0 ? { name: "genosyn_fixture_echo", input: { value: "mid" } } : "OK";
+    });
+    try {
+      const model = poolTurnModel(fixture.baseURL, "mid-turn-refusal");
+      const result = await realTurn(model, [echoTool(calls)], {}, undefined, {
+        onKeyFailover: (change) => failovers.push(change),
+      });
+      assert.equal(result.finalText, "OK");
+      assert.deepEqual(calls, [{ value: "mid" }]);
+      // The first step on its own key, the second refused there and resent on
+      // the next key, where the rest of the turn stays.
+      assert.deepEqual(
+        fixture.requests.map((request) => request.auth),
+        [first.apiKey, first.apiKey, second.apiKey],
+      );
+      assert.deepEqual(failovers, [
+        { from: first.preview, to: second.preview, status: 429, kind: "rate_limit" },
+      ]);
+      assert.equal(model.keys?.key.id, second.id);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode finishes a Claude turn on another key when its key is refused",
+  { timeout: 180_000 },
+  async () => {
+    const failovers: ApiKeyFailover[] = [];
+    const calls: Array<Record<string, unknown>> = [];
+    const fixture = await fakeProvider((_body, index, auth) => {
+      if (auth === DEAD_KEY)
+        return {
+          reject: {
+            status: 401,
+            body: {
+              type: "error",
+              error: { type: "authentication_error", message: "invalid x-api-key" },
+            },
+          },
+        };
+      return index <= 1 ? { name: "genosyn_fixture_echo", input: { value: "actual tool" } } : "OK";
+    });
+    try {
+      const result = await realTurn(
+        twoKeyModel(fixture.baseURL),
+        [echoTool(calls)],
+        {},
+        undefined,
+        { onKeyFailover: (change) => failovers.push(change) },
+      );
+      // The AI Employee's turn ran as if nothing happened: tool call, reply.
+      assert.equal(result.finalText, "OK");
+      assert.deepEqual(calls, [{ value: "actual tool" }]);
+      // First request refused on the turn's key and resent on the other; the
+      // turn stays there, so the next step goes straight to it.
+      assert.deepEqual(
+        fixture.requests.map((request) => request.auth),
+        [DEAD_KEY, LIVE_KEY, LIVE_KEY],
+      );
+      assert.deepEqual(fixture.requests[0].body, fixture.requests[1].body);
+      assert.deepEqual(failovers, [
+        { from: "sk-…0001", to: "sk-…0002", status: 401, kind: "auth" },
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode reports the provider's refusal, without any key, when every key is refused",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider((_body, _index, auth) => ({
+      reject: {
+        status: 401,
+        body: {
+          type: "error",
+          error: { type: "authentication_error", message: `invalid x-api-key: ${auth}` },
+          request_id: "req_fixture",
+        },
+      },
+    }));
+    try {
+      await assert.rejects(
+        realTurn(twoKeyModel(fixture.baseURL, "every-key-refused"), []),
+        (error: Error & { status?: number; providerDetail?: string }) => {
+          assert.equal(error.status, 401);
+          for (const key of [DEAD_KEY, LIVE_KEY]) {
+            assert.ok(!error.message.includes(key));
+            assert.ok(!(error.providerDetail ?? "").includes(key));
+          }
+          assert.match(error.providerDetail ?? "", /invalid x-api-key: \[redacted\]/);
+          return true;
+        },
+      );
+      assert.deepEqual(
+        fixture.requests.map((request) => request.auth),
+        [DEAD_KEY, LIVE_KEY],
+        "both keys tried once; a 401 is not retried",
+      );
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+// 2026-10-02: a YouTube prospecting Run on Qwen thought for 18,334 tokens,
+// then ended its turn with no reply and no tool call, and was recorded as
+// Completed with nothing done.
+test(
+  "pinned OpenCode asks a work turn that stopped silently to continue in the same session",
+  { timeout: 180_000 },
+  async () => {
+    const fixture = await fakeProvider((_body, index) =>
+      index === 0
+        ? { reasoningOnly: "Next I should research the channels." }
+        : "Researched 4 channels.",
+    );
+    try {
+      const silentStops: number[] = [];
+      const result = await realTurn(customFixtureModel(fixture.baseURL), [], {
+        maxSteps: null,
+        callbacks: { onSilentStop: () => silentStops.push(fixture.requests.length) },
+      });
+      assert.equal(result.finalText, "Researched 4 channels.");
+      assert.equal(result.stopReason, "end_turn");
+      assert.deepEqual(silentStops, [1]);
+      assert.equal(fixture.requests.length, 2);
+      const nudge = JSON.stringify(fixture.requests[1].body);
+      assert.ok(nudge.includes(SILENT_STOP_NUDGE.slice(0, 60)));
+      assert.ok(nudge.includes("Verify the fixture"), "the nudge continues the same conversation");
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  "pinned OpenCode asks a silent work turn once and leaves a bounded turn alone",
+  { timeout: 180_000 },
+  async () => {
+    const silent = await fakeProvider(() => ({ reasoningOnly: "Still thinking." }));
+    try {
+      const result = await realTurn(customFixtureModel(silent.baseURL), [], { maxSteps: null });
+      assert.equal(result.finalText, "");
+      assert.equal(silent.requests.length, 1 + SILENT_STOP_NUDGES);
+    } finally {
+      await silent.close();
+    }
+    const bounded = await fakeProvider(() => ({ reasoningOnly: "Noted." }));
+    try {
+      const result = await realTurn(customFixtureModel(bounded.baseURL), [], { maxSteps: 4 });
+      assert.equal(result.finalText, "");
+      assert.equal(bounded.requests.length, 1, "a bounded turn such as grading is not nudged");
+    } finally {
+      await bounded.close();
+    }
+  },
+);
+
+// 2026-10-02: restarting the vLLM server behind the self-hosted Qwen model
+// ended both Runs working on it with "The AI Model request failed (HTTP 502)"
+// once OpenCode's minute of retries ran out; the server was back minutes later.
+test(
+  "pinned OpenCode waits out a self-hosted model server that stops answering mid-turn",
+  { timeout: 180_000 },
+  async () => {
+    let down = true;
+    let restart: NodeJS.Timeout | undefined;
+    const posts: boolean[] = [];
+    const upstream = createServer(async (req, res) => {
+      for await (const chunk of req) void chunk;
+      if (req.method === "POST") posts.push(down);
+      // The server comes back 1.5s after the turn's first model request.
+      if (req.method === "POST") restart ??= setTimeout(() => (down = false), 1_500);
+      if (down) {
+        res.writeHead(502, { "Content-Type": "text/plain" }).end("upstream unavailable");
+        return;
+      }
+      if (req.method === "GET") {
+        res
+          .writeHead(200, { "Content-Type": "application/json" })
+          .end(JSON.stringify({ object: "list", data: [{ id: "fixture", object: "model" }] }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      chatResponse(res, "Recovered after the restart.");
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    assert.ok(address && typeof address !== "string");
+    try {
+      const outages: ModelOutage[] = [];
+      const retries: number[] = [];
+      const result = await realTurn(
+        customFixtureModel(`http://127.0.0.1:${address.port}/v1`),
+        [],
+        { maxSteps: null, callbacks: { onModelRetry: (retry) => retries.push(retry.attempt) } },
+        undefined,
+        { holdOutages: true, probeMs: 100, onOutage: (outage) => outages.push(outage) },
+      );
+      assert.equal(result.finalText, "Recovered after the restart.");
+      assert.deepEqual(
+        outages.map((outage) => outage.state),
+        ["waiting", "answered"],
+      );
+      assert.ok(outages[1].waitedMs >= 1_000);
+      assert.deepEqual(posts, [true, false], "the held request was sent again, once");
+      assert.deepEqual(retries, [], "OpenCode never saw the outage, so it spent no retries");
+    } finally {
+      if (restart) clearTimeout(restart);
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  },
+);
+
+// 2026-10-02: a Daily Partner Prospecting Run asked for five partnership records
+// at once with an unlisted tool name. OpenCode repairs each call into the same
+// `invalid` call, and three identical calls in a row trip its repeat guard,
+// which fell under "*": "deny": the denial failed the turn after 52 minutes.
+for (const repeated of [
+  {
+    label: "three calls to an unlisted tool",
+    calls: ["Acme", "Globex", "Initech"].map((value) => ({
+      name: "fixture_create",
+      input: { value },
+    })),
+    runs: 0,
+  },
+  {
+    label: "three identical calls to a Genosyn tool",
+    calls: [1, 2, 3].map(() => ({ name: "genosyn_fixture_echo", input: { value: "same" } })),
+    runs: 3,
+  },
+])
+  test(
+    `pinned OpenCode lets a work turn make ${repeated.label} in one reply and carry on`,
+    { timeout: 180_000 },
+    async () => {
+      const calls: Array<Record<string, unknown>> = [];
+      const fixture = await fakeProvider((_body, index) =>
+        index === 0 ? { parallel: repeated.calls } : "Recovered after repeating.",
+      );
+      try {
+        const result = await realTurn(customFixtureModel(fixture.baseURL), [echoTool(calls)], {
+          maxSteps: null,
+        });
+        assert.equal(result.finalText, "Recovered after repeating.");
+        assert.equal(result.stopReason, "end_turn");
+        assert.equal(calls.length, repeated.runs);
+        assert.equal(fixture.requests.length, 2);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+// 2026-10-02: an operator asked that Genosyn pick up a new model when vLLM is
+// restarted with one; the old id is answered "The model … does not exist".
+test(
+  "pinned OpenCode carries a turn onto the one model a restarted server now serves",
+  { timeout: 180_000 },
+  async () => {
+    const posted: string[] = [];
+    const upstream = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      if (req.method === "GET") {
+        res
+          .writeHead(200, { "Content-Type": "application/json" })
+          .end(JSON.stringify({ object: "list", data: [{ id: "fixture-next", object: "model" }] }));
+        return;
+      }
+      const model = (JSON.parse(Buffer.concat(chunks).toString()) as { model: string }).model;
+      posted.push(model);
+      if (model !== "fixture-next") {
+        res.writeHead(404, { "Content-Type": "application/json" }).end(
+          JSON.stringify({
+            error: { message: `The model \`${model}\` does not exist.`, param: "model", code: 404 },
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      chatResponse(res, "Answered by the new model.");
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    assert.ok(address && typeof address !== "string");
+    const changes: string[] = [];
+    // The server's model list is read through the outbound address check.
+    const privateHosts = [...config.security.outboundPrivateHostAllowlist];
+    config.security.outboundPrivateHostAllowlist.splice(0, Infinity, "127.0.0.1");
+    try {
+      const result = await realTurn(
+        customFixtureModel(`http://127.0.0.1:${address.port}/v1`),
+        [],
+        {},
+        undefined,
+        { onServedModelChange: ({ from, to }) => changes.push(`${from} -> ${to.id}`) },
+      );
+      assert.equal(result.finalText, "Answered by the new model.");
+      assert.deepEqual(changes, ["fixture -> fixture-next"]);
+      assert.deepEqual(posted, ["fixture", "fixture-next"]);
+    } finally {
+      config.security.outboundPrivateHostAllowlist.splice(0, Infinity, ...privateHosts);
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  },
+);

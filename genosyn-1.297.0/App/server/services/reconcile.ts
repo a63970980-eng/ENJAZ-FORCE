@@ -1,0 +1,997 @@
+import { In, IsNull } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import { BankFeed } from "../db/entities/BankFeed.js";
+import { BankTransaction } from "../db/entities/BankTransaction.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { InvoicePayment } from "../db/entities/InvoicePayment.js";
+import { Invoice } from "../db/entities/Invoice.js";
+import { LedgerEntry } from "../db/entities/LedgerEntry.js";
+import { ProviderRequestError, parseRetryAfter } from "../integrations/providerErrors.js";
+import {
+  type BrexCashAccountSummary,
+  type BrexConfig,
+  getBrexCashTransactionsPage,
+  listBrexCashAccounts,
+  summarizeBrexCashAccount,
+} from "../integrations/providers/brex.js";
+import { FeedSyncError, withProviderRetry } from "./feedSyncErrors.js";
+import { decryptConnectionConfig } from "./integrations.js";
+import { Account } from "../db/entities/Account.js";
+import { LedgerLine } from "../db/entities/LedgerLine.js";
+import {
+  claimedPaymentIds,
+  hasLinkedPayments,
+  linkedPayments,
+  transactionClaiming,
+  unlinkPayments,
+} from "./bankPaymentLinks.js";
+import { bookedLines, findClosedPeriodCovering, postLedgerEntry } from "./ledger.js";
+import { syncMercuryAccountFeed } from "./mercuryFeeds.js";
+import { syncWiseBalanceFeed } from "./wiseFeeds.js";
+
+/**
+ * Reconciliation service. Phase D of the Finance milestone (M19) — see
+ * ROADMAP.md.
+ *
+ * Three responsibilities:
+ *   1. Ingest bank lines (Stripe payouts pull or CSV upload).
+ *   2. Auto-match obvious cases — same amount and date within ±3 days
+ *      of an unmatched `InvoicePayment`, when there's exactly one
+ *      candidate.
+ *   3. Manual match / unmatch from the UI.
+ *
+ * A match to a payment is written on the payment
+ * (`InvoicePayment.bankTransactionId`, older ones on
+ * `BankTransaction.matchedPaymentId` — see `bankPaymentLinks.ts`), and a
+ * match to an entry on the transaction (`matchedLedgerEntryId`), which
+ * `reconciledAt` marks done. We don't post any ledger entries for a
+ * match. The payment/entry was already posted by Phase B's invoice flow
+ * — reconciliation just records that we've seen the bank's side of the
+ * same money.
+ */
+
+const STRIPE_API = "https://api.stripe.com/v1";
+const STRIPE_TIMEOUT_MS = 30_000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MATCH_DATE_WINDOW_MS = 3 * DAY_MS;
+/**
+ * How far before the last successful sync the next one asks again. A
+ * transaction a provider posts late — or a sync that finished while one was
+ * posting — still comes in, and dedupe by the provider's id keeps the second
+ * look free of duplicates. The window starts at the last *successful* sync,
+ * whenever that was, so an account that missed months catches up on all of
+ * them in one pass.
+ */
+export const BANK_SYNC_OVERLAP_MS = 7 * DAY_MS;
+
+/**
+ * Advance a feed's cursor — the last successful sync — without saving the
+ * whole row. A `save` would write back every column of the copy this sync
+ * loaded, over the sync status `bankingSync.ts` keeps on the same row.
+ */
+async function recordFeedSynced(
+  feed: BankFeed,
+  at: Date,
+  balance?: { cents: number; currency: string } | null,
+): Promise<void> {
+  const values: Partial<BankFeed> = { lastSyncAt: at };
+  if (balance) {
+    values.balanceCents = balance.cents;
+    values.balanceCurrency = balance.currency;
+    values.balanceAt = at;
+  }
+  await AppDataSource.getRepository(BankFeed).update({ id: feed.id, companyId: feed.companyId }, values);
+  Object.assign(feed, values);
+}
+
+/** Why a deposit that already paid some invoices can't be matched or categorized whole. */
+export const PARTLY_PAID =
+  "Part of this deposit already paid invoices. Mark what the rest paid, or undo it to start over.";
+
+// ─────────────────────────── Stripe payouts ────────────────────────────
+
+type StripePayout = {
+  id: string;
+  amount: number;
+  arrival_date: number; // unix seconds
+  description?: string;
+  statement_descriptor?: string;
+  status: string;
+  currency: string;
+};
+
+type StripePayoutsResponse = {
+  data: StripePayout[];
+  has_more?: boolean;
+};
+
+/** Stripe refused a request, or never answered it (`status` 0). */
+export class StripeApiError extends ProviderRequestError {
+  constructor(message: string, status: number, retryAfterMs: number | null = null, request = "") {
+    super(message, "Stripe", status, retryAfterMs, request);
+    this.name = "StripeApiError";
+  }
+}
+
+/** Stripe's own sentence for a refused request, from its `{ error: { message } }` body. */
+function stripeErrorMessage(status: number, text: string): string {
+  try {
+    const message = (JSON.parse(text) as { error?: { message?: unknown } })?.error?.message;
+    if (typeof message === "string" && message.trim()) return `Stripe ${status}: ${message.trim()}`;
+  } catch {
+    // Not JSON: a proxy's page, or nothing at all.
+  }
+  const trimmed = text.trim();
+  return trimmed && !trimmed.startsWith("<")
+    ? `Stripe ${status}: ${trimmed.slice(0, 200)}`
+    : `Stripe ${status}`;
+}
+
+async function getStripePayoutsPage(
+  apiKey: string,
+  options: { startingAfter?: string; createdGte?: number },
+): Promise<StripePayoutsResponse> {
+  const url = new URL(`${STRIPE_API}/payouts`);
+  url.searchParams.set("limit", "100");
+  if (options.startingAfter) url.searchParams.set("starting_after", options.startingAfter);
+  if (options.createdGte !== undefined) {
+    url.searchParams.set("created[gte]", String(options.createdGte));
+  }
+  const request = "GET /v1/payouts";
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(STRIPE_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new StripeApiError(
+        `Stripe didn't answer within ${STRIPE_TIMEOUT_MS / 1000} seconds. Try again.`,
+        0,
+        null,
+        request,
+      );
+    }
+    throw err;
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    throw new StripeApiError(
+      stripeErrorMessage(res.status, text),
+      res.status,
+      parseRetryAfter(res.headers.get("retry-after")),
+      request,
+    );
+  }
+  try {
+    return JSON.parse(text) as StripePayoutsResponse;
+  } catch {
+    throw new FeedSyncError("bad_data", "Stripe answered the payout list with something other than JSON");
+  }
+}
+
+/**
+ * Pull payouts from Stripe and create `BankTransaction` rows for any
+ * we haven't seen before. Returns the count of new rows. Idempotent —
+ * dedupes on `(feedId, externalId=stripe payout id)`.
+ *
+ * The first sync walks the whole payout history; later ones ask only for
+ * payouts created since a week before the last successful sync, however long
+ * ago that was. Stripe caps a page at 100 and sets `has_more` when more remain.
+ */
+export async function syncStripePayouts(feed: BankFeed, now = new Date()): Promise<number> {
+  if (feed.kind !== "stripe_payouts") {
+    throw new Error("Feed is not a Stripe payouts feed");
+  }
+  if (!feed.connectionId) {
+    throw new FeedSyncError("connection_missing", "Stripe feed has no connection — pick one first");
+  }
+  const conn = await AppDataSource.getRepository(IntegrationConnection).findOneBy({
+    id: feed.connectionId,
+    companyId: feed.companyId,
+  });
+  if (!conn) throw new FeedSyncError("connection_missing", "Stripe connection not found");
+  let cfg: { apiKey?: string };
+  try {
+    cfg = decryptConnectionConfig(conn) as { apiKey?: string };
+  } catch (err) {
+    throw new FeedSyncError("credentials", (err as Error).message);
+  }
+  const apiKey = cfg.apiKey;
+  if (!apiKey) throw new FeedSyncError("credentials", "Stripe connection is missing an API key");
+  const createdGte = feed.lastSyncAt
+    ? Math.floor((feed.lastSyncAt.getTime() - BANK_SYNC_OVERLAP_MS) / 1000)
+    : undefined;
+
+  // The page cap is a backstop against a pathological response looping forever.
+  const payouts: StripePayout[] = [];
+  let startingAfter: string | undefined;
+  for (let page = 0; page < 1000; page += 1) {
+    const parsed = await withProviderRetry(() =>
+      getStripePayoutsPage(apiKey, { startingAfter, createdGte }),
+    );
+    const batch = parsed.data ?? [];
+    payouts.push(...batch);
+    if (!parsed.has_more || batch.length === 0) break;
+    startingAfter = batch[batch.length - 1].id;
+  }
+
+  const existing = await AppDataSource.getRepository(BankTransaction).find({
+    where: { feedId: feed.id },
+    select: ["externalId"],
+  });
+  const seen = new Set(existing.map((b) => b.externalId).filter((x): x is string => !!x));
+
+  const txnRepo = AppDataSource.getRepository(BankTransaction);
+  const fresh: BankTransaction[] = [];
+  for (const p of payouts) {
+    if (seen.has(p.id)) continue;
+    if (!Number.isSafeInteger(p.amount) || !Number.isFinite(p.arrival_date)) {
+      throw new FeedSyncError("bad_data", `Stripe payout ${p.id} has no usable amount or arrival date`);
+    }
+    seen.add(p.id);
+    fresh.push(
+      txnRepo.create({
+        companyId: feed.companyId,
+        feedId: feed.id,
+        externalId: p.id,
+        date: new Date(p.arrival_date * 1000),
+        amountCents: p.amount,
+        description: p.description ?? p.statement_descriptor ?? `Stripe payout ${p.id}`,
+        reference: p.id,
+        raw: JSON.stringify(p),
+      }),
+    );
+  }
+  if (fresh.length > 0) {
+    await txnRepo.save(fresh);
+  }
+  await recordFeedSynced(feed, now);
+  return fresh.length;
+}
+
+// ─────────────────────────── Brex Cash ────────────────────────────────
+
+async function getBrexConfig(companyId: string, connectionId: string): Promise<BrexConfig> {
+  const connection = await AppDataSource.getRepository(IntegrationConnection).findOneBy({
+    id: connectionId,
+    companyId,
+    provider: "brex",
+  });
+  if (!connection) throw new FeedSyncError("connection_missing", "Brex Connection not found");
+  let config: Partial<BrexConfig>;
+  try {
+    config = decryptConnectionConfig(connection) as Partial<BrexConfig>;
+  } catch (err) {
+    throw new FeedSyncError("credentials", (err as Error).message);
+  }
+  if (!config.userToken || typeof config.userToken !== "string") {
+    throw new FeedSyncError("credentials", "Brex Connection is missing its user token");
+  }
+  return { userToken: config.userToken };
+}
+
+/** Return display-safe account choices for the new-feed UI. Full account and
+ * routing numbers never leave the server. */
+export async function listBrexCashAccountsForConnection(
+  companyId: string,
+  connectionId: string,
+): Promise<BrexCashAccountSummary[]> {
+  const config = await getBrexConfig(companyId, connectionId);
+  const accounts = await listBrexCashAccounts(config.userToken);
+  return accounts.map(summarizeBrexCashAccount);
+}
+
+/** Confirm that a feed points at a real account visible to this company's
+ * Brex Connection before persisting it. */
+export async function assertBrexCashAccountConnection(
+  companyId: string,
+  connectionId: string,
+  accountId: string,
+): Promise<void> {
+  const accounts = await listBrexCashAccountsForConnection(companyId, connectionId);
+  if (!accounts.some((account) => account.id === accountId)) {
+    throw new Error("Brex Cash account not found on this Connection");
+  }
+}
+
+/**
+ * Pull settled transactions for one Brex Cash account. The first sync walks
+ * the complete paginated history. Later syncs ask for everything posted since
+ * a week before the last successful sync — however long ago that was — so
+ * late-posted rows are not missed and an account that went months without a
+ * sync catches up on all of them; Brex transaction ids make every retry
+ * idempotent. Each sync also reads the account itself, for the balance the
+ * Banking card shows and to notice an account that was closed.
+ */
+export async function syncBrexCashTransactions(feed: BankFeed, now = new Date()): Promise<number> {
+  if (feed.kind !== "brex_cash") throw new Error("Feed is not a Brex Cash feed");
+  if (!feed.connectionId) {
+    throw new FeedSyncError("connection_missing", "Brex feed has no Connection — pick one first");
+  }
+  const accountId = feed.externalAccountId;
+  if (!accountId) {
+    throw new FeedSyncError("account_missing", "Brex feed has no Cash account — pick one first");
+  }
+  const config = await getBrexConfig(feed.companyId, feed.connectionId);
+  const account = (await withProviderRetry(() => listBrexCashAccounts(config.userToken))).find(
+    (candidate) => candidate.id === accountId,
+  );
+  if (!account) {
+    throw new FeedSyncError(
+      "account_missing",
+      "This Brex cash account is no longer on the Connection — it may have been closed",
+    );
+  }
+  const existing = await AppDataSource.getRepository(BankTransaction).find({
+    where: { feedId: feed.id },
+    select: ["externalId"],
+  });
+  const seen = new Set(existing.map((row) => row.externalId).filter((id): id is string => !!id));
+  const postedAtStart = feed.lastSyncAt
+    ? new Date(feed.lastSyncAt.getTime() - BANK_SYNC_OVERLAP_MS)
+    : undefined;
+  const seenCursors = new Set<string>();
+  const transactionRepo = AppDataSource.getRepository(BankTransaction);
+  let cursor: string | undefined;
+  let inserted = 0;
+
+  for (;;) {
+    const page = await withProviderRetry(() =>
+      getBrexCashTransactionsPage(config.userToken, accountId, {
+        cursor,
+        limit: 100,
+        postedAtStart,
+      }),
+    );
+    const fresh: BankTransaction[] = [];
+    for (const transaction of page.items ?? []) {
+      if (seen.has(transaction.id)) continue;
+      if (!transaction.amount || !Number.isSafeInteger(transaction.amount.amount)) {
+        throw new FeedSyncError(
+          "bad_data",
+          `Brex transaction ${transaction.id} has no safe integer amount`,
+        );
+      }
+      const postedAt = new Date(transaction.posted_at_date);
+      if (Number.isNaN(postedAt.getTime())) {
+        throw new FeedSyncError(
+          "bad_data",
+          `Brex transaction ${transaction.id} has an invalid posted date`,
+        );
+      }
+      seen.add(transaction.id);
+      fresh.push(
+        transactionRepo.create({
+          companyId: feed.companyId,
+          feedId: feed.id,
+          externalId: transaction.id,
+          date: postedAt,
+          amountCents: transaction.amount.amount,
+          description: transaction.description || "Brex Cash transaction",
+          reference: transaction.transfer_id ?? transaction.id,
+          raw: JSON.stringify(transaction),
+        }),
+      );
+    }
+    if (fresh.length > 0) {
+      await transactionRepo.save(fresh);
+      inserted += fresh.length;
+    }
+    const next = page.next_cursor ?? undefined;
+    if (!next) break;
+    if (seenCursors.has(next)) {
+      throw new FeedSyncError("bad_data", "Brex returned a repeated transaction cursor");
+    }
+    seenCursors.add(next);
+    cursor = next;
+  }
+
+  const balance = account.current_balance;
+  await recordFeedSynced(
+    feed,
+    now,
+    balance && Number.isSafeInteger(balance.amount)
+      ? { cents: balance.amount, currency: (balance.currency ?? "USD").toUpperCase() }
+      : null,
+  );
+  return inserted;
+}
+
+export async function syncBankFeed(feed: BankFeed): Promise<number> {
+  if (feed.kind === "stripe_payouts") return syncStripePayouts(feed);
+  if (feed.kind === "brex_cash") return syncBrexCashTransactions(feed);
+  if (feed.kind === "mercury_account") return syncMercuryAccountFeed(feed);
+  if (feed.kind === "wise_balance") return syncWiseBalanceFeed(feed);
+  throw new FeedSyncError("unsupported", "This feed type can only be imported via CSV");
+}
+
+// ─────────────────────────── CSV import ────────────────────────────────
+
+/**
+ * Parse a CSV body into bank-transaction-shaped objects, then dedupe
+ * against existing rows for this feed by `(date, amount, description)`
+ * triple. Returns the count of new rows inserted.
+ *
+ * Tolerates the column-name variants real banks use. Strict about the
+ * structural bits (must have a header row, must have a date and an
+ * amount column).
+ */
+export async function importBankCsv(
+  feed: BankFeed,
+  csvText: string,
+): Promise<{ inserted: number; skipped: number }> {
+  const rows = parseCsv(csvText);
+  if (rows.length < 2) {
+    throw new Error("CSV needs a header row plus at least one data row");
+  }
+  const headers = rows[0].map((h) => h.toLowerCase().trim());
+  const dateIdx = findColumn(headers, ["date", "transaction date", "posting date"]);
+  const amountIdx = findColumn(headers, ["amount", "transaction amount", "value"]);
+  const descIdx = findColumn(headers, ["description", "memo", "details", "narrative"]);
+  const refIdx = findColumn(headers, ["reference", "ref", "transaction id"]);
+  if (dateIdx < 0 || amountIdx < 0) {
+    throw new Error("CSV needs at least date and amount columns");
+  }
+
+  const existing = await AppDataSource.getRepository(BankTransaction).find({
+    where: { feedId: feed.id },
+    select: ["date", "amountCents", "description"],
+  });
+  const seenKey = new Set(
+    existing.map((b) => `${b.date.toISOString().slice(0, 10)}|${b.amountCents}|${b.description}`),
+  );
+
+  const txnRepo = AppDataSource.getRepository(BankTransaction);
+  const fresh: BankTransaction[] = [];
+  let skipped = 0;
+  for (let i = 1; i < rows.length; i += 1) {
+    const r = rows[i];
+    if (r.length === 0 || r.every((c) => !c.trim())) continue;
+    const dateStr = r[dateIdx]?.trim();
+    const amountStr = r[amountIdx]?.trim();
+    if (!dateStr || !amountStr) {
+      skipped += 1;
+      continue;
+    }
+    const date = parseDate(dateStr);
+    if (!date) {
+      skipped += 1;
+      continue;
+    }
+    const cents = parseAmountToCents(amountStr);
+    if (cents === null) {
+      skipped += 1;
+      continue;
+    }
+    const description = (descIdx >= 0 ? r[descIdx] : "")?.trim() ?? "";
+    const reference = (refIdx >= 0 ? r[refIdx] : "")?.trim() ?? "";
+    const key = `${date.toISOString().slice(0, 10)}|${cents}|${description}`;
+    if (seenKey.has(key)) {
+      skipped += 1;
+      continue;
+    }
+    seenKey.add(key);
+    fresh.push(
+      txnRepo.create({
+        companyId: feed.companyId,
+        feedId: feed.id,
+        externalId: null,
+        date,
+        amountCents: cents,
+        description,
+        reference,
+        raw: JSON.stringify(r),
+      }),
+    );
+  }
+  if (fresh.length > 0) await txnRepo.save(fresh);
+  await recordFeedSynced(feed, new Date());
+  return { inserted: fresh.length, skipped };
+}
+
+function findColumn(headers: string[], candidates: string[]): number {
+  for (let i = 0; i < headers.length; i += 1) {
+    if (candidates.includes(headers[i])) return i;
+  }
+  return -1;
+}
+
+function parseDate(s: string): Date | null {
+  // Accept ISO (2026-05-04), US (05/04/2026), EU (04/05/2026 → ambiguous,
+  // we try ISO-style parse first and fall back to splitting on /).
+  const iso = new Date(s);
+  if (!Number.isNaN(iso.getTime())) return iso;
+  const parts = s.split(/[/-]/).map((p) => p.trim());
+  if (parts.length === 3) {
+    // Default to MM/DD/YYYY (US convention) when the first part looks
+    // like a small number ≤12.
+    const a = Number(parts[0]);
+    const b = Number(parts[1]);
+    const c = Number(parts[2]);
+    const year = c < 100 ? 2000 + c : c;
+    if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
+      const d = new Date(Date.UTC(year, a - 1, b));
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+  }
+  return null;
+}
+
+function parseAmountToCents(s: string): number | null {
+  // Strip everything except digits, sign, decimal point. Accept
+  // parens-as-negative ("(123.45)") and comma thousand separators.
+  const negParens = /^\s*\(.+\)\s*$/.test(s);
+  const cleaned = s.replace(/[(),$£€¥\s]/g, "").replace(/[^0-9.\-+]/g, "");
+  if (!cleaned) return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n)) return null;
+  const cents = Math.round(n * 100);
+  return negParens ? -Math.abs(cents) : cents;
+}
+
+/**
+ * Minimal RFC-4180 CSV parser. Handles quoted fields, embedded commas,
+ * and escaped double-quotes. Newline detection covers CRLF + LF.
+ */
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          cell += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cell += c;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (c === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (c === "\r") {
+      // skip; \n on the next iteration finalizes the row
+    } else {
+      cell += c;
+    }
+  }
+  if (cell || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+}
+
+// ─────────────────────────── Matching ──────────────────────────────────
+
+/**
+ * Score-and-match unmatched transactions on this feed against
+ * unmatched `InvoicePayment` rows. A bank txn is auto-matched when:
+ *   - There is exactly one candidate payment with the same
+ *     `amountCents` and a `paidAt` within ±3 days.
+ *   - That payment is not already matched to another bank txn.
+ *   - No payment is linked to the txn yet: a deposit that already
+ *     paid some invoices waits for a person to say what the rest paid.
+ *
+ * Returns the count of newly matched rows. Conservative on purpose
+ * — when in doubt, accountants want to see the candidate set, not
+ * an auto-decision they have to investigate later.
+ */
+export async function autoMatchFeed(feed: BankFeed): Promise<number> {
+  const txnRepo = AppDataSource.getRepository(BankTransaction);
+  // Only the ones still in review, found through the company's reconciled-at
+  // index: this runs after every sync — every half hour for a connected
+  // account — and a feed's matched history only grows.
+  const unmatched = await txnRepo.find({
+    where: { companyId: feed.companyId, feedId: feed.id, reconciledAt: IsNull() },
+  });
+  if (unmatched.length === 0) return 0;
+
+  // Pull every payment for this company, then filter in memory. Phase D
+  // doesn't have many — likely tens, hundreds for a busy company.
+  const allPayments = await AppDataSource.getRepository(InvoicePayment).find({
+    where: {
+      invoiceId: In(
+        (
+          await AppDataSource.getRepository(Invoice).find({
+            where: { companyId: feed.companyId },
+            select: ["id"],
+          })
+        ).map((inv) => inv.id),
+      ),
+    },
+  });
+  // A payment matched on *any* of the company's feeds is taken — not only on
+  // this one, or a second feed carrying the same deposit could claim it again
+  // — and so is one this run has just matched.
+  const claimed = new Set((await claimedPaymentIds(feed.companyId)).keys());
+  const holding = new Set(
+    allPayments.map((p) => p.bankTransactionId).filter((id): id is string => !!id),
+  );
+
+  const linked: InvoicePayment[] = [];
+  for (const t of unmatched) {
+    if (holding.has(t.id)) continue;
+    const tWindow = t.date.getTime();
+    const hits = allPayments.filter(
+      (p) =>
+        !claimed.has(p.id) &&
+        p.amountCents === t.amountCents &&
+        Math.abs(p.paidAt.getTime() - tWindow) <= MATCH_DATE_WINDOW_MS,
+    );
+    if (hits.length === 1) {
+      hits[0].bankTransactionId = t.id;
+      t.matchedPaymentId = null;
+      t.matchedLedgerEntryId = null;
+      t.reconciledAt = new Date();
+      t.reconciledById = null;
+      claimed.add(hits[0].id);
+      linked.push(hits[0]);
+    }
+  }
+  if (linked.length > 0) {
+    await AppDataSource.getRepository(InvoicePayment).save(linked);
+    await txnRepo.save(unmatched.filter((t) => t.reconciledAt));
+  }
+  return linked.length;
+}
+
+export async function manualMatch(
+  txn: BankTransaction,
+  target: { paymentId?: string | null; ledgerEntryId?: string | null },
+  actorUserId: string | null,
+): Promise<BankTransaction> {
+  const repo = AppDataSource.getRepository(BankTransaction);
+  // Matching explains the whole line. One already explained — or holding the
+  // payments of invoices part of it paid — is undone first, so no payment it
+  // links to is silently dropped and no category is left posted beside it.
+  // Matching it again to what already explains it changes nothing.
+  const linked = await linkedPayments(txn);
+  if (txn.reconciledAt || linked.length > 0) {
+    const unchanged =
+      !!txn.reconciledAt &&
+      (target.paymentId
+        ? linked.length === 1 && linked[0].id === target.paymentId
+        : !!target.ledgerEntryId && target.ledgerEntryId === txn.matchedLedgerEntryId);
+    if (unchanged) return txn;
+    throw new Error(
+      txn.reconciledAt
+        ? "This transaction is already matched or categorized. Undo that first."
+        : PARTLY_PAID,
+    );
+  }
+  if (target.paymentId) {
+    const p = await AppDataSource.getRepository(InvoicePayment).findOneBy({
+      id: target.paymentId,
+    });
+    if (!p) throw new Error("Payment not found");
+    // InvoicePayment carries no companyId of its own — only invoiceId — so
+    // confirm the payment belongs to THIS company via its invoice before
+    // matching. Without this a caller could point one tenant's bank line at
+    // another tenant's payment id (the ledgerEntryId branch below is already
+    // company-scoped; this branch was not).
+    const owningInvoice = await AppDataSource.getRepository(Invoice).findOneBy({
+      id: p.invoiceId,
+      companyId: txn.companyId,
+    });
+    if (!owningInvoice) throw new Error("Payment not found");
+    // A payment is in one bank line at most: one already matched to another
+    // line, or recorded from another deposit, is spoken for. The candidate list
+    // hides it; this keeps a direct call from matching it twice.
+    const claimedBy = await transactionClaiming(txn.companyId, p, txn.id);
+    if (claimedBy) {
+      throw new Error(
+        `That payment on ${owningInvoice.number || "this invoice"} is already matched to the bank line from ${claimedBy.date
+          .toISOString()
+          .slice(
+            0,
+            10,
+          )}${claimedBy.description ? ` (${claimedBy.description})` : ""}. Unmatch that line first.`,
+      );
+    }
+    p.bankTransactionId = txn.id;
+    await AppDataSource.getRepository(InvoicePayment).save(p);
+    txn.matchedPaymentId = null;
+    txn.matchedLedgerEntryId = null;
+  } else if (target.ledgerEntryId) {
+    const e = await AppDataSource.getRepository(LedgerEntry).findOneBy({
+      id: target.ledgerEntryId,
+      companyId: txn.companyId,
+    });
+    if (!e) throw new Error("Ledger entry not found");
+    txn.matchedLedgerEntryId = e.id;
+    txn.matchedPaymentId = null;
+  } else {
+    throw new Error("Match needs either paymentId or ledgerEntryId");
+  }
+  txn.reconciledAt = new Date();
+  txn.reconciledById = actorUserId;
+  return repo.save(txn);
+}
+
+export async function unmatch(txn: BankTransaction): Promise<BankTransaction> {
+  // A plain match just links to a pre-existing payment/entry — clearing the
+  // links is enough, and the payments stay on their invoices. But if this line
+  // was *categorized* (we posted a journal entry for it), unmatching must
+  // reverse that entry so the books truly undo.
+  if (txn.matchedLedgerEntryId) {
+    const entry = await AppDataSource.getRepository(LedgerEntry).findOneBy({
+      id: txn.matchedLedgerEntryId,
+      companyId: txn.companyId,
+    });
+    if (entry && entry.source === "bank_categorization" && entry.sourceRefId === txn.id) {
+      const closed = await findClosedPeriodCovering(txn.companyId, entry.date);
+      if (closed) {
+        throw new Error(
+          `This line was categorized into the closed period "${closed.name}" and can't be unmatched. Reopen the period first.`,
+        );
+      }
+      // As the books hold it now, with any category change Entry review
+      // approved before Banking became the one place to make one, so the undo
+      // takes the money out of wherever it sits.
+      const origLines = (await bookedLines(txn.companyId, [entry.id])).get(entry.id) ?? [];
+      // Explicit forward-posted mirror keyed on the entry id (unique per
+      // categorization), so re-categorizing and unmatching again never
+      // collides with a prior reversal's idempotency key.
+      await postLedgerEntry({
+        companyId: txn.companyId,
+        date: new Date(),
+        memo: `Uncategorize ${txn.description || "bank line"}`,
+        source: "bank_categorization_void",
+        sourceRefId: entry.id,
+        createdById: txn.reconciledById,
+        lines: origLines.map((l) => ({
+          accountId: l.accountId,
+          debitCents: l.creditCents,
+          creditCents: l.debitCents,
+          description: l.description ? `Reversal: ${l.description}` : "",
+        })),
+      });
+    }
+  }
+  await unlinkPayments(txn);
+  txn.matchedPaymentId = null;
+  txn.matchedLedgerEntryId = null;
+  txn.reconciledAt = null;
+  txn.reconciledById = null;
+  return AppDataSource.getRepository(BankTransaction).save(txn);
+}
+
+/**
+ * Turn an uncleared bank line into a categorized journal entry — the first
+ * path in the product that posts a bank line to the ledger. Money in debits the
+ * feed's bank account and credits the chosen category; money out reverses.
+ * Bank lines are home-currency in this milestone (see BankTransaction), so the
+ * amount posts to the ledger directly with no FX conversion.
+ */
+export async function categorizeBankTransaction(
+  txn: BankTransaction,
+  categoryAccountId: string,
+  actorUserId: string | null,
+): Promise<BankTransaction> {
+  if (txn.reconciledAt) {
+    throw new Error("This bank line is already reconciled — unmatch it first");
+  }
+  if (await hasLinkedPayments(txn)) throw new Error(PARTLY_PAID);
+  if (txn.amountCents === 0) throw new Error("Cannot categorize a zero-amount line");
+  const feed = await AppDataSource.getRepository(BankFeed).findOneBy({
+    id: txn.feedId,
+    companyId: txn.companyId,
+  });
+  if (!feed) throw new Error("Bank feed not found");
+  const acctRepo = AppDataSource.getRepository(Account);
+  const bankAccount = await acctRepo.findOneBy({ id: feed.accountId, companyId: txn.companyId });
+  if (!bankAccount) throw new Error("The feed's bank account no longer exists");
+  const category = await acctRepo.findOneBy({ id: categoryAccountId, companyId: txn.companyId });
+  if (!category) throw new Error("Category account not found");
+  if (category.archivedAt) throw new Error("That category account is archived");
+  if (category.id === bankAccount.id) {
+    throw new Error("Pick a category other than the feed's own bank account");
+  }
+  const closed = await findClosedPeriodCovering(txn.companyId, txn.date);
+  if (closed) {
+    throw new Error(`This line's date falls in the closed period "${closed.name}".`);
+  }
+
+  const abs = Math.abs(txn.amountCents);
+  const desc = txn.description || "Bank transaction";
+  const lines =
+    txn.amountCents > 0
+      ? [
+          { accountId: bankAccount.id, debitCents: abs, description: desc },
+          { accountId: category.id, creditCents: abs, description: desc },
+        ]
+      : [
+          { accountId: category.id, debitCents: abs, description: desc },
+          { accountId: bankAccount.id, creditCents: abs, description: desc },
+        ];
+  const { entry } = await postLedgerEntry({
+    companyId: txn.companyId,
+    date: txn.date,
+    memo: desc,
+    source: "bank_categorization",
+    sourceRefId: txn.id,
+    createdById: actorUserId,
+    lines,
+  });
+  txn.matchedPaymentId = null;
+  txn.matchedLedgerEntryId = entry.id;
+  txn.reconciledAt = new Date();
+  txn.reconciledById = actorUserId;
+  return AppDataSource.getRepository(BankTransaction).save(txn);
+}
+
+// ─────────────────────── Match candidates (drill) ──────────────────────
+
+export type MatchCandidate =
+  | {
+      kind: "payment";
+      paymentId: string;
+      invoiceNumber: string;
+      invoiceSlug: string;
+      customerName: string;
+      amountCents: number;
+      paidAt: string;
+      method: string;
+      /** 0..1 confidence score from the auto-matcher heuristic. */
+      score: number;
+    }
+  | {
+      /** Any posted entry with a line on the feed's bank account — bill
+       *  payments, card settlements, refunds, deposits, manual entries. The
+       *  whole money-out side that invoice-payment matching alone missed. */
+      kind: "ledger_entry";
+      ledgerEntryId: string;
+      memo: string;
+      source: string;
+      /** What posted the entry — a bill payment is `bill_payment:<id>`. */
+      sourceRefId: string | null;
+      date: string;
+      /** The bank-account line amount, signed (+ in / − out). */
+      amountCents: number;
+      score: number;
+    };
+
+/**
+ * Suggest payment candidates for a given bank transaction, ranked by
+ * (amount-equality, date-proximity). Caller decides whether to commit
+ * by calling `manualMatch`.
+ */
+export async function findMatchCandidates(txn: BankTransaction): Promise<MatchCandidate[]> {
+  const invoices = await AppDataSource.getRepository(Invoice).find({
+    where: { companyId: txn.companyId },
+  });
+  const invIds = invoices.map((i) => i.id);
+  const out: MatchCandidate[] = [];
+
+  // Invoice-payment candidates (the classic money-in path). Skipped when the
+  // company has no invoices — but the ledger-entry sweep below still runs, so a
+  // company that only pays bills can still reconcile its money-out lines.
+  if (invIds.length > 0) {
+    const customers = new Map(
+      (
+        await AppDataSource.getRepository(
+          (await import("../db/entities/Customer.js")).Customer,
+        ).find({
+          where: {
+            id: In(invoices.map((i) => i.customerId)),
+            companyId: txn.companyId,
+          },
+          select: ["id", "name"],
+        })
+      ).map((c) => [c.id, c.name]),
+    );
+    const allPayments = await AppDataSource.getRepository(InvoicePayment).find({
+      where: { invoiceId: In(invIds) },
+    });
+    const claimed = await claimedPaymentIds(txn.companyId);
+    const invById = new Map(invoices.map((i) => [i.id, i]));
+    for (const p of allPayments) {
+      const claimedBy = claimed.get(p.id);
+      if (claimedBy && claimedBy !== txn.id) continue;
+      const inv = invById.get(p.invoiceId);
+      if (!inv) continue;
+      const amtMatch = p.amountCents === txn.amountCents ? 0.6 : 0;
+      const dayDiff = Math.abs(p.paidAt.getTime() - txn.date.getTime()) / (24 * 60 * 60 * 1000);
+      const dateScore = Math.max(0, 0.4 - 0.05 * dayDiff);
+      const score = amtMatch + dateScore;
+      if (score <= 0) continue;
+      out.push({
+        kind: "payment",
+        paymentId: p.id,
+        invoiceNumber: inv.number || "(draft)",
+        invoiceSlug: inv.slug,
+        customerName: customers.get(inv.customerId) ?? "—",
+        amountCents: p.amountCents,
+        paidAt: p.paidAt.toISOString(),
+        method: p.method,
+        score,
+      });
+    }
+  }
+  // Ledger-entry candidates: any posted entry with a line on the feed's bank
+  // account, matching this line's amount + direction and not already claimed.
+  // Covers the money-out side (bill payments, card settlements, refunds) and
+  // manual entries that plain invoice-payment matching could never reach.
+  const feed = await AppDataSource.getRepository(BankFeed).findOneBy({
+    id: txn.feedId,
+    companyId: txn.companyId,
+  });
+  const bankAccountId = feed?.accountId ?? null;
+  if (bankAccountId) {
+    const bankLines = await AppDataSource.getRepository(LedgerLine).find({
+      where: { companyId: txn.companyId, accountId: bankAccountId },
+    });
+    const entryIds = [...new Set(bankLines.map((l) => l.ledgerEntryId))];
+    const entries = entryIds.length
+      ? await AppDataSource.getRepository(LedgerEntry).find({
+          where: { id: In(entryIds), companyId: txn.companyId },
+        })
+      : [];
+    const entryById = new Map(entries.map((e) => [e.id, e]));
+    const claimedEntries = new Set(
+      (
+        await AppDataSource.getRepository(BankTransaction).find({
+          where: { companyId: txn.companyId },
+          select: ["matchedLedgerEntryId"],
+        })
+      )
+        .map((t) => t.matchedLedgerEntryId)
+        .filter((x): x is string => !!x),
+    );
+    // invoice_payment entries are already offered via the payment path above;
+    // bank_categorization entries were themselves created from a bank line.
+    const excludeSources = new Set([
+      "invoice_payment",
+      "bank_categorization",
+      "bank_categorization_void",
+    ]);
+    const wantIn = txn.amountCents > 0;
+    const abs = Math.abs(txn.amountCents);
+    const seenEntries = new Set<string>();
+    for (const l of bankLines) {
+      const e = entryById.get(l.ledgerEntryId);
+      if (!e || seenEntries.has(e.id)) continue;
+      if (excludeSources.has(e.source)) continue;
+      if (claimedEntries.has(e.id) && e.id !== txn.matchedLedgerEntryId) continue;
+      // Money in ⇒ a debit to the bank account; money out ⇒ a credit.
+      const lineAmount = wantIn ? l.debitCents : l.creditCents;
+      if (lineAmount === 0) continue;
+      seenEntries.add(e.id);
+      const amtMatch = lineAmount === abs ? 0.6 : 0;
+      const dayDiff = Math.abs(e.date.getTime() - txn.date.getTime()) / (24 * 60 * 60 * 1000);
+      const dateScore = Math.max(0, 0.4 - 0.05 * dayDiff);
+      const score = amtMatch + dateScore;
+      if (score <= 0) continue;
+      out.push({
+        kind: "ledger_entry",
+        ledgerEntryId: e.id,
+        memo: e.memo || "(no memo)",
+        source: e.source,
+        sourceRefId: e.sourceRefId,
+        date: e.date.toISOString(),
+        amountCents: wantIn ? lineAmount : -lineAmount,
+        score,
+      });
+    }
+  }
+
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, 25);
+}

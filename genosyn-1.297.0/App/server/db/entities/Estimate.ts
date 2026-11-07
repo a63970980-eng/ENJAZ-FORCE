@@ -1,0 +1,175 @@
+import type { SubsidiaryIssuerSnapshot } from "./Subsidiary.js";
+import { dateTimeColumnType } from "./columnTypes.js";
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  Index,
+} from "typeorm";
+
+/**
+ * Estimate (also called Quotation) statuses.
+ *
+ * - `draft`     — fully editable, deletable. `numberSeq` is 0 and no
+ *                  display number until issued.
+ * - `sent`      — Number minted at issue; customer and issuer fixed.
+ *                  Customer-facing; can be revised and resent under the
+ *                  same number (`services/estimates.ts > updateEstimate()`),
+ *                  accepted, declined, voided, or converted to an invoice.
+ * - `accepted`  — customer has accepted. Can still be converted to an
+ *                  invoice (the common path) or voided. Editing it returns
+ *                  it to `sent`.
+ * - `declined`  — customer has declined. Terminal.
+ * - `void`      — terminal. Cannot be edited or deleted.
+ *
+ * "Expired" is computed at read-time from `validUntil` + status, not
+ * stored, so adjusting the validity window can't leave estimates in an
+ * inconsistent state.
+ *
+ * Estimates intentionally do *not* post to the general ledger — they are
+ * pre-sale documents, not financial transactions. The journal posting
+ * happens only when an accepted estimate is converted to an Invoice.
+ */
+export type EstimateStatus = "draft" | "sent" | "accepted" | "declined" | "void";
+
+/**
+ * An Estimate is a quotation issued to a `Customer` before a sale is
+ * finalized. Mirrors the shape of `Invoice` minus payments/balance —
+ * estimates carry no money, just proposed line items.
+ *
+ * Numbering: `numberSeq` is a per-company gapless integer minted at
+ * issue (transition draft → sent). Drafts carry `numberSeq = 0` and
+ * `number = ""`. Display format is `EST-0001`; format is owned by
+ * `lib/money.ts > formatEstimateNumber()`.
+ *
+ * Cent columns (`subtotalCents`, `taxCents`, `totalCents`) are
+ * recomputed by the service layer from the lines. The route layer
+ * never writes them directly.
+ */
+@Entity("estimates")
+@Index(["companyId", "slug"], { unique: true })
+@Index(["companyId", "status"])
+@Index(["companyId", "customerId"])
+@Index(["companyId", "numberSeq"])
+@Index(["companyId", "archivedAt"])
+export class Estimate {
+  @PrimaryGeneratedColumn("uuid")
+  id!: string;
+
+  @Column({ type: "varchar" })
+  companyId!: string;
+
+  @Column({ type: "varchar" })
+  customerId!: string;
+
+  /** Optional legal issuer; null retains the company default. */
+  @Column({ type: "varchar", nullable: true })
+  subsidiaryId!: string | null;
+
+  /** Frozen when the issuer is selected; later profile edits never rewrite documents. */
+  @Column({ type: "simple-json", nullable: true })
+  issuerSnapshot!: SubsidiaryIssuerSnapshot | null;
+
+  /** URL slug — `est-0001` once issued, `edraft-<short>` while in draft.
+   *  Renames don't change the slug; voiding doesn't either. */
+  @Column({ type: "varchar" })
+  slug!: string;
+
+  /** Gapless per-company sequence. `0` until the estimate is issued. */
+  @Column({ type: "int", default: 0 })
+  numberSeq!: number;
+
+  /** Display string — e.g. `EST-0001`. Empty while in draft. */
+  @Column({ type: "varchar", default: "" })
+  number!: string;
+
+  @Column({ type: "varchar", default: "draft" })
+  status!: EstimateStatus;
+
+  @Column({ type: dateTimeColumnType })
+  issueDate!: Date;
+
+  /** The day this quote stops being valid. Past `validUntil` + status
+   *  `sent` is rendered as "expired" in the UI without changing the
+   *  stored status. */
+  @Column({ type: dateTimeColumnType })
+  validUntil!: Date;
+
+  @Column({ type: "varchar", default: "USD" })
+  currency!: string;
+
+  /** Pre-tax amount charged: the lines' subtotal less any discount, so
+   *  `subtotalCents + taxCents = totalCents` and revenue is the subtotal. */
+  @Column({ type: "int", default: 0 })
+  subtotalCents!: number;
+
+  /** Whole-document discount as a percentage (0–100), taken off before tax.
+   *  Zero when the discount is a fixed amount or there is none — see
+   *  `shared/documentDiscount.ts`. */
+  @Column({ type: "real", default: 0 })
+  discountPercent!: number;
+
+  /** Whole-document discount as a fixed pre-tax amount in minor units. Zero
+   *  when the discount is a percentage or there is none. */
+  @Column({ type: "int", default: 0 })
+  discountAmountCents!: number;
+
+  /** The discount actually taken, pre-tax. Derived like the other cent
+   *  columns; `subtotalCents` is already net of it. */
+  @Column({ type: "int", default: 0 })
+  discountCents!: number;
+
+  @Column({ type: "int", default: 0 })
+  taxCents!: number;
+
+  @Column({ type: "int", default: 0 })
+  totalCents!: number;
+
+  /** Free-form note shown on the estimate (above the totals). */
+  @Column({ type: "text", default: "" })
+  notes!: string;
+
+  /** Free-form footer (terms, contact details, thank-you note). */
+  @Column({ type: "text", default: "" })
+  footer!: string;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  sentAt!: Date | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  acceptedAt!: Date | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  declinedAt!: Date | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  voidedAt!: Date | null;
+
+  /** Set when this estimate has been converted to an invoice. The UI
+   *  presents this as a synthetic "invoiced" badge and links to the
+   *  invoice; the stored status stays at `accepted` (or whatever it
+   *  was at conversion time). */
+  @Column({ type: "varchar", nullable: true })
+  invoiceId!: string | null;
+
+  @Column({ type: dateTimeColumnType, nullable: true })
+  convertedAt!: Date | null;
+
+  /** Filing, not a status: an archived estimate leaves the default lists
+   *  but keeps its number, status, PDF, and invoice link, and its actions
+   *  still work. Restoring clears it. Orthogonal to `status` so archiving
+   *  can never rewrite where an estimate stands with the customer. */
+  @Column({ type: dateTimeColumnType, nullable: true })
+  archivedAt!: Date | null;
+
+  @Column({ type: "varchar", nullable: true })
+  createdById!: string | null;
+
+  @CreateDateColumn()
+  createdAt!: Date;
+
+  @UpdateDateColumn()
+  updatedAt!: Date;
+}

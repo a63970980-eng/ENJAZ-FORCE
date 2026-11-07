@@ -1,0 +1,618 @@
+import React from "react";
+import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
+import { ArrowLeft, GitMerge, Plus, Star, Trash2 } from "lucide-react";
+import {
+  api,
+  Company,
+  Customer,
+  CustomerContact,
+  CustomerContactDraft,
+  Employee,
+  Member,
+  parseMoneyToCents,
+} from "../lib/api";
+import { domainConflictOf, type DomainHolder } from "../lib/accountMerge";
+import { errorMessage } from "../lib/errors";
+import { canWriteFinance, effectiveFinanceAccess } from "../lib/subpages";
+import { Breadcrumbs } from "../components/AppShell";
+import { Button } from "../components/ui/Button";
+import { FormError } from "../components/ui/FormError";
+import { Spinner } from "../components/ui/Spinner";
+import { Input } from "../components/ui/Input";
+import { Select } from "../components/ui/Select";
+import { Textarea } from "../components/ui/Textarea";
+import { FinanceReadOnlyPage } from "@/components/finance/FinanceReadOnly";
+import { CustomersClosed, CustomersOutletCtx } from "./CustomersLayout";
+import { CustomerContractsPanel } from "./CustomerContractsPanel";
+
+/**
+ * Customer create / edit page. The form has room to breathe and scrolls
+ * naturally with the page when contacts pile up. Handles both create (no
+ * `:customerSlug` route param) and edit (param present), mirroring the
+ * invoice / estimate / bill flows. In edit mode it also surfaces the
+ * customer's signed contracts.
+ */
+
+/**
+ * Row in the inline contacts editor. Carries a stable `key` so React
+ * doesn't lose focus when sibling rows are added or removed mid-edit.
+ * `id` is null for newly-added rows that haven't been persisted yet — the
+ * save path uses it to choose POST vs PATCH per row.
+ */
+type ContactRow = {
+  key: string;
+  id: string | null;
+  name: string;
+  email: string;
+  phone: string;
+  role: string;
+  isPrimary: boolean;
+};
+
+function emptyContactRow(): ContactRow {
+  return {
+    key: Math.random().toString(36).slice(2, 10),
+    id: null,
+    name: "",
+    email: "",
+    phone: "",
+    role: "",
+    isPrimary: false,
+  };
+}
+
+function rowFromContact(c: CustomerContact): ContactRow {
+  return {
+    key: c.id,
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    phone: c.phone,
+    role: c.role,
+    isPrimary: c.isPrimary,
+  };
+}
+
+/**
+ * `customers/new` and `customers/:customerSlug/edit`. The finance routes save
+ * customers and their contacts, so either needs Full finance access; a
+ * read-only Member who lands here gets a note instead of a form that could
+ * only be refused.
+ */
+export default function CustomerNew() {
+  const { company } = useOutletContext<CustomersOutletCtx>();
+  const { customerSlug } = useParams();
+  // Everything this form sends goes through the finance routes: loading the
+  // customer to edit needs Read, and saving needs Full. With None even the
+  // load answers 403, so the Customers note stands in for the whole form.
+  if (effectiveFinanceAccess(company) === "none") {
+    return (
+      <CustomersClosed companySlug={company.slug} page={customerSlug ? "customer" : "list"} />
+    );
+  }
+  // Read-only can load a customer but not save one, so instead of fields
+  // whose save could only be refused they get the note Finance's own forms
+  // show, with a way back. The catalogue holds New customer to Full for the
+  // same reason, which is why the palette never offers it to them.
+  if (!canWriteFinance(company)) {
+    return (
+      <FinanceReadOnlyPage
+        company={company}
+        section={{ label: "Customers", path: "customers" }}
+        title={customerSlug ? "Edit customer" : "New customer"}
+        backTo={customerSlug ?? ""}
+      />
+    );
+  }
+  return <CustomerForm company={company} />;
+}
+
+function CustomerForm({ company }: { company: Company }) {
+  const navigate = useNavigate();
+  const { customerSlug } = useParams();
+  const isEdit = Boolean(customerSlug);
+  const customersUrl = `/c/${company.slug}/customers`;
+  // Where Back, Cancel and Save lead: the customer being edited, or the list.
+  const customerUrl = customerSlug ? `${customersUrl}/${customerSlug}` : customersUrl;
+
+  const [ready, setReady] = React.useState(!isEdit);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  // The customer already on the domain this save asked for — likely the same company.
+  const [domainHolder, setDomainHolder] = React.useState<DomainHolder | null>(null);
+
+  const [customerId, setCustomerId] = React.useState<string | null>(null);
+  const [name, setName] = React.useState("");
+  const [email, setEmail] = React.useState("");
+  const [phone, setPhone] = React.useState("");
+  const [accountStatus, setAccountStatus] = React.useState<Customer["accountStatus"]>("customer");
+  const [domain, setDomain] = React.useState("");
+  const [websiteUrl, setWebsiteUrl] = React.useState("");
+  const [industry, setIndustry] = React.useState("");
+  const [employeeCount, setEmployeeCount] = React.useState("");
+  const [owner, setOwner] = React.useState("");
+  const [members, setMembers] = React.useState<Member[]>([]);
+  const [employees, setEmployees] = React.useState<Employee[]>([]);
+  const [taxNumber, setTaxNumber] = React.useState("");
+  const [currency, setCurrency] = React.useState("USD");
+  // Annual Contract Value kept as the raw text the user types; converted to
+  // cents on save and back to a plain amount when loading an existing row.
+  const [acv, setAcv] = React.useState("");
+  const [billingAddress, setBillingAddress] = React.useState("");
+  const [notes, setNotes] = React.useState("");
+  const [contacts, setContacts] = React.useState<ContactRow[]>([]);
+  // Track which previously-persisted contacts the user removed so we can
+  // delete them in the save pass.
+  const [removedContactIds, setRemovedContactIds] = React.useState<string[]>([]);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!isEdit || !customerSlug) return;
+    (async () => {
+      try {
+        const c = await api.get<Customer>(
+          `/api/companies/${company.id}/customers/${customerSlug}`,
+        );
+        setCustomerId(c.id);
+        setName(c.name);
+        setEmail(c.email);
+        setPhone(c.phone);
+        setAccountStatus(c.accountStatus);
+        setDomain(c.domain);
+        setWebsiteUrl(c.websiteUrl);
+        setIndustry(c.industry);
+        setEmployeeCount(c.employeeCount > 0 ? String(c.employeeCount) : "");
+        setOwner(
+          c.ownerId ? `user:${c.ownerId}` : c.ownerEmployeeId ? `employee:${c.ownerEmployeeId}` : "",
+        );
+        setTaxNumber(c.taxNumber);
+        setCurrency(c.currency || "USD");
+        setAcv(
+          c.annualContractValueCents > 0
+            ? (c.annualContractValueCents / 100).toFixed(2)
+            : "",
+        );
+        setBillingAddress(c.billingAddress);
+        setNotes(c.notes);
+        setContacts(c.contacts.map(rowFromContact));
+        setReady(true);
+      } catch (err) {
+        setLoadError(errorMessage(err));
+        setReady(true);
+      }
+    })();
+  }, [company.id, customerSlug, isEdit]);
+
+  React.useEffect(() => {
+    void Promise.all([
+      api.get<Member[]>(`/api/companies/${company.id}/members`).catch(() => []),
+      api.get<Employee[]>(`/api/companies/${company.id}/employees`).catch(() => []),
+    ]).then(([memberRows, employeeRows]) => {
+      setMembers(memberRows);
+      setEmployees(employeeRows);
+    });
+  }, [company.id]);
+
+  function patchContact(idx: number, patch: Partial<ContactRow>) {
+    setContacts((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+  function addContact() {
+    setContacts((rows) => [...rows, emptyContactRow()]);
+  }
+  function removeContact(idx: number) {
+    setContacts((rows) => {
+      const removed = rows[idx];
+      if (removed.id) {
+        setRemovedContactIds((ids) => [...ids, removed.id!]);
+      }
+      return rows.filter((_, i) => i !== idx);
+    });
+  }
+  function setPrimary(idx: number) {
+    setContacts((rows) =>
+      rows.map((r, i) => ({ ...r, isPrimary: i === idx ? !r.isPrimary : false })),
+    );
+  }
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setBusy(true);
+    setSaveError(null);
+    setDomainHolder(null);
+    try {
+      const trimmedContacts = contacts
+        .map((r, i) => ({ ...r, sortOrder: i }))
+        .filter((r) => r.name.trim().length > 0);
+
+      const baseBody = {
+        name: name.trim(),
+        email: email.trim(),
+        phone: phone.trim(),
+        accountStatus,
+        domain: domain.trim(),
+        websiteUrl: websiteUrl.trim(),
+        industry: industry.trim(),
+        employeeCount: employeeCount ? Number(employeeCount) : 0,
+        ownerId: owner.startsWith("user:") ? owner.slice(5) : null,
+        ownerEmployeeId: owner.startsWith("employee:") ? owner.slice(9) : null,
+        taxNumber: taxNumber.trim(),
+        currency: currency.trim().toUpperCase(),
+        annualContractValueCents: parseMoneyToCents(acv),
+        billingAddress,
+        notes,
+      };
+
+      if (isEdit && customerSlug) {
+        // Updates: patch the customer row, then reconcile contacts row by
+        // row — POST new ones, PATCH existing ones, DELETE removed ones.
+        await api.patch(
+          `/api/companies/${company.id}/customers/${customerSlug}`,
+          baseBody,
+        );
+        for (const id of removedContactIds) {
+          await api.del(
+            `/api/companies/${company.id}/customers/${customerSlug}/contacts/${id}`,
+          );
+        }
+        for (let i = 0; i < trimmedContacts.length; i += 1) {
+          const r = trimmedContacts[i];
+          const payload = {
+            name: r.name.trim(),
+            email: r.email.trim(),
+            phone: r.phone.trim(),
+            role: r.role.trim(),
+            isPrimary: r.isPrimary,
+            sortOrder: i,
+          };
+          if (r.id) {
+            await api.patch(
+              `/api/companies/${company.id}/customers/${customerSlug}/contacts/${r.id}`,
+              payload,
+            );
+          } else {
+            await api.post(
+              `/api/companies/${company.id}/customers/${customerSlug}/contacts`,
+              payload,
+            );
+          }
+        }
+      } else {
+        // Creates: send everything in one round-trip so a freshly-created
+        // customer never exists momentarily without its contacts.
+        const inlineContacts: CustomerContactDraft[] = trimmedContacts.map(
+          (r, i) => ({
+            name: r.name.trim(),
+            email: r.email.trim(),
+            phone: r.phone.trim(),
+            role: r.role.trim(),
+            isPrimary: r.isPrimary,
+            sortOrder: i,
+          }),
+        );
+        const created = await api.post<Customer>(`/api/companies/${company.id}/customers`, {
+          ...baseBody,
+          contacts: inlineContacts,
+        });
+        // Straight to the customer just made, where invoices, contracts and
+        // people get added — not back to the list to search for them.
+        navigate(`${customersUrl}/${created.slug}`);
+        return;
+      }
+      // An edit returns to the customer it changed. A rename keeps the slug.
+      navigate(customerUrl);
+    } catch (err) {
+      setSaveError(errorMessage(err));
+      setDomainHolder(domainConflictOf(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!ready) {
+    return (
+      <div className="flex justify-center p-16">
+        <Spinner size={20} />
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="mx-auto max-w-3xl p-8">
+        <Breadcrumbs
+          items={[
+            { label: "Customers", to: customersUrl },
+            { label: "Edit" },
+          ]}
+        />
+        <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+          {loadError}
+        </div>
+        <div className="mt-4">
+          <Link to={customersUrl}>
+            <Button variant="secondary">Back</Button>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={save} className="mx-auto max-w-3xl p-8">
+      <div className="mb-6">
+        <Breadcrumbs
+          items={[
+            { label: "Customers", to: customersUrl },
+            { label: isEdit ? "Edit" : "New" },
+          ]}
+        />
+      </div>
+
+      <div className="mb-6 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Link
+            to={customerUrl}
+            aria-label={isEdit ? "Back to the customer" : "Back to customers"}
+            className="touch-target relative rounded-md p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            <ArrowLeft size={18} />
+          </Link>
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl dark:text-slate-100">
+            {isEdit ? "Edit customer" : "New customer"}
+          </h1>
+        </div>
+        <div className="flex gap-2">
+          <Link to={customerUrl}>
+            <Button type="button" variant="secondary" disabled={busy}>
+              Cancel
+            </Button>
+          </Link>
+          <Button type="submit" loading={busy} disabled={!name.trim()}>
+            {isEdit ? "Save changes" : "Create customer"}
+          </Button>
+        </div>
+      </div>
+
+      <FormError message={saveError} className={domainHolder ? "mb-3" : "mb-6"} />
+      {domainHolder && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+          <p className="min-w-0 flex-1">
+            {isEdit
+              ? `If this is the same company as ${domainHolder.name}, merge it in: its contacts, invoices and history move to ${domainHolder.name}. Other changes on this page aren't saved.`
+              : `${domainHolder.name} is probably the customer you're adding. Open it instead of creating a duplicate.`}
+          </p>
+          <div className="flex shrink-0 gap-2">
+            <Link to={`${customersUrl}/${domainHolder.slug}`}>
+              <Button type="button" variant="secondary" size="sm">
+                Open {domainHolder.name}
+              </Button>
+            </Link>
+            {isEdit && customerSlug && (
+              <Link
+                to={`${customersUrl}/${customerSlug}?mergeInto=${encodeURIComponent(domainHolder.slug)}`}
+              >
+                <Button type="button" size="sm">
+                  <GitMerge size={14} /> Merge into {domainHolder.name}
+                </Button>
+              </Link>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <Input
+              label="Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              maxLength={120}
+              autoFocus={!isEdit}
+            />
+          </div>
+          <Input
+            label="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            type="email"
+            maxLength={200}
+          />
+          <Input
+            label="Phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            maxLength={60}
+          />
+          <Select
+            label="Account status"
+            value={accountStatus}
+            onChange={(e) => setAccountStatus(e.target.value as Customer["accountStatus"])}
+          >
+            <option value="prospect">Prospect</option>
+            <option value="customer">Customer</option>
+            <option value="former">Former customer</option>
+          </Select>
+          <Select label="Account owner" value={owner} onChange={(e) => setOwner(e.target.value)}>
+            <option value="">Unassigned</option>
+            {members.map((member) => (
+              <option key={member.userId} value={`user:${member.userId}`}>
+                {member.name || member.email || "Member"}
+              </option>
+            ))}
+            {employees.map((employee) => (
+              <option key={employee.id} value={`employee:${employee.id}`}>
+                {employee.name} · AI Employee
+              </option>
+            ))}
+          </Select>
+          <Input
+            label="Domain"
+            value={domain}
+            onChange={(e) => setDomain(e.target.value)}
+            placeholder="example.com"
+            maxLength={255}
+          />
+          <Input
+            label="Website"
+            type="url"
+            value={websiteUrl}
+            onChange={(e) => setWebsiteUrl(e.target.value)}
+            placeholder="https://example.com"
+          />
+          <Input
+            label="Industry"
+            value={industry}
+            onChange={(e) => setIndustry(e.target.value)}
+            maxLength={200}
+          />
+          <Input
+            label="Employee count"
+            type="number"
+            min={0}
+            value={employeeCount}
+            onChange={(e) => setEmployeeCount(e.target.value)}
+          />
+          <Input
+            label="Tax / VAT number"
+            value={taxNumber}
+            onChange={(e) => setTaxNumber(e.target.value)}
+            maxLength={60}
+          />
+          <Input
+            label="Default currency (ISO)"
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value)}
+            maxLength={3}
+            placeholder="USD"
+          />
+          <Input
+            label={`Annual contract value (${currency || "USD"})`}
+            value={acv}
+            onChange={(e) => setAcv(e.target.value)}
+            inputMode="decimal"
+            placeholder="0.00"
+          />
+          <div className="sm:col-span-2">
+            <Textarea
+              label="Billing address"
+              value={billingAddress}
+              onChange={(e) => setBillingAddress(e.target.value)}
+              rows={3}
+              placeholder="Street address, city, postcode, country"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <Textarea
+              label="Account notes"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={2}
+            />
+          </div>
+        </div>
+
+        <div className="mt-6 border-t border-slate-100 pt-6 dark:border-slate-800">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Contacts
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                People at this account. The email above is used for invoices
+                and estimates; contacts are for your records.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={addContact}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-indigo-600 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:bg-indigo-500/10"
+            >
+              <Plus size={12} /> Add contact
+            </button>
+          </div>
+
+          {contacts.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-slate-200 p-4 text-center text-xs text-slate-400 dark:border-slate-700 dark:text-slate-500">
+              No additional contacts yet.
+            </div>
+          ) : (
+            <ul className="space-y-2">
+              {contacts.map((r, i) => (
+                <li
+                  key={r.key}
+                  className="rounded-lg border border-slate-200 p-3 dark:border-slate-700"
+                >
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <Input
+                      label="Name"
+                      value={r.name}
+                      onChange={(e) => patchContact(i, { name: e.target.value })}
+                      maxLength={120}
+                      required
+                    />
+                    <Input
+                      label="Role / title (optional)"
+                      value={r.role}
+                      onChange={(e) => patchContact(i, { role: e.target.value })}
+                      maxLength={120}
+                    />
+                    <Input
+                      label="Email"
+                      value={r.email}
+                      onChange={(e) => patchContact(i, { email: e.target.value })}
+                      type="email"
+                      maxLength={200}
+                    />
+                    <Input
+                      label="Phone"
+                      value={r.phone}
+                      onChange={(e) => patchContact(i, { phone: e.target.value })}
+                      maxLength={60}
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => setPrimary(i)}
+                      className={
+                        "inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition " +
+                        (r.isPrimary
+                          ? "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                          : "text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800")
+                      }
+                      aria-pressed={r.isPrimary}
+                    >
+                      <Star size={12} className={r.isPrimary ? "fill-current" : ""} />
+                      {r.isPrimary ? "Primary contact" : "Mark primary"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeContact(i)}
+                      className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                      aria-label="Remove contact"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      {isEdit && customerId && (
+        <div className="mt-6">
+          <CustomerContractsPanel
+            company={company}
+            customerId={customerId}
+            customerName={name}
+          />
+        </div>
+      )}
+    </form>
+  );
+}

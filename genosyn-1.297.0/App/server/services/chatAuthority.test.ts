@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+
+import { composeUntrustedChatSystemPrompt, resolveInteractiveChatContextAccess } from "./chat.js";
+
+describe("interactive chat prompt authority", () => {
+  test("an untrusted surface receives no company-derived context", () => {
+    const access = resolveInteractiveChatContextAccess(null, "untrusted");
+
+    assert.deepEqual(access, {
+      soulAndSkills: false,
+      memory: false,
+      repositories: false,
+      finance: false,
+      signing: false,
+      revenue: false,
+      marketing: false,
+      recruiting: false,
+      dataRooms: false,
+      support: false,
+      resources: false,
+      extraSystem: false,
+      taggedReferences: false,
+      privilegedToolSources: false,
+    });
+
+    const briefing = composeUntrustedChatSystemPrompt();
+    assert.match(briefing, /not linked to an authenticated Genosyn Member/);
+    assert.match(briefing, /Answer only from the current conversation/);
+    assert.doesNotMatch(briefing, /## Soul|## Skill|## Memory|## Finance|## Revenue/);
+  });
+
+  test("a regular Member receives human-readable context but no unprovenanced sources", () => {
+    const access = resolveInteractiveChatContextAccess(
+      { role: "member", financeAccess: "none" },
+      undefined,
+    );
+
+    assert.equal(access.soulAndSkills, true);
+    assert.equal(access.signing, true);
+    assert.equal(access.revenue, true);
+    assert.equal(access.marketing, true);
+    // Recruiting is Member-level on the human route, so its briefing is too.
+    assert.equal(access.recruiting, true);
+    // Data rooms are owners' and admins' on the human route, so a Member's turn
+    // is not briefed on them — their tools answer 403 under delegation anyway.
+    assert.equal(access.dataRooms, false);
+    // Support is Member-level on the human route, so its briefing is too.
+    assert.equal(access.support, true);
+    // A read-only Resources briefing only narrows what the employee attempts,
+    // and the Member can already see the setting on the Resources page.
+    assert.equal(access.resources, true);
+    assert.equal(access.finance, false);
+    assert.equal(access.memory, false);
+    assert.equal(access.repositories, false);
+    assert.equal(access.privilegedToolSources, false);
+  });
+
+  test("administrative Members and employee automation retain their intended authority", () => {
+    const admin = resolveInteractiveChatContextAccess(
+      { role: "admin", financeAccess: "none" },
+      undefined,
+    );
+    const automation = resolveInteractiveChatContextAccess(null, "employee");
+
+    assert.equal(Object.values(admin).every(Boolean), true);
+    assert.equal(Object.values(automation).every(Boolean), true);
+  });
+});

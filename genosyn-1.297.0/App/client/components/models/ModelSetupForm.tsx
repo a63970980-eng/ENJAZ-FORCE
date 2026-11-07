@@ -1,0 +1,445 @@
+import React from "react";
+import { ExternalLink } from "lucide-react";
+import {
+  api,
+  type AIModel,
+  type AuthMode,
+  type Company,
+  type Employee,
+  type Provider,
+} from "@/lib/api";
+import { Button } from "@/components/ui/Button";
+import { FormError } from "@/components/ui/FormError";
+import { Input } from "@/components/ui/Input";
+import { Select } from "@/components/ui/Select";
+import { companyModelPath } from "@/lib/companyModels";
+import { errorDetail } from "@/lib/errors";
+
+type ModelCatalog = { models: Array<{ id: string; label: string }>; recommendedModel: string };
+
+/** Where to create an API key, for the services that take one. */
+const API_KEY_PAGES: Partial<Record<Provider, { label: string; href: string }>> = {
+  anthropic: { label: "Get an Anthropic key", href: "https://console.anthropic.com/settings/keys" },
+  openai: { label: "Get an OpenAI key", href: "https://platform.openai.com/api-keys" },
+};
+
+/**
+ * Connect a new company AI Model, or change one. One submit connects an API
+ * model; an optional choice follows live account discovery.
+ *
+ * Every model belongs to the company. Made from an AI Employee's Model page
+ * (`emp`), the new model is attached to that employee as its active one; made
+ * from Settings → AI Models it waits there to be attached. Changing a model
+ * changes it for every employee using it.
+ */
+export function ModelSetupForm({
+  mode,
+  editModelId,
+  initial,
+  company,
+  emp,
+  onSaved,
+  submitLabel,
+  catalogFromSavedKeys = false,
+}: {
+  mode: "create" | "edit";
+  editModelId?: string;
+  initial: { provider: Provider; model: string; authMode: AuthMode };
+  company: Pick<Company, "id">;
+  /** The AI Employee a new model is for; it becomes that employee's active model. */
+  emp?: Pick<Employee, "id">;
+  onSaved: (model: AIModel) => void;
+  submitLabel: string;
+  /**
+   * Editing a connected API-key model: list the models its saved keys reach,
+   * so changing the model needs no key typed. A model with no key yet has
+   * nothing to ask with.
+   */
+  catalogFromSavedKeys?: boolean;
+}) {
+  const [provider, setProvider] = React.useState(initial.provider);
+  const [authMode, setAuthMode] = React.useState(initial.authMode);
+  const [modelStr, setModelStr] = React.useState(initial.model === "auto" ? "" : initial.model);
+  const [apiKey, setApiKey] = React.useState("");
+  const [baseURL, setBaseURL] = React.useState("");
+  const [customModelId, setCustomModelId] = React.useState("");
+  const [catalog, setCatalog] = React.useState<ModelCatalog | null>(null);
+  const [discovering, setDiscovering] = React.useState(false);
+  const [discoveryError, setDiscoveryError] = React.useState<string | null>(null);
+  // The thrown value, so a failed test can offer the service's own explanation.
+  const [error, setError] = React.useState<unknown>(null);
+  const [saving, setSaving] = React.useState(false);
+  const [refresh, setRefresh] = React.useState(0);
+  const requestVersion = React.useRef(0);
+  const base = companyModelPath(company.id);
+  // A new model goes to the employee it was made for, if any.
+  const attachTo = emp ? { employeeIds: [emp.id] } : {};
+  const isCustom = provider === "custom";
+  const editingExistingCustom = mode === "edit" && isCustom && initial.provider === "custom";
+  const isApiKey = !isCustom && authMode === "apikey";
+  const needsKey =
+    mode === "create" || provider !== initial.provider || authMode !== initial.authMode;
+  // A connected API-key model keeps its pool of keys when its model changes:
+  // keys are added and removed under API keys, never replaced from here.
+  const keepsKeys = mode === "edit" && isApiKey && !needsKey && catalogFromSavedKeys;
+  const keyPage = isApiKey ? API_KEY_PAGES[provider] : undefined;
+
+  function clearDiscovery() {
+    requestVersion.current += 1;
+    setCatalog(null);
+    setDiscoveryError(null);
+    setDiscovering(false);
+    setError(null);
+  }
+
+  // Changing a connected model's model is a pick from a list: until a new key
+  // is typed, the list comes from the keys the model already holds, so nothing
+  // has to be pasted again (`GET …/models/:id/catalog`).
+  const usesStoredKeys =
+    catalogFromSavedKeys &&
+    mode === "edit" &&
+    Boolean(editModelId) &&
+    isApiKey &&
+    provider === initial.provider &&
+    authMode === initial.authMode &&
+    !apiKey.trim();
+
+  React.useEffect(() => {
+    if (!usesStoredKeys || !editModelId) return;
+    const version = ++requestVersion.current;
+    let stopped = false;
+    setDiscovering(true);
+    api
+      .get<ModelCatalog>(`${base}/${editModelId}/catalog`)
+      .then((result) => {
+        if (!stopped && version === requestVersion.current) setCatalog(result);
+      })
+      .catch((err: unknown) => {
+        if (!stopped && version === requestVersion.current) setDiscoveryError(message(err));
+      })
+      .finally(() => {
+        if (!stopped && version === requestVersion.current) setDiscovering(false);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [base, editModelId, usesStoredKeys, refresh]);
+
+  React.useEffect(() => {
+    if (!isApiKey || !apiKey.trim()) return;
+    const version = ++requestVersion.current;
+    let stopped = false;
+    setDiscovering(true);
+    const timer = window.setTimeout(() => {
+      api
+        .post<ModelCatalog>(`${base}/discover`, { provider, apiKey: apiKey.trim() })
+        .then((result) => {
+          if (!stopped && version === requestVersion.current) setCatalog(result);
+        })
+        .catch((err: unknown) => {
+          if (!stopped && version === requestVersion.current) setDiscoveryError(message(err));
+        })
+        .finally(() => {
+          if (!stopped && version === requestVersion.current) setDiscovering(false);
+        });
+    }, 500);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiKey, base, isApiKey, provider, refresh]);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (editingExistingCustom) return;
+    setError(null);
+    setSaving(true);
+    try {
+      let saved: AIModel;
+      if (isApiKey && mode === "create") {
+        saved = await api.post<AIModel>(`${base}/connect`, {
+          provider,
+          apiKey: apiKey.trim(),
+          ...(modelStr || catalog?.recommendedModel
+            ? { model: modelStr || catalog?.recommendedModel }
+            : {}),
+          ...attachTo,
+        });
+      } else if (isCustom) {
+        saved = await api.post<AIModel>(`${base}/connect-custom`, {
+          baseURL,
+          modelId: customModelId,
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...attachTo,
+        });
+      } else {
+        const selectedModel =
+          modelStr || catalog?.recommendedModel || (authMode === "subscription" ? "auto" : "");
+        const payload = {
+          provider,
+          authMode,
+          model: selectedModel,
+          ...(isApiKey && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        };
+        saved =
+          mode === "create"
+            ? await api.post<AIModel>(base, { ...payload, ...attachTo })
+            : await api.put<AIModel>(`${base}/${editModelId}`, payload);
+      }
+      setApiKey("");
+      onSaved(saved);
+    } catch (err) {
+      setError(err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const keyField = (
+    <>
+      <Input
+        label={needsKey ? "API key" : "API key (optional)"}
+        type="password"
+        autoComplete="off"
+        // Connecting a model is pasting a key: start there, not on the
+        // provider list above it (editing leaves focus alone).
+        autoFocus={mode === "create"}
+        value={apiKey}
+        onChange={(e) => {
+          clearDiscovery();
+          setApiKey(e.target.value);
+        }}
+        required={needsKey}
+        placeholder={
+          provider === "anthropic" ? "Paste your Anthropic API key" : "Paste your OpenAI API key"
+        }
+      />
+      <p className="text-xs text-slate-500 dark:text-slate-400">
+        We find the available models and test a real reply before connecting. Your key is stored
+        encrypted. The small test uses your API account.
+        {keyPage && needsKey && (
+          <>
+            {" "}
+            <a
+              href={keyPage.href}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+            >
+              {keyPage.label} <ExternalLink size={11} />
+            </a>
+          </>
+        )}
+      </p>
+    </>
+  );
+
+  const current = mode === "edit" ? initial.model : null;
+  const modelPicker = (
+    <>
+      {discovering && (
+        <p role="status" className="text-xs text-slate-500 dark:text-slate-400">
+          Finding available models…
+        </p>
+      )}
+      {catalog && (
+        <Select label="Model" value={modelStr} onChange={(e) => setModelStr(e.target.value)}>
+          <option value="">
+            Recommended:{" "}
+            {catalog.models.find((m) => m.id === catalog.recommendedModel)?.label ||
+              catalog.recommendedModel}
+          </option>
+          {modelStr && !catalog.models.some((m) => m.id === modelStr) && (
+            <option value={modelStr}>
+              {modelStr} ({modelStr === current ? "current" : "your choice"})
+            </option>
+          )}
+          {catalog.models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.id === current ? `${m.label} (current)` : m.label}
+            </option>
+          ))}
+        </Select>
+      )}
+      {catalog && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Recommended from the newest compatible models your account can access.
+        </p>
+      )}
+      {discoveryError && (
+        <div className="space-y-2">
+          <FormError message={discoveryError} />
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            onClick={() => {
+              clearDiscovery();
+              setRefresh((n) => n + 1);
+            }}
+          >
+            Try loading models again
+          </Button>
+        </div>
+      )}
+      <details className="text-xs text-slate-600 dark:text-slate-300">
+        <summary className="cursor-pointer">Choose a model ID manually</summary>
+        <div className="mt-3">
+          <Input
+            label="Model ID (optional)"
+            value={modelStr}
+            onChange={(e) => setModelStr(e.target.value)}
+            placeholder="Leave blank to choose automatically"
+          />
+        </div>
+      </details>
+    </>
+  );
+
+  return (
+    <form className="flex flex-col gap-4" onSubmit={submit}>
+      <fieldset disabled={saving} className="flex min-w-0 flex-col gap-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Select
+            label="AI Model service"
+            value={provider}
+            onChange={(e) => {
+              clearDiscovery();
+              const next = e.target.value as Provider;
+              setProvider(next);
+              setAuthMode(next === "custom" ? "customEndpoint" : "apikey");
+              setModelStr("");
+              setApiKey("");
+            }}
+          >
+            <option value="anthropic">Claude (Anthropic)</option>
+            <option value="openai">OpenAI / ChatGPT</option>
+            <option value="custom" disabled={mode === "edit" && initial.provider !== "custom"}>
+              Custom endpoint
+            </option>
+          </Select>
+          {provider === "openai" && (
+            <Select
+              label="Connect with"
+              value={authMode}
+              onChange={(e) => {
+                clearDiscovery();
+                setAuthMode(e.target.value as AuthMode);
+                setModelStr("");
+                setApiKey("");
+              }}
+            >
+              <option value="apikey">OpenAI API key</option>
+              <option
+                value="subscription"
+                disabled={mode === "edit" && initial.authMode !== "subscription"}
+              >
+                ChatGPT sign-in
+              </option>
+            </Select>
+          )}
+        </div>
+        {mode === "edit" && initial.provider !== "custom" && (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            To use a custom endpoint or a ChatGPT sign-in instead, add another AI Model.
+          </p>
+        )}
+        {isApiKey && mode === "edit" && (
+          <>
+            {modelPicker}
+            {keepsKeys ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                The models listed are the ones this AI Model&apos;s API keys can reach. We test the
+                model you pick with them before saving; the keys themselves stay as they are — add
+                or remove keys under API keys.
+              </p>
+            ) : (
+              keyField
+            )}
+          </>
+        )}
+        {isApiKey && mode === "create" && (
+          <>
+            {keyField}
+            {modelPicker}
+          </>
+        )}
+        {authMode === "subscription" && (
+          <>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {mode === "edit"
+                ? "We test your selected model with the existing ChatGPT sign-in before saving. Leave the model ID blank to use your workspace’s current default."
+                : "Continue to sign in with ChatGPT. We use your workspace’s current default model and test a reply before connecting."}
+            </p>
+            <details className="text-xs text-slate-600 dark:text-slate-300">
+              <summary className="cursor-pointer">Choose a model ID manually</summary>
+              <div className="mt-3">
+                <Input
+                  label="Model ID (optional)"
+                  value={modelStr}
+                  onChange={(e) => setModelStr(e.target.value)}
+                  placeholder="Use the ChatGPT default"
+                />
+              </div>
+            </details>
+          </>
+        )}
+        {editingExistingCustom && (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Change a custom endpoint&apos;s model or credentials from its Endpoint setting.
+          </p>
+        )}
+        {isCustom && !editingExistingCustom && (
+          <>
+            <Input
+              label="Base URL"
+              value={baseURL}
+              onChange={(e) => setBaseURL(e.target.value)}
+              placeholder="http://localhost:11434/v1"
+              required
+            />
+            <Input
+              label="Model ID (optional)"
+              value={customModelId}
+              onChange={(e) => setCustomModelId(e.target.value)}
+              placeholder="Blank: the model the server serves"
+            />
+            <Input
+              label="API key (optional)"
+              type="password"
+              autoComplete="off"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+          </>
+        )}
+        <FormError message={error ? message(error) : null} detail={errorDetail(error)} />
+        {!editingExistingCustom && (
+          <div>
+            <Button
+              type="submit"
+              loading={saving}
+              disabled={discovering || (isApiKey && needsKey && !apiKey.trim())}
+            >
+              {saving
+                ? authMode === "subscription" && mode === "create"
+                  ? "Preparing sign-in…"
+                  : "Testing connection…"
+                : isApiKey && mode === "create"
+                  ? "Connect AI Model"
+                  : authMode === "subscription" && mode === "create"
+                    ? "Continue to ChatGPT sign-in"
+                    : submitLabel}
+            </Button>
+          </div>
+        )}
+      </fieldset>
+    </form>
+  );
+}
+
+function message(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Could not connect this AI Model. Please try again.";
+}

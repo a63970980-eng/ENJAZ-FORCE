@@ -1,0 +1,5079 @@
+import { Router, type Request, type RequestHandler } from "express";
+import { z } from "zod";
+import { In, IsNull, Not } from "typeorm";
+import multer from "multer";
+import cron from "node-cron";
+import { AppDataSource } from "../db/datasource.js";
+import { Account } from "../db/entities/Account.js";
+import { BankFeed, BankFeedKind } from "../db/entities/BankFeed.js";
+import { BankTransaction } from "../db/entities/BankTransaction.js";
+import { Customer } from "../db/entities/Customer.js";
+import { Contact } from "../db/entities/Contact.js";
+import { Deal } from "../db/entities/Deal.js";
+import { Meeting } from "../db/entities/Meeting.js";
+import { Partnership } from "../db/entities/Partnership.js";
+import { RevenueDocument } from "../db/entities/RevenueDocument.js";
+import { CustomerContact } from "../db/entities/CustomerContact.js";
+import { CustomerContract } from "../db/entities/CustomerContract.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { Invoice } from "../db/entities/Invoice.js";
+import { InvoiceLineItem } from "../db/entities/InvoiceLineItem.js";
+import { InvoicePayment } from "../db/entities/InvoicePayment.js";
+import { InvoiceWriteOff } from "../db/entities/InvoiceWriteOff.js";
+import { SignatureEnvelope } from "../db/entities/SignatureEnvelope.js";
+import { RecurringInvoice } from "../db/entities/RecurringInvoice.js";
+import { Estimate } from "../db/entities/Estimate.js";
+import { EstimateLineItem } from "../db/entities/EstimateLineItem.js";
+import { LedgerEntry } from "../db/entities/LedgerEntry.js";
+import { LedgerLine } from "../db/entities/LedgerLine.js";
+import { Product } from "../db/entities/Product.js";
+import { TaxRate } from "../db/entities/TaxRate.js";
+import { validateBody, validateParams, validateQuery } from "../middleware/validate.js";
+import { requireAuth, requireCompanyMember } from "../middleware/auth.js";
+import { requireFinanceRead, requireFinanceWrite } from "../middleware/financeAccess.js";
+import { toSlug } from "../lib/slug.js";
+import {
+  createInvoiceDraft,
+  deleteDraftInvoice,
+  discountOf,
+  duplicateInvoice,
+  getInvoiceEmailDetails,
+  hydrateInvoices,
+  InvoiceDeleteError,
+  InvoiceEditError,
+  type InvoiceSendResult,
+  issueInvoice,
+  listInvoiceResendActivities,
+  loadCustomerBySlug,
+  loadInvoiceBySlug,
+  loadProductBySlug,
+  requestedDiscount,
+  resolveInvoiceRecipients,
+  sendInvoiceEmail,
+  setInvoicesArchived,
+  uniqueCustomerSlug,
+  updateInvoice,
+  voidInvoice,
+} from "../services/finance.js";
+import {
+  InvoicePaymentError,
+  type RecordedInvoicePayment,
+  recordInvoicePayment,
+  removeInvoicePayment,
+} from "../services/invoicePayments.js";
+import { documentRevisionState, reviseAction } from "../services/documentRevisions.js";
+import {
+  normalizeAccountDomain,
+  revenueAccountRestoreBlocker,
+} from "../services/revenue/accounts.js";
+import { findMergedRecordRedirect } from "../services/revenue/operations.js";
+import {
+  createInvoiceWriteOff,
+  listInvoiceWriteOffs,
+  reverseInvoiceWriteOff,
+} from "../services/writeOffs.js";
+import {
+  applyFinanceProposal,
+  createJournalEntryProposal,
+  getFinanceProposal,
+  journalEntryPayloadSchema,
+  listFinanceProposals,
+  rejectFinanceProposal,
+} from "../services/financeProposals.js";
+import {
+  applyCustomerCredit,
+  createCreditNoteFromInvoice,
+  createDeposit,
+  creditOpenCents,
+  getCreditLines,
+  issueCreditNote,
+  listApplicationsForInvoice,
+  listCreditApplications,
+  listCreditRefunds,
+  listCustomerCredits,
+  loadCreditBySlug,
+  loadRefundById,
+  refundCustomerCredit,
+  unapplyCustomerCredit,
+  voidCreditNote,
+  voidCustomerRefund,
+} from "../services/customerCredits.js";
+import { CustomerCredit } from "../db/entities/CustomerCredit.js";
+import { CustomerCreditApplication } from "../db/entities/CustomerCreditApplication.js";
+import { VendorCredit } from "../db/entities/VendorCredit.js";
+import { VendorCreditApplication } from "../db/entities/VendorCreditApplication.js";
+import {
+  applyVendorCredit,
+  createVendorCreditFromBill,
+  getVendorCreditLines,
+  issueVendorCredit,
+  listVendorApplicationsForBill,
+  listVendorCreditApplications,
+  listVendorCreditRefunds,
+  listVendorCredits,
+  loadVendorCreditBySlug,
+  loadVendorRefundById,
+  refundVendorCredit,
+  unapplyVendorCredit,
+  vendorCreditOpenCents,
+  voidVendorCredit,
+  voidVendorRefund,
+} from "../services/vendorCredits.js";
+import { recordAudit } from "../services/audit.js";
+import { countCustomerChannelsForCustomer } from "../services/customerChannels/cleanup.js";
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import {
+  FINANCE_ACCESS_LEVELS,
+  type FinanceAccessLevel,
+} from "../db/entities/EmployeeFinanceGrant.js";
+import {
+  deleteFinanceGrant,
+  listFinanceGrantCandidates,
+  listFinanceGrants,
+  upsertFinanceGrant,
+} from "../services/financeGrants.js";
+import {
+  applyRecurringInvoiceStatus,
+  deleteRecurringInvoice,
+  duplicateRecurringInvoice,
+  findPendingRecurringInvoiceRun,
+  generateInvoiceFromRecurring,
+  hydrateRecurringInvoices,
+  loadRecurringInvoiceBySlug,
+  nameForNewRecurringInvoice,
+  processRecurringInvoiceRun,
+  RECURRING_INVOICE_NAME_REQUIRED_ERROR,
+  registerRecurringInvoice,
+  replaceRecurringInvoiceLines,
+  setRecurringInvoicesArchived,
+} from "../services/recurringInvoices.js";
+import { recurringRevenueMetrics } from "../services/recurringInvoiceMetrics.js";
+import { invoiceStats } from "../services/invoiceStats.js";
+import { estimateStats } from "../services/estimateStats.js";
+import { getReportingCurrency } from "../services/revenue/revenueData.js";
+import { RECURRING_INVOICE_NAME_MAX_LENGTH } from "../../shared/recurringInvoiceName.js";
+import { renderInvoiceHtmlForCompany } from "../services/invoiceHtml.js";
+import { renderEstimateHtmlForCompany } from "../services/estimateHtml.js";
+import { renderCustomerStatementHtmlForCompany } from "../services/customerStatementHtml.js";
+import { buildCustomerStatement } from "../services/customerStatement.js";
+import { htmlToPdf } from "../services/htmlToPdf.js";
+import {
+  acceptEstimate,
+  convertEstimateToInvoice,
+  createEstimateDraft,
+  declineEstimate,
+  duplicateEstimate,
+  EstimateEditError,
+  type EstimateSendResult,
+  failedEstimateSend,
+  getEstimateEmailDetails,
+  hydrateEstimates,
+  issueEstimate,
+  loadEstimateBySlug,
+  resolveEstimateRecipients,
+  sendEstimateEmail,
+  setEstimatesArchived,
+  updateEstimate,
+  voidEstimate,
+} from "../services/estimates.js";
+import {
+  findClosedPeriodCovering,
+  postLedgerEntry,
+  seedChartOfAccounts,
+  trialBalance,
+} from "../services/ledger.js";
+import {
+  approveLedgerReview,
+  bulkLedgerReview,
+  getLedgerEntryForReview,
+  hydrateLedgerEntries,
+  ledgerReviewQuerySchema,
+  ledgerReviewSummary,
+  listLedgerEntriesForReview,
+  pageLedgerEntriesForReview,
+  returnLedgerReview,
+} from "../services/transactionReviews.js";
+import { findReviewedCategoryDrift } from "../services/reviewedCategoryDrift.js";
+import {
+  accountActivity,
+  balanceSheet,
+  cashFlow,
+  financialTrends,
+  incomeStatement,
+} from "../services/reports.js";
+import {
+  assertBrexCashAccountConnection,
+  autoMatchFeed,
+  categorizeBankTransaction,
+  findMatchCandidates,
+  importBankCsv,
+  listBrexCashAccountsForConnection,
+  manualMatch,
+} from "../services/reconcile.js";
+import {
+  assertMercuryAccountFeed,
+  listMercuryAccountsForConnection,
+} from "../services/mercuryFeeds.js";
+import { assertWiseBalanceFeed, listWiseBalancesForConnection } from "../services/wiseFeeds.js";
+import {
+  BankingAccountError,
+  changeFeedConnection,
+  hydrateBankTransactions,
+  listBankingAccounts,
+  listBankTransactions,
+  openInvoicesForBankTransaction,
+  payInvoicesFromBankTransaction,
+  removeBankFeed,
+  undoBankTransaction,
+} from "../services/banking.js";
+import {
+  FeedBusyError,
+  FeedNotFoundError,
+  syncFeedForRequest,
+  syncResponse,
+  whileFeedIdle,
+} from "../services/bankingSync.js";
+import { FeedSyncError } from "../services/feedSyncErrors.js";
+import { BANKING_BULK_MAX, bulkBanking } from "../services/bankingBulk.js";
+import {
+  bankingFilterFrom,
+  bankingQueue,
+  bankingQueueQuerySchema,
+} from "../services/bankingQueue.js";
+import { ListQueryError, pageQueryShape } from "../services/listPaging.js";
+import {
+  type BillListFilter,
+  billListQuery,
+  invoiceDateFilterShape,
+  type InvoiceListFilter,
+  invoiceListQuery,
+  pageBills,
+  pageInvoices,
+} from "../services/financeListPages.js";
+import {
+  accountPatchSchema,
+  accountWriteSchema,
+  createLedgerAccount,
+  LedgerAccountError,
+  loadLedgerAccount,
+  updateLedgerAccount,
+} from "../services/ledgerAccounts.js";
+import {
+  getFinanceSettings,
+  seedCurrencies,
+  setAutomaticExchangeRates,
+  setFinanceTemplates,
+  setHomeCurrency,
+  setInvoiceCcEmails,
+  setRate,
+} from "../services/fx.js";
+import {
+  ExchangeRateFeedError,
+  exchangeRateOverview,
+  refreshCompanyExchangeRates,
+  refreshCompanyExchangeRatesSoon,
+} from "../services/exchangeRateFeed.js";
+import { Currency } from "../db/entities/Currency.js";
+import { ExchangeRate } from "../db/entities/ExchangeRate.js";
+import { AccountingPeriod } from "../db/entities/AccountingPeriod.js";
+import { closePeriod, reopenPeriod } from "../services/periods.js";
+import {
+  exportCustomersCsv,
+  exportInvoicesCsv,
+  exportJournalCsv,
+  exportTrialBalanceCsv,
+} from "../services/exports.js";
+import { Vendor } from "../db/entities/Vendor.js";
+import { Bill } from "../db/entities/Bill.js";
+import {
+  billDisplayStatus,
+  hydrateBills,
+  issueBill,
+  loadBillBySlug,
+  loadVendorBySlug,
+  voidBill,
+} from "../services/bills.js";
+import {
+  createBillDraft,
+  createVendor,
+  deleteDraftBill,
+  deleteVendor,
+  PayablesError,
+  recordBillPayment,
+  removeBillPayment,
+  updateBill,
+  updateVendor,
+} from "../services/payables.js";
+import { hydrateCustomers, listCustomers } from "../services/customers.js";
+import { listCustomerMail } from "../services/customerMail.js";
+import {
+  listRecipientSuggestions,
+  MAX_RECIPIENT_SUGGESTIONS,
+} from "../services/recipientSuggestions.js";
+import { resolveDocumentIssuer } from "../services/subsidiaries.js";
+import { subsidiariesRouter } from "./subsidiaries.js";
+import { customerMergeRouter } from "./customerMerge.js";
+
+/**
+ * Phase A of the Finance milestone (M19) — see ROADMAP.md.
+ *
+ * One router for all four resource families (customers, products, tax
+ * rates, invoices) so the mount point in `app.ts` stays compact and
+ * cross-resource validation (e.g. "this product references a missing
+ * tax rate") can stay local.
+ */
+export const financeRouter = Router({ mergeParams: true });
+financeRouter.use(requireAuth);
+financeRouter.use(requireCompanyMember);
+financeRouter.use("/finance/subsidiaries", subsidiariesRouter);
+// Merging duplicate customers. Its routes carry their own finance gates.
+financeRouter.use(customerMergeRouter);
+
+// Per-member finance authorization (M33 A4). Rather than repeat the guard on
+// ~130 routes (and risk missing one), wrap the router's verb methods so every
+// finance route registered below carries the access gate automatically: a GET
+// needs at least `read`, any mutation needs `full`. The gate binds to the
+// matched route's handler chain, so sibling routers sharing the
+// `/api/companies/:cid` mount (contracts, explore, mail, revenue) are never
+// touched by it — only routes that actually resolve inside financeRouter.
+for (const verb of ["get", "post", "put", "patch", "delete"] as const) {
+  const original = financeRouter[verb].bind(financeRouter) as (
+    path: string,
+    ...handlers: RequestHandler[]
+  ) => unknown;
+  (financeRouter as unknown as Record<string, typeof original>)[verb] = (
+    path: string,
+    ...handlers: RequestHandler[]
+  ) => original(path, verb === "get" ? requireFinanceRead : requireFinanceWrite, ...handlers);
+}
+
+/**
+ * Audit a Member's write to one finance record. These rows are what the
+ * record's History feed reads, so `targetType` is the `RECORD_HISTORY_TYPES`
+ * key, `targetId` the record's own id, and `metadata` stays compact (amounts
+ * in cents, statuses, the names of the fields an edit touched).
+ */
+function auditFinance(
+  req: Request,
+  action: string,
+  target: { type: string; id: string; label: string },
+  metadata?: Record<string, unknown>,
+): Promise<void> {
+  return recordAudit({
+    companyId: (req.params as Record<string, string>).cid,
+    actorUserId: req.userId ?? null,
+    action,
+    targetType: target.type,
+    targetId: target.id,
+    targetLabel: target.label,
+    metadata,
+  });
+}
+
+/** The fields a PATCH body set — what an `update` row names. */
+function changedKeys(body: object): string[] {
+  return Object.entries(body)
+    .filter(([, v]) => v !== undefined)
+    .map(([k]) => k);
+}
+
+// Reused throughout — ISO 4217 codes are 3 ASCII letters. We don't enforce
+// the full ISO list because Phase E (multi-currency) will introduce a
+// `Currency` table that does the validation properly.
+const currencySchema = z
+  .string()
+  .regex(/^[A-Za-z]{3}$/)
+  .transform((s) => s.toUpperCase());
+
+// ──────────────────────────── Customers ────────────────────────────────
+// `uniqueCustomerSlug` lives in services/finance.ts now (shared with the
+// AI `create_customer` tool).
+
+/**
+ * The active customer already on a domain, if any. A domain belongs to one
+ * active account, as in Revenue: an archived customer — a merged duplicate
+ * above all — keeps its domain as history, and Unarchive refuses to bring it
+ * back onto a domain taken since (`revenueAccountRestoreBlocker`).
+ */
+function activeCustomerOnDomain(
+  companyId: string,
+  domain: string,
+  exceptId?: string,
+): Promise<Customer | null> {
+  return AppDataSource.getRepository(Customer).findOneBy({
+    companyId,
+    domain,
+    archivedAt: IsNull(),
+    ...(exceptId ? { id: Not(exceptId) } : {}),
+  });
+}
+
+/** A taken domain names its customer, so the page can open it or merge into it. */
+function domainTaken(holder: Customer, domain: string) {
+  return {
+    error: `${holder.name} already uses the domain ${domain}`,
+    conflict: { id: holder.id, slug: holder.slug, name: holder.name },
+  };
+}
+
+// ─────────────────────── Customer contacts ────────────────────────────
+
+const contactWriteSchema = z.object({
+  name: z.string().min(1).max(120),
+  email: z.string().email().max(200).or(z.literal("")).optional(),
+  phone: z.string().max(60).optional(),
+  role: z.string().max(120).optional(),
+  isPrimary: z.boolean().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+/**
+ * Ensure at most one contact per customer carries the `isPrimary` flag.
+ * If the caller toggled a contact on, clear the flag on any other rows
+ * for the same customer in the same operation so the database stays
+ * single-source-of-truth instead of relying on UI to enforce it.
+ */
+async function clearOtherPrimaries(customerId: string, exceptId: string | null): Promise<void> {
+  const repo = AppDataSource.getRepository(CustomerContact);
+  const others = await repo.find({
+    where: { customerId, isPrimary: true },
+  });
+  for (const ct of others) {
+    if (ct.id === exceptId) continue;
+    ct.isPrimary = false;
+    await repo.save(ct);
+  }
+}
+
+const customerListQuerySchema = z
+  .object({
+    q: z.string().trim().max(200).optional(),
+    archived: z
+      .enum(["true", "false"])
+      .transform((value) => value === "true")
+      .optional(),
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    offset: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  })
+  .strict();
+
+financeRouter.get("/customers", validateQuery(customerListQuerySchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const query = req.query as unknown as z.infer<typeof customerListQuerySchema>;
+  const pageRequested = query.limit !== undefined || query.offset !== undefined;
+  const result = await listCustomers(cid, {
+    q: query.q,
+    includeArchived: query.archived,
+    limit: query.limit,
+    offset: query.offset,
+  });
+  res.json(pageRequested ? result : result.customers);
+});
+
+const customerWriteSchema = z.object({
+  name: z.string().min(1).max(120),
+  email: z.string().email().max(200).or(z.literal("")).optional(),
+  phone: z.string().max(60).optional(),
+  accountStatus: z.enum(["prospect", "customer", "former"]).optional(),
+  domain: z.string().max(255).optional(),
+  websiteUrl: z.string().max(1000).optional(),
+  industry: z.string().max(200).optional(),
+  employeeCount: z.number().int().min(0).max(2_000_000_000).optional(),
+  ownerId: z.string().uuid().nullable().optional(),
+  ownerEmployeeId: z.string().uuid().nullable().optional(),
+  billingAddress: z.string().max(2000).optional(),
+  shippingAddress: z.string().max(2000).optional(),
+  taxNumber: z.string().max(60).optional(),
+  currency: currencySchema.optional(),
+  /** Annual Contract Value in minor units of `currency`. Capped at
+   *  2_000_000_000 ($20M) to stay within a 32-bit int on Postgres, matching
+   *  the line-item money columns. */
+  annualContractValueCents: z.number().int().min(0).max(2_000_000_000).optional(),
+  notes: z.string().max(2000).optional(),
+  /** Optional inline contacts so the create flow can land a customer
+   *  plus several people in one round-trip. */
+  contacts: z.array(contactWriteSchema).max(50).optional(),
+});
+
+financeRouter.post("/customers", validateBody(customerWriteSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof customerWriteSchema>;
+  const repo = AppDataSource.getRepository(Customer);
+  const domain = normalizeAccountDomain(body.domain ?? "");
+  const taken = domain ? await activeCustomerOnDomain(cid, domain) : null;
+  if (taken) return res.status(409).json(domainTaken(taken, domain));
+  const slug = await uniqueCustomerSlug(cid, toSlug(body.name));
+  const c = repo.create({
+    companyId: cid,
+    name: body.name,
+    slug,
+    email: body.email ?? "",
+    phone: body.phone ?? "",
+    accountStatus: body.accountStatus ?? "customer",
+    domain,
+    websiteUrl: body.websiteUrl ?? "",
+    industry: body.industry ?? "",
+    employeeCount: body.employeeCount ?? 0,
+    ownerId: body.ownerId ?? null,
+    ownerEmployeeId: body.ownerEmployeeId ?? null,
+    billingAddress: body.billingAddress ?? "",
+    shippingAddress: body.shippingAddress ?? "",
+    taxNumber: body.taxNumber ?? "",
+    currency: body.currency ?? "USD",
+    annualContractValueCents: body.annualContractValueCents ?? 0,
+    notes: body.notes ?? "",
+    createdById: req.userId ?? null,
+  });
+  await repo.save(c);
+
+  if (body.contacts && body.contacts.length > 0) {
+    const contactRepo = AppDataSource.getRepository(CustomerContact);
+    let primaryAlreadyAssigned = false;
+    for (let i = 0; i < body.contacts.length; i += 1) {
+      const draft = body.contacts[i];
+      const isPrimary = !!draft.isPrimary && !primaryAlreadyAssigned;
+      if (isPrimary) primaryAlreadyAssigned = true;
+      await contactRepo.save(
+        contactRepo.create({
+          companyId: cid,
+          customerId: c.id,
+          name: draft.name,
+          email: draft.email ?? "",
+          phone: draft.phone ?? "",
+          role: draft.role ?? "",
+          isPrimary,
+          sortOrder: draft.sortOrder ?? i,
+        }),
+      );
+    }
+  }
+
+  await auditFinance(req, "finance.customer.create", {
+    type: "customer",
+    id: c.id,
+    label: c.name,
+  });
+  const [hydrated] = await hydrateCustomers(cid, [c]);
+  res.json(hydrated);
+});
+
+financeRouter.get("/customers/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).json({ error: "Customer not found" });
+  const [hydrated] = await hydrateCustomers(cid, [c]);
+  res.json({ ...hydrated, mergedInto: c.archivedAt ? await mergedInto(cid, c.id) : null });
+});
+
+/** Where a merged duplicate's history lives now — the end of any merge chain. */
+async function mergedInto(
+  companyId: string,
+  customerId: string,
+): Promise<Pick<Customer, "id" | "slug" | "name"> | null> {
+  const redirect = await findMergedRecordRedirect(companyId, "account", customerId);
+  if (!redirect) return null;
+  const survivor = await AppDataSource.getRepository(Customer).findOneBy({
+    companyId,
+    id: redirect.targetId,
+  });
+  return survivor ? { id: survivor.id, slug: survivor.slug, name: survivor.name } : null;
+}
+
+// Mail exchanged with the customer, across every connected mailbox — see
+// services/customerMail.ts for how a conversation is matched to an account.
+const customerMailQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    offset: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  })
+  .strict();
+
+financeRouter.get(
+  "/customers/:slug/mail",
+  validateQuery(customerMailQuerySchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const c = await loadCustomerBySlug(cid, req.params.slug);
+    if (!c) return res.status(404).json({ error: "Customer not found" });
+    const query = req.query as unknown as z.infer<typeof customerMailQuerySchema>;
+    res.json(await listCustomerMail(cid, c, query));
+  },
+);
+
+// ─────────────────────── Customer statement ───────────────────────────
+//
+// A statement of account is derived on the fly from the customer's issued
+// invoices + payments (no entity) — see services/customerStatement.ts. The
+// JSON shape feeds the in-app view; /html and /pdf mirror the invoice
+// print/download path so a customer can be handed a portable document.
+
+const statementQuerySchema = z.object({
+  // `yyyy-mm-dd` (or any Date-parseable string). `from` omitted = all time.
+  from: z.string().min(1).optional(),
+  to: z.string().min(1).optional(),
+  currency: z.string().length(3).optional(),
+});
+
+function parseStatementQuery(query: unknown): {
+  from: Date | null;
+  to: Date | undefined;
+  currency: string | undefined;
+} {
+  const parsed = statementQuerySchema.parse(query);
+  const toDate = (s: string | undefined): Date | undefined => {
+    if (!s) return undefined;
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) throw new Error(`Invalid date: ${s}`);
+    return d;
+  };
+  return {
+    from: toDate(parsed.from) ?? null,
+    to: toDate(parsed.to),
+    currency: parsed.currency ? parsed.currency.toUpperCase() : undefined,
+  };
+}
+
+financeRouter.get("/customers/:slug/statement", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).json({ error: "Customer not found" });
+  let opts;
+  try {
+    opts = parseStatementQuery(req.query);
+  } catch (err) {
+    return res.status(400).json({ error: (err as Error).message });
+  }
+  const statement = await buildCustomerStatement(cid, c, opts);
+  res.json({ customer: { id: c.id, name: c.name, slug: c.slug }, statement });
+});
+
+financeRouter.get("/customers/:slug/statement/html", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).type("text/plain").send("Not found");
+  let opts;
+  try {
+    opts = parseStatementQuery(req.query);
+  } catch (err) {
+    return res
+      .status(400)
+      .type("text/plain")
+      .send((err as Error).message);
+  }
+  const statement = await buildCustomerStatement(cid, c, opts);
+  const html = await renderCustomerStatementHtmlForCompany(cid, c, statement);
+  res.type("text/html").send(html);
+});
+
+financeRouter.get("/customers/:slug/statement/pdf", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).type("text/plain").send("Not found");
+  let opts;
+  try {
+    opts = parseStatementQuery(req.query);
+  } catch (err) {
+    return res
+      .status(400)
+      .type("text/plain")
+      .send((err as Error).message);
+  }
+  const statement = await buildCustomerStatement(cid, c, opts);
+  const html = await renderCustomerStatementHtmlForCompany(cid, c, statement);
+  try {
+    const pdf = await htmlToPdf(html);
+    const filename = `statement-${c.slug}-${statement.toDate}.pdf`;
+    res
+      .type("application/pdf")
+      .setHeader("Content-Disposition", `attachment; filename="${filename}"`)
+      .send(pdf);
+  } catch (err) {
+    res
+      .status(503)
+      .type("text/plain")
+      .send(`PDF rendering unavailable: ${(err as Error).message}`);
+  }
+});
+
+financeRouter.patch(
+  "/customers/:slug",
+  validateBody(
+    customerWriteSchema
+      .extend({
+        archived: z.boolean().optional(),
+      })
+      .partial(),
+  ),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const c = await loadCustomerBySlug(cid, req.params.slug);
+    if (!c) return res.status(404).json({ error: "Customer not found" });
+    const body = req.body as Partial<z.infer<typeof customerWriteSchema>> & {
+      archived?: boolean;
+    };
+    if (body.domain !== undefined) {
+      const domain = normalizeAccountDomain(body.domain);
+      const taken = domain ? await activeCustomerOnDomain(cid, domain, c.id) : null;
+      if (taken) return res.status(409).json(domainTaken(taken, domain));
+      c.domain = domain;
+    }
+    if (body.name !== undefined) c.name = body.name;
+    if (body.email !== undefined) c.email = body.email;
+    if (body.phone !== undefined) c.phone = body.phone;
+    if (body.accountStatus !== undefined) c.accountStatus = body.accountStatus;
+    if (body.websiteUrl !== undefined) c.websiteUrl = body.websiteUrl;
+    if (body.industry !== undefined) c.industry = body.industry;
+    if (body.employeeCount !== undefined) c.employeeCount = body.employeeCount;
+    if (body.ownerId !== undefined) {
+      c.ownerId = body.ownerId;
+      if (body.ownerId) c.ownerEmployeeId = null;
+    }
+    if (body.ownerEmployeeId !== undefined) {
+      c.ownerEmployeeId = body.ownerEmployeeId;
+      if (body.ownerEmployeeId) c.ownerId = null;
+    }
+    if (body.billingAddress !== undefined) c.billingAddress = body.billingAddress;
+    if (body.shippingAddress !== undefined) c.shippingAddress = body.shippingAddress;
+    if (body.taxNumber !== undefined) c.taxNumber = body.taxNumber;
+    if (body.currency !== undefined) c.currency = body.currency;
+    if (body.annualContractValueCents !== undefined) {
+      c.annualContractValueCents = body.annualContractValueCents;
+    }
+    if (body.notes !== undefined) c.notes = body.notes;
+    // Only a change of state is an archive or a restore; repeating either
+    // (a double click, a stale tab) keeps the original date and History.
+    const archiveChanged = body.archived !== undefined && body.archived !== !!c.archivedAt;
+    if (archiveChanged && !body.archived) {
+      // Unarchiving here and Restore on the Revenue account are one action.
+      const blocked = await revenueAccountRestoreBlocker(cid, c);
+      if (blocked) return res.status(409).json({ error: blocked });
+    }
+    if (archiveChanged) c.archivedAt = body.archived ? new Date() : null;
+    await AppDataSource.getRepository(Customer).save(c);
+    const { archived, ...edits } = body;
+    const target = { type: "customer", id: c.id, label: c.name };
+    const fields = changedKeys(edits);
+    if (fields.length > 0) {
+      await auditFinance(req, "finance.customer.update", target, { fields });
+    }
+    if (archiveChanged) {
+      await auditFinance(req, archived ? "finance.customer.archive" : "finance.customer.restore", target);
+    }
+    const [hydrated] = await hydrateCustomers(cid, [c]);
+    res.json(hydrated);
+  },
+);
+
+financeRouter.delete("/customers/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).json({ error: "Customer not found" });
+  // Customer is the shared Revenue account. Refuse a hard delete when any
+  // finance or go-to-market history points at it; archive keeps that history
+  // intact and prevents dangling relationship ids.
+  const [
+    invoiceCount,
+    contactCount,
+    dealCount,
+    partnershipCount,
+    documentCount,
+    contractCount,
+    signatureEnvelopeCount,
+    customerChannelCount,
+    meetingCount,
+  ] = await Promise.all([
+    AppDataSource.getRepository(Invoice).count({ where: { companyId: cid, customerId: c.id } }),
+    AppDataSource.getRepository(Contact).count({ where: { companyId: cid, customerId: c.id } }),
+    AppDataSource.getRepository(Deal).count({ where: { companyId: cid, customerId: c.id } }),
+    AppDataSource.getRepository(Partnership).count({
+      where: { companyId: cid, customerId: c.id },
+    }),
+    AppDataSource.getRepository(RevenueDocument).count({
+      where: { companyId: cid, customerId: c.id },
+    }),
+    AppDataSource.getRepository(CustomerContract).count({
+      where: { companyId: cid, customerId: c.id },
+    }),
+    AppDataSource.getRepository(SignatureEnvelope).count({
+      where: { companyId: cid, customerId: c.id },
+    }),
+    countCustomerChannelsForCustomer(cid, c.id),
+    AppDataSource.getRepository(Meeting).count({ where: { companyId: cid, customerId: c.id } }),
+  ]);
+  if (
+    invoiceCount +
+      contactCount +
+      dealCount +
+      partnershipCount +
+      documentCount +
+      contractCount +
+      signatureEnvelopeCount +
+      customerChannelCount +
+      meetingCount >
+    0
+  ) {
+    return res.status(409).json({
+      error: "This account has linked Revenue, finance, or signing history. Archive it instead.",
+    });
+  }
+  await AppDataSource.getRepository(CustomerContact).delete({ customerId: c.id });
+  await AppDataSource.getRepository(Customer).delete({ id: c.id });
+  await auditFinance(req, "finance.customer.delete", { type: "customer", id: c.id, label: c.name });
+  res.json({ ok: true });
+});
+
+financeRouter.get("/customers/:slug/contacts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).json({ error: "Customer not found" });
+  const contacts = await AppDataSource.getRepository(CustomerContact).find({
+    where: { customerId: c.id },
+    order: { sortOrder: "ASC", createdAt: "ASC" },
+  });
+  res.json(contacts);
+});
+
+const customerSlugParamsSchema = z.object({
+  cid: z.string().min(1),
+  slug: z.string().min(1).max(200),
+});
+
+export const recipientSuggestionsQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(MAX_RECIPIENT_SUGGESTIONS).optional(),
+  })
+  .strict();
+
+// Who to offer in an invoice or estimate's send dialog: the customer's people,
+// best first. See services/recipientSuggestions.ts for who counts and why.
+financeRouter.get(
+  "/customers/:slug/recipient-suggestions",
+  validateParams(customerSlugParamsSchema),
+  validateQuery(recipientSuggestionsQuerySchema),
+  async (req, res) => {
+    const { cid, slug } = req.params as z.infer<typeof customerSlugParamsSchema>;
+    const query = req.query as unknown as z.infer<typeof recipientSuggestionsQuerySchema>;
+    const customer = await loadCustomerBySlug(cid, slug);
+    if (!customer) return res.status(404).json({ error: "Customer not found" });
+    res.json(await listRecipientSuggestions(cid, customer, { limit: query.limit }));
+  },
+);
+
+financeRouter.post(
+  "/customers/:slug/contacts",
+  validateBody(contactWriteSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const c = await loadCustomerBySlug(cid, req.params.slug);
+    if (!c) return res.status(404).json({ error: "Customer not found" });
+    const body = req.body as z.infer<typeof contactWriteSchema>;
+    const repo = AppDataSource.getRepository(CustomerContact);
+    const ct = repo.create({
+      companyId: cid,
+      customerId: c.id,
+      name: body.name,
+      email: body.email ?? "",
+      phone: body.phone ?? "",
+      role: body.role ?? "",
+      isPrimary: !!body.isPrimary,
+      sortOrder: body.sortOrder ?? 0,
+    });
+    await repo.save(ct);
+    if (ct.isPrimary) await clearOtherPrimaries(c.id, ct.id);
+    await auditFinance(
+      req,
+      "finance.customer.contact.add",
+      { type: "customer", id: c.id, label: c.name },
+      { contact: ct.name },
+    );
+    res.json(ct);
+  },
+);
+
+financeRouter.patch(
+  "/customers/:slug/contacts/:contactId",
+  validateBody(contactWriteSchema.partial()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const c = await loadCustomerBySlug(cid, req.params.slug);
+    if (!c) return res.status(404).json({ error: "Customer not found" });
+    const repo = AppDataSource.getRepository(CustomerContact);
+    const ct = await repo.findOneBy({
+      id: req.params.contactId,
+      customerId: c.id,
+    });
+    if (!ct) return res.status(404).json({ error: "Contact not found" });
+    const body = req.body as Partial<z.infer<typeof contactWriteSchema>>;
+    if (body.name !== undefined) ct.name = body.name;
+    if (body.email !== undefined) ct.email = body.email;
+    if (body.phone !== undefined) ct.phone = body.phone;
+    if (body.role !== undefined) ct.role = body.role;
+    if (body.isPrimary !== undefined) ct.isPrimary = body.isPrimary;
+    if (body.sortOrder !== undefined) ct.sortOrder = body.sortOrder;
+    await repo.save(ct);
+    if (ct.isPrimary) await clearOtherPrimaries(c.id, ct.id);
+    await auditFinance(
+      req,
+      "finance.customer.contact.update",
+      { type: "customer", id: c.id, label: c.name },
+      { contact: ct.name, fields: changedKeys(body) },
+    );
+    res.json(ct);
+  },
+);
+
+financeRouter.delete("/customers/:slug/contacts/:contactId", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const c = await loadCustomerBySlug(cid, req.params.slug);
+  if (!c) return res.status(404).json({ error: "Customer not found" });
+  const repo = AppDataSource.getRepository(CustomerContact);
+  const ct = await repo.findOneBy({
+    id: req.params.contactId,
+    customerId: c.id,
+  });
+  if (!ct) return res.status(404).json({ error: "Contact not found" });
+  await repo.delete({ id: ct.id });
+  await auditFinance(
+    req,
+    "finance.customer.contact.remove",
+    { type: "customer", id: c.id, label: c.name },
+    { contact: ct.name },
+  );
+  res.json({ ok: true });
+});
+
+// ──────────────────────────── Products ─────────────────────────────────
+
+async function uniqueProductSlug(companyId: string, base: string): Promise<string> {
+  const repo = AppDataSource.getRepository(Product);
+  let slug = base || "product";
+  let n = 1;
+  while (await repo.findOneBy({ companyId, slug })) {
+    n += 1;
+    slug = `${base}-${n}`;
+  }
+  return slug;
+}
+
+financeRouter.get("/products", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const includeArchived = String(req.query.archived ?? "") === "true";
+  const products = await AppDataSource.getRepository(Product).find({
+    where: { companyId: cid },
+    order: { createdAt: "DESC" },
+  });
+  res.json(includeArchived ? products : products.filter((p) => !p.archivedAt));
+});
+
+const productWriteSchema = z.object({
+  name: z.string().min(1).max(120),
+  description: z.string().max(2000).optional(),
+  unitPriceCents: z.number().int().min(0).max(2_000_000_000),
+  currency: currencySchema.optional(),
+  defaultTaxRateId: z.string().uuid().nullable().optional(),
+});
+
+financeRouter.post("/products", validateBody(productWriteSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof productWriteSchema>;
+  if (body.defaultTaxRateId) {
+    const tax = await AppDataSource.getRepository(TaxRate).findOneBy({
+      id: body.defaultTaxRateId,
+      companyId: cid,
+    });
+    if (!tax) return res.status(400).json({ error: "Invalid tax rate" });
+  }
+  const slug = await uniqueProductSlug(cid, toSlug(body.name));
+  const repo = AppDataSource.getRepository(Product);
+  const p = repo.create({
+    companyId: cid,
+    name: body.name,
+    slug,
+    description: body.description ?? "",
+    unitPriceCents: body.unitPriceCents,
+    currency: body.currency ?? "USD",
+    defaultTaxRateId: body.defaultTaxRateId ?? null,
+    createdById: req.userId ?? null,
+  });
+  await repo.save(p);
+  res.json(p);
+});
+
+financeRouter.patch(
+  "/products/:slug",
+  validateBody(
+    productWriteSchema
+      .extend({
+        archived: z.boolean().optional(),
+      })
+      .partial(),
+  ),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const p = await loadProductBySlug(cid, req.params.slug);
+    if (!p) return res.status(404).json({ error: "Product not found" });
+    const body = req.body as Partial<z.infer<typeof productWriteSchema>> & {
+      archived?: boolean;
+    };
+    if (body.defaultTaxRateId) {
+      const tax = await AppDataSource.getRepository(TaxRate).findOneBy({
+        id: body.defaultTaxRateId,
+        companyId: cid,
+      });
+      if (!tax) return res.status(400).json({ error: "Invalid tax rate" });
+    }
+    if (body.name !== undefined) p.name = body.name;
+    if (body.description !== undefined) p.description = body.description;
+    if (body.unitPriceCents !== undefined) p.unitPriceCents = body.unitPriceCents;
+    if (body.currency !== undefined) p.currency = body.currency;
+    if (body.defaultTaxRateId !== undefined) {
+      p.defaultTaxRateId = body.defaultTaxRateId;
+    }
+    if (body.archived !== undefined) {
+      p.archivedAt = body.archived ? new Date() : null;
+    }
+    await AppDataSource.getRepository(Product).save(p);
+    res.json(p);
+  },
+);
+
+financeRouter.delete("/products/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const p = await loadProductBySlug(cid, req.params.slug);
+  if (!p) return res.status(404).json({ error: "Product not found" });
+  // Line items snapshot description / unitPrice / tax — deletion is safe
+  // and won't break historical invoices. The product reference on those
+  // lines just becomes a dangling pointer (we tolerate that).
+  await AppDataSource.getRepository(Product).delete({ id: p.id });
+  res.json({ ok: true });
+});
+
+// ──────────────────────────── Tax rates ────────────────────────────────
+
+financeRouter.get("/tax-rates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const includeArchived = String(req.query.archived ?? "") === "true";
+  const rates = await AppDataSource.getRepository(TaxRate).find({
+    where: { companyId: cid },
+    order: { createdAt: "ASC" },
+  });
+  res.json(includeArchived ? rates : rates.filter((r) => !r.archivedAt));
+});
+
+const taxRateWriteSchema = z.object({
+  name: z.string().min(1).max(60),
+  ratePercent: z.number().min(0).max(1000),
+  inclusive: z.boolean().optional(),
+});
+
+financeRouter.post("/tax-rates", validateBody(taxRateWriteSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof taxRateWriteSchema>;
+  const repo = AppDataSource.getRepository(TaxRate);
+  const t = repo.create({
+    companyId: cid,
+    name: body.name,
+    ratePercent: body.ratePercent,
+    inclusive: body.inclusive ?? false,
+  });
+  await repo.save(t);
+  res.json(t);
+});
+
+financeRouter.patch(
+  "/tax-rates/:id",
+  validateBody(taxRateWriteSchema.extend({ archived: z.boolean().optional() }).partial()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const repo = AppDataSource.getRepository(TaxRate);
+    const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+    if (!t) return res.status(404).json({ error: "Tax rate not found" });
+    const body = req.body as Partial<z.infer<typeof taxRateWriteSchema>> & {
+      archived?: boolean;
+    };
+    if (body.name !== undefined) t.name = body.name;
+    if (body.ratePercent !== undefined) t.ratePercent = body.ratePercent;
+    if (body.inclusive !== undefined) t.inclusive = body.inclusive;
+    if (body.archived !== undefined) {
+      t.archivedAt = body.archived ? new Date() : null;
+    }
+    await repo.save(t);
+    res.json(t);
+  },
+);
+
+financeRouter.delete("/tax-rates/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(TaxRate);
+  const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!t) return res.status(404).json({ error: "Tax rate not found" });
+  await repo.delete({ id: t.id });
+  res.json({ ok: true });
+});
+
+// ───────────────────────────── Invoices ────────────────────────────────
+// `draftInvoiceSlug` lives in services/finance.ts now (shared with the AI
+// `create_invoice` tool).
+
+const lineDraftSchema = z.object({
+  productId: z.string().uuid().nullable().optional(),
+  description: z.string().min(1).max(500),
+  quantity: z.number().min(0).max(1_000_000),
+  unitPriceCents: z.number().int().min(-2_000_000_000).max(2_000_000_000),
+  taxRateId: z.string().uuid().nullable().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+// A whole-document discount, taken off before tax: a percentage or a fixed
+// amount, never both. Sending either replaces the discount; zero for both
+// removes it. `shared/documentDiscount.ts` owns the math.
+const discountFields = {
+  discountPercent: z.number().min(0).max(100).optional(),
+  discountAmountCents: z.number().int().min(0).max(2_000_000_000).optional(),
+};
+
+export const invoiceCreateSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  customerId: z.string().uuid(),
+  issueDate: z.string().datetime().optional(),
+  dueDate: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  lines: z.array(lineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+export const invoiceListQuerySchema = z.object({
+  status: z.string().max(40).optional(),
+  customerId: z.string().max(100).optional(),
+  recurringInvoiceId: z.string().max(100).optional(),
+  archived: z.string().max(10).optional(),
+  ...invoiceDateFilterShape,
+  ...pageQueryShape,
+});
+
+/** A list row: no lines or payments, which the detail page fetches by slug. */
+async function invoiceListRows(cid: string, invoices: Invoice[]) {
+  return (await hydrateInvoices(cid, invoices)).map(
+    ({ lines: _lines, payments: _payments, ...rest }) => ({
+      ...rest,
+      linesCount: _lines.length,
+      paymentsCount: _payments.length,
+    }),
+  );
+}
+
+financeRouter.get("/invoices", validateQuery(invoiceListQuerySchema), async (req, res, next) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const query = req.query as unknown as z.infer<typeof invoiceListQuerySchema>;
+  const filter: InvoiceListFilter = {
+    status: (query.status || undefined) as InvoiceListFilter["status"],
+    customerId: query.customerId || undefined,
+    // The invoices one recurring invoice schedule created, for its own page.
+    recurringInvoiceId: query.recurringInvoiceId || undefined,
+    // Archived invoices are filed away, so lists leave them out unless asked —
+    // the same `archived=true` that estimates take. A page that totals money
+    // asks: an archived invoice still counts.
+    includeArchived: query.archived === "true",
+    from: query.from,
+    to: query.to,
+    dueFrom: query.dueFrom,
+    dueTo: query.dueTo,
+  };
+  try {
+    // Asked for a page — the list the `list_invoices` AI tool reads.
+    if (query.limit !== undefined || query.cursor !== undefined) {
+      const { rows, ...info } = await pageInvoices(
+        cid,
+        filter,
+        { limit: query.limit, cursor: query.cursor },
+        (invoices) => invoiceListRows(cid, invoices),
+      );
+      return res.json({ ...info, invoices: rows });
+    }
+    const invoices = await invoiceListQuery(cid, filter)
+      // SQLite stamps `createdAt` to the second; the issue date a new invoice
+      // takes is to the millisecond, so two made in the same second keep order.
+      .orderBy("invoice.createdAt", "DESC")
+      .addOrderBy("invoice.issueDate", "DESC")
+      .getMany();
+    res.json(await invoiceListRows(cid, invoices));
+  } catch (err) {
+    if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+financeRouter.post("/invoices", validateBody(invoiceCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof invoiceCreateSchema>;
+  try {
+    const invoice = await createInvoiceDraft({
+      companyId: cid,
+      customerId: body.customerId,
+      subsidiaryId: body.subsidiaryId,
+      issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+      dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+      currency: body.currency,
+      notes: body.notes,
+      footer: body.footer,
+      lines: body.lines,
+      discountPercent: body.discountPercent,
+      discountAmountCents: body.discountAmountCents,
+      createdById: req.userId ?? null,
+    });
+    await auditFinance(
+      req,
+      "finance.invoice.create",
+      { type: "invoice", id: invoice.id, label: invoice.number || "Draft invoice" },
+      { totalCents: invoice.totalCents, currency: invoice.currency },
+    );
+    const [hydrated] = await hydrateInvoices(cid, [invoice]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+export const invoiceBulkSchema = z.object({
+  action: z.enum(["archive", "restore"]),
+  ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+// Archive or restore many invoices at once. Ids rather than slugs: issuing a
+// draft re-slugs it, and a selection made a moment earlier must still land.
+financeRouter.post("/invoices/bulk", validateBody(invoiceBulkSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof invoiceBulkSchema>;
+  try {
+    const { changed, skipped } = await setInvoicesArchived(cid, body.ids, body.action);
+    // One row per invoice, so each one's History shows it was archived or
+    // restored — not only the first of the selection.
+    for (const inv of changed) {
+      await auditFinance(req, `finance.invoice.${body.action}`, { type: "invoice", id: inv.id, label: inv.number || "Draft invoice" }, {
+        bulk: changed.length > 1,
+      });
+    }
+    res.json({ action: body.action, succeeded: changed.map((inv) => inv.id), skipped });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// The figures the invoice list leads with: what is outstanding and how late,
+// what came in lately, and how long customers take to pay. Registered before
+// `/:slug`, which would otherwise take "stats" for an invoice's slug.
+financeRouter.get("/invoices/stats", validateQuery(z.object({}).strict()), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await invoiceStats(cid));
+});
+
+financeRouter.get("/invoices/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  const [hydratedRows, emailDetails, resendActivities, writeOffs, apps, revision, homeCurrency] =
+    await Promise.all([
+      hydrateInvoices(cid, [inv]),
+      getInvoiceEmailDetails(cid, inv),
+      listInvoiceResendActivities(cid, inv.id),
+      listInvoiceWriteOffs(cid, inv.id),
+      listApplicationsForInvoice(inv.id),
+      documentRevisionState(cid, "invoice", inv.id),
+      getReportingCurrency(cid),
+    ]);
+  const creditIds = [...new Set(apps.map((a) => a.creditId))];
+  const credits = creditIds.length
+    ? await AppDataSource.getRepository(CustomerCredit).find({
+        where: { id: In(creditIds), companyId: cid },
+        select: ["id", "number", "slug"],
+      })
+    : [];
+  const creditById = new Map(credits.map((c) => [c.id, c]));
+  const creditApplications = apps.map((a) => ({
+    ...a,
+    creditNumber: creditById.get(a.creditId)?.number ?? null,
+    creditSlug: creditById.get(a.creditId)?.slug ?? null,
+  }));
+  res.json({
+    ...hydratedRows[0],
+    emailDetails,
+    resendActivities,
+    writeOffs,
+    creditApplications,
+    revision,
+    // What its locked rates convert into.
+    homeCurrency,
+  });
+});
+
+export const invoicePatchSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  dueDate: z.string().datetime().optional(),
+  customerId: z.string().uuid().optional(),
+  issueDate: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  lines: z.array(lineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+// Edit a draft, or an issued invoice so it can be corrected and resent under
+// the same number. `updateInvoice` owns what an issued invoice may still
+// change and the journal entry that keeps the books in line with it.
+financeRouter.patch("/invoices/:slug", validateBody(invoicePatchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  const body = req.body as z.infer<typeof invoicePatchSchema>;
+  try {
+    const result = await updateInvoice(
+      inv,
+      {
+        subsidiaryId: body.subsidiaryId,
+        customerId: body.customerId,
+        issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+        dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+        currency: body.currency,
+        notes: body.notes,
+        footer: body.footer,
+        lines: body.lines,
+        discountPercent: body.discountPercent,
+        discountAmountCents: body.discountAmountCents,
+      },
+      req.userId ?? null,
+    );
+    const updated = result.invoice;
+    if (result.changed.length > 0) {
+      await auditFinance(
+        req,
+        result.afterIssue ? reviseAction("invoice") : "finance.invoice.update",
+        { type: "invoice", id: updated.id, label: updated.number || "Draft invoice" },
+        {
+          fields: result.changed,
+          totalCents: updated.totalCents,
+          ...(updated.totalCents !== result.previousTotalCents
+            ? { previousTotalCents: result.previousTotalCents }
+            : {}),
+        },
+      );
+    }
+    const [hydrated] = await hydrateInvoices(cid, [updated]);
+    res.json(hydrated);
+  } catch (err) {
+    res
+      .status(err instanceof InvoiceEditError ? err.status : 400)
+      .json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/invoices/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  try {
+    await deleteDraftInvoice(inv);
+  } catch (err) {
+    if (err instanceof InvoiceDeleteError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  await auditFinance(req, "finance.invoice.delete", {
+    type: "invoice",
+    id: inv.id,
+    label: inv.number || "Draft invoice",
+  });
+  res.json({ ok: true });
+});
+
+// Issue (mint number, lock lines, auto-post DR AR / CR Revenue + Tax)
+financeRouter.post("/invoices/:slug/issue", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  if (inv.status !== "draft") {
+    return res.status(409).json({ error: "Already issued" });
+  }
+  // A non-positive total books no Accounts Receivable at issue
+  // (postInvoiceIssue skips the ledger when totalCents <= 0), which would
+  // later strand any payment against a receivable that was never debited.
+  if (inv.totalCents <= 0) {
+    return res.status(400).json({
+      error: `Cannot issue an invoice with a non-positive total (${inv.totalCents} ${inv.currency}). Add positive line items first.`,
+    });
+  }
+  try {
+    const issued = await issueInvoice(inv, req.userId ?? null);
+    await auditFinance(
+      req,
+      "finance.invoice.issue",
+      { type: "invoice", id: issued.id, label: issued.number || "Invoice" },
+      { totalCents: issued.totalCents },
+    );
+    const [hydrated] = await hydrateInvoices(cid, [issued]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+/**
+ * What the send dialog confirms before an invoice or estimate is emailed. An
+ * empty body sends to the customer's billing email with the PDF attached —
+ * Issue & send — and `to` / `cc`, when given, are exactly who it goes to
+ * (plus Finance → Settings → Always Cc, on an invoice).
+ */
+const documentSendSchema = z.preprocess(
+  (value) => value ?? {},
+  z
+    .object({
+      message: z.string().max(4000).default(""),
+      attachPdf: z.boolean().default(true),
+      to: z.array(z.string().trim().email().max(320)).min(1).max(25).optional(),
+      cc: z.array(z.string().trim().email().max(320)).max(25).default([]),
+    })
+    .strict(),
+);
+const invoiceSendSchema = documentSendSchema;
+
+// Email send (auto-issues drafts, then sends). Issued invoices reach this
+// endpoint through the resend confirmation modal.
+financeRouter.post("/invoices/:slug/send", validateBody(invoiceSendSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  let inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  if (inv.status === "void") {
+    return res.status(409).json({ error: "Voided invoices cannot be sent" });
+  }
+  // Sending a draft auto-issues it first; a non-positive total books no AR at
+  // issue, so refuse rather than strand a later payment against it. Issued
+  // invoices being resent are already valid and skip this check.
+  if (inv.status === "draft" && inv.totalCents <= 0) {
+    return res.status(400).json({
+      error: `Cannot issue an invoice with a non-positive total (${inv.totalCents} ${inv.currency}). Add positive line items first.`,
+    });
+  }
+  const isResend = inv.status !== "draft";
+  const body = req.body as z.infer<typeof invoiceSendSchema>;
+  // Issuing a draft mints its gapless number and re-slugs the row from
+  // `draft-…` to `inv-nnnn`, so once we have issued, the caller *must* be told
+  // the new slug — an error response instead leaves the open detail page
+  // refetching a slug that no longer exists and reporting the invoice as
+  // deleted. So: refuse up front for the reasons visible up front (no
+  // customer, no recipient), and downgrade anything that fails after the issue
+  // to a failed send rather than an error status.
+  let issuedHere = false;
+  try {
+    await resolveInvoiceRecipients(cid, inv, body);
+    if (inv.status === "draft") {
+      inv = await issueInvoice(inv, req.userId ?? null);
+      issuedHere = true;
+      await auditFinance(
+        req,
+        "finance.invoice.issue",
+        { type: "invoice", id: inv.id, label: inv.number || "Invoice" },
+        { totalCents: inv.totalCents },
+      );
+    }
+  } catch (err) {
+    return res.status(400).json({ error: (err as Error).message });
+  }
+  let result: InvoiceSendResult;
+  try {
+    result = await sendInvoiceEmail(cid, inv, req.userId ?? null, body);
+  } catch (err) {
+    const errorMessage = (err as Error).message;
+    if (!issuedHere) return res.status(400).json({ error: errorMessage });
+    result = {
+      status: "failed",
+      logId: "",
+      errorMessage,
+      transport: "console",
+      toAddress: "",
+      ccAddress: "",
+      fromAddress: "",
+      replyTo: "",
+      pdfRequested: body.attachPdf,
+      pdfAttached: false,
+      hasMessage: Boolean(body.message.trim()),
+    };
+  }
+  // Express 4 does not catch a rejected async handler, so the tail stays
+  // guarded too — an unanswered request is worse than an error.
+  try {
+    if (isResend) {
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "invoice.email.resend",
+        targetType: "invoice",
+        targetId: inv.id,
+        targetLabel: inv.number || "Invoice",
+        metadata: {
+          status: result.status,
+          toAddress: result.toAddress,
+          ccAddress: result.ccAddress,
+          fromAddress: result.fromAddress,
+          replyTo: result.replyTo,
+          pdfRequested: result.pdfRequested,
+          pdfAttached: result.pdfAttached,
+          hasMessage: result.hasMessage,
+          errorMessage: result.errorMessage,
+          emailLogId: result.logId,
+        },
+      });
+    } else {
+      await auditFinance(
+        req,
+        "finance.invoice.send",
+        { type: "invoice", id: inv.id, label: inv.number || "Invoice" },
+        {
+          status: result.status,
+          toAddress: result.toAddress,
+          ccAddress: result.ccAddress,
+          pdfAttached: result.pdfAttached,
+          errorMessage: result.errorMessage,
+        },
+      );
+    }
+    const [hydrated] = await hydrateInvoices(cid, [inv]);
+    res.json({ invoice: hydrated, send: result });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/invoices/:slug/void", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  try {
+    const voided = await voidInvoice(inv, req.userId ?? null);
+    await auditFinance(req, "finance.invoice.void", {
+      type: "invoice",
+      id: voided.id,
+      label: voided.number || "Invoice",
+    });
+    const [hydrated] = await hydrateInvoices(cid, [voided]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Duplicate (clone into a fresh draft — works on any status, including
+// paid and void; payments and status timestamps are intentionally not
+// copied).
+financeRouter.post("/invoices/:slug/duplicate", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  try {
+    const draft = await duplicateInvoice(inv, req.userId ?? null);
+    await auditFinance(
+      req,
+      "finance.invoice.duplicate",
+      { type: "invoice", id: inv.id, label: inv.number || "Draft invoice" },
+      { copy: draft.slug },
+    );
+    await auditFinance(
+      req,
+      "finance.invoice.create",
+      { type: "invoice", id: draft.id, label: "Draft invoice" },
+      { duplicatedFrom: inv.number || inv.slug },
+    );
+    const [hydrated] = await hydrateInvoices(cid, [draft]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+/**
+ * Load the full set of rows the printable / PDF view needs in one go:
+ * invoice header, customer, lines, payments. Returns null when any of
+ * the required pieces is missing so route handlers can 404 uniformly.
+ */
+async function loadInvoicePrintBundle(
+  companyId: string,
+  slug: string,
+): Promise<null | {
+  invoice: Invoice;
+  customer: Customer;
+  lines: InvoiceLineItem[];
+  payments: InvoicePayment[];
+}> {
+  const invoice = await loadInvoiceBySlug(companyId, slug);
+  if (!invoice) return null;
+  const customer = await AppDataSource.getRepository(Customer).findOneBy({
+    id: invoice.customerId,
+    companyId,
+  });
+  if (!customer) return null;
+  const [lines, payments] = await Promise.all([
+    AppDataSource.getRepository(InvoiceLineItem).find({
+      where: { invoiceId: invoice.id },
+      order: { sortOrder: "ASC" },
+    }),
+    AppDataSource.getRepository(InvoicePayment).find({
+      where: { invoiceId: invoice.id },
+      order: { paidAt: "ASC" },
+    }),
+  ]);
+  return { invoice, customer, lines, payments };
+}
+
+// Printable HTML — kept for previews and the email-send path. Browsers
+// can still File → Print this page if a user wants the print dialog.
+financeRouter.get("/invoices/:slug/html", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const bundle = await loadInvoicePrintBundle(cid, req.params.slug);
+  if (!bundle) return res.status(404).type("text/plain").send("Not found");
+  const html = await renderInvoiceHtmlForCompany(
+    cid,
+    bundle.invoice,
+    bundle.customer,
+    bundle.lines,
+    bundle.payments,
+  );
+  res.type("text/html").send(html);
+});
+
+// Server-rendered PDF for the "Download PDF" button. Falls back to a 503
+// if Chromium isn't available so the UI can surface a meaningful error
+// instead of a generic 500.
+financeRouter.get("/invoices/:slug/pdf", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const bundle = await loadInvoicePrintBundle(cid, req.params.slug);
+  if (!bundle) return res.status(404).type("text/plain").send("Not found");
+  const html = await renderInvoiceHtmlForCompany(
+    cid,
+    bundle.invoice,
+    bundle.customer,
+    bundle.lines,
+    bundle.payments,
+  );
+  try {
+    const pdf = await htmlToPdf(html);
+    const filename = `${bundle.invoice.number || "draft"}.pdf`;
+    res
+      .type("application/pdf")
+      .setHeader("Content-Disposition", `attachment; filename="${filename}"`)
+      .send(pdf);
+  } catch (err) {
+    res
+      .status(503)
+      .type("text/plain")
+      .send(`PDF rendering unavailable: ${(err as Error).message}`);
+  }
+});
+
+// ───────────────────────────── Payments ────────────────────────────────
+
+const paymentCreateSchema = z.object({
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  currency: currencySchema.optional(),
+  paidAt: z.string().datetime().optional(),
+  method: z.enum(["cash", "bank_transfer", "stripe", "lightning", "other"]).optional(),
+  reference: z.string().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+  allowOverpayment: z.boolean().optional(),
+});
+
+financeRouter.post(
+  "/invoices/:slug/payments",
+  validateBody(paymentCreateSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const inv = await loadInvoiceBySlug(cid, req.params.slug);
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+    const body = req.body as z.infer<typeof paymentCreateSchema>;
+    let recorded: RecordedInvoicePayment;
+    try {
+      recorded = await recordInvoicePayment(
+        inv,
+        {
+          amountCents: body.amountCents,
+          currency: body.currency,
+          paidAt: body.paidAt ? new Date(body.paidAt) : undefined,
+          method: body.method,
+          reference: body.reference,
+          notes: body.notes,
+          allowOverpayment: body.allowOverpayment,
+        },
+        req.userId ?? null,
+      );
+    } catch (err) {
+      return res
+        .status(err instanceof InvoicePaymentError ? err.status : 400)
+        .json({ error: (err as Error).message });
+    }
+    await auditInvoicePayment(req, inv, recorded, body.amountCents, body.method ?? "other");
+    const [hydrated] = await hydrateInvoices(cid, [recorded.invoice]);
+    res.json(hydrated);
+  },
+);
+
+/** The audit rows a recorded payment leaves: its credit, if any, then the payment. */
+async function auditInvoicePayment(
+  req: Request,
+  inv: Invoice,
+  recorded: RecordedInvoicePayment,
+  amountCents: number,
+  method: string,
+): Promise<void> {
+  if (recorded.credit) {
+    await auditFinance(
+      req,
+      "finance.credit_note.create",
+      { type: "credit_note", id: recorded.credit.id, label: recorded.credit.number },
+      { amountCents: recorded.excessCents, overpaidInvoice: inv.number || inv.slug },
+    );
+  }
+  await auditFinance(
+    req,
+    "finance.invoice.payment",
+    { type: "invoice", id: inv.id, label: inv.number || "Invoice" },
+    {
+      amountCents,
+      ...(recorded.excessCents > 0 ? { creditedCents: recorded.excessCents } : {}),
+      method,
+      reference: recorded.reference,
+      balanceCents: recorded.invoice.balanceCents,
+      status: recorded.invoice.status,
+    },
+  );
+}
+
+financeRouter.delete("/invoices/:slug/payments/:pid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  let removed: Awaited<ReturnType<typeof removeInvoicePayment>>;
+  try {
+    removed = await removeInvoicePayment(inv, req.params.pid, req.userId ?? null);
+  } catch (err) {
+    return res
+      .status(err instanceof InvoicePaymentError ? err.status : 400)
+      .json({ error: (err as Error).message });
+  }
+  await auditFinance(
+    req,
+    "finance.invoice.payment.delete",
+    { type: "invoice", id: inv.id, label: inv.number || "Invoice" },
+    { amountCents: removed.payment.amountCents, balanceCents: removed.invoice.balanceCents },
+  );
+  const [hydrated] = await hydrateInvoices(cid, [removed.invoice]);
+  res.json(hydrated);
+});
+
+// ───────────────────────────── Write-offs ─────────────────────────────
+
+const writeOffCreateSchema = z.object({
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  kind: z.enum(["bad_debt", "residual"]),
+  expenseAccountId: z.string().uuid().nullable().optional(),
+  writeOffDate: z.string().datetime().optional(),
+  note: z.string().max(2000).optional(),
+});
+
+financeRouter.post(
+  "/invoices/:slug/write-off",
+  validateBody(writeOffCreateSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const inv = await loadInvoiceBySlug(cid, req.params.slug);
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+    const body = req.body as z.infer<typeof writeOffCreateSchema>;
+    try {
+      const writeOff = await createInvoiceWriteOff(
+        inv,
+        {
+          amountCents: body.amountCents,
+          kind: body.kind,
+          expenseAccountId: body.expenseAccountId ?? null,
+          writeOffDate: body.writeOffDate ? new Date(body.writeOffDate) : undefined,
+          note: body.note,
+        },
+        req.userId ?? null,
+      );
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.invoice.write_off",
+        targetType: "invoice",
+        targetId: inv.id,
+        targetLabel: inv.number || inv.slug,
+        metadata: { writeOffId: writeOff.id, amountCents: body.amountCents, kind: body.kind },
+      });
+      const fresh = await loadInvoiceBySlug(cid, req.params.slug);
+      const [hydrated] = await hydrateInvoices(cid, [fresh!]);
+      const writeOffs = await listInvoiceWriteOffs(cid, inv.id);
+      res.json({ ...hydrated, writeOffs });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+financeRouter.delete("/invoices/:slug/write-offs/:wid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const inv = await loadInvoiceBySlug(cid, req.params.slug);
+  if (!inv) return res.status(404).json({ error: "Invoice not found" });
+  const w = await AppDataSource.getRepository(InvoiceWriteOff).findOneBy({
+    id: req.params.wid,
+    companyId: cid,
+    invoiceId: inv.id,
+  });
+  if (!w) return res.status(404).json({ error: "Write-off not found" });
+  try {
+    await reverseInvoiceWriteOff(w, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.invoice.write_off_reversed",
+      targetType: "invoice",
+      targetId: inv.id,
+      targetLabel: inv.number || inv.slug,
+      metadata: { writeOffId: w.id, amountCents: w.amountCents },
+    });
+    const fresh = await loadInvoiceBySlug(cid, req.params.slug);
+    const [hydrated] = await hydrateInvoices(cid, [fresh!]);
+    const writeOffs = await listInvoiceWriteOffs(cid, inv.id);
+    res.json({ ...hydrated, writeOffs });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ─────────────────────────── Credit notes ─────────────────────────────
+
+async function serializeCreditDetail(companyId: string, credit: CustomerCredit) {
+  const [lines, apps, refunds] = await Promise.all([
+    getCreditLines(credit.id),
+    listCreditApplications(credit.id),
+    listCreditRefunds(credit.id),
+  ]);
+  const invIds = [...new Set(apps.map((a) => a.invoiceId))];
+  const invs = invIds.length
+    ? await AppDataSource.getRepository(Invoice).find({
+        where: { id: In(invIds), companyId },
+        select: ["id", "number", "slug"],
+      })
+    : [];
+  const invById = new Map(invs.map((i) => [i.id, i]));
+  return {
+    ...credit,
+    openCents: creditOpenCents(credit),
+    lines,
+    applications: apps.map((a) => ({
+      ...a,
+      invoiceNumber: invById.get(a.invoiceId)?.number ?? null,
+      invoiceSlug: invById.get(a.invoiceId)?.slug ?? null,
+    })),
+    refunds,
+  };
+}
+
+const creditListQuerySchema = z.object({
+  customerId: z.string().uuid().optional(),
+});
+
+financeRouter.get("/credit-notes", validateQuery(creditListQuerySchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const query = req.query as unknown as z.infer<typeof creditListQuerySchema>;
+  const credits = await listCustomerCredits(cid, { customerId: query.customerId });
+  res.json(credits.map((c) => ({ ...c, openCents: creditOpenCents(c) })));
+});
+
+financeRouter.get("/credit-notes/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Credit note not found" });
+  res.json(await serializeCreditDetail(cid, credit));
+});
+
+const creditFromInvoiceSchema = z.object({
+  mode: z.enum(["full", "amount"]),
+  amountCents: z.number().int().min(1).max(2_000_000_000).optional(),
+  applyNow: z.boolean().optional(),
+  reason: z.string().max(2000).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+financeRouter.post(
+  "/invoices/:slug/credit-note",
+  validateBody(creditFromInvoiceSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const inv = await loadInvoiceBySlug(cid, req.params.slug);
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+    const body = req.body as z.infer<typeof creditFromInvoiceSchema>;
+    if (body.mode === "amount" && !body.amountCents) {
+      return res.status(400).json({ error: "amountCents is required for a partial credit" });
+    }
+    try {
+      const draft = await createCreditNoteFromInvoice(
+        inv,
+        { mode: body.mode, amountCents: body.amountCents, reason: body.reason, notes: body.notes },
+        req.userId ?? null,
+      );
+      let credit = await issueCreditNote(draft, req.userId ?? null);
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.credit_note.issue",
+        targetType: "credit_note",
+        targetId: credit.id,
+        targetLabel: credit.number,
+        metadata: { totalCents: credit.totalCents, sourceInvoice: inv.number || inv.slug },
+      });
+      // The common flow: a credit raised against an invoice immediately reduces
+      // what the customer owes on it. Apply up to the room available.
+      if (body.applyNow !== false) {
+        const freshInv = await loadInvoiceBySlug(cid, req.params.slug);
+        const room = Math.min(creditOpenCents(credit), freshInv!.balanceCents);
+        if (room > 0) {
+          await applyCustomerCredit(credit, freshInv!, room, req.userId ?? null);
+          credit = (await loadCreditBySlug(cid, credit.slug))!;
+        }
+      }
+      res.json(await serializeCreditDetail(cid, credit));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const creditApplySchema = z.object({
+  invoiceSlug: z.string().min(1).max(200),
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+});
+
+financeRouter.post("/credit-notes/:slug/apply", validateBody(creditApplySchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Credit note not found" });
+  const body = req.body as z.infer<typeof creditApplySchema>;
+  const inv = await loadInvoiceBySlug(cid, body.invoiceSlug);
+  if (!inv) return res.status(404).json({ error: "Target invoice not found" });
+  try {
+    const app = await applyCustomerCredit(credit, inv, body.amountCents, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.credit_note.apply",
+      targetType: "credit_note",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { applicationId: app.id, invoice: inv.number || inv.slug, amountCents: body.amountCents },
+    });
+    const fresh = await loadCreditBySlug(cid, req.params.slug);
+    res.json(await serializeCreditDetail(cid, fresh!));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/credit-notes/:slug/applications/:aid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Credit note not found" });
+  const app = await AppDataSource.getRepository(CustomerCreditApplication).findOneBy({
+    id: req.params.aid,
+    companyId: cid,
+    creditId: credit.id,
+  });
+  if (!app) return res.status(404).json({ error: "Application not found" });
+  try {
+    await unapplyCustomerCredit(app, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.credit_note.unapply",
+      targetType: "credit_note",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { applicationId: app.id },
+    });
+    const fresh = await loadCreditBySlug(cid, req.params.slug);
+    res.json(await serializeCreditDetail(cid, fresh!));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/credit-notes/:slug/void", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Credit note not found" });
+  try {
+    const voided = await voidCreditNote(credit, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.credit_note.void",
+      targetType: "credit_note",
+      targetId: credit.id,
+      targetLabel: credit.number,
+    });
+    res.json(await serializeCreditDetail(cid, voided));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const refundSchema = z.object({
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  refundedAt: z.string().datetime().optional(),
+  method: z.string().max(60).optional(),
+  reference: z.string().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+  bankAccountId: z.string().uuid().nullable().optional(),
+});
+
+financeRouter.post("/credit-notes/:slug/refund", validateBody(refundSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Credit note not found" });
+  const body = req.body as z.infer<typeof refundSchema>;
+  try {
+    const refund = await refundCustomerCredit(
+      credit,
+      {
+        amountCents: body.amountCents,
+        refundedAt: body.refundedAt ? new Date(body.refundedAt) : undefined,
+        method: body.method,
+        reference: body.reference,
+        notes: body.notes,
+        bankAccountId: body.bankAccountId ?? null,
+      },
+      req.userId ?? null,
+    );
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.credit_note.refund",
+      targetType: "credit_note",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { refundId: refund.id, amountCents: body.amountCents },
+    });
+    const fresh = await loadCreditBySlug(cid, req.params.slug);
+    res.json(await serializeCreditDetail(cid, fresh!));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/customer-refunds/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const refund = await loadRefundById(cid, req.params.id);
+  if (!refund) return res.status(404).json({ error: "Refund not found" });
+  try {
+    await voidCustomerRefund(refund, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.credit_note.refund_reversed",
+      targetType: "credit_note",
+      targetId: refund.creditId,
+      targetLabel: refund.id,
+      metadata: { refundId: refund.id, amountCents: refund.amountCents },
+    });
+    const credit = await AppDataSource.getRepository(CustomerCredit).findOneBy({
+      id: refund.creditId,
+      companyId: cid,
+    });
+    res.json(credit ? await serializeCreditDetail(cid, credit) : { ok: true });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const depositSchema = z.object({
+  customerId: z.string().uuid(),
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  currency: currencySchema.optional(),
+  bankAccountId: z.string().uuid().nullable().optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+financeRouter.post("/deposits", validateBody(depositSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof depositSchema>;
+  try {
+    const credit = await createDeposit(
+      cid,
+      {
+        customerId: body.customerId,
+        amountCents: body.amountCents,
+        currency: body.currency ?? "USD",
+        bankAccountId: body.bankAccountId ?? null,
+        notes: body.notes,
+      },
+      req.userId ?? null,
+    );
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.deposit.create",
+      targetType: "credit_note",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { amountCents: body.amountCents, customerId: body.customerId },
+    });
+    res.json(await serializeCreditDetail(cid, credit));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ─────────────────────────── Vendor credits ───────────────────────────
+
+async function serializeVendorCreditDetail(companyId: string, credit: VendorCredit) {
+  const [lines, apps, refunds] = await Promise.all([
+    getVendorCreditLines(credit.id),
+    listVendorCreditApplications(credit.id),
+    listVendorCreditRefunds(credit.id),
+  ]);
+  const billIds = [...new Set(apps.map((a) => a.billId))];
+  const bills = billIds.length
+    ? await AppDataSource.getRepository(Bill).find({
+        where: { id: In(billIds), companyId },
+        select: ["id", "number", "slug"],
+      })
+    : [];
+  const billById = new Map(bills.map((b) => [b.id, b]));
+  return {
+    ...credit,
+    openCents: vendorCreditOpenCents(credit),
+    lines,
+    applications: apps.map((a) => ({
+      ...a,
+      billNumber: billById.get(a.billId)?.number ?? null,
+      billSlug: billById.get(a.billId)?.slug ?? null,
+    })),
+    refunds,
+  };
+}
+
+financeRouter.get("/vendor-credits", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credits = await listVendorCredits(cid);
+  res.json(credits.map((c) => ({ ...c, openCents: vendorCreditOpenCents(c) })));
+});
+
+financeRouter.get("/vendor-credits/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadVendorCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Vendor credit not found" });
+  res.json(await serializeVendorCreditDetail(cid, credit));
+});
+
+const vendorCreditFromBillSchema = z.object({
+  mode: z.enum(["full", "amount"]),
+  amountCents: z.number().int().min(1).max(2_000_000_000).optional(),
+  applyNow: z.boolean().optional(),
+  reason: z.string().max(2000).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+financeRouter.post(
+  "/bills/:slug/vendor-credit",
+  validateBody(vendorCreditFromBillSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const bill = await loadBillBySlug(cid, req.params.slug);
+    if (!bill) return res.status(404).json({ error: "Bill not found" });
+    const body = req.body as z.infer<typeof vendorCreditFromBillSchema>;
+    if (body.mode === "amount" && !body.amountCents) {
+      return res.status(400).json({ error: "amountCents is required for a partial credit" });
+    }
+    try {
+      const draft = await createVendorCreditFromBill(
+        bill,
+        { mode: body.mode, amountCents: body.amountCents, reason: body.reason, notes: body.notes },
+        req.userId ?? null,
+      );
+      let credit = await issueVendorCredit(draft, req.userId ?? null);
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.vendor_credit.issue",
+        targetType: "vendor_credit",
+        targetId: credit.id,
+        targetLabel: credit.number,
+        metadata: { totalCents: credit.totalCents, sourceBill: bill.number || bill.slug },
+      });
+      if (body.applyNow !== false) {
+        const freshBill = await loadBillBySlug(cid, req.params.slug);
+        const room = Math.min(vendorCreditOpenCents(credit), freshBill!.balanceCents);
+        if (room > 0) {
+          await applyVendorCredit(credit, freshBill!, room, req.userId ?? null);
+          credit = (await loadVendorCreditBySlug(cid, credit.slug))!;
+        }
+      }
+      res.json(await serializeVendorCreditDetail(cid, credit));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const vendorCreditApplySchema = z.object({
+  billSlug: z.string().min(1).max(200),
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+});
+
+financeRouter.post(
+  "/vendor-credits/:slug/apply",
+  validateBody(vendorCreditApplySchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const credit = await loadVendorCreditBySlug(cid, req.params.slug);
+    if (!credit) return res.status(404).json({ error: "Vendor credit not found" });
+    const body = req.body as z.infer<typeof vendorCreditApplySchema>;
+    const bill = await loadBillBySlug(cid, body.billSlug);
+    if (!bill) return res.status(404).json({ error: "Target bill not found" });
+    try {
+      const app = await applyVendorCredit(credit, bill, body.amountCents, req.userId ?? null);
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.vendor_credit.apply",
+        targetType: "vendor_credit",
+        targetId: credit.id,
+        targetLabel: credit.number,
+        metadata: { applicationId: app.id, bill: bill.number || bill.slug, amountCents: body.amountCents },
+      });
+      const fresh = await loadVendorCreditBySlug(cid, req.params.slug);
+      res.json(await serializeVendorCreditDetail(cid, fresh!));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+financeRouter.delete("/vendor-credits/:slug/applications/:aid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadVendorCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Vendor credit not found" });
+  const app = await AppDataSource.getRepository(VendorCreditApplication).findOneBy({
+    id: req.params.aid,
+    companyId: cid,
+    creditId: credit.id,
+  });
+  if (!app) return res.status(404).json({ error: "Application not found" });
+  try {
+    await unapplyVendorCredit(app, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.vendor_credit.unapply",
+      targetType: "vendor_credit",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { applicationId: app.id },
+    });
+    const fresh = await loadVendorCreditBySlug(cid, req.params.slug);
+    res.json(await serializeVendorCreditDetail(cid, fresh!));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/vendor-credits/:slug/void", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadVendorCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Vendor credit not found" });
+  try {
+    const voided = await voidVendorCredit(credit, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.vendor_credit.void",
+      targetType: "vendor_credit",
+      targetId: credit.id,
+      targetLabel: credit.number,
+    });
+    res.json(await serializeVendorCreditDetail(cid, voided));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const vendorRefundSchema = z.object({
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  refundedAt: z.string().datetime().optional(),
+  method: z.string().max(60).optional(),
+  reference: z.string().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+  bankAccountId: z.string().uuid().nullable().optional(),
+});
+
+financeRouter.post("/vendor-credits/:slug/refund", validateBody(vendorRefundSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const credit = await loadVendorCreditBySlug(cid, req.params.slug);
+  if (!credit) return res.status(404).json({ error: "Vendor credit not found" });
+  const body = req.body as z.infer<typeof vendorRefundSchema>;
+  try {
+    const refund = await refundVendorCredit(
+      credit,
+      {
+        amountCents: body.amountCents,
+        refundedAt: body.refundedAt ? new Date(body.refundedAt) : undefined,
+        method: body.method,
+        reference: body.reference,
+        notes: body.notes,
+        bankAccountId: body.bankAccountId ?? null,
+      },
+      req.userId ?? null,
+    );
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.vendor_credit.refund",
+      targetType: "vendor_credit",
+      targetId: credit.id,
+      targetLabel: credit.number,
+      metadata: { refundId: refund.id, amountCents: body.amountCents },
+    });
+    const fresh = await loadVendorCreditBySlug(cid, req.params.slug);
+    res.json(await serializeVendorCreditDetail(cid, fresh!));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/vendor-refunds/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const refund = await loadVendorRefundById(cid, req.params.id);
+  if (!refund) return res.status(404).json({ error: "Refund not found" });
+  try {
+    await voidVendorRefund(refund, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.vendor_credit.refund_reversed",
+      targetType: "vendor_credit",
+      targetId: refund.creditId,
+      targetLabel: refund.id,
+      metadata: { refundId: refund.id, amountCents: refund.amountCents },
+    });
+    const credit = await AppDataSource.getRepository(VendorCredit).findOneBy({
+      id: refund.creditId,
+      companyId: cid,
+    });
+    res.json(credit ? await serializeVendorCreditDetail(cid, credit) : { ok: true });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ───────────────────────────── Estimates ──────────────────────────────
+
+export const estimateCreateSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  customerId: z.string().uuid(),
+  issueDate: z.string().datetime().optional(),
+  validUntil: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  lines: z.array(lineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+financeRouter.get("/estimates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const where: Record<string, unknown> = { companyId: cid };
+  const status = req.query.status;
+  if (typeof status === "string" && status) where.status = status;
+  const customerId = req.query.customerId;
+  if (typeof customerId === "string" && customerId) where.customerId = customerId;
+  // Archived estimates are filed away, so lists leave them out unless asked —
+  // the same `archived=true` that products, tax rates, and vendors take.
+  if (String(req.query.archived ?? "") !== "true") where.archivedAt = IsNull();
+  const estimates = await AppDataSource.getRepository(Estimate).find({
+    where,
+    order: { createdAt: "DESC" },
+  });
+  const hydrated = await hydrateEstimates(cid, estimates);
+  // Strip lines from the list view so payloads stay small — detail
+  // page calls /estimates/:slug for the full thing.
+  res.json(
+    hydrated.map(({ lines: _lines, ...rest }) => ({
+      ...rest,
+      linesCount: _lines.length,
+    })),
+  );
+});
+
+financeRouter.post("/estimates", validateBody(estimateCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof estimateCreateSchema>;
+  try {
+    const estimate = await createEstimateDraft({
+      companyId: cid,
+      customerId: body.customerId,
+      subsidiaryId: body.subsidiaryId,
+      issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+      validUntil: body.validUntil ? new Date(body.validUntil) : undefined,
+      currency: body.currency,
+      notes: body.notes,
+      footer: body.footer,
+      lines: body.lines,
+      discountPercent: body.discountPercent,
+      discountAmountCents: body.discountAmountCents,
+      createdById: req.userId ?? null,
+    });
+    await auditFinance(req, "finance.estimate.create", { type: "estimate", id: estimate.id, label: estimate.number || "Draft estimate" }, {
+      totalCents: estimate.totalCents,
+      currency: estimate.currency,
+    });
+    const [hydrated] = await hydrateEstimates(cid, [estimate]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+export const estimateBulkSchema = z.object({
+  action: z.enum(["archive", "restore"]),
+  ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+// Archive or restore many estimates at once. Ids rather than slugs: issuing a
+// draft re-slugs it, and a selection made a moment earlier must still land.
+financeRouter.post("/estimates/bulk", validateBody(estimateBulkSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof estimateBulkSchema>;
+  try {
+    const { changed, skipped } = await setEstimatesArchived(cid, body.ids, body.action);
+    // One row per estimate, so each one's History shows it was archived or
+    // restored — not only the first of the selection.
+    for (const e of changed) {
+      await auditFinance(req, `finance.estimate.${body.action}`, { type: "estimate", id: e.id, label: e.number || "Draft estimate" }, {
+        bulk: changed.length > 1,
+      });
+    }
+    res.json({ action: body.action, succeeded: changed.map((e) => e.id), skipped });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// The figures the estimate list leads with: what is open and about to lapse,
+// what was won but not billed, and how the last 90 days of quotes went.
+// Registered before `/:slug`, which would otherwise take "stats" for a slug.
+financeRouter.get("/estimates/stats", validateQuery(z.object({}).strict()), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await estimateStats(cid));
+});
+
+financeRouter.get("/estimates/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  const [[hydrated], revision, emailDetails] = await Promise.all([
+    hydrateEstimates(cid, [est]),
+    documentRevisionState(cid, "estimate", est.id),
+    getEstimateEmailDetails(cid, est),
+  ]);
+  res.json({ ...hydrated, revision, emailDetails });
+});
+
+export const estimatePatchSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  validUntil: z.string().datetime().optional(),
+  customerId: z.string().uuid().optional(),
+  issueDate: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  lines: z.array(lineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+// Edit a draft, or a sent or accepted estimate so a quote can be revised and
+// resent under the same number. `updateEstimate` owns what an issued estimate
+// may still change, and sends an accepted one back to `sent`.
+financeRouter.patch("/estimates/:slug", validateBody(estimatePatchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  const body = req.body as z.infer<typeof estimatePatchSchema>;
+  try {
+    const result = await updateEstimate(est, {
+      subsidiaryId: body.subsidiaryId,
+      customerId: body.customerId,
+      issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+      validUntil: body.validUntil ? new Date(body.validUntil) : undefined,
+      currency: body.currency,
+      notes: body.notes,
+      footer: body.footer,
+      lines: body.lines,
+      discountPercent: body.discountPercent,
+      discountAmountCents: body.discountAmountCents,
+    });
+    const updated = result.estimate;
+    if (result.changed.length > 0) {
+      await auditFinance(
+        req,
+        result.afterIssue ? reviseAction("estimate") : "finance.estimate.update",
+        { type: "estimate", id: updated.id, label: updated.number || "Draft estimate" },
+        {
+          fields: result.changed,
+          totalCents: updated.totalCents,
+          ...(updated.totalCents !== result.previousTotalCents
+            ? { previousTotalCents: result.previousTotalCents }
+            : {}),
+          ...(updated.status !== result.previousStatus
+            ? { status: updated.status, previousStatus: result.previousStatus }
+            : {}),
+        },
+      );
+    }
+    const [hydrated] = await hydrateEstimates(cid, [updated]);
+    res.json(hydrated);
+  } catch (err) {
+    res
+      .status(err instanceof EstimateEditError ? err.status : 400)
+      .json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/estimates/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  if (est.status !== "draft") {
+    return res
+      .status(409)
+      .json({ error: "Only drafts can be deleted — void issued estimates instead" });
+  }
+  await AppDataSource.getRepository(EstimateLineItem).delete({
+    estimateId: est.id,
+  });
+  await AppDataSource.getRepository(Estimate).delete({ id: est.id });
+  await auditFinance(req, "finance.estimate.delete", { type: "estimate", id: est.id, label: est.number || "Draft estimate" });
+  res.json({ ok: true });
+});
+
+financeRouter.post("/estimates/:slug/issue", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  if (est.status !== "draft") {
+    return res.status(409).json({ error: "Already issued" });
+  }
+  try {
+    const issued = await issueEstimate(est, req.userId ?? null);
+    await auditFinance(req, "finance.estimate.issue", { type: "estimate", id: issued.id, label: issued.number || "Draft estimate" }, {
+      totalCents: issued.totalCents,
+    });
+    const [hydrated] = await hydrateEstimates(cid, [issued]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Email send (auto-issues drafts, then sends). Issued estimates reach this
+// endpoint through the resend dialog, which confirms the recipients.
+financeRouter.post("/estimates/:slug/send", validateBody(documentSendSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  let est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  if (est.status === "void") {
+    return res.status(409).json({ error: "Voided estimates cannot be sent" });
+  }
+  const body = req.body as z.infer<typeof documentSendSchema>;
+  // Issuing a draft mints its gapless number and re-slugs the row from
+  // `edraft-…` to `est-nnnn`, so once we have issued, the caller *must* be
+  // told the new slug — an error response instead leaves the open detail page
+  // refetching a slug that no longer exists and reporting the estimate as
+  // deleted. So: refuse up front for the reasons visible up front (no
+  // customer, no address), and downgrade anything that fails after the issue
+  // to a failed send rather than an error status.
+  let issuedHere = false;
+  try {
+    await resolveEstimateRecipients(cid, est, body);
+    if (est.status === "draft") {
+      est = await issueEstimate(est, req.userId ?? null);
+      issuedHere = true;
+      await auditFinance(req, "finance.estimate.issue", { type: "estimate", id: est.id, label: est.number || "Draft estimate" }, {
+        totalCents: est.totalCents,
+      });
+    }
+  } catch (err) {
+    return res.status(400).json({ error: (err as Error).message });
+  }
+  let send: EstimateSendResult;
+  try {
+    send = await sendEstimateEmail(cid, est, req.userId ?? null, body);
+  } catch (err) {
+    const errorMessage = (err as Error).message;
+    if (!issuedHere) return res.status(400).json({ error: errorMessage });
+    send = failedEstimateSend(errorMessage, body);
+  }
+  await auditFinance(req, "finance.estimate.send", { type: "estimate", id: est.id, label: est.number || "Draft estimate" }, {
+    status: send.status,
+    errorMessage: send.errorMessage,
+    toAddress: send.toAddress,
+    ccAddress: send.ccAddress,
+    pdfRequested: send.pdfRequested,
+    pdfAttached: send.pdfAttached,
+    hasMessage: send.hasMessage,
+  });
+  // Express 4 does not catch a rejected async handler, so the tail stays
+  // guarded too — an unanswered request is worse than an error.
+  try {
+    const [hydrated] = await hydrateEstimates(cid, [est]);
+    res.json({ estimate: hydrated, send });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/estimates/:slug/accept", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  try {
+    const updated = await acceptEstimate(est, req.userId ?? null);
+    await auditFinance(req, "finance.estimate.accept", { type: "estimate", id: updated.id, label: updated.number || "Draft estimate" });
+    const [hydrated] = await hydrateEstimates(cid, [updated]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/estimates/:slug/decline", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  try {
+    const updated = await declineEstimate(est, req.userId ?? null);
+    await auditFinance(req, "finance.estimate.decline", { type: "estimate", id: updated.id, label: updated.number || "Draft estimate" });
+    const [hydrated] = await hydrateEstimates(cid, [updated]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/estimates/:slug/void", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  try {
+    const voided = await voidEstimate(est, req.userId ?? null);
+    await auditFinance(req, "finance.estimate.void", { type: "estimate", id: voided.id, label: voided.number || "Draft estimate" });
+    const [hydrated] = await hydrateEstimates(cid, [voided]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Duplicate (clone into a fresh draft — works on any status, including
+// void/declined/invoiced; the resulting invoice link is intentionally
+// not copied).
+financeRouter.post("/estimates/:slug/duplicate", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const est = await loadEstimateBySlug(cid, req.params.slug);
+  if (!est) return res.status(404).json({ error: "Estimate not found" });
+  try {
+    const draft = await duplicateEstimate(est, req.userId ?? null);
+    await auditFinance(req, "finance.estimate.duplicate", { type: "estimate", id: est.id, label: est.number || "Draft estimate" }, { copy: draft.slug });
+    await auditFinance(req, "finance.estimate.create", { type: "estimate", id: draft.id, label: draft.number || "Draft estimate" }, {
+      duplicatedFrom: est.number || est.slug,
+    });
+    const [hydrated] = await hydrateEstimates(cid, [draft]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const estimateConvertSchema = z.object({
+  dueInDays: z.number().int().min(0).max(365).optional(),
+});
+
+financeRouter.post(
+  "/estimates/:slug/convert",
+  validateBody(estimateConvertSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const est = await loadEstimateBySlug(cid, req.params.slug);
+    if (!est) return res.status(404).json({ error: "Estimate not found" });
+    const body = req.body as z.infer<typeof estimateConvertSchema>;
+    try {
+      const { estimate: updated, invoice } = await convertEstimateToInvoice(
+        est,
+        req.userId ?? null,
+        { dueInDays: body.dueInDays },
+      );
+      await auditFinance(req, "finance.estimate.convert.invoice", { type: "estimate", id: updated.id, label: updated.number || "Draft estimate" }, {
+        invoice: invoice.number || "Draft invoice",
+      });
+      await auditFinance(
+        req,
+        "finance.invoice.create",
+        { type: "invoice", id: invoice.id, label: invoice.number || "Draft invoice" },
+        { fromEstimate: updated.number || updated.slug, totalCents: invoice.totalCents },
+      );
+      const [hydrated] = await hydrateEstimates(cid, [updated]);
+      res.json({ estimate: hydrated, invoice });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+async function loadEstimatePrintBundle(
+  companyId: string,
+  slug: string,
+): Promise<null | {
+  estimate: Estimate;
+  customer: Customer;
+  lines: EstimateLineItem[];
+}> {
+  const estimate = await loadEstimateBySlug(companyId, slug);
+  if (!estimate) return null;
+  const customer = await AppDataSource.getRepository(Customer).findOneBy({
+    id: estimate.customerId,
+    companyId,
+  });
+  if (!customer) return null;
+  const lines = await AppDataSource.getRepository(EstimateLineItem).find({
+    where: { estimateId: estimate.id },
+    order: { sortOrder: "ASC" },
+  });
+  return { estimate, customer, lines };
+}
+
+// Printable HTML — kept for previews and the email-send path.
+financeRouter.get("/estimates/:slug/html", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const bundle = await loadEstimatePrintBundle(cid, req.params.slug);
+  if (!bundle) return res.status(404).type("text/plain").send("Not found");
+  const html = await renderEstimateHtmlForCompany(
+    cid,
+    bundle.estimate,
+    bundle.customer,
+    bundle.lines,
+  );
+  res.type("text/html").send(html);
+});
+
+// Server-rendered PDF for the "Download PDF" button. 503 on Chromium
+// failure so the UI can surface a meaningful error.
+financeRouter.get("/estimates/:slug/pdf", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const bundle = await loadEstimatePrintBundle(cid, req.params.slug);
+  if (!bundle) return res.status(404).type("text/plain").send("Not found");
+  const html = await renderEstimateHtmlForCompany(
+    cid,
+    bundle.estimate,
+    bundle.customer,
+    bundle.lines,
+  );
+  try {
+    const pdf = await htmlToPdf(html);
+    const filename = `${bundle.estimate.number || "draft"}.pdf`;
+    res
+      .type("application/pdf")
+      .setHeader("Content-Disposition", `attachment; filename="${filename}"`)
+      .send(pdf);
+  } catch (err) {
+    res
+      .status(503)
+      .type("text/plain")
+      .send(`PDF rendering unavailable: ${(err as Error).message}`);
+  }
+});
+
+// ─────────────────────────── Accounts (Phase B) ────────────────────────
+
+financeRouter.get("/accounts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  // Auto-seed the default chart of accounts on first visit so the
+  // accounts page is never empty for a brand-new company.
+  const accounts = await seedChartOfAccounts(cid);
+  res.json(accounts);
+});
+
+// Adding to and changing the chart of accounts. The rules live in
+// `services/ledgerAccounts.ts`, which the `create_finance_account` and
+// `update_finance_account` AI tools call too.
+financeRouter.post("/accounts", validateBody(accountWriteSchema), async (req, res, next) => {
+  const cid = (req.params as Record<string, string>).cid;
+  try {
+    res.json(await createLedgerAccount(cid, req.body as z.infer<typeof accountWriteSchema>));
+  } catch (err) {
+    if (err instanceof LedgerAccountError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+financeRouter.patch("/accounts/:id", validateBody(accountPatchSchema), async (req, res, next) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const account = await loadLedgerAccount(cid, req.params.id);
+  if (!account) return res.status(404).json({ error: "Account not found" });
+  try {
+    res.json(await updateLedgerAccount(account, req.body as z.infer<typeof accountPatchSchema>));
+  } catch (err) {
+    if (err instanceof LedgerAccountError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+financeRouter.delete("/accounts/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(Account);
+  const a = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!a) return res.status(404).json({ error: "Account not found" });
+  if (a.isSystem) {
+    return res
+      .status(409)
+      .json({ error: "System accounts cannot be deleted — archive them instead" });
+  }
+  const used = await AppDataSource.getRepository(LedgerLine).count({
+    where: { accountId: a.id },
+  });
+  if (used > 0) {
+    return res.status(409).json({ error: "Account has ledger lines — archive it instead" });
+  }
+  await repo.delete({ id: a.id });
+  res.json({ ok: true });
+});
+
+// ─────────────────────────── Ledger entries ────────────────────────────
+
+const ledgerEntryQuerySchema = z.object({
+  source: z.string().min(1).max(80).optional(),
+  reviewStatus: z.enum(["unreviewed", "ai_reviewed", "approved"]).optional(),
+  from: z.string().max(40).optional(),
+  to: z.string().max(40).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+financeRouter.get("/ledger-entries", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const parsed = ledgerEntryQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid ledger transaction filters" });
+  }
+  const from = parsed.data.from ? new Date(parsed.data.from) : undefined;
+  const to = parsed.data.to ? new Date(parsed.data.to) : undefined;
+  if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+    return res.status(400).json({ error: "Invalid transaction date filter" });
+  }
+  res.json(
+    await listLedgerEntriesForReview({
+      companyId: cid,
+      source: parsed.data.source,
+      reviewStatus: parsed.data.reviewStatus,
+      from,
+      to,
+      limit: parsed.data.limit,
+    }),
+  );
+});
+
+// Entry review's journal one page at a time, with every filter the
+// `list_finance_transactions` AI tool takes — the same function answers both.
+// `/ledger-entries` above keeps its plain array of at most 500 for the Finance
+// pages that read it.
+financeRouter.get(
+  "/finance/transactions",
+  validateQuery(ledgerReviewQuerySchema),
+  async (req, res, next) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const { limit, cursor, ...filters } = req.query as unknown as z.infer<
+      typeof ledgerReviewQuerySchema
+    >;
+    try {
+      res.json(await pageLedgerEntriesForReview(cid, filters, { limit, cursor }));
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+financeRouter.get("/ledger-review-summary", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await ledgerReviewSummary(cid));
+});
+
+const ledgerEntryParamsSchema = z.object({ id: z.string().uuid() });
+
+financeRouter.get("/ledger-entries/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const parsed = ledgerEntryParamsSchema.safeParse(req.params);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid transaction id" });
+  const entry = await getLedgerEntryForReview(cid, parsed.data.id);
+  if (!entry) return res.status(404).json({ error: "Transaction not found" });
+  res.json(entry);
+});
+
+const ledgerLineDraftSchema = z.object({
+  accountId: z.string().uuid(),
+  debitCents: z.number().int().min(0).max(2_000_000_000).optional(),
+  creditCents: z.number().int().min(0).max(2_000_000_000).optional(),
+  description: z.string().max(500).optional(),
+});
+
+const ledgerEntryCreateSchema = z.object({
+  date: z.string().datetime().optional(),
+  memo: z.string().max(1000).optional(),
+  lines: z.array(ledgerLineDraftSchema).min(2).max(50),
+});
+
+financeRouter.post("/ledger-entries", validateBody(ledgerEntryCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof ledgerEntryCreateSchema>;
+  try {
+    const { entry } = await postLedgerEntry({
+      companyId: cid,
+      date: body.date ? new Date(body.date) : new Date(),
+      memo: body.memo ?? "",
+      source: "manual",
+      sourceRefId: null,
+      createdById: req.userId ?? null,
+      lines: body.lines,
+    });
+    const [hydrated] = await hydrateLedgerEntries([entry]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.delete("/ledger-entries/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(LedgerEntry);
+  const e = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!e) return res.status(404).json({ error: "Entry not found" });
+  if (e.reviewStatus === "approved") {
+    return res.status(409).json({
+      error: "Approved transactions are locked — post a reversing entry instead",
+    });
+  }
+  // Genuine hand-posted journal entries carry a null sourceRefId. Auto-post
+  // paths that overload the `manual` source — bill issue/payment and the
+  // period-close entry — set a sourceRefId, and are managed by their own
+  // void / reopen flows. Blocking `manual`-with-a-sourceRefId here stops a
+  // member erasing a bill's AP posting (or a closing entry) through this route.
+  if (e.source !== "manual" || e.sourceRefId) {
+    return res
+      .status(409)
+      .json({ error: "Auto-posted entries cannot be deleted directly — void the source instead" });
+  }
+  // A closed period is frozen against edits from either direction: posting
+  // into it is already blocked, and so must deleting out of it, or the
+  // period's reported numbers would silently change after the books closed.
+  const closed = await findClosedPeriodCovering(cid, e.date);
+  if (closed) {
+    return res.status(409).json({
+      error: `This entry is in the closed period "${closed.name}" and can't be deleted. Reopen the period first.`,
+    });
+  }
+  await AppDataSource.getRepository(LedgerLine).delete({ ledgerEntryId: e.id });
+  await repo.delete({ id: e.id });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "finance.ledger_entry.delete",
+    targetType: "ledger_entry",
+    targetId: e.id,
+    targetLabel: e.memo || e.source,
+    metadata: { source: e.source, date: e.date.toISOString() },
+  });
+  res.json({ ok: true });
+});
+
+const ledgerReviewChangeSchema = z.object({
+  lineId: z.string().uuid(),
+  accountId: z.string().uuid(),
+});
+
+const ledgerApproveSchema = z.object({
+  changes: z.array(ledgerReviewChangeSchema).max(20).optional(),
+  note: z.string().max(2000).optional(),
+});
+
+function canApproveFinance(req: unknown): boolean {
+  const role = (req as { role?: string }).role;
+  return role === "owner" || role === "admin";
+}
+
+financeRouter.post(
+  "/ledger-entries/:id/approve",
+  validateBody(ledgerApproveSchema),
+  async (req, res) => {
+    if (!canApproveFinance(req)) {
+      return res.status(403).json({ error: "Only owners and admins can approve transactions" });
+    }
+    const cid = (req.params as Record<string, string>).cid;
+    const params = ledgerEntryParamsSchema.safeParse(req.params);
+    if (!params.success) return res.status(400).json({ error: "Invalid transaction id" });
+    const body = req.body as z.infer<typeof ledgerApproveSchema>;
+    try {
+      const entry = await approveLedgerReview({
+        companyId: cid,
+        entryId: params.data.id,
+        userId: req.userId!,
+        changes: body.changes,
+        note: body.note,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId,
+        action: "finance.transaction.approve",
+        targetType: "ledger_entry",
+        targetId: entry.id,
+        targetLabel: entry.memo,
+        metadata: { categoryChanges: entry.reviewChanges },
+      });
+      res.json(entry);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const ledgerReturnSchema = z.object({
+  note: z.string().max(2000).optional(),
+});
+
+financeRouter.post(
+  "/ledger-entries/:id/return",
+  validateBody(ledgerReturnSchema),
+  async (req, res) => {
+    if (!canApproveFinance(req)) {
+      return res.status(403).json({ error: "Only owners and admins can return transactions" });
+    }
+    const cid = (req.params as Record<string, string>).cid;
+    const params = ledgerEntryParamsSchema.safeParse(req.params);
+    if (!params.success) return res.status(400).json({ error: "Invalid transaction id" });
+    const body = req.body as z.infer<typeof ledgerReturnSchema>;
+    try {
+      const entry = await returnLedgerReview({
+        companyId: cid,
+        entryId: params.data.id,
+        note: body.note,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId,
+        action: "finance.transaction.return",
+        targetType: "ledger_entry",
+        targetId: entry.id,
+        targetLabel: entry.memo,
+        metadata: { note: body.note ?? "" },
+      });
+      res.json(entry);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const ledgerBulkSchema = z.object({
+  action: z.enum(["approve", "return", "delete", "recategorize"]),
+  ids: z.array(z.string().uuid()).min(1).max(500),
+  toAccountId: z.string().uuid().optional(),
+  note: z.string().max(2000).optional(),
+});
+
+financeRouter.post("/ledger-entries/bulk", validateBody(ledgerBulkSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof ledgerBulkSchema>;
+  // Deleting is limited to unapproved manual drafts, matching the single-entry
+  // DELETE; the other three actions post to the ledger, so they stay behind the
+  // same owner/admin gate as one-at-a-time approval.
+  if (body.action !== "delete" && !canApproveFinance(req)) {
+    return res
+      .status(403)
+      .json({ error: "Only owners and admins can approve, return, or recategorize transactions" });
+  }
+  if (body.action === "recategorize" && !body.toAccountId) {
+    return res.status(400).json({ error: "Pick a category to apply" });
+  }
+  try {
+    const result = await bulkLedgerReview({
+      companyId: cid,
+      userId: req.userId!,
+      action: body.action,
+      entryIds: body.ids,
+      toAccountId: body.toAccountId,
+      note: body.note,
+    });
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId,
+      action: `finance.transaction.bulk_${body.action}`,
+      targetType: "ledger_entry",
+      targetId: result.succeeded[0] ?? null,
+      targetLabel: `${result.succeeded.length} transaction(s)`,
+      metadata: {
+        requested: body.ids.length,
+        succeeded: result.succeeded.length,
+        skipped: result.skipped.length,
+        toAccountId: body.toAccountId ?? null,
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Reversed entries that still carry a category Entry review gave them, from
+// before reversals took a reviewed category back. Read-only: it lists what is
+// left over and the change that would clear it, and posts nothing.
+financeRouter.get(
+  "/ledger-review-drift",
+  validateQuery(z.object({}).strict()),
+  async (req, res) => {
+    if (!canApproveFinance(req)) {
+      return res.status(403).json({ error: "Only owners and admins can check reviewed categories" });
+    }
+    const cid = (req.params as Record<string, string>).cid;
+    res.json({ drift: await findReviewedCategoryDrift(cid) });
+  },
+);
+
+// ─────────────────────────── Trial balance ─────────────────────────────
+
+financeRouter.get("/ledger/trial-balance", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const asOfQ = req.query.asOf;
+  const asOf = typeof asOfQ === "string" && asOfQ ? new Date(asOfQ) : new Date();
+  if (Number.isNaN(asOf.getTime())) {
+    return res.status(400).json({ error: "Invalid asOf date" });
+  }
+  const rows = await trialBalance(cid, asOf);
+  res.json({ asOf: asOf.toISOString(), rows });
+});
+
+// ───────────────────────────── Reports (Phase C) ───────────────────────
+
+/**
+ * Parse a query-string ISO date and validate it. Returns null when the
+ * param is missing/empty (caller picks a default), throws when the
+ * value is present but unparseable so the route can return 400.
+ */
+function parseDateParam(raw: unknown, label: string): Date | null {
+  if (typeof raw !== "string" || !raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) {
+    throw new Error(`Invalid ${label} date`);
+  }
+  return d;
+}
+
+financeRouter.get("/reports/income-statement", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  try {
+    const from = parseDateParam(req.query.from, "from");
+    const to = parseDateParam(req.query.to, "to");
+    if (!from || !to) {
+      return res.status(400).json({ error: "from and to are required" });
+    }
+    const compareFrom = parseDateParam(req.query.compareFrom, "compareFrom");
+    const compareTo = parseDateParam(req.query.compareTo, "compareTo");
+    const current = await incomeStatement(cid, from, to);
+    const prior =
+      compareFrom && compareTo ? await incomeStatement(cid, compareFrom, compareTo) : null;
+    res.json({ current, prior });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.get("/reports/balance-sheet", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  try {
+    const asOfRaw = parseDateParam(req.query.asOf, "asOf");
+    const asOf = asOfRaw ?? new Date();
+    const compareAsOf = parseDateParam(req.query.compareAsOf, "compareAsOf");
+    const current = await balanceSheet(cid, asOf);
+    const prior = compareAsOf ? await balanceSheet(cid, compareAsOf) : null;
+    res.json({ current, prior });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.get("/reports/cash-flow", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  try {
+    const from = parseDateParam(req.query.from, "from");
+    const to = parseDateParam(req.query.to, "to");
+    if (!from || !to) {
+      return res.status(400).json({ error: "from and to are required" });
+    }
+    const compareFrom = parseDateParam(req.query.compareFrom, "compareFrom");
+    const compareTo = parseDateParam(req.query.compareTo, "compareTo");
+    const current = await cashFlow(cid, from, to);
+    const prior = compareFrom && compareTo ? await cashFlow(cid, compareFrom, compareTo) : null;
+    res.json({ current, prior });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const financialTrendsQuerySchema = z.object({
+  from: z.string().min(1).max(40),
+  to: z.string().min(1).max(40),
+});
+
+financeRouter.get("/reports/trends", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const parsed = financialTrendsQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "from and to are required" });
+  }
+  try {
+    const from = new Date(parsed.data.from);
+    const to = new Date(parsed.data.to);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+      return res.status(400).json({ error: "Invalid report trend date" });
+    }
+    res.json(await financialTrends(cid, from, to));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+/**
+ * Account activity feed for a single account in an optional date
+ * range. Powers the "click any line in a report to drill through"
+ * panel — the report rows post `accountId` plus the report's date
+ * range and get back a running-balance ledger.
+ */
+financeRouter.get("/reports/account-activity", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const accountId = req.query.accountId;
+  if (typeof accountId !== "string" || !accountId) {
+    return res.status(400).json({ error: "accountId is required" });
+  }
+  try {
+    const from = parseDateParam(req.query.from, "from");
+    const to = parseDateParam(req.query.to, "to");
+    const report = await accountActivity(cid, accountId, from, to);
+    if (!report) return res.status(404).json({ error: "Account not found" });
+    res.json(report);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ─────────────────────── Bank feeds (Phase D) ──────────────────────────
+
+const FEED_KINDS: [BankFeedKind, ...BankFeedKind[]] = [
+  "stripe_payouts",
+  "brex_cash",
+  "mercury_account",
+  "wise_balance",
+  "csv",
+];
+
+const csvUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+financeRouter.get("/bank-feeds", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const feeds = await AppDataSource.getRepository(BankFeed).find({
+    where: { companyId: cid },
+    order: { createdAt: "ASC" },
+  });
+  res.json(feeds);
+});
+
+const brexAccountsQuerySchema = z.object({
+  connectionId: z.string().uuid(),
+});
+
+financeRouter.get("/bank-feeds/brex-accounts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const parsed = brexAccountsQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "A valid Brex connectionId is required" });
+  }
+  try {
+    res.json(await listBrexCashAccountsForConnection(cid, parsed.data.connectionId));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const mercuryAccountsQuerySchema = z.object({
+  connectionId: z.string().uuid(),
+});
+
+// The accounts a Mercury Connection can read, each saying why it can't be
+// added when it can't — one already on Banking, or one Mercury closed.
+financeRouter.get(
+  "/bank-feeds/mercury-accounts",
+  validateQuery(mercuryAccountsQuerySchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const query = req.query as z.infer<typeof mercuryAccountsQuerySchema>;
+    try {
+      res.json(await listMercuryAccountsForConnection(cid, query.connectionId));
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const wiseBalancesQuerySchema = z.object({
+  connectionId: z.string().uuid(),
+});
+
+// The balances a Wise Connection can read, each saying why it can't be added
+// when it can't — only home-currency balances become Banking accounts.
+financeRouter.get("/bank-feeds/wise-balances", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const parsed = wiseBalancesQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "A valid Wise connectionId is required" });
+  }
+  try {
+    res.json(await listWiseBalancesForConnection(cid, parsed.data.connectionId));
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const feedCreateSchema = z.object({
+  name: z.string().min(1).max(120),
+  kind: z.enum(FEED_KINDS),
+  accountId: z.string().uuid(),
+  connectionId: z.string().uuid().nullable().optional(),
+  externalAccountId: z.string().min(1).max(255).nullable().optional(),
+});
+
+financeRouter.post("/bank-feeds", validateBody(feedCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof feedCreateSchema>;
+  const acct = await AppDataSource.getRepository(Account).findOneBy({
+    id: body.accountId,
+    companyId: cid,
+  });
+  if (!acct) return res.status(400).json({ error: "Invalid account" });
+  if (acct.type !== "asset") {
+    return res.status(400).json({ error: "Bank feeds reconcile against asset accounts only" });
+  }
+  if (body.kind === "stripe_payouts") {
+    if (!body.connectionId) {
+      return res.status(400).json({ error: "Stripe feeds need a connectionId" });
+    }
+    const conn = await AppDataSource.getRepository(IntegrationConnection).findOneBy({
+      id: body.connectionId,
+      companyId: cid,
+    });
+    if (!conn || conn.provider !== "stripe") {
+      return res.status(400).json({ error: "Connection is not Stripe" });
+    }
+  } else if (body.kind === "brex_cash") {
+    if (!body.connectionId) {
+      return res.status(400).json({ error: "Brex feeds need a connectionId" });
+    }
+    if (!body.externalAccountId) {
+      return res.status(400).json({ error: "Brex feeds need a Cash account" });
+    }
+    try {
+      await assertBrexCashAccountConnection(cid, body.connectionId, body.externalAccountId);
+    } catch (err) {
+      return res.status(400).json({ error: (err as Error).message });
+    }
+  } else if (body.kind === "mercury_account") {
+    if (!body.connectionId) {
+      return res.status(400).json({ error: "Mercury feeds need a connectionId" });
+    }
+    if (!body.externalAccountId) {
+      return res.status(400).json({ error: "Mercury feeds need an account" });
+    }
+    try {
+      await assertMercuryAccountFeed(cid, body.connectionId, body.externalAccountId);
+    } catch (err) {
+      return res.status(400).json({ error: (err as Error).message });
+    }
+  } else if (body.kind === "wise_balance") {
+    if (!body.connectionId) {
+      return res.status(400).json({ error: "Wise feeds need a connectionId" });
+    }
+    if (!body.externalAccountId) {
+      return res.status(400).json({ error: "Wise feeds need a balance" });
+    }
+    try {
+      await assertWiseBalanceFeed(cid, body.connectionId, body.externalAccountId);
+    } catch (err) {
+      return res.status(400).json({ error: (err as Error).message });
+    }
+  }
+  const repo = AppDataSource.getRepository(BankFeed);
+  const f = repo.create({
+    companyId: cid,
+    name: body.name,
+    kind: body.kind,
+    accountId: body.accountId,
+    connectionId: body.kind === "csv" ? null : (body.connectionId ?? null),
+    externalAccountId:
+      body.kind === "brex_cash" || body.kind === "mercury_account" || body.kind === "wise_balance"
+        ? (body.externalAccountId ?? null)
+        : null,
+  });
+  await repo.save(f);
+  res.json(f);
+});
+
+const bankFeedParamsSchema = z.object({
+  cid: z.string().min(1),
+  id: z.string().uuid(),
+});
+
+const feedConnectionSchema = z.object({
+  connectionId: z.string().uuid(),
+});
+
+financeRouter.delete(
+  "/bank-feeds/:id",
+  validateParams(bankFeedParamsSchema),
+  async (req, res, next) => {
+    const { cid, id } = req.params as z.infer<typeof bankFeedParamsSchema>;
+    try {
+      const f = await AppDataSource.getRepository(BankFeed).findOneBy({ id, companyId: cid });
+      if (!f) return res.status(404).json({ error: "Feed not found" });
+      // Never under a sync that is still writing its transactions.
+      await whileFeedIdle({ kind: "bank", companyId: cid, id }, () => removeBankFeed(f));
+      res.json({ ok: true });
+    } catch (err) {
+      if (err instanceof FeedBusyError) return res.status(409).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+// Point a connected account at another Connection of the same provider — the
+// way back for one whose Connection was removed. The next sync runs at once.
+financeRouter.patch(
+  "/bank-feeds/:id",
+  validateParams(bankFeedParamsSchema),
+  validateBody(feedConnectionSchema),
+  async (req, res, next) => {
+    const { cid, id } = req.params as z.infer<typeof bankFeedParamsSchema>;
+    const body = req.body as z.infer<typeof feedConnectionSchema>;
+    try {
+      const f = await AppDataSource.getRepository(BankFeed).findOneBy({ id, companyId: cid });
+      if (!f) return res.status(404).json({ error: "Feed not found" });
+      res.json(
+        await whileFeedIdle({ kind: "bank", companyId: cid, id }, () =>
+          changeFeedConnection("bank", f, body.connectionId),
+        ),
+      );
+    } catch (err) {
+      if (err instanceof FeedBusyError) return res.status(409).json({ error: err.message });
+      // The new Connection can't reach this account, or isn't the right one.
+      if (err instanceof BankingAccountError) return res.status(400).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+// Sync one connected account now, exactly as the background sync does. A sync
+// that fails is answered 400 with why — and the account keeps saying so on
+// Banking — while one still running after twenty seconds is answered 202 and
+// carries on.
+financeRouter.post(
+  "/bank-feeds/:id/sync",
+  validateParams(bankFeedParamsSchema),
+  async (req, res, next) => {
+    const { cid, id } = req.params as z.infer<typeof bankFeedParamsSchema>;
+    try {
+      const { status, body } = syncResponse(
+        await syncFeedForRequest({ kind: "bank", companyId: cid, id }),
+      );
+      res.status(status).json(body);
+    } catch (err) {
+      if (err instanceof FeedNotFoundError) return res.status(404).json({ error: "Feed not found" });
+      if (err instanceof FeedSyncError) return res.status(400).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+financeRouter.post("/bank-feeds/:id/import", csvUpload.single("file"), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(BankFeed);
+  const f = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!f) return res.status(404).json({ error: "Feed not found" });
+  if (!req.file) return res.status(400).json({ error: "Missing CSV file" });
+  try {
+    const text = req.file.buffer.toString("utf8");
+    const result = await importBankCsv(f, text);
+    const matched = await autoMatchFeed(f);
+    res.json({ ...result, matched });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ─────────────────────── Bank transactions ─────────────────────────────
+
+const bankTransactionListQuerySchema = z.object({
+  feedId: z.string().uuid().optional(),
+  // `review` waits for someone to explain it; `done` is matched or categorized.
+  status: z.enum(["review", "done"]).optional(),
+  // The original spelling of `status=review`, kept for existing callers.
+  unmatched: z.enum(["true", "false"]).optional(),
+});
+
+financeRouter.get(
+  "/bank-transactions",
+  validateQuery(bankTransactionListQuerySchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const query = req.query as z.infer<typeof bankTransactionListQuerySchema>;
+    const txns = await listBankTransactions(cid, {
+      feedId: query.feedId,
+      status: query.status ?? (query.unmatched === "true" ? "review" : undefined),
+    });
+    res.json(await hydrateBankTransactions(cid, txns));
+  },
+);
+
+// Every bank account and card, with how many of their transactions wait for
+// review — the account strip on Banking and the count on the Overview.
+financeRouter.get("/banking/accounts", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await listBankingAccounts(cid));
+});
+
+// Bank lines and card purchases in one list, newest first, one page at a time
+// with the bookkeeper's filters — the list the `list_banking_transactions` AI
+// tool reads, from the same function, so an API client and an AI Employee
+// reach exactly the same transactions. Finance → Banking reads it too, with
+// `view=records` for the whole transaction its rows act on.
+financeRouter.get(
+  "/banking/transactions",
+  validateQuery(bankingQueueQuerySchema),
+  async (req, res, next) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const { limit, cursor, view, ...filters } = req.query as unknown as z.infer<
+      typeof bankingQueueQuerySchema
+    >;
+    try {
+      res.json(
+        await bankingQueue(
+          cid,
+          bankingFilterFrom(filters),
+          { limit, cursor },
+          { records: view === "records" },
+        ),
+      );
+    } catch (err) {
+      if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  },
+);
+
+const bankTransactionParamsSchema = z.object({
+  cid: z.string().min(1),
+  id: z.string().uuid(),
+});
+
+financeRouter.get("/bank-transactions/:id/candidates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(BankTransaction);
+  const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!t) return res.status(404).json({ error: "Transaction not found" });
+  const candidates = await findMatchCandidates(t);
+  res.json(candidates);
+});
+
+// The open invoices a deposit could be the payment of, best guess first, and
+// the sets of one customer's invoices that add up to exactly the deposit.
+financeRouter.get(
+  "/bank-transactions/:id/open-invoices",
+  validateParams(bankTransactionParamsSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as z.infer<typeof bankTransactionParamsSchema>;
+    const t = await AppDataSource.getRepository(BankTransaction).findOneBy({ id, companyId: cid });
+    if (!t) return res.status(404).json({ error: "Transaction not found" });
+    res.json(await openInvoicesForBankTransaction(t));
+  },
+);
+
+const payInvoicesSchema = z.object({
+  invoices: z
+    .array(
+      z.object({
+        invoiceId: z.string().uuid(),
+        amountCents: z.number().int().positive(),
+      }),
+    )
+    .min(1)
+    .max(200),
+});
+
+// Mark invoices paid with this deposit: records a payment on each invoice for
+// its share and matches the deposit to them in one step. The shares add up to
+// the deposit, and none is more than what is still due on its invoice.
+financeRouter.post(
+  "/bank-transactions/:id/pay-invoices",
+  validateParams(bankTransactionParamsSchema),
+  validateBody(payInvoicesSchema),
+  async (req, res) => {
+    const { cid, id } = req.params as z.infer<typeof bankTransactionParamsSchema>;
+    const t = await AppDataSource.getRepository(BankTransaction).findOneBy({ id, companyId: cid });
+    if (!t) return res.status(404).json({ error: "Transaction not found" });
+    const body = req.body as z.infer<typeof payInvoicesSchema>;
+    let result: Awaited<ReturnType<typeof payInvoicesFromBankTransaction>>;
+    try {
+      result = await payInvoicesFromBankTransaction(t, body.invoices, req.userId ?? null);
+    } catch (err) {
+      return res
+        .status(err instanceof InvoicePaymentError ? err.status : 400)
+        .json({ error: (err as Error).message });
+    }
+    for (const { invoice, recorded } of result.paid) {
+      await auditInvoicePayment(
+        req,
+        invoice,
+        recorded,
+        recorded.payment.amountCents,
+        "bank_transfer",
+      );
+    }
+    const [hydrated] = await hydrateBankTransactions(cid, [result.transaction]);
+    res.json(hydrated);
+  },
+);
+
+const matchSchema = z.object({
+  paymentId: z.string().uuid().nullable().optional(),
+  ledgerEntryId: z.string().uuid().nullable().optional(),
+});
+
+financeRouter.post("/bank-transactions/:id/match", validateBody(matchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(BankTransaction);
+  const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!t) return res.status(404).json({ error: "Transaction not found" });
+  const body = req.body as z.infer<typeof matchSchema>;
+  try {
+    const fresh = await manualMatch(t, body, req.userId ?? null);
+    const [hydrated] = await hydrateBankTransactions(cid, [fresh]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Undo whatever explains the transaction and put it back to review: a category
+// is reversed, and every payment Banking recorded from this deposit comes off
+// its invoice again. A payment recorded on the invoice itself stays there.
+financeRouter.post("/bank-transactions/:id/unmatch", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(BankTransaction);
+  const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!t) return res.status(404).json({ error: "Transaction not found" });
+  let undone: Awaited<ReturnType<typeof undoBankTransaction>>;
+  try {
+    undone = await undoBankTransaction(t, req.userId ?? null);
+  } catch (err) {
+    return res
+      .status(err instanceof InvoicePaymentError ? err.status : 400)
+      .json({ error: (err as Error).message });
+  }
+  for (const { invoice, payment } of undone.removedPayments) {
+    await auditFinance(
+      req,
+      "finance.invoice.payment.delete",
+      { type: "invoice", id: invoice.id, label: invoice.number || "Invoice" },
+      { amountCents: payment.amountCents, balanceCents: invoice.balanceCents },
+    );
+  }
+  const [hydrated] = await hydrateBankTransactions(cid, [undone.transaction]);
+  res.json(hydrated);
+});
+
+const categorizeSchema = z.object({ accountId: z.string().uuid() });
+
+financeRouter.post(
+  "/bank-transactions/:id/categorize",
+  validateBody(categorizeSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const repo = AppDataSource.getRepository(BankTransaction);
+    const t = await repo.findOneBy({ id: req.params.id, companyId: cid });
+    if (!t) return res.status(404).json({ error: "Transaction not found" });
+    const body = req.body as z.infer<typeof categorizeSchema>;
+    try {
+      const fresh = await categorizeBankTransaction(t, body.accountId, req.userId ?? null);
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.bank_transaction.categorize",
+        targetType: "bank_transaction",
+        targetId: t.id,
+        targetLabel: t.description || t.reference || t.id,
+        metadata: { accountId: body.accountId, amountCents: t.amountCents },
+      });
+      const [hydrated] = await hydrateBankTransactions(cid, [fresh]);
+      res.json(hydrated);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const bankingBulkSchema = z
+  .object({
+    action: z.enum(["categorize", "mark_reviewed", "send_to_review"]),
+    accountId: z.string().uuid().optional(),
+    bankTransactionIds: z.array(z.string().uuid()).max(BANKING_BULK_MAX).default([]),
+    cardTransactionIds: z.array(z.string().uuid()).max(BANKING_BULK_MAX).default([]),
+  })
+  .refine(
+    (body) => {
+      const count = body.bankTransactionIds.length + body.cardTransactionIds.length;
+      return count > 0 && count <= BANKING_BULK_MAX;
+    },
+    { message: `Choose between 1 and ${BANKING_BULK_MAX} transactions` },
+  )
+  .refine((body) => body.action !== "categorize" || !!body.accountId, {
+    message: "Pick a category",
+    path: ["accountId"],
+  });
+
+// Banking's bulk bar: categorize, mark reviewed, or send back to review many
+// bank and card transactions at once, each under its own row's rules. One
+// that can't take the action is skipped with a reason; the rest go through.
+financeRouter.post("/banking/bulk", validateBody(bankingBulkSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof bankingBulkSchema>;
+  let outcome: Awaited<ReturnType<typeof bulkBanking>>;
+  try {
+    outcome = await bulkBanking({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: body.action,
+      accountId: body.accountId,
+      bankTransactionIds: body.bankTransactionIds,
+      cardTransactionIds: body.cardTransactionIds,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: (err as Error).message });
+  }
+  // The same row a bank transaction's own Categorize leaves, so its History
+  // reads the same however it was categorized.
+  for (const txn of outcome.categorized) {
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.bank_transaction.categorize",
+      targetType: "bank_transaction",
+      targetId: txn.id,
+      targetLabel: txn.description || txn.reference || txn.id,
+      metadata: { accountId: body.accountId, amountCents: txn.amountCents, bulk: true },
+    });
+  }
+  const succeeded = outcome.succeeded.bank.length + outcome.succeeded.card.length;
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: `finance.banking.bulk_${body.action}`,
+    targetType: "bank_transaction",
+    targetId: null,
+    targetLabel: `${succeeded} transaction${succeeded === 1 ? "" : "s"}`,
+    metadata: {
+      accountId: body.accountId ?? null,
+      bank: outcome.succeeded.bank.length,
+      card: outcome.succeeded.card.length,
+      skipped: outcome.skipped.length,
+    },
+  });
+  res.json({ action: outcome.action, succeeded: outcome.succeeded, skipped: outcome.skipped });
+});
+
+// ─────────────────────── AI access (finance grants) ────────────────────
+//
+// Which AI employees may touch the finance system, and at what level
+// (read < invoice < full). This governs the AI surface only — human members
+// still reach Finance through company membership. Reading the grant list is
+// open to any member; changing grants is owner/admin, like transaction
+// approvals (`canApproveFinance`).
+
+financeRouter.get("/finance/grants", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json({ direct: await listFinanceGrants(cid) });
+});
+
+financeRouter.get("/finance/grant-candidates", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await listFinanceGrantCandidates(cid));
+});
+
+const financeGrantCreateSchema = z.object({
+  employeeId: z.string().uuid(),
+  accessLevel: z
+    .enum(FINANCE_ACCESS_LEVELS as [FinanceAccessLevel, ...FinanceAccessLevel[]])
+    .default("read"),
+});
+
+financeRouter.post("/finance/grants", validateBody(financeGrantCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  if (!canApproveFinance(req)) {
+    return res.status(403).json({ error: "Only owners and admins can change finance access" });
+  }
+  const body = req.body as z.infer<typeof financeGrantCreateSchema>;
+  const employee = await AppDataSource.getRepository(AIEmployee).findOneBy({
+    id: body.employeeId,
+    companyId: cid,
+  });
+  if (!employee) return res.status(404).json({ error: "Employee not found" });
+  await upsertFinanceGrant(cid, employee.id, body.accessLevel);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "finance.grant.create",
+    targetType: "employee",
+    targetId: employee.id,
+    targetLabel: employee.name,
+    metadata: { accessLevel: body.accessLevel },
+  });
+  const [grant] = (await listFinanceGrants(cid)).filter((g) => g.employeeId === employee.id);
+  res.json({ grant: grant ?? null });
+});
+
+const financeGrantPatchSchema = z.object({
+  accessLevel: z.enum(FINANCE_ACCESS_LEVELS as [FinanceAccessLevel, ...FinanceAccessLevel[]]),
+});
+
+financeRouter.patch("/finance/grants/:gid", validateBody(financeGrantPatchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  if (!canApproveFinance(req)) {
+    return res.status(403).json({ error: "Only owners and admins can change finance access" });
+  }
+  const grants = await listFinanceGrants(cid);
+  const existing = grants.find((g) => g.id === req.params.gid);
+  if (!existing) return res.status(404).json({ error: "Grant not found" });
+  const body = req.body as z.infer<typeof financeGrantPatchSchema>;
+  await upsertFinanceGrant(cid, existing.employeeId, body.accessLevel);
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "finance.grant.update",
+    targetType: "employee",
+    targetId: existing.employeeId,
+    targetLabel: existing.employee?.name ?? "",
+    metadata: { accessLevel: body.accessLevel },
+  });
+  const [grant] = (await listFinanceGrants(cid)).filter((g) => g.employeeId === existing.employeeId);
+  res.json({ grant: grant ?? null });
+});
+
+financeRouter.delete("/finance/grants/:gid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  if (!canApproveFinance(req)) {
+    return res.status(403).json({ error: "Only owners and admins can change finance access" });
+  }
+  const removed = await deleteFinanceGrant(cid, req.params.gid);
+  if (!removed) return res.status(404).json({ error: "Grant not found" });
+  await recordAudit({
+    companyId: cid,
+    actorUserId: req.userId ?? null,
+    action: "finance.grant.delete",
+    targetType: "employee",
+    targetId: removed.employeeId,
+    targetLabel: "",
+    metadata: { accessLevel: removed.accessLevel },
+  });
+  res.json({ ok: true });
+});
+
+// ─────────────────────── Multi-currency (Phase E) ──────────────────────
+
+financeRouter.get("/finance-settings", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const s = await getFinanceSettings(cid);
+  res.json(s);
+});
+
+const settingsPatchSchema = z.object({
+  homeCurrency: z
+    .string()
+    .regex(/^[A-Za-z]{3}$/)
+    .optional(),
+  defaultFromBlock: z.string().max(4000).optional(),
+  defaultFooter: z.string().max(2000).optional(),
+  invoiceCcEmails: z
+    .array(
+      z
+        .string()
+        .trim()
+        .email()
+        .max(320)
+        .transform((email) => email.toLowerCase()),
+    )
+    .max(25)
+    .optional(),
+  automaticExchangeRates: z.boolean().optional(),
+});
+
+financeRouter.patch("/finance-settings", validateBody(settingsPatchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof settingsPatchSchema>;
+  try {
+    const before = await getFinanceSettings(cid);
+    if (body.homeCurrency !== undefined) {
+      await setHomeCurrency(cid, body.homeCurrency);
+    }
+    if (body.automaticExchangeRates !== undefined) {
+      await setAutomaticExchangeRates(cid, body.automaticExchangeRates);
+    }
+    if (body.defaultFromBlock !== undefined || body.defaultFooter !== undefined) {
+      await setFinanceTemplates(cid, {
+        defaultFromBlock: body.defaultFromBlock,
+        defaultFooter: body.defaultFooter,
+      });
+    }
+    if (body.invoiceCcEmails !== undefined) {
+      await setInvoiceCcEmails(cid, body.invoiceCcEmails);
+    }
+    const after = await getFinanceSettings(cid);
+    // Automatic rates just turned on, or now convert into another home
+    // currency: fetch them now rather than on the next pass.
+    if (
+      after.automaticExchangeRates &&
+      (!before.automaticExchangeRates || after.homeCurrency !== before.homeCurrency)
+    ) {
+      refreshCompanyExchangeRatesSoon(cid);
+    }
+    res.json(after);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.get("/currencies", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  res.json(await seedCurrencies(cid));
+});
+
+const currencyCreateSchema = z.object({
+  code: z.string().regex(/^[A-Za-z]{3}$/),
+  name: z.string().min(1).max(60),
+  symbol: z.string().max(8).optional(),
+  decimalPlaces: z.number().int().min(0).max(8).optional(),
+});
+
+financeRouter.post("/currencies", validateBody(currencyCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof currencyCreateSchema>;
+  const repo = AppDataSource.getRepository(Currency);
+  const code = body.code.toUpperCase();
+  const dup = await repo.findOneBy({ companyId: cid, code });
+  if (dup) return res.status(409).json({ error: "Currency already exists" });
+  const c = await repo.save(
+    repo.create({
+      companyId: cid,
+      code,
+      name: body.name,
+      symbol: body.symbol ?? "",
+      decimalPlaces: body.decimalPlaces ?? 2,
+    }),
+  );
+  res.json(c);
+});
+
+financeRouter.delete("/currencies/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(Currency);
+  const c = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!c) return res.status(404).json({ error: "Currency not found" });
+  const settings = await getFinanceSettings(cid);
+  if (settings.homeCurrency === c.code) {
+    return res.status(409).json({ error: "Cannot delete the home currency" });
+  }
+  await repo.delete({ id: c.id });
+  res.json({ ok: true });
+});
+
+const rateListQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+  /** `false` lists only the rates a person set; `true` only fetched ones. */
+  automatic: z.enum(["true", "false"]).optional(),
+});
+
+financeRouter.get("/exchange-rates", validateQuery(rateListQuerySchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const query = req.query as z.infer<typeof rateListQuerySchema>;
+  const where: Record<string, unknown> = { companyId: cid };
+  if (query.from) where.fromCurrency = query.from.toUpperCase();
+  if (query.to) where.toCurrency = query.to.toUpperCase();
+  if (query.automatic) where.automatic = query.automatic === "true";
+  const rates = await AppDataSource.getRepository(ExchangeRate).find({
+    where,
+    order: { date: "DESC" },
+    take: 200,
+  });
+  res.json(rates);
+});
+
+// What Finance → Currencies shows above the rates: whether automatic rates
+// are on, and the rate each currency in use converts at today.
+financeRouter.get(
+  "/exchange-rates/overview",
+  validateQuery(z.object({}).strict()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    res.json(await exchangeRateOverview(cid));
+  },
+);
+
+// Update now: fetch the ECB's rates for this company immediately.
+financeRouter.post(
+  "/exchange-rates/refresh",
+  validateBody(z.object({}).strict()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const settings = await getFinanceSettings(cid);
+    if (!settings.automaticExchangeRates) {
+      return res.status(409).json({ error: "Turn on automatic rates to fetch them." });
+    }
+    try {
+      res.json(await refreshCompanyExchangeRates(cid));
+    } catch (err) {
+      if (err instanceof ExchangeRateFeedError) {
+        return res.status(502).json({ error: err.message });
+      }
+      throw err;
+    }
+  },
+);
+
+const rateUpsertSchema = z.object({
+  fromCurrency: z.string().regex(/^[A-Za-z]{3}$/),
+  toCurrency: z.string().regex(/^[A-Za-z]{3}$/),
+  date: z.string().datetime(),
+  rate: z.number().positive(),
+  source: z.string().max(120).optional(),
+});
+
+financeRouter.post("/exchange-rates", validateBody(rateUpsertSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof rateUpsertSchema>;
+  if (body.fromCurrency.toUpperCase() === body.toCurrency.toUpperCase()) {
+    return res.status(400).json({ error: "from and to currencies must differ" });
+  }
+  const r = await setRate(
+    cid,
+    body.fromCurrency,
+    body.toCurrency,
+    new Date(body.date),
+    body.rate,
+    body.source ?? "manual",
+  );
+  res.json(r);
+});
+
+financeRouter.delete("/exchange-rates/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(ExchangeRate);
+  const r = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!r) return res.status(404).json({ error: "Rate not found" });
+  await repo.delete({ id: r.id });
+  res.json({ ok: true });
+});
+
+// ─────────────────── Periods + exports (Phase F) ───────────────────────
+
+financeRouter.get("/periods", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const periods = await AppDataSource.getRepository(AccountingPeriod).find({
+    where: { companyId: cid },
+    order: { startDate: "DESC" },
+  });
+  res.json(periods);
+});
+
+const periodCreateSchema = z.object({
+  name: z.string().min(1).max(60),
+  startDate: z.string().datetime(),
+  endDate: z.string().datetime(),
+});
+
+financeRouter.post("/periods", validateBody(periodCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof periodCreateSchema>;
+  const start = new Date(body.startDate);
+  const end = new Date(body.endDate);
+  if (end.getTime() < start.getTime()) {
+    return res.status(400).json({ error: "endDate must be after startDate" });
+  }
+  const repo = AppDataSource.getRepository(AccountingPeriod);
+  // Accounting periods must partition the calendar — two overlapping periods
+  // would double-count the overlapping P&L into Retained Earnings when both
+  // close. Reject any new range that intersects an existing one.
+  const existing = await repo.find({ where: { companyId: cid } });
+  const clash = existing.find(
+    (existingPeriod) =>
+      start.getTime() <= existingPeriod.endDate.getTime() &&
+      existingPeriod.startDate.getTime() <= end.getTime(),
+  );
+  if (clash) {
+    return res.status(409).json({
+      error: `This range overlaps the existing period "${clash.name}" (${clash.startDate
+        .toISOString()
+        .slice(0, 10)} – ${clash.endDate.toISOString().slice(0, 10)}).`,
+    });
+  }
+  const p = await repo.save(
+    repo.create({
+      companyId: cid,
+      name: body.name,
+      startDate: start,
+      endDate: end,
+    }),
+  );
+  res.json(p);
+});
+
+financeRouter.delete("/periods/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(AccountingPeriod);
+  const p = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!p) return res.status(404).json({ error: "Period not found" });
+  if (p.status === "closed") {
+    return res.status(409).json({ error: "Re-open the period before deleting" });
+  }
+  await repo.delete({ id: p.id });
+  res.json({ ok: true });
+});
+
+financeRouter.post("/periods/:id/close", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(AccountingPeriod);
+  const p = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!p) return res.status(404).json({ error: "Period not found" });
+  try {
+    const closed = await closePeriod(p, req.userId ?? null);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.period.close",
+      targetType: "accounting_period",
+      targetId: p.id,
+      targetLabel: p.name,
+    });
+    res.json(closed);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/periods/:id/reopen", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const repo = AppDataSource.getRepository(AccountingPeriod);
+  const p = await repo.findOneBy({ id: req.params.id, companyId: cid });
+  if (!p) return res.status(404).json({ error: "Period not found" });
+  try {
+    const opened = await reopenPeriod(p);
+    await recordAudit({
+      companyId: cid,
+      actorUserId: req.userId ?? null,
+      action: "finance.period.reopen",
+      targetType: "accounting_period",
+      targetId: p.id,
+      targetLabel: p.name,
+    });
+    res.json(opened);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// CSV exports — text/csv with a Content-Disposition so the browser
+// saves to a sensible filename. `from` and `to` are optional ISO
+// dates; missing means unbounded on that side.
+
+function parseOptionalDate(raw: unknown): Date | null {
+  if (typeof raw !== "string" || !raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+financeRouter.get("/exports/customers.csv", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const csv = await exportCustomersCsv(cid);
+  res.type("text/csv").attachment("customers.csv").send(csv);
+});
+
+financeRouter.get("/exports/invoices.csv", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const csv = await exportInvoicesCsv(
+    cid,
+    parseOptionalDate(req.query.from),
+    parseOptionalDate(req.query.to),
+  );
+  res.type("text/csv").attachment("invoices.csv").send(csv);
+});
+
+financeRouter.get("/exports/journal.csv", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const csv = await exportJournalCsv(
+    cid,
+    parseOptionalDate(req.query.from),
+    parseOptionalDate(req.query.to),
+  );
+  res.type("text/csv").attachment("journal.csv").send(csv);
+});
+
+financeRouter.get("/exports/trial-balance.csv", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const asOf = parseOptionalDate(req.query.asOf) ?? new Date();
+  const csv = await exportTrialBalanceCsv(cid, asOf);
+  res.type("text/csv").attachment("trial-balance.csv").send(csv);
+});
+
+// ─────────────────────────── Vendors (Phase G) ─────────────────────────
+
+financeRouter.get("/vendors", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const includeArchived = String(req.query.archived ?? "") === "true";
+  const list = await AppDataSource.getRepository(Vendor).find({
+    where: { companyId: cid },
+    order: { createdAt: "DESC" },
+  });
+  res.json(includeArchived ? list : list.filter((v) => !v.archivedAt));
+});
+
+const vendorWriteSchema = z.object({
+  name: z.string().min(1).max(120),
+  email: z.string().email().max(200).or(z.literal("")).optional(),
+  phone: z.string().max(60).optional(),
+  address: z.string().max(2000).optional(),
+  taxNumber: z.string().max(60).optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+financeRouter.post("/vendors", validateBody(vendorWriteSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof vendorWriteSchema>;
+  res.json(await createVendor(cid, body, req.userId ?? null));
+});
+
+financeRouter.patch(
+  "/vendors/:slug",
+  validateBody(vendorWriteSchema.extend({ archived: z.boolean().optional() }).partial()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const v = await loadVendorBySlug(cid, req.params.slug);
+    if (!v) return res.status(404).json({ error: "Vendor not found" });
+    const body = req.body as Partial<z.infer<typeof vendorWriteSchema>> & {
+      archived?: boolean;
+    };
+    res.json(await updateVendor(v, body));
+  },
+);
+
+financeRouter.delete("/vendors/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const v = await loadVendorBySlug(cid, req.params.slug);
+  if (!v) return res.status(404).json({ error: "Vendor not found" });
+  try {
+    await deleteVendor(v);
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  res.json({ ok: true });
+});
+
+// ─────────────────────────── Bills ─────────────────────────────────────
+
+const billLineDraftSchema = z.object({
+  expenseAccountId: z.string().uuid().nullable().optional(),
+  description: z.string().min(1).max(500),
+  quantity: z.number().min(0).max(1_000_000),
+  unitPriceCents: z.number().int().min(-2_000_000_000).max(2_000_000_000),
+  taxRateId: z.string().uuid().nullable().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+const billCreateSchema = z.object({
+  vendorId: z.string().uuid(),
+  vendorRef: z.string().max(120).optional(),
+  issueDate: z.string().datetime().optional(),
+  dueDate: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(4000).optional(),
+  lines: z.array(billLineDraftSchema).max(200).optional(),
+});
+
+const billListQuerySchema = z.object({
+  status: z.string().max(40).optional(),
+  vendorId: z.string().max(100).optional(),
+  from: invoiceDateFilterShape.from.describe(
+    "Issued on or after: YYYY-MM-DD (a UTC calendar day) or an ISO timestamp.",
+  ),
+  to: invoiceDateFilterShape.to.describe("Issued on or before; YYYY-MM-DD includes the whole day."),
+  dueFrom: invoiceDateFilterShape.dueFrom.describe("Due on or after."),
+  dueTo: invoiceDateFilterShape.dueTo.describe("Due on or before; YYYY-MM-DD includes the whole day."),
+  ...pageQueryShape,
+});
+
+/** A list row: no lines or payments, which the detail page fetches by slug. */
+async function billListRows(cid: string, bills: Bill[]) {
+  return (await hydrateBills(cid, bills)).map(
+    ({ lines: _lines, payments: _payments, ...rest }) => ({
+      ...rest,
+      linesCount: _lines.length,
+      paymentsCount: _payments.length,
+    }),
+  );
+}
+
+// Newest first as a plain array, as Finance → Bills reads it; or, when a page
+// is asked for (limit or cursor), soonest due first one page at a time — the
+// list the `list_bills` AI tool reads.
+financeRouter.get("/bills", validateQuery(billListQuerySchema), async (req, res, next) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const query = req.query as unknown as z.infer<typeof billListQuerySchema>;
+  const filter: BillListFilter = {
+    status: (query.status || undefined) as BillListFilter["status"],
+    vendorId: query.vendorId || undefined,
+    from: query.from,
+    to: query.to,
+    dueFrom: query.dueFrom,
+    dueTo: query.dueTo,
+  };
+  try {
+    if (query.limit !== undefined || query.cursor !== undefined) {
+      const { rows, ...info } = await pageBills(
+        cid,
+        filter,
+        { limit: query.limit, cursor: query.cursor },
+        (bills) => billListRows(cid, bills),
+      );
+      return res.json({ ...info, bills: rows });
+    }
+    const list = await billListQuery(cid, filter).orderBy("bill.createdAt", "DESC").getMany();
+    res.json(await billListRows(cid, list));
+  } catch (err) {
+    if (err instanceof ListQueryError) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+financeRouter.post("/bills", validateBody(billCreateSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const body = req.body as z.infer<typeof billCreateSchema>;
+  let b: Bill;
+  try {
+    b = await createBillDraft(
+      cid,
+      {
+        ...body,
+        issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+        dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+      },
+      req.userId ?? null,
+    );
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  const recomputed = b;
+  await auditFinance(req, "finance.bill.create", { type: "bill", id: b.id, label: b.number || "Draft bill" }, {
+    totalCents: recomputed.totalCents,
+    currency: recomputed.currency,
+  });
+  const [hydrated] = await hydrateBills(cid, [recomputed]);
+  res.json(hydrated);
+});
+
+financeRouter.get("/bills/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  const [[hydrated], apps, homeCurrency] = await Promise.all([
+    hydrateBills(cid, [b]),
+    listVendorApplicationsForBill(b.id),
+    getReportingCurrency(cid),
+  ]);
+  const creditIds = [...new Set(apps.map((a) => a.creditId))];
+  const credits = creditIds.length
+    ? await AppDataSource.getRepository(VendorCredit).find({
+        where: { id: In(creditIds), companyId: cid },
+        select: ["id", "number", "slug"],
+      })
+    : [];
+  const creditById = new Map(credits.map((c) => [c.id, c]));
+  const vendorCreditApplications = apps.map((a) => ({
+    ...a,
+    creditNumber: creditById.get(a.creditId)?.number ?? null,
+    creditSlug: creditById.get(a.creditId)?.slug ?? null,
+  }));
+  // `homeCurrency`: what its locked rates convert into.
+  res.json({ ...hydrated, vendorCreditApplications, homeCurrency });
+});
+
+const billPatchSchema = z.object({
+  notes: z.string().max(4000).optional(),
+  vendorRef: z.string().max(120).optional(),
+  dueDate: z.string().datetime().optional(),
+  vendorId: z.string().uuid().optional(),
+  issueDate: z.string().datetime().optional(),
+  currency: currencySchema.optional(),
+  lines: z.array(billLineDraftSchema).max(200).optional(),
+});
+
+financeRouter.patch("/bills/:slug", validateBody(billPatchSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  const body = req.body as z.infer<typeof billPatchSchema>;
+  let recomputed: Bill;
+  try {
+    recomputed = await updateBill(b, {
+      ...body,
+      issueDate: body.issueDate ? new Date(body.issueDate) : undefined,
+      dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+    });
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  await auditFinance(req, "finance.bill.update", { type: "bill", id: b.id, label: b.number || "Draft bill" }, {
+    fields: changedKeys(body),
+    totalCents: recomputed.totalCents,
+  });
+  const [hydrated] = await hydrateBills(cid, [recomputed]);
+  res.json(hydrated);
+});
+
+financeRouter.delete("/bills/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  try {
+    await deleteDraftBill(b);
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  await auditFinance(req, "finance.bill.delete", { type: "bill", id: b.id, label: b.number || "Draft bill" });
+  res.json({ ok: true });
+});
+
+financeRouter.post("/bills/:slug/issue", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  if (b.status !== "draft") return res.status(409).json({ error: "Already issued" });
+  try {
+    const issued = await issueBill(b, req.userId ?? null);
+    await auditFinance(req, "finance.bill.issue", { type: "bill", id: issued.id, label: issued.number || "Draft bill" }, { totalCents: issued.totalCents });
+    const [hydrated] = await hydrateBills(cid, [issued]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+financeRouter.post("/bills/:slug/void", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  try {
+    const voided = await voidBill(b, req.userId ?? null);
+    await auditFinance(req, "finance.bill.void", { type: "bill", id: voided.id, label: voided.number || "Draft bill" });
+    const [hydrated] = await hydrateBills(cid, [voided]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+const billPaymentSchema = z.object({
+  amountCents: z.number().int().min(1).max(2_000_000_000),
+  currency: currencySchema.optional(),
+  paidAt: z.string().datetime().optional(),
+  method: z.enum(["cash", "bank_transfer", "stripe", "lightning", "other"]).optional(),
+  reference: z.string().max(200).optional(),
+  notes: z.string().max(2000).optional(),
+});
+
+financeRouter.post("/bills/:slug/payments", validateBody(billPaymentSchema), async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  const body = req.body as z.infer<typeof billPaymentSchema>;
+  let recorded: Awaited<ReturnType<typeof recordBillPayment>>;
+  try {
+    recorded = await recordBillPayment(
+      b,
+      { ...body, paidAt: body.paidAt ? new Date(body.paidAt) : undefined },
+      req.userId ?? null,
+    );
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  const { bill: recomputed, payment: p } = recorded;
+  await auditFinance(req, "finance.bill.payment", { type: "bill", id: b.id, label: b.number || "Draft bill" }, {
+    amountCents: p.amountCents,
+    method: p.method,
+    reference: p.reference,
+    balanceCents: recomputed.balanceCents,
+    status: recomputed.status,
+  });
+  const [hydrated] = await hydrateBills(cid, [recomputed]);
+  res.json(hydrated);
+});
+
+financeRouter.delete("/bills/:slug/payments/:pid", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  let removed: Awaited<ReturnType<typeof removeBillPayment>>;
+  try {
+    removed = await removeBillPayment(b, req.params.pid, req.userId ?? null);
+  } catch (err) {
+    if (err instanceof PayablesError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
+  const { bill: recomputed, payment: p } = removed;
+  await auditFinance(req, "finance.bill.payment.delete", { type: "bill", id: b.id, label: b.number || "Draft bill" }, {
+    amountCents: p.amountCents,
+    balanceCents: recomputed.balanceCents,
+  });
+  const [hydrated] = await hydrateBills(cid, [recomputed]);
+  res.json(hydrated);
+});
+
+// Convenience for the UI: a "display status" snapshot that promotes
+// `sent` → `overdue` past dueDate. The list endpoint above already
+// returns enough info for the client to compute this; this endpoint
+// exists so MCP tools (Phase H+) can ask the server for the same.
+financeRouter.get("/bills/:slug/display-status", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const b = await loadBillBySlug(cid, req.params.slug);
+  if (!b) return res.status(404).json({ error: "Bill not found" });
+  res.json({ status: billDisplayStatus(b) });
+});
+
+// ──────────────────────── Recurring invoices ───────────────────────────
+//
+// Schedule-driven invoice templates. Each row carries a cron expression
+// and a set of template line items; the heartbeat in
+// `services/recurringInvoices.ts` materializes a fresh Invoice on each
+// fire. See ROADMAP.md M19 (Phase A follow-up).
+
+async function uniqueRecurringInvoiceSlug(companyId: string): Promise<string> {
+  const repo = AppDataSource.getRepository(RecurringInvoice);
+  for (let i = 0; i < 16; i += 1) {
+    const slug = `ri-${Math.random().toString(36).slice(2, 8)}`;
+    if (!(await repo.findOneBy({ companyId, slug }))) return slug;
+  }
+  return `ri-${Date.now().toString(36)}`;
+}
+
+const recurringLineDraftSchema = z.object({
+  productId: z.string().uuid().nullable().optional(),
+  description: z.string().min(1).max(500),
+  quantity: z.number().min(0).max(1_000_000),
+  unitPriceCents: z.number().int().min(-2_000_000_000).max(2_000_000_000),
+  taxRateId: z.string().uuid().nullable().optional(),
+  sortOrder: z.number().int().optional(),
+});
+
+export const recurringInvoiceCreateSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  customerId: z.string().uuid(),
+  name: z
+    .string()
+    .trim()
+    .max(RECURRING_INVOICE_NAME_MAX_LENGTH)
+    .optional()
+    .describe("Schedule name. Omitted or blank, the schedule is named after its customer."),
+  cronExpr: z
+    .string()
+    .min(1)
+    .max(120)
+    .refine((v) => cron.validate(v), "Invalid cron expression"),
+  frequency: z.enum(["daily", "weekly", "monthly", "quarterly", "yearly"]).optional(),
+  intervalCount: z.number().int().min(1).max(99).optional(),
+  status: z.enum(["active", "paused"]).optional(),
+  daysUntilDue: z.number().int().min(0).max(365).optional(),
+  autoSend: z.boolean().optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  maxRuns: z.number().int().min(1).max(10_000).nullable().optional(),
+  endsOn: z.string().datetime().nullable().optional(),
+  lines: z.array(recurringLineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+financeRouter.get("/recurring-invoices", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const where: Record<string, unknown> = { companyId: cid };
+  const status = req.query.status;
+  if (typeof status === "string" && status) where.status = status;
+  const customerId = req.query.customerId;
+  if (typeof customerId === "string" && customerId) where.customerId = customerId;
+  // Archived schedules are filed away, so lists leave them out unless asked.
+  if (String(req.query.archived ?? "") !== "true") where.archivedAt = IsNull();
+  const rows = await AppDataSource.getRepository(RecurringInvoice).find({
+    where,
+    order: { createdAt: "DESC" },
+  });
+  const hydrated = await hydrateRecurringInvoices(cid, rows);
+  res.json(
+    hydrated.map(({ lines: _lines, ...rest }) => ({
+      ...rest,
+      linesCount: _lines.length,
+    })),
+  );
+});
+
+// The recurring revenue the list leads with: ARR, what bills next, and what
+// is paused or ending. Registered before `/:slug`, which would otherwise
+// take "metrics" for a schedule's slug.
+financeRouter.get(
+  "/recurring-invoices/metrics",
+  validateQuery(z.object({}).strict()),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    res.json(await recurringRevenueMetrics(cid));
+  },
+);
+
+financeRouter.post(
+  "/recurring-invoices",
+  validateBody(recurringInvoiceCreateSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const body = req.body as z.infer<typeof recurringInvoiceCreateSchema>;
+    const customer = await AppDataSource.getRepository(Customer).findOneBy({
+      id: body.customerId,
+      companyId: cid,
+    });
+    if (!customer) return res.status(400).json({ error: "Invalid customer" });
+    const name = nameForNewRecurringInvoice(body.name, customer);
+    if (!name) return res.status(400).json({ error: RECURRING_INVOICE_NAME_REQUIRED_ERROR });
+
+    let subsidiaryId: string | null;
+    let discount: ReturnType<typeof requestedDiscount>;
+    try {
+      subsidiaryId = (await resolveDocumentIssuer(cid, body.subsidiaryId)).subsidiaryId;
+      discount = requestedDiscount(body);
+    } catch (err) {
+      return res.status(400).json({ error: (err as Error).message });
+    }
+
+    const repo = AppDataSource.getRepository(RecurringInvoice);
+    const slug = await uniqueRecurringInvoiceSlug(cid);
+    const ri = repo.create({
+      companyId: cid,
+      customerId: customer.id,
+      subsidiaryId,
+      slug,
+      name,
+      cronExpr: body.cronExpr,
+      frequency: body.frequency ?? "monthly",
+      intervalCount: body.intervalCount ?? 1,
+      status: body.status ?? "active",
+      daysUntilDue: body.daysUntilDue ?? 14,
+      autoSend: body.autoSend ?? false,
+      currency: body.currency ?? customer.currency ?? "USD",
+      notes: body.notes ?? "",
+      footer: body.footer ?? "",
+      ...discount,
+      maxRuns: body.maxRuns ?? null,
+      endsOn: body.endsOn ? new Date(body.endsOn) : null,
+      runsCreated: 0,
+      lastInvoiceSlug: "",
+      createdById: req.userId ?? null,
+    });
+    registerRecurringInvoice(ri);
+    await repo.save(ri);
+    if (body.lines && body.lines.length > 0) {
+      await replaceRecurringInvoiceLines(ri, body.lines);
+    }
+    await auditFinance(req, "finance.recurring_invoice.create", { type: "recurring_invoice", id: ri.id, label: ri.name }, {
+      frequency: ri.frequency,
+      status: ri.status,
+      autoSend: ri.autoSend,
+    });
+    const [hydrated] = await hydrateRecurringInvoices(cid, [ri]);
+    res.json(hydrated);
+  },
+);
+
+export const recurringInvoiceBulkSchema = z.object({
+  action: z.enum(["archive", "restore"]),
+  ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+// Archive or restore many schedules at once, by id like the other bulk
+// endpoints. An active schedule is skipped: it would bill from out of sight.
+financeRouter.post(
+  "/recurring-invoices/bulk",
+  validateBody(recurringInvoiceBulkSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const body = req.body as z.infer<typeof recurringInvoiceBulkSchema>;
+    try {
+      const { changed, skipped } = await setRecurringInvoicesArchived(cid, body.ids, body.action);
+      // One row per schedule, so each one's History shows it.
+      for (const ri of changed) {
+        await auditFinance(req, `finance.recurring_invoice.${body.action}`, { type: "recurring_invoice", id: ri.id, label: ri.name }, {
+          bulk: changed.length > 1,
+        });
+      }
+      res.json({ action: body.action, succeeded: changed.map((ri) => ri.id), skipped });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+financeRouter.get("/recurring-invoices/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const ri = await loadRecurringInvoiceBySlug(cid, req.params.slug);
+  if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+  const [hydrated] = await hydrateRecurringInvoices(cid, [ri]);
+  res.json(hydrated);
+});
+
+export const recurringInvoicePatchSchema = z.object({
+  subsidiaryId: z.string().uuid().nullable().optional(),
+  customerId: z.string().uuid().optional(),
+  name: z
+    .string()
+    .trim()
+    .min(1, "Name can't be blank")
+    .max(RECURRING_INVOICE_NAME_MAX_LENGTH)
+    .optional()
+    .describe("New schedule name; it cannot be blank. Omit it to keep the current name."),
+  cronExpr: z
+    .string()
+    .min(1)
+    .max(120)
+    .refine((v) => cron.validate(v), "Invalid cron expression")
+    .optional(),
+  frequency: z.enum(["daily", "weekly", "monthly", "quarterly", "yearly"]).optional(),
+  intervalCount: z.number().int().min(1).max(99).optional(),
+  status: z.enum(["active", "paused", "ended"]).optional(),
+  daysUntilDue: z.number().int().min(0).max(365).optional(),
+  autoSend: z.boolean().optional(),
+  currency: currencySchema.optional(),
+  notes: z.string().max(4000).optional(),
+  footer: z.string().max(1000).optional(),
+  maxRuns: z.number().int().min(1).max(10_000).nullable().optional(),
+  endsOn: z.string().datetime().nullable().optional(),
+  lines: z.array(recurringLineDraftSchema).max(200).optional(),
+  ...discountFields,
+});
+
+financeRouter.patch(
+  "/recurring-invoices/:slug",
+  validateBody(recurringInvoicePatchSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const ri = await loadRecurringInvoiceBySlug(cid, req.params.slug);
+    if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+    const body = req.body as z.infer<typeof recurringInvoicePatchSchema>;
+
+    if (body.subsidiaryId !== undefined && body.subsidiaryId !== ri.subsidiaryId) {
+      try {
+        ri.subsidiaryId = (await resolveDocumentIssuer(cid, body.subsidiaryId)).subsidiaryId;
+      } catch (err) {
+        return res.status(400).json({ error: (err as Error).message });
+      }
+    }
+    try {
+      Object.assign(ri, requestedDiscount(body, discountOf(ri)));
+    } catch (err) {
+      return res.status(400).json({ error: (err as Error).message });
+    }
+    if (body.customerId !== undefined) {
+      const c = await AppDataSource.getRepository(Customer).findOneBy({
+        id: body.customerId,
+        companyId: cid,
+      });
+      if (!c) return res.status(400).json({ error: "Invalid customer" });
+      ri.customerId = c.id;
+    }
+    if (body.name !== undefined) ri.name = body.name;
+    if (body.cronExpr !== undefined) ri.cronExpr = body.cronExpr;
+    if (body.frequency !== undefined) ri.frequency = body.frequency;
+    if (body.intervalCount !== undefined) ri.intervalCount = body.intervalCount;
+    // A changed cadence (pattern, unit, or count) re-phases the interval:
+    // drop the anchor so re-registration seeds a fresh one from now.
+    if (
+      body.cronExpr !== undefined ||
+      body.frequency !== undefined ||
+      body.intervalCount !== undefined
+    ) {
+      ri.anchorAt = null;
+    }
+    if (body.daysUntilDue !== undefined) ri.daysUntilDue = body.daysUntilDue;
+    if (body.autoSend !== undefined) ri.autoSend = body.autoSend;
+    if (body.currency !== undefined) ri.currency = body.currency;
+    if (body.notes !== undefined) ri.notes = body.notes;
+    if (body.footer !== undefined) ri.footer = body.footer;
+    if (body.maxRuns !== undefined) ri.maxRuns = body.maxRuns;
+    if (body.endsOn !== undefined) {
+      ri.endsOn = body.endsOn ? new Date(body.endsOn) : null;
+    }
+    if (body.status !== undefined) {
+      applyRecurringInvoiceStatus(ri, body.status);
+    } else {
+      // Re-register so a changed cron / cap / endsOn takes effect.
+      registerRecurringInvoice(ri);
+    }
+    await AppDataSource.getRepository(RecurringInvoice).save(ri);
+
+    if (body.lines !== undefined) {
+      await replaceRecurringInvoiceLines(ri, body.lines);
+    }
+    const { status, ...edits } = body;
+    const target = { type: "recurring_invoice", id: ri.id, label: ri.name };
+    const fields = changedKeys(edits);
+    if (fields.length > 0) {
+      await auditFinance(req, "finance.recurring_invoice.update", target, { fields });
+    }
+    if (status !== undefined) {
+      const verb = status === "paused" ? "pause" : status === "ended" ? "close" : "resume";
+      await auditFinance(req, `finance.recurring_invoice.${verb}`, target, { status: ri.status });
+    }
+    const [hydrated] = await hydrateRecurringInvoices(cid, [ri]);
+    res.json(hydrated);
+  },
+);
+
+financeRouter.delete("/recurring-invoices/:slug", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const ri = await loadRecurringInvoiceBySlug(cid, req.params.slug);
+  if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+  await deleteRecurringInvoice(ri);
+  await auditFinance(req, "finance.recurring_invoice.delete", { type: "recurring_invoice", id: ri.id, label: ri.name });
+  res.json({ ok: true });
+});
+
+// Run-now: generate a single invoice immediately. Does NOT consume a
+// scheduled slot — `nextRunAt` is untouched so the next scheduled fire
+// still happens on time. The generated invoice is counted toward
+// `runsCreated` though, so any `maxRuns` cap is respected.
+//
+// While a scheduled run is still retrying, Run now retries *that* run
+// instead: an extra invoice now plus the retried one later would bill the
+// customer twice for the same slot.
+financeRouter.post("/recurring-invoices/:slug/run-now", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const ri = await loadRecurringInvoiceBySlug(cid, req.params.slug);
+  if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+  if (ri.status === "ended") {
+    return res.status(409).json({ error: "This schedule has ended" });
+  }
+  const pending = ri.status === "active" ? await findPendingRecurringInvoiceRun(ri.id) : null;
+  if (pending) {
+    const result = await processRecurringInvoiceRun(pending.id, {
+      ignoreBackoff: true,
+      actorUserId: req.userId ?? null,
+    });
+    if (!result) {
+      return res
+        .status(409)
+        .json({ error: "This run is being retried right now. Refresh in a moment." });
+    }
+    if (result.run.status === "pending" || result.run.status === "cancelled") {
+      return res.status(400).json({ error: result.run.lastError });
+    }
+    const fresh = (await loadRecurringInvoiceBySlug(cid, req.params.slug)) ?? ri;
+    const [hydrated] = await hydrateRecurringInvoices(cid, [fresh]);
+    return res.json({
+      recurringInvoice: hydrated,
+      invoice: result.invoice,
+      emailStatus: result.run.emailStatus || "not_attempted",
+      emailError: result.run.status === "failed" ? result.run.lastError : "",
+    });
+  }
+  try {
+    const result = await generateInvoiceFromRecurring(ri, req.userId ?? null);
+    ri.runsCreated += 1;
+    ri.lastRunAt = new Date();
+    ri.lastInvoiceSlug = result.invoice.slug;
+    // Re-evaluate the cap; if this manual run hit it, status flips
+    // automatically.
+    registerRecurringInvoice(ri);
+    await AppDataSource.getRepository(RecurringInvoice).save(ri);
+    const [hydrated] = await hydrateRecurringInvoices(cid, [ri]);
+    res.json({
+      recurringInvoice: hydrated,
+      invoice: result.invoice,
+      emailStatus: result.emailStatus,
+      emailError: result.emailError,
+    });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// Duplicate: clone the schedule into a fresh, paused copy (run history
+// reset, template lines copied). Paused on purpose so an exact copy of an
+// active schedule doesn't immediately start billing the customer.
+financeRouter.post("/recurring-invoices/:slug/duplicate", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const ri = await loadRecurringInvoiceBySlug(cid, req.params.slug);
+  if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+  try {
+    const copy = await duplicateRecurringInvoice(ri, req.userId ?? null);
+    await auditFinance(req, "finance.recurring_invoice.duplicate", { type: "recurring_invoice", id: ri.id, label: ri.name }, { copy: copy.name });
+    await auditFinance(req, "finance.recurring_invoice.create", { type: "recurring_invoice", id: copy.id, label: copy.name }, {
+      duplicatedFrom: ri.name,
+    });
+    const [hydrated] = await hydrateRecurringInvoices(cid, [copy]);
+    res.json(hydrated);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ─────────────────────── Finance proposals (M33 A3) ─────────────────────
+// The maker-checker spine: one member stages a balanced journal entry, another
+// applies it. Also the substrate AI finance tools post through in later
+// increments — an AI can propose, but only a human applies.
+
+const proposalStatusQuerySchema = z.enum(["pending", "applied", "rejected", "superseded"]);
+
+financeRouter.get("/finance-proposals", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const statusRaw = (req.query as Record<string, string>).status;
+  const status = proposalStatusQuerySchema.safeParse(statusRaw);
+  const proposals = await listFinanceProposals(cid, {
+    status: status.success ? status.data : undefined,
+  });
+  res.json(proposals);
+});
+
+financeRouter.get("/finance-proposals/:id", async (req, res) => {
+  const cid = (req.params as Record<string, string>).cid;
+  const proposal = await getFinanceProposal(cid, req.params.id);
+  if (!proposal) return res.status(404).json({ error: "Proposal not found" });
+  res.json(proposal);
+});
+
+financeRouter.post(
+  "/finance-proposals",
+  validateBody(journalEntryPayloadSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const body = req.body as z.infer<typeof journalEntryPayloadSchema>;
+    try {
+      const proposal = await createJournalEntryProposal(cid, body, {
+        type: "human",
+        id: req.userId ?? null,
+        label: req.user?.name || req.user?.email || null,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.proposal.create",
+        targetType: "finance_proposal",
+        targetId: proposal.id,
+        targetLabel: proposal.title,
+        metadata: { kind: proposal.kind },
+      });
+      res.status(201).json(proposal);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+const proposalReviewSchema = z.object({ note: z.string().max(2000).optional() });
+
+financeRouter.post(
+  "/finance-proposals/:id/apply",
+  validateBody(proposalReviewSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const proposal = await getFinanceProposal(cid, req.params.id);
+    if (!proposal) return res.status(404).json({ error: "Proposal not found" });
+    const body = req.body as z.infer<typeof proposalReviewSchema>;
+    try {
+      const applied = await applyFinanceProposal(proposal, {
+        userId: req.userId ?? null,
+        note: body.note ?? null,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.proposal.apply",
+        targetType: "finance_proposal",
+        targetId: applied.id,
+        targetLabel: applied.title,
+        metadata: { kind: applied.kind, appliedEntryId: applied.appliedEntryId },
+      });
+      res.json(applied);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);
+
+financeRouter.post(
+  "/finance-proposals/:id/reject",
+  validateBody(proposalReviewSchema),
+  async (req, res) => {
+    const cid = (req.params as Record<string, string>).cid;
+    const proposal = await getFinanceProposal(cid, req.params.id);
+    if (!proposal) return res.status(404).json({ error: "Proposal not found" });
+    const body = req.body as z.infer<typeof proposalReviewSchema>;
+    try {
+      const rejected = await rejectFinanceProposal(proposal, {
+        userId: req.userId ?? null,
+        note: body.note ?? null,
+      });
+      await recordAudit({
+        companyId: cid,
+        actorUserId: req.userId ?? null,
+        action: "finance.proposal.reject",
+        targetType: "finance_proposal",
+        targetId: rejected.id,
+        targetLabel: rejected.title,
+        metadata: { kind: rejected.kind },
+      });
+      res.json(rejected);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  },
+);

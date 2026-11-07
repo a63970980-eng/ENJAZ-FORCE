@@ -1,0 +1,177 @@
+/*
+ * Genosyn service worker.
+ *
+ * This is a plain static file the browser fetches directly at /sw.js — it is
+ * not part of the TypeScript build (a service worker cannot be a bundled
+ * module). Registered from client/main.tsx in production only; in dev it would
+ * fight Vite's HMR. See also manifest.webmanifest.
+ *
+ * Genosyn is an API-driven app that is useless without its server, so this
+ * worker is about installability + a fast, resilient shell, not deep offline:
+ *   - navigations   → network-first, falling back to the cached shell offline
+ *   - static assets → stale-while-revalidate (Vite content-hashes filenames,
+ *                     so a cached asset is never stale for its URL)
+ *   - /api/*        → never touched; always hits the network (auth-sensitive,
+ *                     dynamic, and covers the WebSocket + SSE endpoints)
+ *   - /careers/*    → never touched: the public careers site is a separate
+ *                     page, and caching it as the App shell would break both
+ *   - /help/*       → never touched: a help center page carries its own title
+ *                     and may be a real 404, neither of which belongs in the
+ *                     shell's place
+ *   - /.well-known/*, /oauth/authorize → never touched: OAuth discovery and
+ *                     the authorization endpoint an MCP client sends the
+ *                     browser to answer with JSON or a redirect, not the shell
+ *   - push          → renders Web Push payloads sent by the server (see
+ *                     server/services/push.ts); clicking deep-links into
+ *                     the SPA.
+ *
+ * Bump CACHE when the caching logic changes to drop stale caches on activate.
+ */
+const CACHE = "genosyn-v3";
+const SHELL = "/index.html";
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open(CACHE);
+      // Precache the shell so the app opens offline once installed. Best-effort:
+      // a failed precache must not block the worker from installing.
+      try {
+        await cache.add(new Request(SHELL, { cache: "reload" }));
+      } catch {
+        /* offline at install time — the fetch handler will fill the cache */
+      }
+      await self.skipWaiting();
+    })(),
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)),
+      );
+      await self.clients.claim();
+    })(),
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  if (request.method !== "GET") return;
+
+  const url = new URL(request.url);
+  // Same-origin only — leave Google Fonts and any other cross-origin GETs to
+  // the browser's own HTTP cache.
+  if (url.origin !== self.location.origin) return;
+  // The API (including /api/ws and SSE streams) must always reach the server.
+  if (url.pathname.startsWith("/api/")) return;
+  // The public careers site is its own page, not the App: never serve it the
+  // App shell, and never cache it as one.
+  if (url.pathname === "/careers" || url.pathname.startsWith("/careers/")) return;
+  // So is the Chat widget, framed on a company's own site. Its headers decide who
+  // may open it, which only holds if the server is the one answering.
+  if (url.pathname.startsWith("/support-chat/")) return;
+  // A help center page's answer is its own: never store it as the App shell.
+  if (url.pathname === "/help" || url.pathname.startsWith("/help/")) return;
+  // OAuth for the MCP server: server answers, never the App shell, and a
+  // redirect must not be cached in the shell's place.
+  if (url.pathname.startsWith("/.well-known/") || url.pathname === "/oauth/authorize") return;
+
+  // App navigations: prefer the network so we always render the latest shell
+  // (which references the current content-hashed assets); fall back to the
+  // cached shell when offline.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      (async () => {
+        try {
+          const fresh = await fetch(request);
+          const cache = await caches.open(CACHE);
+          cache.put(SHELL, fresh.clone());
+          return fresh;
+        } catch {
+          const cached =
+            (await caches.match(SHELL)) || (await caches.match("/"));
+          return cached || Response.error();
+        }
+      })(),
+    );
+    return;
+  }
+
+  // Static assets (JS, CSS, icons, fonts): serve from cache immediately and
+  // refresh the entry in the background.
+  event.respondWith(
+    (async () => {
+      const cache = await caches.open(CACHE);
+      const cached = await cache.match(request);
+      const network = fetch(request)
+        .then((response) => {
+          if (response && response.status === 200 && response.type === "basic") {
+            cache.put(request, response.clone());
+          }
+          return response;
+        })
+        .catch(() => cached);
+      return cached || network;
+    })(),
+  );
+});
+
+// ── Web Push ────────────────────────────────────────────────────────────────
+// The server sends a small JSON payload ({ title, body, link, tag }) for
+// every bell notification; see server/services/push.ts. Spec requires every
+// push event to surface a notification, so even a malformed payload renders
+// a generic one.
+
+self.addEventListener("push", (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = { body: event.data ? event.data.text() : "" };
+  }
+  const title = data.title || "Genosyn";
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: data.body || "",
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-192.png",
+      tag: data.tag || undefined,
+      data: { link: data.link || "/" },
+    }),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const link =
+    (event.notification.data && event.notification.data.link) || "/";
+  const url = new URL(link, self.location.origin).href;
+  event.waitUntil(
+    (async () => {
+      // Re-use an existing app window when there is one; otherwise open a
+      // fresh tab/PWA window at the deep link.
+      const wins = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      for (const client of wins) {
+        if ("focus" in client) {
+          await client.focus();
+          if ("navigate" in client) {
+            try {
+              await client.navigate(url);
+            } catch {
+              /* cross-origin or detached client — fall through to open */
+            }
+          }
+          return;
+        }
+      }
+      await self.clients.openWindow(url);
+    })(),
+  );
+});

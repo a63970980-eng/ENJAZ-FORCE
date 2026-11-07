@@ -1,0 +1,255 @@
+import parser from "cron-parser";
+import type { RunErrorKind, RunStatus, RunTrigger } from "../db/entities/Run.js";
+import { isValidTimeZone } from "../lib/timeZone.js";
+
+/**
+ * Pure scheduling arithmetic: when a schedule next fires, and what to do about
+ * downtime and retries.
+ *
+ * `nextRunFor` and the five functions after it are the entire decision logic
+ * behind "when does this run, and the server was off — what now?": the next
+ * slot, how many occurrences we missed, whether a stale slot is still worth
+ * serving, whether a `running` row is crash debris, how long to wait before
+ * another attempt, and whether another attempt is owed at all. They live apart
+ * from `services/cron.ts` so they can be unit-tested without a database, and
+ * they take an explicit `from: Date` instead of reading the clock. Nothing here
+ * may import `cron.ts` — `cron.ts` imports this.
+ */
+
+/**
+ * The `cron-parser` options that pick the clock an expression is read on.
+ *
+ * `timeZone` is a company's IANA zone, or empty for **server time** — the
+ * process's own clock, which is how every expression was read before companies
+ * had a zone. Empty has to mean *no option at all*: `cron-parser` rejects
+ * `tz: ""` outright, and `nextRunFor()` would then report a perfectly good
+ * expression as unschedulable. A name this runtime cannot resolve is treated
+ * the same way for the same reason — a Routine that keeps firing on the old
+ * clock is a smaller failure than one that silently stops.
+ */
+export function cronZoneOptions(timeZone: string | null | undefined): { tz?: string } {
+  const zone = typeof timeZone === "string" ? timeZone.trim() : "";
+  return zone && isValidTimeZone(zone) ? { tz: zone } : {};
+}
+
+/**
+ * Compute the next scheduled fire time for a cron expression, or null if the
+ * expression is invalid. `from` defaults to now; callers pass a specific
+ * moment when they want "next after this run" semantics.
+ *
+ * `timeZone` is the IANA zone the expression's clock fields are read in — a
+ * Routine passes its company's (`Company.timezone`), so "0 9 * * *" means nine
+ * o'clock *there*, daylight saving included. Leave it out, or pass the empty
+ * string, to read the expression on the server's own clock: that is how a
+ * company that has not picked a zone behaves, and how every schedule that is
+ * not a Routine (Pipelines, recurring invoices, Revenue Signals) is still read.
+ *
+ * `services/cron.ts` re-exports this under the name every caller already
+ * imports.
+ */
+export function nextRunFor(
+  cronExpr: string,
+  from: Date = new Date(),
+  timeZone?: string | null,
+): Date | null {
+  try {
+    const interval = parser.parseExpression(cronExpr, {
+      currentDate: from,
+      ...cronZoneOptions(timeZone),
+    });
+    return interval.next().toDate();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Grace added on top of a routine's own `timeoutSec` before a still-`running`
+ * Run counts as crash debris. The runner aborts a run at its timeout, so a row
+ * older than `timeoutSec + this` cannot legitimately still be executing —
+ * either the process died or the row was orphaned by a restart.
+ *
+ * `services/cron.ts` imports this for its overlap guard rather than declaring
+ * its own copy: the reconciler and the guard MUST agree about when a run is
+ * dead, or one will resurrect the schedule while the other still blocks it.
+ */
+export const ORPHAN_GRACE_MS = 60 * 1000;
+
+/**
+ * How late a due slot has to be before the `"skip"` catch-up policy drops it.
+ * Twice the heartbeat interval, so an ordinary on-time tick is never mistaken
+ * for a catch-up.
+ */
+export const STALE_SLOT_MS = 60 * 1000;
+
+/** Ceiling on any single retry delay, whatever the attempt or backoff base. */
+export const RETRY_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Default pause before the one crash-recovery attempt owed to an interrupted
+ * scheduled Run. This applies only when the routine has not opted into its own
+ * retry budget (`maxAttempts === 1`); configured retry chains keep using their
+ * operator-selected jitter/backoff.
+ */
+export const INTERRUPTED_RECOVERY_DELAY_MS = 60 * 60 * 1000;
+
+/**
+ * How many scheduled occurrences elapsed strictly after `after` and at or
+ * before `until` — i.e. how much work a catch-up run is standing in for.
+ *
+ * Bounded by `cap` so a `* * * * *` routine that was down for a week cannot
+ * materialize ten thousand Dates just to produce a number nobody reads past
+ * "lots". Returns `{ count: 0, capped: false }` on an unparseable expression,
+ * matching how `nextRunFor()` swallows parse errors rather than throwing into
+ * the heartbeat.
+ *
+ * `timeZone` is the zone the expression is read in (see {@link cronZoneOptions});
+ * leave it out for server time. A schedule is counted on the same clock it is
+ * fired on, so the number recorded on a catch-up Run is the number of slots
+ * that really elapsed.
+ *
+ * The walk calls `next()` and stops when it throws, rather than asking
+ * `hasNext()` first: `hasNext()` does the same search and throws it away, so
+ * the question doubled the cost of every step — and a step costs several times
+ * more on a named zone, which a long-overdue minutely Routine would otherwise
+ * pay a thousand times on the heartbeat's thread.
+ */
+export function countMissedSlots(
+  cronExpr: string,
+  after: Date,
+  until: Date,
+  cap: number,
+  timeZone?: string | null,
+): { count: number; capped: boolean } {
+  if (until.getTime() <= after.getTime() || cap <= 0) return { count: 0, capped: false };
+  try {
+    const it = parser.parseExpression(cronExpr, {
+      currentDate: after,
+      endDate: until,
+      ...cronZoneOptions(timeZone),
+    });
+    let count = 0;
+    while (count < cap) {
+      try {
+        it.next();
+      } catch {
+        // Past `until`: cron-parser reports the end of the window by throwing.
+        break;
+      }
+      count += 1;
+    }
+    return { count, capped: count === cap };
+  } catch {
+    return { count: 0, capped: false };
+  }
+}
+
+/**
+ * True when a due slot is more than `staleMs` old — the test the `"skip"`
+ * catch-up policy applies before deciding a run is no longer worth firing.
+ */
+export function isSlotStale(dueSlot: Date, now: Date, staleMs: number = STALE_SLOT_MS): boolean {
+  return now.getTime() - dueSlot.getTime() > staleMs;
+}
+
+/**
+ * True when a still-`running` Run row can only be crash debris.
+ *
+ * Lifted from the scheduler's overlap guard so the crash path is finally
+ * testable, and so both places share one definition of "dead". A run cannot
+ * outlive its own timeout — the runner aborts it — so anything past
+ * `timeoutSec + graceMs` was orphaned. The `Math.max(1, …)` clamp guards a
+ * zero or negative `timeoutSec`; a `startedAt` in the future (clock skew)
+ * reads as not-orphaned rather than instantly dead.
+ */
+export function isRunOrphaned(
+  startedAt: Date,
+  timeoutSec: number,
+  now: Date,
+  graceMs: number = ORPHAN_GRACE_MS,
+): boolean {
+  return startedAt.getTime() + Math.max(1, timeoutSec) * 1000 + graceMs < now.getTime();
+}
+
+/**
+ * Full-jitter exponential backoff. `attempt` is 1-based and names the attempt
+ * that just failed, so attempt 1 yields the delay before the first retry.
+ *
+ * `rng` is injected rather than calling `Math.random()` internally — otherwise
+ * the jitter makes this untestable. The exponent is clamped before the `**`,
+ * not after: `2 ** attempt` overflows past `Number.MAX_SAFE_INTEGER` long
+ * before a naive `Math.min()` on the product could bite.
+ */
+export function backoffDelayMs(
+  attempt: number,
+  opts: { baseMs: number; maxMs?: number; rng?: () => number },
+): number {
+  const exp = Math.min(Math.max(0, Math.floor(attempt) - 1), 30);
+  const ceiling = Math.min(opts.maxMs ?? RETRY_MAX_BACKOFF_MS, Math.max(0, opts.baseMs) * 2 ** exp);
+  const rng = opts.rng ?? Math.random;
+  return Math.max(0, Math.floor(rng() * ceiling));
+}
+
+/**
+ * Effective attempt ceiling for a terminal Run.
+ *
+ * Ordinary failures preserve the configured budget exactly. An interrupted
+ * scheduled Run gets one bounded recovery attempt even on the default
+ * `maxAttempts = 1`, so its effective ceiling is two. Keeping this calculation
+ * in one place prevents logs and journals from saying "attempt 2 of 1".
+ */
+export function automaticRetryLimit(
+  status: RunStatus,
+  maxAttempts: number,
+  errorKind?: RunErrorKind | null,
+): number {
+  return status === "interrupted" || (status === "error" && errorKind === "interrupted")
+    ? Math.max(2, maxAttempts)
+    : maxAttempts;
+}
+
+/**
+ * Delay before the next automatic attempt.
+ *
+ * The implicit crash-recovery attempt waits a predictable hour. Once an
+ * operator raises `maxAttempts`, the routine's existing full-jitter backoff
+ * remains authoritative for failures, timeouts, and interruptions alike.
+ */
+export function automaticRetryDelayMs(a: {
+  status: RunStatus;
+  errorKind?: RunErrorKind | null;
+  attempt: number;
+  maxAttempts: number;
+  baseMs: number;
+  rng?: () => number;
+}): number {
+  if (automaticRetryLimit(a.status, a.maxAttempts, a.errorKind) > a.maxAttempts) {
+    return INTERRUPTED_RECOVERY_DELAY_MS;
+  }
+  return backoffDelayMs(a.attempt, { baseMs: a.baseMs, rng: a.rng });
+}
+
+/**
+ * The single authority on whether another attempt is owed.
+ *
+ * Deliberately excludes `manual`, `webhook` and `approval` triggers: someone
+ * was present and saw the outcome, so a background respawn would surprise
+ * them. `timeout` is gated separately because retrying one re-burns the whole
+ * time budget — up to six hours of model spend.
+ */
+export function shouldRetry(a: {
+  status: RunStatus;
+  errorKind?: RunErrorKind | null;
+  triggerKind: RunTrigger;
+  attempt: number;
+  maxAttempts: number;
+  retryOnTimeout: boolean;
+}): boolean {
+  if (a.triggerKind !== "schedule" && a.triggerKind !== "retry") return false;
+  const attemptLimit = automaticRetryLimit(a.status, a.maxAttempts, a.errorKind);
+  if (attemptLimit <= 1 || a.attempt >= attemptLimit) return false;
+  if (a.status === "timeout" || (a.status === "error" && a.errorKind === "timeout"))
+    return a.retryOnTimeout;
+  if (a.status === "failed" || a.status === "error" || a.status === "interrupted") return true;
+  return false;
+}

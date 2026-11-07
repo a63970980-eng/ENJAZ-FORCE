@@ -1,0 +1,1625 @@
+import assert from "node:assert/strict";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { describe, test, type TestContext } from "node:test";
+import type { Locator, Page } from "playwright-core";
+
+import { setHumanInputEnabledForTests } from "../humanInput.js";
+import {
+  admissionCutoff,
+  captureGoogleMeetCaptions,
+  createGoogleMeetRecorder,
+  disclosedNotetakerName,
+  isGoogleMeetConferenceUrl,
+  joinGoogleMeetAsGuest,
+  waitForGoogleMeetToEnd,
+  type GoogleMeetJoinArgs,
+} from "./googleMeetRecorder.js";
+import type { MeetingCaption } from "./recorder.js";
+
+// The lobby suites below exercise the decisions — what to press, when to ask
+// again, what a screen means — on fakes with mocked clocks, where typing a
+// name one jittered keystroke at a time would only stretch every timing
+// assertion. "Google Meet guest input" turns humanised input back on and pins
+// how the request is actually entered.
+setHumanInputEnabledForTests(false);
+
+class FakeFfmpeg extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly signals: NodeJS.Signals[] = [];
+  qWrites = 0;
+  stdinStopError: Error | null = null;
+  private closed = false;
+
+  constructor(private readonly audio = Buffer.from("webm-opus-audio")) {
+    super();
+    this.stdin.on("data", (chunk: Buffer) => {
+      if (chunk.toString("utf8").includes("q")) {
+        this.qWrites += 1;
+        if (this.stdinStopError) this.stdin.emit("error", this.stdinStopError);
+        this.finish(0);
+      }
+    });
+  }
+
+  emitAudio(bytes: Buffer): void {
+    this.stdout.write(bytes);
+  }
+
+  kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
+    this.signals.push(signal);
+    this.finish(null, signal);
+    return true;
+  }
+
+  fail(message: string): void {
+    this.stderr.write(message);
+    this.finish(1);
+  }
+
+  private finish(code: number | null, signal: NodeJS.Signals | null = null): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (code === 0) this.stdout.write(this.audio);
+    this.stdout.end();
+    this.stderr.end();
+    queueMicrotask(() => this.emit("close", code, signal));
+  }
+}
+
+type RecorderHarnessOptions = {
+  joinGuest?: () => Promise<void>;
+  waitForEnd?: () => Promise<void>;
+  ffmpeg?: FakeFfmpeg;
+  failUnload?: boolean;
+  maxRecordingBytes?: number;
+  /** Read per join, so a test can prove the cap is not frozen at construction. */
+  readMaxRecordingBytes?: () => number;
+  /** Refuse `module-null-source`, the way a PulseAudio build without it would. */
+  noSilentSource?: boolean;
+  /** What reading Meet's captions during the call produced. */
+  captions?: MeetingCaption[];
+};
+
+function recorderHarness(options: RecorderHarnessOptions = {}) {
+  const commands: Array<{ command: string; args: string[] }> = [];
+  const ffmpegCommands: Array<{ command: string; args: string[] }> = [];
+  const ffmpeg = options.ffmpeg ?? new FakeFfmpeg();
+  const page = { kind: "dedicated-meet-page" };
+  const lifecycle = {
+    contextClosed: 0,
+    browserClosed: 0,
+    /** When the caption read began, and whether it ended before the page closed. */
+    captionsStartedAt: null as number | null,
+    captionsStoppedWhileOpen: null as boolean | null,
+  };
+  const warnings: string[] = [];
+  let launchOptions: Record<string, unknown> | null = null;
+  let contextOptions: Record<string, unknown> | null = null;
+  let now = 1_000;
+
+  const context = {
+    newPage: async () => page,
+    close: async () => {
+      lifecycle.contextClosed += 1;
+    },
+  };
+  const browser = {
+    newContext: async (received: Record<string, unknown>) => {
+      contextOptions = received;
+      return context;
+    },
+    close: async () => {
+      lifecycle.browserClosed += 1;
+    },
+  };
+
+  const recorder = createGoogleMeetRecorder({
+    loadLauncher: async () => ({
+      launch: async (received) => {
+        launchOptions = received;
+        return browser;
+      },
+    }),
+    launchOptions: async () => ({
+      args: ["--existing"],
+      ignoreDefaultArgs: ["--enable-automation"],
+      env: { EXISTING: "yes" },
+    }),
+    contextOptions: async () => ({ locale: "en-GB" }),
+    initScript: async () => "",
+    runCommand: async (command, args) => {
+      commands.push({ command, args });
+      if (options.failUnload && args[0] === "unload-module") {
+        throw new Error("PulseAudio refused to unload module");
+      }
+      if (options.noSilentSource && args[1] === "module-null-source") {
+        throw new Error("Module initialization failed");
+      }
+      return args[0] === "load-module"
+        ? { stdout: "41\n", stderr: "" }
+        : { stdout: "", stderr: "" };
+    },
+    spawnProcess: (command, args) => {
+      ffmpegCommands.push({ command, args });
+      return ffmpeg as unknown as ChildProcessWithoutNullStreams;
+    },
+    joinGuest: async () => {
+      if (options.joinGuest) await options.joinGuest();
+    },
+    waitForEnd: async () => {
+      if (options.waitForEnd) await options.waitForEnd();
+      now = 4_000;
+    },
+    captureCaptions: (_page, admittedAt) => {
+      lifecycle.captionsStartedAt = admittedAt;
+      return {
+        stop: async () => {
+          lifecycle.captionsStoppedWhileOpen = lifecycle.contextClosed === 0;
+          return options.captions ?? [];
+        },
+      };
+    },
+    now: () => now,
+    randomToken: () => "fixed123",
+    maxRecordingBytes: () =>
+      options.readMaxRecordingBytes?.() ?? options.maxRecordingBytes ?? 1024 * 1024,
+    warn: (message) => warnings.push(message),
+  });
+
+  return {
+    commands,
+    ffmpegCommands,
+    ffmpeg,
+    lifecycle,
+    recorder,
+    warnings,
+    getLaunchOptions: () => launchOptions,
+    getContextOptions: () => contextOptions,
+  };
+}
+
+function joinArgs(signal = new AbortController().signal) {
+  return {
+    companyId: "company-1",
+    meetingId: "meeting-1",
+    conferenceUrl: "https://meet.google.com/abc-defg-hij",
+    displayName: "Genosyn",
+    scheduledEndAt: new Date(Date.now() + 10 * 60_000),
+    signal,
+    onJoined: async () => undefined,
+  };
+}
+
+describe("Google Meet URL and disclosure boundary", () => {
+  test("accepts only canonical, encrypted meet.google.com call links", () => {
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/abc-defg-hij"), true);
+    assert.equal(
+      isGoogleMeetConferenceUrl("https://MEET.GOOGLE.COM/abc-defg-hij?authuser=0"),
+      true,
+    );
+    assert.equal(isGoogleMeetConferenceUrl("http://meet.google.com/abc-defg-hij"), false);
+    assert.equal(
+      isGoogleMeetConferenceUrl("https://meet.google.com.evil.test/abc-defg-hij"),
+      false,
+    );
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/landing"), false);
+    assert.equal(isGoogleMeetConferenceUrl("not a url"), false);
+    // A Workspace "nicknamed" meeting. `conferenceForEvent` has always labelled
+    // these `meet`, so the calendar armed them and then the driver refused the
+    // very link the policy had accepted — a whole class of invite that could
+    // never be joined and never said why.
+    assert.equal(
+      isGoogleMeetConferenceUrl("https://meet.google.com/lookup/northwind-standup"),
+      true,
+    );
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/lookup/"), false);
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/lookup/a/b"), false);
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/_meet/settings"), false);
+    // Where Meet now serves the pre-join page and the call itself.
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/meet/abc-defg-hij"), true);
+    assert.equal(isGoogleMeetConferenceUrl("https://meet.google.com/meet/landing"), false);
+  });
+
+  test("keeps recording a call that Meet serves from /meet/<code>", async () => {
+    // Admitted guests are moved to `/meet/<code>`. Read as "not a call", that
+    // path ended every recording the moment it began.
+    const page = {
+      isClosed: () => false,
+      url: () => "https://meet.google.com/meet/abc-defg-hij",
+      locator: () => ({ innerText: async () => "Raise hand Turn on captions Leave call" }),
+    } as unknown as Page;
+    const started = Date.now();
+
+    await waitForGoogleMeetToEnd(page, { ...joinArgs(), scheduledEndAt: new Date(started + 1_200) });
+
+    assert.ok(Date.now() - started >= 1_000, "the call was still running");
+  });
+
+  test("makes the recording role visible and bounds Meet's guest name", () => {
+    assert.equal(
+      disclosedNotetakerName(" Genosyn  Notes "),
+      "Genosyn Notes (AI notetaker — recording)",
+    );
+    assert.match(disclosedNotetakerName("x".repeat(200)), /AI notetaker — recording/);
+    assert.ok(disclosedNotetakerName("x".repeat(200)).length <= 100);
+    assert.equal(disclosedNotetakerName("Acme recording notetaker"), "Acme recording notetaker");
+    assert.match(
+      disclosedNotetakerName(`${"x".repeat(120)} recording notetaker`),
+      /AI notetaker — recording/,
+    );
+  });
+});
+
+describe("Google Meet guest lobby", () => {
+  test("discloses recording, disables devices, asks to join, and waits for admission", async () => {
+    let admitted = false;
+    const filled: string[] = [];
+    const clicked: string[] = [];
+
+    const locator = (name: string, visible: () => boolean, text = "") =>
+      ({
+        first() {
+          return this;
+        },
+        isVisible: async () => visible(),
+        isEnabled: async () => visible(),
+        click: async () => {
+          clicked.push(name);
+          if (name === "ask") admitted = true;
+        },
+        fill: async (value: string) => {
+          filled.push(value);
+        },
+        innerText: async () => text,
+      }) as unknown as Locator;
+
+    const hidden = locator("hidden", () => false);
+    const page = {
+      setDefaultTimeout: () => undefined,
+      goto: async () => null,
+      getByRole: (_role: string, options: { name?: RegExp }) => {
+        const pattern = options.name?.source ?? "";
+        if (pattern.includes("your name")) return locator("name", () => true);
+        if (pattern.includes("turn off microphone")) return locator("microphone", () => true);
+        if (pattern.includes("turn off camera")) return locator("camera", () => true);
+        if (pattern.includes("ask to join")) return locator("ask", () => true);
+        if (pattern.includes("leave call")) return locator("leave", () => admitted);
+        if (pattern.includes("raise hand")) return locator("raise", () => admitted);
+        return hidden;
+      },
+      locator: (selector: string) =>
+        selector === "body" ? locator("body", () => true, "") : hidden,
+      url: () => "https://meet.google.com/abc-defg-hij",
+      isClosed: () => false,
+    } as unknown as Page;
+
+    await joinGoogleMeetAsGuest(page, joinArgs());
+
+    assert.deepEqual(filled, ["Genosyn (AI notetaker — recording)"]);
+    assert.deepEqual(clicked, ["microphone", "camera", "ask"]);
+    assert.equal(admitted, true);
+  });
+
+  test("reports when the host denies admission", async () => {
+    let asked = false;
+    const locator = (visible: () => boolean, text = "", click?: () => void) =>
+      ({
+        first() {
+          return this;
+        },
+        isVisible: async () => visible(),
+        isEnabled: async () => visible(),
+        click: async () => click?.(),
+        fill: async () => undefined,
+        innerText: async () => text,
+      }) as unknown as Locator;
+    const hidden = locator(() => false);
+    const page = {
+      setDefaultTimeout: () => undefined,
+      goto: async () => null,
+      getByRole: (_role: string, options: { name?: RegExp }) => {
+        const pattern = options.name?.source ?? "";
+        if (pattern.includes("your name")) return locator(() => true);
+        if (pattern.includes("ask to join")) {
+          return locator(
+            () => true,
+            "",
+            () => {
+              asked = true;
+            },
+          );
+        }
+        return hidden;
+      },
+      locator: (selector: string) =>
+        selector === "body"
+          ? locator(() => true, asked ? "Your request to join was denied" : "")
+          : hidden,
+      url: () => "https://meet.google.com/abc-defg-hij",
+      isClosed: () => false,
+    } as unknown as Page;
+
+    await assert.rejects(joinGoogleMeetAsGuest(page, joinArgs()), /host denied/);
+  });
+});
+
+/**
+ * A Meet lobby that can be described rather than mocked call by call.
+ *
+ * `visible` is the set of controls currently on screen, keyed by the logical
+ * name the driver's accessible-name pattern picks out; `body` is the page
+ * text the driver scans for Meet's own status sentences. `onClick` lets a test
+ * move the lobby on — admit the guest, close a dialog, refuse a request —
+ * which is what makes the multi-pass behaviour testable at all.
+ */
+function fakeLobby(options: {
+  visible: string[];
+  body?: string;
+  onClick?: (name: string, state: { visible: Set<string>; body: string }) => void;
+  /** Runs once per pass of the lobby loop, which reads the body every time. */
+  onPass?: (pass: number, state: { visible: Set<string>; body: string }) => void;
+  failClicks?: Set<string>;
+  failEnabledChecks?: Set<string>;
+}) {
+  const state = { visible: new Set(options.visible), body: options.body ?? "" };
+  const clicks: string[] = [];
+  const fills: string[] = [];
+  const failed: string[] = [];
+  let pass = 0;
+
+  const control = (name: string) =>
+    ({
+      first() {
+        return this;
+      },
+      isVisible: async () => state.visible.has(name),
+      isEnabled: async () => {
+        if (options.failEnabledChecks?.has(name)) {
+          failed.push(name);
+          options.failEnabledChecks.delete(name);
+          throw new Error("element was replaced while checking whether it is enabled");
+        }
+        return state.visible.has(name);
+      },
+      click: async () => {
+        if (options.failClicks?.has(name)) {
+          failed.push(name);
+          options.failClicks.delete(name);
+          throw new Error("element is not stable");
+        }
+        clicks.push(name);
+        options.onClick?.(name, state);
+      },
+      fill: async (value: string) => {
+        fills.push(value);
+      },
+      innerText: async () => {
+        if (name === "__body__") {
+          pass += 1;
+          options.onPass?.(pass, state);
+        }
+        return state.body;
+      },
+    }) as unknown as Locator;
+
+  const byPattern: Array<[RegExp, string]> = [
+    [/your name/, "name"],
+    [/accept all/, "consent"],
+    [/got it/, "gotIt"],
+    [/continue without/, "continueWithout"],
+    [/join without/, "joinWithout"],
+    [/dismiss/, "dismiss"],
+    [/turn off microphone/, "microphone"],
+    [/turn off camera/, "camera"],
+    [/ask to join/, "ask"],
+    [/join now/, "joinNow"],
+    // "leave" stands for the in-call controls. Admission takes Leave call and
+    // a control the waiting room lacks; "Google Meet guest request
+    // confirmation" covers the waiting room that shows Leave call alone.
+    [/leave call|raise hand/, "leave"],
+  ];
+
+  const page = {
+    setDefaultTimeout: () => undefined,
+    goto: async () => null,
+    getByRole: (_role: string, roleOptions: { name?: RegExp }) => {
+      const pattern = roleOptions.name?.source ?? "";
+      for (const [match, name] of byPattern) {
+        if (match.test(pattern)) return control(name);
+      }
+      return control("__absent__");
+    },
+    locator: (selector: string) =>
+      selector === "body" ? control("__body__") : control("__absent__"),
+    url: () => "https://meet.google.com/abc-defg-hij",
+    isClosed: () => false,
+  } as unknown as Page;
+
+  // `body` is read through innerText on a control that is never "visible",
+  // which is exactly how the driver reads it.
+  state.visible.add("__body__");
+  return { page, state, clicks, fills, failed };
+}
+
+describe("the Google Meet admission window", () => {
+  const at = (minutes: number) => new Date(60_000 * minutes);
+
+  test("waits for the whole call, not an arbitrary five minutes", () => {
+    // The dispatcher asks to join 30s *before* the start, so a flat five
+    // minutes gave up at 4m30s past the hour — before a great many hosts have
+    // finished their previous meeting.
+    assert.equal(admissionCutoff({ scheduledEndAt: at(30) }, 0), 30 * 60_000);
+  });
+
+  test("never keeps a browser and a recording in a lobby indefinitely", () => {
+    assert.equal(admissionCutoff({ scheduledEndAt: at(600) }, 0), 30 * 60_000);
+  });
+
+  test("still gives a nearly-over call the ordinary grace period", () => {
+    assert.equal(admissionCutoff({ scheduledEndAt: at(1) }, 0), 5 * 60_000);
+  });
+
+  test("falls back to five minutes when nothing says when the call ends", () => {
+    assert.equal(admissionCutoff({ scheduledEndAt: null }, 0), 5 * 60_000);
+  });
+});
+
+describe("Google Meet lobby interstitials", () => {
+  test("closes the no-microphone dialog that used to block every click", async () => {
+    // The dialog is modal. Meet raises it after the SPA has rendered, so the
+    // old one-shot check ran too early to see it and every later click landed
+    // on the scrim — the notetaker sat there until the deadline and then
+    // reported that Meet had never offered it a button.
+    const lobby = fakeLobby({
+      visible: ["continueWithout", "name", "ask"],
+      onClick: (name, state) => {
+        if (name === "continueWithout") state.visible.delete("continueWithout");
+        if (name === "ask") state.visible.add("leave");
+      },
+    });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(lobby.clicks, ["continueWithout", "ask"]);
+    assert.deepEqual(lobby.fills, ["Genosyn (AI notetaker — recording)"]);
+  });
+
+  test("dismisses an interstitial that arrives after the page did", async () => {
+    // Meet is a single-page app. The old code checked for consent and "Got it"
+    // exactly once, immediately after `goto` — while the lobby was still
+    // blank — so anything Google rendered a moment later stayed on screen
+    // over the join button for the rest of the join window.
+    const lobby = fakeLobby({
+      visible: ["name"],
+      onPass: (pass, state) => {
+        if (pass === 2) state.visible.add("gotIt");
+      },
+      onClick: (name, state) => {
+        if (name === "gotIt") {
+          state.visible.delete("gotIt");
+          state.visible.add("ask");
+        }
+        if (name === "ask") state.visible.add("leave");
+      },
+    });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(lobby.clicks, ["gotIt", "ask"]);
+  });
+
+  test("asks again when Meet reports that nobody responded", async () => {
+    // Meet expires an unanswered request after a couple of minutes and offers
+    // to ask again. Treating that as terminal is what made a late host mean no
+    // notetaker at all.
+    const lobby = fakeLobby({
+      visible: ["name", "ask"],
+      onClick: (name, state) => {
+        if (name !== "ask") return;
+        state.body = state.body.includes("No one responded")
+          ? ""
+          : "No one responded to your request to join";
+        if (!state.body) state.visible.add("leave");
+      },
+    });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(
+      lobby.clicks.filter((name) => name === "ask"),
+      ["ask", "ask"],
+    );
+  });
+
+  test("a click that loses a race with Meet's re-render costs a pass, not the call", async () => {
+    const lobby = fakeLobby({
+      visible: ["name", "ask"],
+      failClicks: new Set(["ask"]),
+      onClick: (name, state) => {
+        if (name === "ask") state.visible.add("leave");
+      },
+    });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(lobby.failed, ["ask"]);
+    assert.deepEqual(lobby.clicks, ["ask"]);
+  });
+
+  test("an enabled check that loses a race with Meet's re-render retries the join", async () => {
+    const lobby = fakeLobby({
+      visible: ["name", "ask"],
+      failEnabledChecks: new Set(["ask"]),
+      onClick: (name, state) => {
+        if (name === "ask") state.visible.add("leave");
+      },
+    });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(lobby.failed, ["ask"]);
+    assert.deepEqual(lobby.clicks, ["ask"]);
+  });
+
+  test("recognises a guest who is already in the call", async () => {
+    const lobby = fakeLobby({ visible: ["leave", "name", "ask"] });
+
+    await joinGoogleMeetAsGuest(lobby.page, joinArgs());
+
+    assert.deepEqual(lobby.clicks, []);
+    assert.deepEqual(lobby.fills, []);
+  });
+
+  test("reports a call that ended before anybody admitted the guest", async () => {
+    const lobby = fakeLobby({
+      visible: ["name", "ask"],
+      body: "This meeting has ended",
+    });
+
+    await assert.rejects(joinGoogleMeetAsGuest(lobby.page, joinArgs()), /ended before/);
+  });
+
+  test("reports a meeting that does not allow guests, with the fix in the sentence", async () => {
+    const lobby = fakeLobby({
+      visible: [],
+      body: "You need to sign in to join this video call",
+    });
+
+    await assert.rejects(joinGoogleMeetAsGuest(lobby.page, joinArgs()), /Allow guests/);
+  });
+
+  test("stops as soon as a Member asks it to", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const lobby = fakeLobby({ visible: ["name", "ask"] });
+
+    await assert.rejects(
+      joinGoogleMeetAsGuest(lobby.page, joinArgs(controller.signal)),
+      /was stopped/,
+    );
+  });
+});
+
+describe("Google Meet guest request confirmation", () => {
+  type GuestScreen = {
+    body?: string;
+    name?: boolean;
+    ask?: boolean;
+    /** Meet names the button for the devices the guest brings. */
+    askLabel?: string;
+    /** The pre-join page's other "Ask to …" buttons, which must never be pressed. */
+    otherAsks?: boolean;
+    microphone?: boolean;
+    camera?: boolean;
+    continueWithout?: { role: "button" | "link"; name: string };
+    /** Meet's waiting room, which already offers Leave call. */
+    waitingRoom?: boolean;
+    admitted?: boolean;
+    url?: string;
+  };
+
+  function guestHarness(t: TestContext, initialScreen: GuestScreen = {}) {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000_000 });
+    let screen = initialScreen;
+    let ask = () => {
+      screen = { body: "You'll join the call when someone lets you in" };
+    };
+    let continueWithout = () => {
+      screen = { name: true, ask: true };
+    };
+    const clicked: string[] = [];
+    const filled: string[] = [];
+    type Control = { key: string; role: string; name: string; click?: () => void };
+    const controls = (): Control[] => [
+      ...(screen.name ? [{ key: "name", role: "textbox", name: "Your name" }] : []),
+      ...(screen.ask
+        ? [
+            {
+              key: "ask",
+              role: "button",
+              name: screen.askLabel ?? "Ask to join",
+              click: () => ask(),
+            },
+          ]
+        : []),
+      ...(screen.otherAsks
+        ? [
+            { key: "present", role: "button", name: "Ask to present" },
+            { key: "companion", role: "button", name: "Ask to use Companion mode" },
+          ]
+        : []),
+      ...(screen.microphone
+        ? [
+            {
+              key: "microphone",
+              role: "button",
+              name: "Turn off microphone",
+              click: () => {
+                screen.microphone = false;
+              },
+            },
+          ]
+        : []),
+      ...(screen.camera
+        ? [
+            {
+              key: "camera",
+              role: "button",
+              name: "Turn off camera",
+              click: () => {
+                screen.camera = false;
+              },
+            },
+          ]
+        : []),
+      ...(screen.continueWithout
+        ? [{ key: "continue", ...screen.continueWithout, click: () => continueWithout() }]
+        : []),
+      ...(screen.waitingRoom || screen.admitted
+        ? [{ key: "leave", role: "button", name: "Leave call" }]
+        : []),
+      ...(screen.admitted
+        ? [
+            { key: "raiseHand", role: "button", name: "Raise hand (ctrl + alt + h)" },
+            { key: "captions", role: "button", name: "Turn on captions" },
+          ]
+        : []),
+    ];
+    const locator = (find: () => Control | undefined, isBody = false) =>
+      ({
+        first() {
+          return this;
+        },
+        isVisible: async () => isBody || Boolean(find()),
+        isEnabled: async () => Boolean(find()),
+        click: async () => {
+          const control = find();
+          assert.ok(control, "only visible controls can be clicked");
+          clicked.push(control.key);
+          control.click?.();
+        },
+        fill: async (value: string) => {
+          assert.equal(find()?.key, "name");
+          filled.push(value);
+        },
+        innerText: async () => screen.body ?? "",
+      }) as unknown as Locator;
+    const page = {
+      setDefaultTimeout: () => undefined,
+      goto: async () => null,
+      getByRole: (role: string, options: { name?: RegExp | string }) =>
+        locator(() =>
+          controls().find(
+            (control) =>
+              control.role === role &&
+              (typeof options.name === "string"
+                ? options.name === control.name
+                : options.name?.test(control.name)),
+          ),
+        ),
+      locator: (selector: string) =>
+        locator(() => {
+          const key = selector.includes("placeholder")
+            ? "name"
+            : selector.includes("leave call")
+              ? "leave"
+              : selector.includes("microphone")
+                ? "microphone"
+                : selector.includes("camera")
+                  ? "camera"
+                  : "hidden";
+          return controls().find((control) => control.key === key);
+        }, selector === "body"),
+      url: () => screen.url ?? "https://meet.google.com/abc-defg-hij",
+      isClosed: () => false,
+    } as unknown as Page;
+
+    return {
+      clicked,
+      filled,
+      setScreen: (next: GuestScreen) => {
+        screen = next;
+      },
+      onAsk: (next: () => void) => {
+        ask = next;
+      },
+      onContinue: (next: () => void) => {
+        continueWithout = next;
+      },
+      async run(
+        args: GoogleMeetJoinArgs = { ...joinArgs(), scheduledEndAt: null },
+        advance?: (elapsedMs: number) => void,
+      ) {
+        let settled = false;
+        const joining = joinGoogleMeetAsGuest(page, args);
+        // Attach both outcomes before advancing the clock so an expected
+        // rejection never becomes an unhandled rejection between ticks.
+        void joining.then(
+          () => {
+            settled = true;
+          },
+          () => {
+            settled = true;
+          },
+        );
+        for (let elapsed = 0; elapsed <= 6 * 60_000 && !settled; elapsed += 500) {
+          // Let each browser interaction finish before advancing a poll timer.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          if (settled) break;
+          advance?.(elapsed + 500);
+          t.mock.timers.tick(500);
+        }
+        assert.ok(settled, "guest join must settle within the bounded join window");
+        return joining;
+      },
+    };
+  }
+
+  test("discloses recording, disables devices, asks once, and waits for admission", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true, microphone: true, camera: true });
+    guest.onAsk(() =>
+      guest.setScreen({
+        body: "You'll join the call\nwhen someone lets you in",
+        // Meet can leave the old controls visible during the transition.
+        name: true,
+        ask: true,
+      }),
+    );
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed >= 2_000) guest.setScreen({ admitted: true });
+    });
+
+    assert.deepEqual(guest.filled, ["Genosyn (AI notetaker — recording)"]);
+    assert.deepEqual(guest.clicked, ["microphone", "camera", "ask"]);
+  });
+
+  test("asks with the button Meet names for a guest that brings no devices", async (t) => {
+    // A notetaker with no microphone or camera is offered "Ask to join without
+    // microphone & camera". Matching "Ask to join" exactly found nothing, and
+    // the notetaker sat on a ready lobby for the whole join window.
+    const guest = guestHarness(t, {
+      name: true,
+      ask: true,
+      askLabel: "Ask to join without microphone & camera",
+      otherAsks: true,
+    });
+    guest.onAsk(() => guest.setScreen({ admitted: true }));
+
+    await guest.run();
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+  });
+
+  test("waits in Meet's waiting room although it already offers Leave call", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() =>
+      guest.setScreen({
+        body: "Please wait until a meeting host brings you into the call",
+        waitingRoom: true,
+      }),
+    );
+    let admittedAt = 0;
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed === 30_000) {
+        admittedAt = Date.now();
+        guest.setScreen({ admitted: true });
+      }
+    });
+
+    assert.ok(admittedAt > 0, "the guest waited for the host instead of recording the lobby");
+    assert.deepEqual(guest.clicked, ["ask"]);
+  });
+
+  test("reports a confirmed wait when nobody admits it from Meet's waiting room", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() =>
+      guest.setScreen({
+        body: "Please wait until a meeting host brings you into the call",
+        waitingRoom: true,
+      }),
+    );
+
+    await assert.rejects(guest.run(), /confirmed.*waiting.*not admitted/i);
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+  });
+
+  test("says so when Meet never offers a button to ask with", async (t) => {
+    const guest = guestHarness(t, { name: true });
+
+    await assert.rejects(guest.run(), (error: Error) => {
+      assert.match(error.message, /never offered an Ask to join button/);
+      assert.doesNotMatch(error.message, /nobody admitted|host denied|admit the disclosed/i);
+      return true;
+    });
+
+    assert.deepEqual(guest.filled, ["Genosyn (AI notetaker — recording)"]);
+    assert.deepEqual(guest.clicked, []);
+  });
+
+  for (const role of ["button", "link"] as const) {
+    test(`continues past a delayed media ${role} before the guest name appears`, async (t) => {
+      const guest = guestHarness(t);
+      guest.onAsk(() => guest.setScreen({ admitted: true }));
+
+      await guest.run(joinArgs(), (elapsed) => {
+        if (elapsed === 1_000)
+          guest.setScreen({
+            body: "Do you want people to see and hear you in the meeting?",
+            continueWithout: { role, name: "Continue without microphone and camera" },
+          });
+      });
+
+      assert.deepEqual(guest.clicked, ["continue", "ask"]);
+      assert.deepEqual(guest.filled, ["Genosyn (AI notetaker — recording)"]);
+    });
+  }
+
+  test("handles a delayed media prompt after asking and submits the guest request again", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    let requests = 0;
+    guest.onAsk(() => {
+      requests += 1;
+      guest.setScreen(requests === 1 ? {} : { admitted: true });
+    });
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed === 1_000)
+        guest.setScreen({
+          continueWithout: { role: "button", name: "Continue without a microphone and camera" },
+        });
+    });
+
+    assert.deepEqual(guest.clicked, ["ask", "continue", "ask"]);
+    assert.equal(requests, 2);
+    assert.deepEqual(guest.filled, [
+      "Genosyn (AI notetaker — recording)",
+      "Genosyn (AI notetaker — recording)",
+    ]);
+  });
+
+  test("does not resubmit when continuing without media sends the request directly", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() =>
+      guest.setScreen({
+        continueWithout: { role: "link", name: "Continue without audio and video" },
+      }),
+    );
+    guest.onContinue(() =>
+      guest.setScreen({
+        body: "You'll join the call when someone lets you in",
+        name: true,
+        ask: true,
+      }),
+    );
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed >= 2_000) guest.setScreen({ admitted: true });
+    });
+
+    assert.deepEqual(guest.clicked, ["ask", "continue"]);
+  });
+
+  test("does not ask again if a host denial appears after continuing without media", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() =>
+      guest.setScreen({
+        continueWithout: { role: "button", name: "Continue without microphone and camera" },
+      }),
+    );
+    guest.onContinue(() =>
+      guest.setScreen({
+        body: "Your request to join was denied",
+        name: true,
+        ask: true,
+      }),
+    );
+
+    await assert.rejects(guest.run(), /host denied/i);
+
+    assert.deepEqual(guest.clicked, ["ask", "continue"]);
+  });
+
+  test("retries an expired confirmed request and then accepts admission", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    let requests = 0;
+    guest.onAsk(() => {
+      requests += 1;
+      guest.setScreen(
+        requests === 1
+          ? { body: "You'll join the call when someone lets you in", name: true, ask: true }
+          : { admitted: true },
+      );
+    });
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed === 2_000)
+        guest.setScreen({
+          body: "No one responded to your request to join. Ask to join again.",
+          name: true,
+          ask: true,
+        });
+    });
+
+    assert.deepEqual(guest.clicked, ["ask", "ask"]);
+  });
+
+  test("remembers a confirmed waiting request after it expires and retries are exhausted", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    let requests = 0;
+    const expiredScreen = {
+      body: "No one responded to your request to join. Ask to join again.",
+      name: true,
+      ask: true,
+    };
+    guest.onAsk(() => {
+      requests += 1;
+      guest.setScreen(
+        requests === 1
+          ? { body: "You'll join the call when someone lets you in" }
+          : expiredScreen,
+      );
+    });
+
+    await assert.rejects(
+      guest.run({ ...joinArgs(), scheduledEndAt: null }, (elapsed) => {
+        if (elapsed === 2_000) guest.setScreen(expiredScreen);
+      }),
+      (error: Error) => {
+        assert.match(error.message, /confirmed.*waiting.*not admitted/i);
+        assert.doesNotMatch(error.message, /no lobby request was confirmed|could not reach/i);
+        return true;
+      },
+    );
+
+    assert.equal(requests, 8, "expired requests retain the bounded retry allowance");
+    assert.deepEqual(guest.clicked, Array(8).fill("ask"));
+  });
+
+  test("does not blame host admission when Ask to join never reaches the waiting room", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() => undefined);
+    const started = Date.now();
+
+    await assert.rejects(guest.run(), (error: Error) => {
+      assert.match(
+        error.message,
+        /could not reach|did not confirm|not confirmed|could not confirm/i,
+      );
+      assert.doesNotMatch(error.message, /nobody admitted|host denied|admit the disclosed/i);
+      return true;
+    });
+
+    assert.ok(
+      guest.clicked.length > 1,
+      "unconfirmed requests retain the bounded retry opportunity",
+    );
+    assert.ok(guest.clicked.length <= 8, "an unconfirmed request must not spam the host");
+    assert.ok(guest.clicked.every((control) => control === "ask"));
+    assert.ok(Date.now() - started >= 5 * 60_000);
+    assert.ok(Date.now() - started <= 5 * 60_000 + 1_000);
+  });
+
+  test("reports an admission timeout only after Meet confirms a waiting request", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    const started = Date.now();
+
+    await assert.rejects(guest.run(), /waiting.*not admitted.*retry/is);
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+    assert.ok(Date.now() - started >= 5 * 60_000);
+    assert.ok(Date.now() - started <= 5 * 60_000 + 1_000);
+  });
+
+  test("allows admission after unfamiliar waiting text instead of failing after 30 seconds", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    guest.onAsk(() => guest.setScreen({ body: "Asking to join…" }));
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed >= 45_000) guest.setScreen({ admitted: true });
+    });
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+  });
+
+  test("keeps the five-minute grace when the scheduled end is imminent", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+    const started = Date.now();
+
+    await assert.rejects(
+      guest.run({
+        ...joinArgs(),
+        scheduledEndAt: new Date(started + 10_000),
+      }),
+      /waiting.*not admitted/is,
+    );
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+    assert.ok(Date.now() - started >= 5 * 60_000);
+    assert.ok(Date.now() - started <= 5 * 60_000 + 1_000);
+  });
+
+  test("allows a late host to admit the waiting guest after five minutes when the call is still scheduled", async (t) => {
+    const guest = guestHarness(t, { name: true, ask: true });
+
+    await guest.run(joinArgs(), (elapsed) => {
+      if (elapsed >= 5 * 60_000 + 30_000) guest.setScreen({ admitted: true });
+    });
+
+    assert.deepEqual(guest.clicked, ["ask"]);
+  });
+
+  test("does not claim a lobby request exists when the pre-join page never becomes ready", async (t) => {
+    const guest = guestHarness(t);
+
+    await assert.rejects(guest.run(), (error: Error) => {
+      assert.match(error.message, /could not reach|before.*ready|not confirmed/i);
+      assert.doesNotMatch(error.message, /nobody admitted|host denied|admit the disclosed/i);
+      return true;
+    });
+
+    assert.deepEqual(guest.clicked, []);
+    assert.deepEqual(guest.filled, []);
+  });
+
+  const failures = [
+    {
+      description: "invalid meeting link",
+      body: "Check your meeting code",
+      expected: /could not find this meeting/i,
+    },
+    {
+      description: "network connection failure",
+      body: "Can't connect to the video call. Check your internet connection.",
+      expected: /could not connect to Google Meet/i,
+    },
+    {
+      description: "sign-in requirement",
+      body: "Sign in to join this meeting",
+      expected: /requires.*account|sign in|guest access/i,
+    },
+    {
+      description: "generic guest rejection",
+      body: "You can't join this video call",
+      expected: /blocked the guest notetaker.*before the host saw a request/i,
+    },
+    {
+      description: "explicit host denial",
+      body: "Your request to join was denied",
+      expected: /host denied/i,
+    },
+    {
+      description: "ended meeting",
+      body: "This meeting has ended",
+      expected: /call ended|meeting.*ended/i,
+    },
+  ];
+  for (const failure of failures) {
+    for (const afterAsk of [false, true]) {
+      test(`reports ${failure.description} ${afterAsk ? "after asking" : "before the name field"} promptly`, async (t) => {
+        const guest = guestHarness(
+          t,
+          afterAsk ? { name: true, ask: true } : { body: failure.body },
+        );
+        guest.onAsk(() => guest.setScreen({ body: failure.body, name: true, ask: true }));
+        const started = Date.now();
+
+        await assert.rejects(guest.run(), (error: Error) => {
+          assert.match(error.message, failure.expected);
+          assert.doesNotMatch(error.message, /nobody admitted|admit the disclosed/i);
+          if (failure.description === "generic guest rejection") {
+            assert.doesNotMatch(error.message, /host denied/i);
+          }
+          return true;
+        });
+
+        assert.deepEqual(guest.clicked, afterAsk ? ["ask"] : []);
+        assert.ok(
+          Date.now() - started <= 2_000,
+          "terminal Meet screens should not wait for the join deadline",
+        );
+      });
+    }
+  }
+
+  test("recognises an account sign-in redirect before the guest name appears", async (t) => {
+    const guest = guestHarness(t, { url: "https://accounts.google.com/v3/signin/identifier" });
+
+    await assert.rejects(guest.run(), /requires.*account|sign in|guest access/i);
+    assert.deepEqual(guest.clicked, []);
+  });
+
+  for (const waiting of [false, true]) {
+    test(`stops promptly when aborted ${waiting ? "in the waiting room" : "before pre-join is ready"}`, async (t) => {
+      const guest = guestHarness(t, waiting ? { name: true, ask: true } : {});
+      const controller = new AbortController();
+      const started = Date.now();
+
+      await assert.rejects(
+        guest.run(joinArgs(controller.signal), (elapsed) => {
+          if (elapsed >= 1_000) controller.abort();
+        }),
+        /stopped/i,
+      );
+
+      assert.deepEqual(guest.clicked, waiting ? ["ask"] : []);
+      assert.ok(Date.now() - started <= 1_500);
+    });
+  }
+});
+
+describe("Google Meet guest input", () => {
+  test("types the disclosed name and moves the pointer before asking to join", async () => {
+    // Ask to join sends Google "system info … to confirm you're not a bot". A
+    // name set in one shot, then a click from a pointer that never moved, is
+    // answered with "You can't join this video call" on a call that lets
+    // anyone in; the same lobby typed and clicked like a person is admitted.
+    setHumanInputEnabledForTests(true);
+    try {
+      const typed: string[] = [];
+      const setValues: string[] = [];
+      let pointerMoves = 0;
+      let joinClick: Record<string, unknown> | undefined;
+      let asked = false;
+      let admitted = false;
+      const control = (key: string, visible: () => boolean) =>
+        ({
+          first() {
+            return this;
+          },
+          isVisible: async () => visible(),
+          isEnabled: async () => visible(),
+          focus: async () => undefined,
+          fill: async (value: string) => {
+            if (value) setValues.push(value);
+          },
+          click: async (options?: Record<string, unknown>) => {
+            if (key !== "ask") return;
+            joinClick = options;
+            asked = true;
+          },
+          boundingBox: async () => ({ x: 600, y: 400, width: 240, height: 56 }),
+          innerText: async () => {
+            if (asked) admitted = true;
+            return "";
+          },
+        }) as unknown as Locator;
+      const page = {
+        setDefaultTimeout: () => undefined,
+        goto: async () => null,
+        keyboard: {
+          type: async (text: string) => {
+            typed.push(text);
+          },
+        },
+        mouse: {
+          move: async () => {
+            pointerMoves += 1;
+          },
+        },
+        getByRole: (_role: string, options: { name?: RegExp }) => {
+          const pattern = options.name?.source ?? "";
+          if (pattern.includes("your name")) return control("name", () => !asked);
+          if (pattern.includes("ask to join")) return control("ask", () => !asked);
+          if (pattern.includes("leave call") || pattern.includes("raise hand")) {
+            return control("inCall", () => admitted);
+          }
+          return control("hidden", () => false);
+        },
+        locator: (selector: string) =>
+          selector === "body" ? control("body", () => true) : control("hidden", () => false),
+        url: () => "https://meet.google.com/meet/abc-defg-hij",
+        isClosed: () => false,
+      } as unknown as Page;
+
+      await joinGoogleMeetAsGuest(page, { ...joinArgs(), displayName: "Ann" });
+
+      assert.equal(typed.join(""), "Ann (AI notetaker — recording)");
+      assert.ok(typed.length > 1, "the name arrives one keystroke at a time");
+      assert.deepEqual(setValues, [], "the name is never set without keystrokes");
+      assert.ok(pointerMoves > 0, "the pointer travels to Ask to join");
+      // Asking navigates; waiting for that turned a sent request into a timeout.
+      assert.equal(joinClick?.noWaitAfter, true);
+    } finally {
+      setHumanInputEnabledForTests(false);
+    }
+  });
+});
+
+describe("Google Meet captions", () => {
+  type Frame = Array<{ id: number; speaker: string; text: string }>;
+
+  /** A call whose captions region shows `frames`, one per read, once turned on. */
+  function captionedCall(frames: Frame[], options: { on?: boolean; hang?: boolean } = {}) {
+    let on = options.on ?? false;
+    let reads = 0;
+    const clicks: string[] = [];
+    const button = (name: string, visible: () => boolean, press?: () => void) =>
+      ({
+        first() {
+          return this;
+        },
+        isVisible: async () => visible(),
+        click: async () => {
+          clicks.push(name);
+          press?.();
+        },
+        fill: async () => undefined,
+      }) as unknown as Locator;
+    const page = {
+      getByRole: (_role: string, roleOptions: { name?: RegExp }) => {
+        const pattern = roleOptions.name?.source ?? "";
+        if (pattern.includes("turn off captions")) return button("off", () => on);
+        if (pattern.includes("turn on captions")) {
+          return button(
+            "on",
+            () => !on,
+            () => {
+              on = true;
+            },
+          );
+        }
+        return button("hidden", () => false);
+      },
+      evaluate: async () => {
+        if (options.hang) return new Promise(() => undefined);
+        const frame = frames[Math.min(reads, frames.length - 1)] ?? [];
+        reads += 1;
+        return on ? frame : [];
+      },
+    } as unknown as Page;
+    return { page, clicks };
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 25; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  test("turns captions on and keeps each line's final wording", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let clock = 10_000;
+    const call = captionedCall([
+      [{ id: 1, speaker: "Pat Lee", text: "We need" }],
+      [{ id: 1, speaker: "Pat Lee", text: "We need SSO before we sign" }],
+      [
+        { id: 1, speaker: "Pat Lee", text: "We need SSO before we sign." },
+        { id: 2, speaker: "Sam Rivera", text: "I'll send pricing Friday." },
+      ],
+      // Pat's line has scrolled away; it keeps what it last said. Meet has
+      // revised Sam's as recognition settled.
+      [{ id: 2, speaker: "Sam Rivera", text: "I'll send the pricing on Friday." }],
+    ]);
+
+    const capture = captureGoogleMeetCaptions(call.page, 10_000, () => clock);
+    for (let pass = 0; pass < 4; pass += 1) {
+      await settle();
+      clock += 1_000;
+      t.mock.timers.tick(1_000);
+    }
+    await settle();
+    const captions = await capture.stop();
+
+    assert.deepEqual(call.clicks, ["on"]);
+    assert.deepEqual(captions, [
+      { startMs: 0, endMs: 2_000, speaker: "Pat Lee", text: "We need SSO before we sign." },
+      {
+        startMs: 2_000,
+        endMs: 3_000,
+        speaker: "Sam Rivera",
+        text: "I'll send the pricing on Friday.",
+      },
+    ]);
+  });
+
+  test("leaves captions alone when they are already on", async () => {
+    const call = captionedCall([[{ id: 1, speaker: "Pat Lee", text: "Hello." }]], { on: true });
+
+    const capture = captureGoogleMeetCaptions(call.page, 0, () => 500);
+    await settle();
+    const captions = await capture.stop();
+
+    assert.deepEqual(call.clicks, []);
+    assert.deepEqual(captions.map((caption) => caption.text), ["Hello."]);
+  });
+
+  test("a page that stops answering cannot hold the recorder open", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const call = captionedCall([], { on: true, hang: true });
+    const capture = captureGoogleMeetCaptions(call.page, 0);
+    await settle();
+    let captions: MeetingCaption[] | null = null;
+
+    const stopping = capture.stop(true).then((read) => {
+      captions = read;
+    });
+    // Half a second for the read in flight, half a second for a last one.
+    for (let wait = 0; wait < 2; wait += 1) {
+      await settle();
+      t.mock.timers.tick(500);
+    }
+    await stopping;
+
+    assert.deepEqual(captions, []);
+  });
+});
+
+describe("Google Meet recorder lifecycle", () => {
+  test("isolates audio and browser state, records mono Opus, and cleans everything up", async () => {
+    const harness = recorderHarness();
+    let joined = 0;
+    const result = await harness.recorder.join({
+      ...joinArgs(),
+      onJoined: async () => {
+        joined += 1;
+      },
+    });
+
+    assert.equal(joined, 1);
+    assert.deepEqual(result, {
+      bytes: Buffer.from("webm-opus-audio"),
+      mime: "audio/webm",
+      durationMs: 3_000,
+      captions: [],
+    });
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    // Two devices, both private to this call and both unloaded again: the null
+    // sink Chrome plays into, and the null source it captures from.
+    assert.deepEqual(
+      harness.commands.map(({ command, args }) => [command, args[0], args[1]]),
+      [
+        ["pactl", "load-module", "module-null-sink"],
+        ["pactl", "load-module", "module-null-source"],
+        ["pactl", "unload-module", "41"],
+        ["pactl", "unload-module", "41"],
+      ],
+    );
+    // PulseAudio refuses any argument a module does not declare. The null
+    // source is labelled with `description=`; the sink's `source_properties=`
+    // failed every load, and every notetaker joined without a microphone.
+    const silentSource = harness.commands.find(({ args }) => args[1] === "module-null-source");
+    assert.ok(silentSource?.args.includes("description=Genosyn_silent_mic"));
+    assert.ok(!silentSource?.args.some((arg) => arg.startsWith("source_properties=")));
+
+    const ffmpeg = harness.ffmpegCommands[0];
+    assert.equal(ffmpeg.command, "ffmpeg");
+    assert.ok(ffmpeg.args.includes("libopus"));
+    assert.ok(ffmpeg.args.includes("webm"));
+    assert.deepEqual(
+      ffmpeg.args.slice(ffmpeg.args.indexOf("-ac"), ffmpeg.args.indexOf("-ac") + 2),
+      ["-ac", "1"],
+    );
+
+    const launch = harness.getLaunchOptions();
+    assert.ok(launch);
+    assert.deepEqual(launch.args, ["--existing", "--autoplay-policy=no-user-gesture-required"]);
+    assert.deepEqual(launch.ignoreDefaultArgs, ["--enable-automation", "--mute-audio"]);
+    assert.equal((launch.env as Record<string, string>).EXISTING, "yes");
+    assert.match((launch.env as Record<string, string>).PULSE_SINK, /^genosyn_meeting_/);
+    // Capture is pinned to the silent source. Left to PulseAudio's default,
+    // Chrome would capture the monitor of the sink it is playing into.
+    assert.equal(
+      (launch.env as Record<string, string>).PULSE_SOURCE,
+      `${(launch.env as Record<string, string>).PULSE_SINK}_mic`,
+    );
+    // Not even the silent microphone is granted: Google refused the knock of a
+    // guest that had one, and admitted the same guest bringing none.
+    assert.deepEqual(harness.getContextOptions(), {
+      locale: "en-US",
+      serviceWorkers: "allow",
+      permissions: [],
+      acceptDownloads: false,
+    });
+  });
+
+  test("reads Meet's captions from admission and returns them with the audio", async () => {
+    const said: MeetingCaption[] = [
+      { startMs: 0, endMs: 1_500, speaker: "Pat Lee", text: "We need SSO before we sign." },
+    ];
+    const harness = recorderHarness({ captions: said });
+
+    const result = await harness.recorder.join(joinArgs());
+
+    assert.deepEqual(result.captions, said);
+    assert.equal(harness.lifecycle.captionsStartedAt, 1_000, "captions are timed from admission");
+    // The page is the only place the captions exist; closing it first loses
+    // the last words of the call.
+    assert.equal(harness.lifecycle.captionsStoppedWhileOpen, true);
+  });
+
+  test("returns a finalised partial recording when aborted after admission", async () => {
+    const controller = new AbortController();
+    const harness = recorderHarness({
+      waitForEnd: async () => {
+        controller.abort();
+      },
+    });
+
+    const result = await harness.recorder.join(joinArgs(controller.signal));
+
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(result.bytes, Buffer.from("webm-opus-audio"));
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("keeps finalised partial audio when the post-admission wait rejects from abort", async () => {
+    const controller = new AbortController();
+    const abortReason = new Error("The App is shutting down.");
+    const harness = recorderHarness({
+      waitForEnd: async () => {
+        controller.abort(abortReason);
+        throw abortReason;
+      },
+    });
+
+    const result = await harness.recorder.join(joinArgs(controller.signal));
+
+    assert.deepEqual(result.bytes, Buffer.from("webm-opus-audio"));
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("cleans browser, ffmpeg, and PulseAudio after a lobby failure", async () => {
+    const harness = recorderHarness({
+      joinGuest: async () => {
+        throw new Error("host denied admission");
+      },
+    });
+
+    await assert.rejects(harness.recorder.join(joinArgs()), /host denied admission/);
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("preserves finalized audio and logs a meeting-scoped cleanup failure", async () => {
+    const harness = recorderHarness({ failUnload: true });
+
+    const result = await harness.recorder.join(joinArgs());
+
+    assert.deepEqual(result.bytes, Buffer.from("webm-opus-audio"));
+    assert.equal(harness.warnings.length, 1);
+    assert.match(harness.warnings[0], /meeting-1/);
+    assert.match(harness.warnings[0], /PulseAudio refused to unload module/);
+  });
+
+  test("finalises and returns a bounded partial recording at the size threshold", async () => {
+    const ffmpeg = new FakeFfmpeg(Buffer.alloc(4, 0x7f));
+    const harness = recorderHarness({
+      ffmpeg,
+      maxRecordingBytes: 100,
+      waitForEnd: async () => {
+        // Five bytes are reserved at this injected limit. Reaching 95 asks
+        // ffmpeg to write its four-byte stand-in trailer and exit normally.
+        ffmpeg.emitAudio(Buffer.alloc(95, 0x1a));
+        await new Promise<void>(() => undefined);
+      },
+    });
+
+    const result = await harness.recorder.join(joinArgs());
+
+    assert.equal(ffmpeg.qWrites, 1);
+    assert.equal(result.bytes.length, 99);
+    assert.ok(result.bytes.length <= 100);
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("contains an ffmpeg stdin EPIPE emitted while requesting stop", async () => {
+    const ffmpeg = new FakeFfmpeg();
+    ffmpeg.stdinStopError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    const harness = recorderHarness({ ffmpeg });
+
+    const result = await harness.recorder.join(joinArgs());
+
+    assert.equal(ffmpeg.qWrites, 1);
+    assert.deepEqual(result.bytes, Buffer.from("webm-opus-audio"));
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("reports an early ffmpeg failure and still removes every allocated resource", async () => {
+    const ffmpeg = new FakeFfmpeg();
+    const harness = recorderHarness({
+      ffmpeg,
+      joinGuest: async () => {
+        ffmpeg.emitAudio(Buffer.from("valid-looking partial output"));
+        ffmpeg.fail("PulseAudio source disappeared");
+        await new Promise<void>(() => undefined);
+      },
+    });
+
+    await assert.rejects(
+      harness.recorder.join(joinArgs()),
+      /ffmpeg stopped before the meeting ended.*PulseAudio source disappeared/,
+    );
+    assert.equal(harness.lifecycle.contextClosed, 1);
+    assert.equal(harness.lifecycle.browserClosed, 1);
+    assert.equal(harness.commands.at(-1)?.args[0], "unload-module");
+  });
+
+  test("joins without a silent microphone when PulseAudio has no null source", async () => {
+    // `module-null-source` is not in every PulseAudio build. A deployment
+    // without it should still get a notetaker — it just falls back to
+    // dismissing Meet's device dialog instead of satisfying it.
+    const harness = recorderHarness({ noSilentSource: true });
+
+    const result = await harness.recorder.join(joinArgs());
+
+    assert.equal(result.mime, "audio/webm");
+    const launch = harness.getLaunchOptions();
+    assert.equal((launch?.env as Record<string, string>).PULSE_SOURCE, undefined);
+    assert.deepEqual((harness.getContextOptions() as { permissions: string[] }).permissions, []);
+    assert.equal(
+      harness.warnings.some((message) => /silent microphone/.test(message)),
+      true,
+    );
+    // The sink is still created and still cleaned up; only the source is gone.
+    assert.deepEqual(
+      harness.commands.map(({ args }) => [args[0], args[1]]),
+      [
+        ["load-module", "module-null-sink"],
+        ["load-module", "module-null-source"],
+        ["unload-module", "41"],
+      ],
+    );
+  });
+
+  test("reads the recording cap on every join instead of freezing it at boot", async () => {
+    // `createGoogleMeetRecorder` builds its dependencies with a spread, and a
+    // spread *calls* a getter and keeps the number. The cap is an
+    // operator-editable runtime setting, so it has to be read per join —
+    // otherwise every recording for the life of the process uses whatever the
+    // Admin → Runtime value happened to be when the module first loaded.
+    let cap = 1024 * 1024;
+    const harness = recorderHarness({ readMaxRecordingBytes: () => cap });
+
+    assert.equal((await harness.recorder.join(joinArgs())).mime, "audio/webm");
+
+    cap = 1;
+    await assert.rejects(harness.recorder.join(joinArgs()), /greater than one/);
+  });
+
+  test("an already-aborted request allocates nothing", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const harness = recorderHarness();
+
+    await assert.rejects(
+      harness.recorder.join(joinArgs(controller.signal)),
+      /stopped before it could join/,
+    );
+    assert.equal(harness.commands.length, 0);
+    assert.equal(harness.ffmpegCommands.length, 0);
+  });
+});

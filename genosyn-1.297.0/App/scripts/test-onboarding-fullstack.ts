@@ -1,0 +1,1083 @@
+/** Real browser + real Express/services/SQLite account and onboarding regressions.
+ * Run with Node 22: node --import tsx scripts/test-onboarding-fullstack.ts
+ * Append --continuation to focus model Runs on saved work while retaining account flows.
+ * Append --standdown to focus model Runs on returning a stood-down Routine to work.
+ * Uses an isolated in-memory DB, temporary files, console email and a loopback fake model.
+ */
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import { appendFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  chromium,
+  type APIResponse,
+  type Browser,
+  type Page,
+  type Response,
+} from "playwright-core";
+
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const output = path.resolve(appRoot, "../output/playwright");
+const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "genosyn-onboarding-fullstack-"));
+const port = 18487;
+const uiPort = 18489;
+const origin = `http://127.0.0.1:${uiPort}`;
+const continuationOnly = process.argv.includes("--continuation");
+const standdownOnly = process.argv.includes("--standdown");
+await fs.mkdir(output, { recursive: true });
+const serverLogPath = path.join(output, "onboarding-fullstack-server.log");
+const browserLogPath = path.join(output, "onboarding-fullstack-browser.log");
+await fs.writeFile(serverLogPath, "");
+await fs.writeFile(browserLogPath, "");
+const child = spawn(
+  process.execPath,
+  [
+    "--import",
+    "tsx",
+    "scripts/fullstackOnboardingServer.ts",
+    testRoot,
+    String(port),
+    String(uiPort),
+  ],
+  {
+    cwd: appRoot,
+    env: { ...process.env, NODE_ENV: "production" },
+    stdio: ["ignore", "pipe", "pipe"],
+  },
+);
+let serverLog = "";
+child.stdout.on("data", (chunk) => {
+  serverLog += String(chunk);
+  appendFileSync(serverLogPath, chunk);
+  for (const line of String(chunk).split("\n")) {
+    if (line.startsWith("[fullstack-stage]") || line.startsWith("[genosyn] listening"))
+      console.log(line);
+  }
+});
+child.stderr.on("data", (chunk) => {
+  serverLog += String(chunk);
+  appendFileSync(serverLogPath, chunk);
+});
+let browser: Browser | undefined;
+let page: Page | undefined;
+const checks: string[] = [];
+const consoleErrors: string[] = [];
+const email = "onboarding-owner@example.test";
+const password = "Onboarding-QA-password-42";
+const nextPassword = "Onboarding-QA-recovered-84";
+const companyName = "Onboarding QA Company";
+const goalSentence = "Reach 50 paying customers by March";
+const mission = "Help independent schools keep reliable learning tools.";
+const vision = "Every classroom can trust the software it uses.";
+async function until(
+  check: () => boolean | Promise<boolean>,
+  description: string,
+  timeout = 180_000,
+) {
+  const deadline = Date.now() + timeout;
+  while (!(await check())) {
+    if (child.exitCode !== null)
+      throw new Error(
+        `App exited (${child.exitCode}) while ${description}: ${serverLog.slice(-6000)}`,
+      );
+    if (Date.now() > deadline)
+      throw new Error(`Timed out ${description}: ${serverLog.slice(-4000)}`);
+    await delay(200);
+  }
+}
+function record(message: string) {
+  checks.push(message);
+  console.log(`PASS ${message}`);
+}
+async function go(route: string) {
+  await page!.goto(`${origin}${route}`, { waitUntil: "domcontentloaded", timeout: 90_000 });
+}
+async function read<T>(route: string): Promise<T> {
+  const response = await page!.request.get(`${origin}${route}`);
+  assert.equal(response.status(), 200, `${route}: ${await response.text()}`);
+  return response.json() as Promise<T>;
+}
+async function logout() {
+  await page!
+    .locator("header")
+    .getByRole("button", { name: /Onboarding Owner/ })
+    .click();
+  await page!.getByRole("button", { name: "Log out", exact: true }).click();
+  await page!.getByRole("heading", { name: "Welcome back" }).waitFor();
+}
+async function login(secret: string, companyReady = true) {
+  await page!.getByLabel("Email", { exact: true }).fill(email);
+  await page!.getByLabel("Password", { exact: true }).fill(secret);
+  await page!.getByRole("button", { name: "Sign in", exact: true }).click();
+  if (companyReady)
+    await page!.locator("header").getByRole("button", { name: companyName, exact: true }).waitFor();
+  else await page!.getByRole("heading", { name: "Set up your company", exact: true }).waitFor();
+}
+try {
+  await fs.mkdir(output, { recursive: true });
+  await until(
+    () =>
+      serverLog.includes(`[genosyn] listening on :${port}`) &&
+      serverLog.includes(`[fullstack-stage] built client listening on :${uiPort}`),
+    "starting isolated app",
+    600_000,
+  );
+  browser = await chromium.launch({
+    channel: process.env.GENOSYN_TEST_BROWSER ?? "chrome",
+    headless: true,
+  });
+  const context = await browser.newContext({ viewport: { width: 1360, height: 1000 } });
+  context.setDefaultTimeout(45_000);
+  await context.route("**/*", (route) => {
+    const url = new URL(route.request().url());
+    return url.hostname === "127.0.0.1" || url.protocol === "data:" || url.protocol === "blob:"
+      ? route.continue()
+      : route.abort();
+  });
+  page = await context.newPage();
+  page.on("pageerror", (error) => consoleErrors.push(error.message));
+  page.on("response", (response) => {
+    const request = response.request();
+    if (
+      response.url().startsWith(`${origin}/api/`) &&
+      (request.method() !== "GET" || response.status() >= 400)
+    ) {
+      appendFileSync(
+        browserLogPath,
+        `${request.method()} ${response.status()} ${response.url()}\n`,
+      );
+    }
+  });
+  page.on("requestfailed", (request) => {
+    if (request.url().startsWith(origin))
+      appendFileSync(browserLogPath, `FAILED ${request.url()} ${request.failure()?.errorText}\n`);
+  });
+  page.on("console", (message) => {
+    if (message.type() === "error") appendFileSync(browserLogPath, `CONSOLE ${message.text()}\n`);
+  });
+  page.on("framenavigated", (frame) => {
+    if (frame === page!.mainFrame()) appendFileSync(browserLogPath, `PAGE ${frame.url()}\n`);
+  });
+  await go("/signup");
+  await page.getByLabel("Name", { exact: true }).fill("Onboarding Owner");
+  await page.getByLabel("Email", { exact: true }).fill(email);
+  await page.getByLabel("Password", { exact: true }).fill(password);
+  const registered = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/auth/signup") && response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  assert.equal((await registered).status(), 200);
+  // Console email is emitted before the registration response sets the session cookie.
+  // Wait for the completed signup and auth navigation before opening its verification link.
+  await page.waitForURL((url) => url.pathname !== "/signup");
+  assert.equal((await read<{ email: string }>("/api/auth/me")).email, email);
+  await until(
+    () => /http:\/\/127\.0\.0\.1:\d+\/verify-email\/[a-f0-9]+/.test(serverLog),
+    "receiving console verification",
+  );
+  const verifyLink = serverLog.match(/http:\/\/127\.0\.0\.1:\d+\/verify-email\/[a-f0-9]+/)![0];
+  await page.goto(verifyLink, { waitUntil: "domcontentloaded" });
+  await page
+    .getByText("Your email is verified. You can continue to Genosyn.", { exact: true })
+    .waitFor();
+  await page.getByRole("link", { name: "Continue", exact: true }).click();
+  // Bootstrap verification promotes this account and intentionally invalidates its
+  // earlier session. The operator proves their password again before company setup.
+  await page.getByRole("heading", { name: "Welcome back", exact: true }).waitFor();
+  await login(password, false);
+  record("Signup, console email verification and bootstrap operator login");
+
+  await page.getByLabel("Company name", { exact: true }).fill(companyName);
+  await page.getByLabel("Your Goal", { exact: true }).fill(goalSentence);
+  // Mission and vision are optional and sit behind a closed disclosure.
+  await page.getByText("Add a mission and vision (optional)", { exact: true }).click();
+  await page.getByLabel("Mission", { exact: true }).fill(mission);
+  await page.getByLabel("Vision", { exact: true }).fill(vision);
+  await page.getByRole("button", { name: "Create company and continue", exact: true }).click();
+  await page.getByRole("heading", { name: "Hire your first AI Employee", exact: true }).waitFor();
+  const companies =
+    await read<
+      Array<{ id: string; slug: string; mission: string; vision: string; hasGoal: boolean }>
+    >("/api/companies");
+  const company = companies[0];
+  assert.equal(company.mission, mission);
+  assert.equal(company.vision, vision);
+  assert.equal(company.hasGoal, true);
+  const goals = await read<
+    Array<{
+      title: string;
+      targetValue: number;
+      unit: string;
+      direction: string;
+      metricKind: string;
+      status: string;
+      parentGoalId: string | null;
+    }>
+  >(`/api/companies/${company.id}/goals`);
+  assert.deepEqual(goals, [
+    {
+      ...goals[0],
+      title: goalSentence,
+      targetValue: 50,
+      unit: "paying customers",
+      direction: "increase_to",
+      metricKind: "manual",
+      status: "active",
+      parentGoalId: null,
+    },
+  ]);
+  record("Company Goal, mission and vision saved before hiring");
+  await page.getByLabel("Name", { exact: true }).fill("Avery QA");
+  await page.getByLabel("Role", { exact: true }).fill("Software Engineer");
+  await page.getByRole("button", { name: "Hire AI Employee", exact: true }).click();
+  await page.getByText("Avery QA is hired", { exact: true }).waitFor();
+  const employees = await read<Array<{ id: string; slug: string; role: string }>>(
+    `/api/companies/${company.id}/employees`,
+  );
+  const employee = employees[0];
+  assert.equal(employee.role, "Software Engineer");
+  const employeeBase = `/api/companies/${company.id}/employees/${employee.id}`;
+  assert.equal((await read<unknown[]>(`${employeeBase}/routines`)).length, 0);
+  record("AI Employee hired with no unreviewed Routines");
+
+  await page.getByRole("combobox", { name: "AI Model service", exact: true }).click();
+  await page.getByRole("option", { name: "Custom endpoint", exact: true }).click();
+  const modelURL = serverLog.match(/\[fullstack-model-url\] (http:\/\/[^\s]+)/)![1];
+  await page.getByLabel("Base URL", { exact: true }).fill(modelURL);
+  await page.getByLabel("Model ID (optional)", { exact: true }).fill("qa-local-model");
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  // A connected model reads as "{provider} · {model}" in plain words.
+  await page
+    .getByText("Custom endpoint · qa-local-model", { exact: true })
+    .waitFor({ timeout: 150_000 });
+  assert(serverLog.includes("[fullstack-model-probe] verified"));
+  const models = await read<Array<{ status: string; isActive: boolean }>>(`${employeeBase}/models`);
+  assert(models.some((model) => model.status === "connected" && model.isActive));
+  record("Connected an AI Model through real OpenCode and a local streaming tool-use test");
+
+  await page.getByRole("button", { name: "Choose Routines", exact: true }).click();
+  await page.getByRole("heading", { name: "Suggested Routines", exact: true }).waitFor();
+  // What Automatic setup adds is listed beside the picks, from the real planner.
+  await page.getByRole("heading", { name: "Also set up for Avery QA", exact: true }).waitFor();
+  await page.getByText("Follow through on open work", { exact: true }).waitFor();
+  await page.getByText("TLDR briefing", { exact: true }).waitFor();
+  const standingPreview = await read<{
+    automaticSetup: boolean;
+    employeeReady: boolean;
+    starters: Array<{ recipeId: string }>;
+    briefing: { schedule: string; writerIsEmployee: boolean } | null;
+  }>(`/api/companies/${company.id}/proactive/preview?employeeId=${employee.id}`);
+  assert.equal(standingPreview.automaticSetup, true);
+  assert.equal(standingPreview.employeeReady, true);
+  assert.deepEqual(
+    standingPreview.starters.map((row) => row.recipeId),
+    ["advance-responsibilities", "work-followthrough", "improve-own-work", "discover-improvements"],
+  );
+  assert.deepEqual(standingPreview.briefing, {
+    schedule: "Daily",
+    writerName: "Avery QA",
+    writerIsEmployee: true,
+  });
+  record("The guide lists the standing work and briefing set up automatically");
+  const plan = await read<{ routines: Array<{ name: string; status: string }> }>(
+    `${employeeBase}/onboarding-recommendations`,
+  );
+  const selectedNames = new Set<string>();
+  for (const routine of plan.routines.filter((routine) => routine.status === "suggested")) {
+    if (
+      await page.getByRole("checkbox", { name: `Select ${routine.name}`, exact: true }).isChecked()
+    )
+      selectedNames.add(routine.name);
+  }
+  assert(selectedNames.size > 0);
+  await page.getByRole("button", { name: /^Schedule \d+ Routines? and continue$/ }).click();
+  await page.getByRole("heading", { name: "Connect email", exact: true }).waitFor();
+  const allRoutines = await read<Array<{ name: string; body: string; acceptanceCriteria: string }>>(
+    `${employeeBase}/routines`,
+  );
+  const routines = allRoutines.filter((routine) => selectedNames.has(routine.name));
+  assert.equal(routines.length, selectedNames.size);
+  assert(
+    routines.every(
+      (routine) =>
+        routine.body.includes(goalSentence) &&
+        routine.body.includes(mission) &&
+        routine.body.includes(vision) &&
+        routine.body.includes("Software Engineer"),
+    ),
+  );
+  // A starter Routine is graded: its Runs carry a definition of done.
+  assert(routines.every((routine) => routine.acceptanceCriteria.trim().length > 0));
+  await page.getByRole("button", { name: "Skip email for now", exact: true }).click();
+  // Granting access is the step after email; nothing has to be ticked to go on.
+  await page.getByRole("heading", { name: "Choose what Avery QA can reach", exact: true }).waitFor();
+  await page.locator('li[data-access-label="Finance"]').waitFor();
+  await page.getByRole("button", { name: "Finish setup", exact: true }).click();
+  await page
+    .getByRole("heading", { name: `Avery QA has joined ${companyName}`, exact: true })
+    .waitFor();
+  record("Reviewed Routines created with the role, mission and vision; optional email skipped");
+  await page.screenshot({ path: path.join(output, "onboarding-fullstack-summary.png") });
+
+  await go(`/c/${company.slug}/employees/${employee.slug}/settings/soul`);
+  const soul =
+    "# Avery QA\n\nBuild reliable learning tools for independent schools. Verify every change and report evidence.";
+  await page.locator("textarea").first().fill(soul);
+  const soulSaved = page.waitForResponse(
+    (response) =>
+      response.url().endsWith(`${employeeBase}/soul`) && response.request().method() === "PUT",
+  );
+  await page.getByRole("button", { name: "Save Soul", exact: true }).click();
+  assert.equal((await soulSaved).status(), 200);
+  assert.equal((await read<{ content: string }>(`${employeeBase}/soul`)).content, soul);
+  record("Soul edited and persisted through its browser editor");
+
+  await go(`/c/${company.slug}/skills/new`);
+  await page.getByLabel("Name", { exact: true }).fill("Release checklist");
+  await page.getByRole("button", { name: "Create skill", exact: true }).click();
+  await page.waitForURL(/\/skills\/avery-qa\/release-checklist/);
+  const skills = await read<Array<{ name: string }>>(`${employeeBase}/skills`);
+  assert(skills.some((skill) => skill.name === "Release checklist"));
+  record("Skill created for the AI Employee");
+
+  if (!continuationOnly && !standdownOnly) {
+    // A model server on this machine serves one Routine at a time unless told
+    // otherwise. This exercise is about one employee running two Routines at
+    // once, so lift the model's limit the way an operator would.
+    const [localModel] = await read<
+      Array<{ id: string; effectiveMaxConcurrentRuns: number | null; concurrencySource: string }>
+    >(`${employeeBase}/models`);
+    assert.equal(localModel.effectiveMaxConcurrentRuns, 1);
+    assert.equal(localModel.concurrencySource, "local-default");
+    // The model is the company's: its settings live on the company's model route.
+    const unlimited = await page.request.put(
+      `${origin}/api/companies/${company.id}/models/${localModel.id}/run-concurrency`,
+      { data: { maxConcurrentRuns: 0 } },
+    );
+    assert.equal(unlimited.status(), 200, await unlimited.text());
+    assert.equal(
+      ((await unlimited.json()) as { effectiveMaxConcurrentRuns: number | null })
+        .effectiveMaxConcurrentRuns,
+      null,
+    );
+    record("A local AI Model serves one Routine at a time by default and accepts No limit");
+    const concurrentRuns: Array<{ routineApi: string; runId: string; marker: string }> = [];
+    for (const marker of ["qa-concurrent-routine-one", "qa-concurrent-routine-two"]) {
+      const created = await page.request.post(`${origin}${employeeBase}/routines`, {
+        data: { name: marker, cronExpr: "0 0 1 1 *" },
+      });
+      assert.equal(created.status(), 200, await created.text());
+      const routine = (await created.json()) as { id: string; slug: string };
+      const routineApi = `/api/companies/${company.id}/routines/${routine.id}`;
+      const saved = await page.request.put(`${origin}${routineApi}/readme`, {
+        data: { content: `Complete the local browser exercise ${marker}.` },
+      });
+      assert.equal(saved.status(), 200, await saved.text());
+      await go(`/c/${company.slug}/routines/${employee.slug}/${routine.slug}`);
+      const started: Promise<Response> = page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`${routineApi}/run`) && response.request().method() === "POST",
+      );
+      await page.getByRole("button", { name: "Run now", exact: true }).first().click();
+      const response: Response = await started;
+      assert.equal(response.status(), 200, await response.text());
+      const run = (await response.json()) as { id: string };
+      concurrentRuns.push({ routineApi, runId: run.id, marker });
+      await page.getByRole("dialog").getByText("running", { exact: true }).waitFor();
+      await page.keyboard.press("Escape");
+    }
+    await until(
+      () =>
+        concurrentRuns.every(({ marker }) =>
+          serverLog.includes(`[fullstack-concurrent] ${marker} reached model`),
+        ),
+      "both Routines reaching the model concurrently",
+    );
+    for (const { runId } of concurrentRuns) {
+      assert.equal(
+        (await read<{ status: string }>(`/api/companies/${company.id}/runs/${runId}/log`)).status,
+        "running",
+      );
+    }
+    // Runs under way have their own page, apart from the list of All routines.
+    await go(`/c/${company.slug}/routines/running`);
+    const runningNow = page.getByRole("region", { name: "Running now", exact: true });
+    for (const { marker } of concurrentRuns) {
+      await runningNow
+        .getByRole("link", { name: `${marker}: view live Run`, exact: true })
+        .waitFor();
+    }
+    await page.screenshot({ path: path.join(output, "routines-running-concurrently.png") });
+    const released = await page.request.post(modelURL.replace(/\/v1$/, "/qa/concurrency/release"));
+    assert.equal(released.status(), 200, await released.text());
+    assert.deepEqual(
+      ((await released.json()) as { reached: string[] }).reached.sort(),
+      concurrentRuns.map(({ marker }) => marker).sort(),
+    );
+    await until(async () => {
+      const histories = await Promise.all(
+        concurrentRuns.map(({ routineApi }) =>
+          read<Array<{ status: string }>>(`${routineApi}/runs`),
+        ),
+      );
+      return histories.every(
+        (history) => history.length === 1 && history[0].status === "completed",
+      );
+    }, "both concurrent Routines completing");
+    record(
+      "Two different Routines for one AI Employee reached the real model concurrently, appeared together under Running now, and completed independently",
+    );
+  }
+
+  if (!continuationOnly) {
+    const marker = "qa-routine-standdown-resumed";
+    const created = await page.request.post(`${origin}${employeeBase}/routines`, {
+      data: { name: marker, cronExpr: "0 0 1 1 *" },
+    });
+    assert.equal(created.status(), 200, await created.text());
+    const routine = (await created.json()) as { id: string; slug: string };
+    const routineApi = `/api/companies/${company.id}/routines/${routine.id}`;
+    const standdownsApi = `/api/companies/${company.id}/standdowns`;
+    const briefSaved = await page.request.put(`${origin}${routineApi}/readme`, {
+      data: { content: `Complete the local browser exercise ${marker}.` },
+    });
+    assert.equal(briefSaved.status(), 200, await briefSaved.text());
+    // Preserve the misleading prose shipped before scoped Standdown journal entries.
+    // It must remain readable history while the live server state permits this Run.
+    const legacyBody =
+      "Review this Routine before its next Run.\n\nNothing you are scheduled for will run, " +
+      "and Runs already in flight were stopped. Work resumes when a human lifts the standdown.";
+    const legacyCreated = await page.request.post(`${origin}${employeeBase}/journal`, {
+      data: { title: "Your work was stood down", body: legacyBody },
+    });
+    assert.equal(legacyCreated.status(), 200, await legacyCreated.text());
+    const legacyEntry = (await legacyCreated.json()) as { id: string };
+
+    await go(`/c/${company.slug}/routines/${employee.slug}/${routine.slug}`);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("button", { name: "Stand down", exact: true }).click();
+    const standdownDialog = page.getByRole("dialog");
+    await standdownDialog.getByRole("textbox").fill("Review this Routine before its next Run.");
+    const placed = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(standdownsApi) && response.request().method() === "POST",
+    );
+    await standdownDialog.getByRole("button", { name: "Stand down", exact: true }).click();
+    const placeResponse = await placed;
+    assert.equal(placeResponse.status(), 200, await placeResponse.text());
+    const standdown = (await placeResponse.json()) as {
+      id: string;
+      scope: string;
+      scopeId: string;
+    };
+    assert.equal(standdown.scope, "routine");
+    assert.equal(standdown.scopeId, routine.id);
+    await page.getByText("This Routine is stood down.", { exact: true }).waitFor();
+    assert.equal(
+      (await read<{ standdown: unknown }>(`${standdownsApi}/active?employeeId=${employee.id}`))
+        .standdown,
+      null,
+      "a Routine Standdown must leave its AI Employee available",
+    );
+    await page.getByText("This Routine is stood down.", { exact: true }).scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(output, "routine-stood-down.png") });
+
+    await page.getByRole("button", { name: "Return to work", exact: true }).click();
+    const returnDialog = page.getByRole("dialog");
+    await returnDialog.getByRole("textbox").fill("The Routine has been reviewed and can resume.");
+    const lifted = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(`${standdownsApi}/${standdown.id}/lift`) &&
+        response.request().method() === "POST",
+    );
+    await returnDialog.getByRole("button", { name: "Return to work", exact: true }).click();
+    assert.equal((await lifted).status(), 200);
+    await page
+      .getByText("This Routine is stood down.", { exact: true })
+      .waitFor({ state: "hidden" });
+    assert.equal(
+      (await read<{ standdown: unknown }>(`${standdownsApi}/active?routineId=${routine.id}`))
+        .standdown,
+      null,
+    );
+    const started = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(`${routineApi}/run`) && response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Run now", exact: true }).first().click();
+    const startResponse = await started;
+    assert.equal(startResponse.status(), 200, await startResponse.text());
+    const run = (await startResponse.json()) as { id: string };
+    const runDialog = page.getByRole("dialog");
+    await runDialog.getByText("completed", { exact: true }).waitFor({ timeout: 180_000 });
+    const persisted = await read<{ status: string; failureReason: string | null; content: string }>(
+      `/api/companies/${company.id}/runs/${run.id}/log`,
+    );
+    assert.equal(persisted.status, "completed");
+    assert.equal(persisted.failureReason, null);
+    assert.match(persisted.content, /No external work performed in this browser regression\./);
+    assert(serverLog.includes("[fullstack-standdown] resumed Run received current status"));
+    const journal = await read<Array<{ id: string; title: string; body: string }>>(
+      `${employeeBase}/journal`,
+    );
+    assert.equal(journal.find((entry) => entry.id === legacyEntry.id)?.body, legacyBody);
+    assert.equal(
+      (await read<{ standdowns: unknown[] }>(`${standdownsApi}?active=true`)).standdowns.length,
+      0,
+    );
+    await page.screenshot({ path: path.join(output, "routine-returned-to-work.png") });
+    await page.keyboard.press("Escape");
+    record(
+      "Routine Standdown and Return to work preserved employee availability and legacy Journal history; a real Run received current status and completed with the deterministic local model",
+    );
+  }
+
+  // Exercise actual OpenCode, the scoped failure-report tool, persistence, and
+  // browser Run log together. Only the loopback model replies are deterministic.
+  const runtimeCases = [
+    ["qa-routine-success", "completed", "Completed"],
+    ["qa-routine-failure", "failed", "Failed"],
+    ["qa-routine-error", "error", "Error"],
+    ["qa-routine-timeout-recovered", "completed", "Completed after model timeouts"],
+    ["qa-routine-retry-terminal-error", "error", "Error after a retried request becomes terminal"],
+  ] as const;
+  for (const [marker, expectedStatus, label] of continuationOnly || standdownOnly
+    ? []
+    : runtimeCases) {
+    const created = await page.request.post(`${origin}${employeeBase}/routines`, {
+      data: { name: marker, cronExpr: "0 0 1 1 *" },
+    });
+    assert.equal(created.status(), 200, await created.text());
+    const newRoutine = (await created.json()) as { id: string; slug: string };
+    const routineApi = `/api/companies/${company.id}/routines/${newRoutine.id}`;
+    const briefSaved = await page.request.put(`${origin}${routineApi}/readme`, {
+      data: { content: `Complete the local browser exercise ${marker}.` },
+    });
+    assert.equal(briefSaved.status(), 200, await briefSaved.text());
+    await go(`/c/${company.slug}/routines/${employee.slug}/${newRoutine.slug}`);
+    if (marker === "qa-routine-success") {
+      await page.getByRole("button", { name: "Settings", exact: true }).click();
+      // Checks live under Advanced, which starts closed.
+      await page.getByRole("button", { name: /^Advanced/ }).click();
+      await page.getByRole("button", { name: "Add a check", exact: true }).click();
+      const editor = page.getByRole("dialog");
+      await editor.getByLabel("Name", { exact: true }).fill("No email was sent");
+      await editor.getByLabel("Action", { exact: true }).fill("mail.send");
+      await editor.getByLabel("At least", { exact: true }).fill("0");
+      await editor.getByLabel("At most (optional)", { exact: true }).fill("0");
+      const createdCheck = page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`${routineApi}/checks`) && response.request().method() === "POST",
+      );
+      await editor.getByRole("button", { name: "Add check", exact: true }).click();
+      assert.equal((await createdCheck).status(), 200);
+      await editor.waitFor({ state: "hidden" });
+      record("Company admin configured a required no-email Check through Routine Settings");
+    }
+    const started: Promise<Response> = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(`${routineApi}/run`) && response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Run now", exact: true }).first().click();
+    const startResponse: Response = await started;
+    assert.equal(startResponse.status(), 200, await startResponse.text());
+    const run = (await startResponse.json()) as { id: string };
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText(expectedStatus, { exact: true }).waitFor({ timeout: 180_000 });
+    const persisted = await read<{
+      status: string;
+      errorKind: string | null;
+      failureReason: string | null;
+      content: string;
+      attempt: number;
+      retryAt: string | null;
+      diagnostics: { failure: { category: string; message: string } | null };
+    }>(`/api/companies/${company.id}/runs/${run.id}/log`);
+    assert.equal(persisted.status, expectedStatus);
+    if (expectedStatus === "completed") {
+      assert.equal(persisted.diagnostics.failure, null);
+      if (marker === "qa-routine-success") {
+        await dialog.getByText("No email was sent", { exact: true }).waitFor();
+        await dialog.getByText("checks passed", { exact: false }).first().waitFor();
+      }
+    } else {
+      assert.ok(persisted.diagnostics.failure?.message);
+      await dialog.getByText(/Failure details/).waitFor();
+      await dialog.getByText(/No Checks ran for this Run/).waitFor();
+    }
+    if (marker === "qa-routine-timeout-recovered" || marker === "qa-routine-retry-terminal-error") {
+      const recovered = marker === "qa-routine-timeout-recovered";
+      const expectedRequests = 3;
+      const attempts = serverLog
+        .split("\n")
+        .filter((line) => line.startsWith("[fullstack-model-timeout] "))
+        .map(
+          (line) =>
+            JSON.parse(line.slice("[fullstack-model-timeout] ".length)) as {
+              marker: string;
+              attempt: number;
+              status: number;
+              atMs: number;
+              requestHash: string;
+            },
+        )
+        .filter((attempt) => attempt.marker === marker);
+      assert.equal(attempts.length, expectedRequests);
+      assert.deepEqual(
+        attempts.map((attempt) => attempt.attempt),
+        Array.from({ length: expectedRequests }, (_, index) => index + 1),
+      );
+      assert.deepEqual(
+        attempts.map((attempt) => attempt.status),
+        recovered ? [504, 504, 200] : [504, 504, 400],
+      );
+      assert.equal(
+        new Set(attempts.map((attempt) => attempt.requestHash)).size,
+        1,
+        "automatic retries must repeat the same model request",
+      );
+      assert.doesNotMatch(persisted.content, /mark_run_failed|\[failed\]/);
+      assert.equal(persisted.failureReason, null);
+      assert.equal(persisted.errorKind, recovered ? null : "runtime");
+      assert.equal(persisted.attempt, 1, "model retries stay inside the original Run");
+      assert.equal(persisted.retryAt, null, "manual Runs do not schedule a new Run");
+      const runHistory = await read<Array<{ id: string; status: string; attempt: number }>>(
+        `${routineApi}/runs`,
+      );
+      assert.deepEqual(
+        runHistory.map((row) => ({ id: row.id, status: row.status, attempt: row.attempt })),
+        [{ id: run.id, status: expectedStatus, attempt: 1 }],
+      );
+      assert.equal(await dialog.getByText("failed", { exact: true }).count(), 0);
+      if (!recovered) assert.match(persisted.content, /HTTP 400/);
+    } else if (expectedStatus === "failed") {
+      const reason =
+        "The required source document was unavailable, so the report could not be completed.";
+      assert.equal(persisted.failureReason, reason);
+      assert.equal(persisted.errorKind, null);
+      await dialog.getByText(reason, { exact: true }).first().waitFor();
+      assert.match(persisted.content, /mark_run_failed/);
+    } else if (expectedStatus === "error") {
+      assert.equal(persisted.errorKind, "runtime");
+      assert.match(persisted.content, /HTTP 400/);
+    }
+    await page.screenshot({
+      path: path.join(
+        output,
+        marker.startsWith("qa-routine-timeout-") || marker.startsWith("qa-routine-retry-")
+          ? `${marker}.png`
+          : `routine-run-${expectedStatus}.png`,
+      ),
+    });
+    await page.keyboard.press("Escape");
+    record(`Routine Run persisted and displayed ${label} through the pinned OpenCode runtime`);
+  }
+
+  // The production scheduler, runner, and MCP tools own the chain. Only model
+  // replies are fixtures; no Run rows or queue timestamps are inserted here.
+  let cancelledContinuationApi = "";
+  for (const cancel of standdownOnly ? [] : [true, false]) {
+    const marker = cancel ? "qa-routine-continuation-cancel" : "qa-routine-continuation";
+    const created = await page.request.post(`${origin}${employeeBase}/routines`, {
+      data: { name: marker, cronExpr: "0 0 1 1 *" },
+    });
+    assert.equal(created.status(), 200, await created.text());
+    const routine = (await created.json()) as { id: string; slug: string; maxAttempts: number };
+    assert.equal(routine.maxAttempts, 1, "continuation must work with unchanged retry defaults");
+    const routineApi = `/api/companies/${company.id}/routines/${routine.id}`;
+    const briefSaved = await page.request.put(`${origin}${routineApi}/readme`, {
+      data: { content: `Review both source pages for ${marker}, saving progress after each page.` },
+    });
+    assert.equal(briefSaved.status(), 200, await briefSaved.text());
+    const routinePath = `/c/${company.slug}/routines/${employee.slug}/${routine.slug}`;
+    await go(routinePath);
+    const started: Promise<Response> = page.waitForResponse(
+      (response) =>
+        response.url().endsWith(`${routineApi}/run`) && response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Run now", exact: true }).first().click();
+    const startResponse: Response = await started;
+    assert.equal(startResponse.status(), 200, await startResponse.text());
+    const parent = (await startResponse.json()) as { id: string };
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("Continuation scheduled", { exact: true }).waitFor({ timeout: 180_000 });
+    await dialog.getByRole("button", { name: "Cancel continuation", exact: true }).waitFor();
+    const parentLog = await read<{
+      status: string;
+      continuationPending: boolean;
+      continuationCount: number;
+      retryAt: string | null;
+      content: string;
+    }>(`/api/companies/${company.id}/runs/${parent.id}/log`);
+    assert.equal(parentLog.status, "continued");
+    assert.equal(parentLog.continuationPending, true);
+    assert.equal(parentLog.continuationCount, 0);
+    assert(parentLog.retryAt);
+    assert.match(parentLog.content, /save_run_checkpoint/);
+    if (cancel) {
+      const cancelled = page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`/runs/${parent.id}/cancel-retry`) &&
+          response.request().method() === "POST",
+      );
+      await dialog.getByRole("button", { name: "Cancel continuation", exact: true }).click();
+      assert.equal((await cancelled).status(), 200);
+      await dialog
+        .getByRole("button", { name: "Cancel continuation", exact: true })
+        .waitFor({ state: "hidden" });
+      const afterCancel = await read<{ continuationPending: boolean; retryAt: string | null }>(
+        `/api/companies/${company.id}/runs/${parent.id}/log`,
+      );
+      assert.equal(afterCancel.continuationPending, false);
+      assert.equal(afterCancel.retryAt, null);
+      cancelledContinuationApi = routineApi;
+      record("Cancelled saved-work continuation through the real Run log control");
+    } else {
+      await page.screenshot({ path: path.join(output, `${marker}-scheduled.png`) });
+      await until(async () => {
+        const runs = await read<
+          Array<{
+            status: string;
+            continuationCount: number;
+          }>
+        >(`${routineApi}/runs`);
+        return runs.some((run) => run.continuationCount === 1 && run.status === "completed");
+      }, "waiting for the scheduler to continue and complete unfinished work");
+      const history = await read<
+        Array<{
+          id: string;
+          status: string;
+          continuationCount: number;
+          continuationPending: boolean;
+          triggerKind: string;
+        }>
+      >(`${routineApi}/runs`);
+      assert.equal(history.length, 2, "one initial Run and one real scheduled continuation");
+      const childRun = history.find((run) => run.continuationCount === 1)!;
+      assert.equal(childRun.status, "completed");
+      assert.equal(childRun.triggerKind, "continuation");
+      assert.equal(childRun.continuationPending, false);
+      assert.equal(history.find((run) => run.id === parent.id)?.continuationPending, false);
+      const childLog = await read<{ content: string }>(
+        `/api/companies/${company.id}/runs/${childRun.id}/log`,
+      );
+      assert.match(childLog.content, /save_run_checkpoint/);
+      assert.match(childLog.content, /source-event-2/);
+      await page.keyboard.press("Escape");
+      await go(`${routinePath}?tab=runs&run=${childRun.id}`);
+      await page.getByText("continuation 1", { exact: true }).first().waitFor();
+      await page.screenshot({ path: path.join(output, "routine-continuation-completed.png") });
+      assert.equal((await read<unknown[]>(`${cancelledContinuationApi}/runs`)).length, 1);
+      record(
+        "Default Routine resumed a saved checkpoint in a real scheduled Run and completed; cancelled continuation stayed cancelled",
+      );
+    }
+    await page.keyboard.press("Escape");
+  }
+
+  const customersApi = `/api/companies/${company.id}/customers`;
+  for (let index = 0; index < 31; index += 1) {
+    const featured = index === 0;
+    const response: APIResponse = await page.request.post(`${origin}${customersApi}`, {
+      data: {
+        name: featured ? "Needle Holdings" : `Browser Customer ${String(index).padStart(2, "0")}`,
+        domain: featured ? "needle.example.test" : `customer-${index}.example.test`,
+        email: featured ? "billing@needle.example.test" : `billing-${index}@example.test`,
+        taxNumber: index >= 1 && index <= 26 ? "PAGE-EDGE" : undefined,
+        contacts: featured
+          ? [
+              {
+                name: "Ada Browser",
+                email: "ada.browser@example.test",
+                role: "Finance Director",
+                isPrimary: true,
+              },
+            ]
+          : [],
+      },
+    });
+    assert.equal(response.status(), 200, await response.text());
+  }
+  const archivedResponse = await page.request.post(`${origin}${customersApi}`, {
+    data: {
+      name: "Archived Browser Customer",
+      domain: "archived-browser.example.test",
+      email: "archived-browser@example.test",
+    },
+  });
+  const archivedBody = await archivedResponse.text();
+  assert.equal(archivedResponse.status(), 200, archivedBody);
+  const archivedCustomer = JSON.parse(archivedBody) as {
+    id: string;
+    name: string;
+    slug: string;
+  };
+  const archiveResponse = await page.request.patch(
+    `${origin}${customersApi}/${archivedCustomer.slug}`,
+    { data: { archived: true } },
+  );
+  assert.equal(archiveResponse.status(), 200, await archiveResponse.text());
+
+  await go(`/c/${company.slug}/customers`);
+  await page.getByRole("heading", { name: "Customers", exact: true }).waitFor();
+  const customerTable = page.getByRole("table", { name: "Customers", exact: true });
+  const customerResultsStatus = page.locator('p[role="status"][aria-live="polite"]');
+  const customerRange = page.locator("span.tabular-nums").filter({ hasText: /customers?$/ });
+  const waitForCustomerRange = async (expected: string) => {
+    await customerRange.filter({ hasText: expected }).waitFor();
+    assert.equal(await customerRange.textContent(), expected);
+  };
+  await waitForCustomerRange("1–25 of 31 customers");
+  assert.equal(await customerResultsStatus.textContent(), "1–25 of 31 customers");
+  assert.equal(await customerTable.locator("tbody tr").count(), 25);
+
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.waitForURL((url) => url.searchParams.get("page") === "2");
+  await waitForCustomerRange("26–31 of 31 customers");
+  assert.equal(await customerTable.locator("tbody tr").count(), 6);
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
+  await page.waitForURL((url) => url.searchParams.get("page") === null);
+  await waitForCustomerRange("1–25 of 31 customers");
+
+  const customerSearch = page.getByLabel("Search customers", { exact: true });
+  await customerSearch.fill("Browser Customer");
+  await page.waitForURL((url) => url.searchParams.get("q") === "Browser Customer");
+  await waitForCustomerRange("1–25 of 30 customers");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.waitForURL(
+    (url) =>
+      url.searchParams.get("q") === "Browser Customer" && url.searchParams.get("page") === "2",
+  );
+  await waitForCustomerRange("26–30 of 30 customers");
+
+  // A draft debounce must not overwrite state restored by browser navigation.
+  await customerSearch.fill("Needle Holdings");
+  await page.goBack();
+  await page.waitForURL(
+    (url) =>
+      url.searchParams.get("q") === "Browser Customer" && url.searchParams.get("page") === null,
+  );
+  await customerSearch.waitFor();
+  await page.waitForFunction(() => {
+    const input = document.querySelector<HTMLInputElement>('[aria-label="Search customers"]');
+    return input?.value === "Browser Customer";
+  });
+  await delay(400);
+  assert.equal(new URL(page.url()).searchParams.get("q"), "Browser Customer");
+  assert.equal(new URL(page.url()).searchParams.get("page"), null);
+
+  // Archiving the only row on a later page must announce an update and
+  // return to the new last page once the server confirms the smaller total.
+  await customerSearch.fill("PAGE-EDGE");
+  await page.waitForURL((url) => url.searchParams.get("q") === "PAGE-EDGE");
+  await waitForCustomerRange("1–25 of 26 customers");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page.waitForURL(
+    (url) => url.searchParams.get("q") === "PAGE-EDGE" && url.searchParams.get("page") === "2",
+  );
+  await waitForCustomerRange("26–26 of 26 customers");
+  const edgeCustomerHref = await customerTable
+    .locator("tbody")
+    .getByRole("link")
+    .getAttribute("href");
+  assert(edgeCustomerHref);
+  const edgeCustomerSlug = new URL(edgeCustomerHref, origin).pathname.split("/").at(-1);
+  assert(edgeCustomerSlug);
+  const edgeMutationUrl = `${origin}${customersApi}/${edgeCustomerSlug}`;
+  let releaseEdgeMutation!: () => void;
+  const edgeMutationRelease = new Promise<void>((resolve) => {
+    releaseEdgeMutation = resolve;
+  });
+  await page.route(edgeMutationUrl, async (route) => {
+    await edgeMutationRelease;
+    await route.continue();
+  });
+  const edgeMutationResponse = page.waitForResponse(
+    (response) => response.url() === edgeMutationUrl && response.request().method() === "PATCH",
+  );
+  await customerTable.getByRole("button", { name: "Row menu", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
+  await page.getByText("Updating customer list…", { exact: true }).waitFor();
+  assert.equal(await customerResultsStatus.textContent(), "Updating customers…");
+  releaseEdgeMutation();
+  assert.equal((await edgeMutationResponse).status(), 200);
+  await page.unroute(edgeMutationUrl);
+  await page.waitForURL(
+    (url) => url.searchParams.get("q") === "PAGE-EDGE" && url.searchParams.get("page") === null,
+  );
+  await waitForCustomerRange("1–25 of 25 customers");
+
+  await customerSearch.fill("Needle Holdings");
+  await page.waitForURL((url) => url.searchParams.get("q") === "Needle Holdings");
+  await page.getByRole("link", { name: "Needle Holdings", exact: true }).waitFor();
+  assert.equal(await customerTable.locator("tbody tr").count(), 1);
+  await waitForCustomerRange("1–1 of 1 customer");
+
+  // Ada Browser is Needle Holdings' contact, so this search finds the same one
+  // customer: the link left from the last search proves nothing, and the table
+  // drops those rows while it asks again. Count once this search has answered.
+  const contactSearch = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === customersApi && url.searchParams.get("q") === "Ada Browser";
+  });
+  await customerSearch.fill("Ada Browser");
+  await page.waitForURL((url) => url.searchParams.get("q") === "Ada Browser");
+  await contactSearch;
+  await page.getByRole("link", { name: "Needle Holdings", exact: true }).waitFor();
+  assert.equal(await customerTable.locator("tbody tr").count(), 1);
+
+  await customerSearch.fill("no matching customer exists");
+  await page.waitForURL((url) => url.searchParams.get("q") === "no matching customer exists");
+  await page
+    .getByRole("heading", { name: "No customers match your search", exact: true })
+    .waitFor();
+  assert.equal(await customerResultsStatus.textContent(), "No customers match your search.");
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await page.waitForURL((url) => url.searchParams.get("q") === null);
+  await waitForCustomerRange("1–25 of 30 customers");
+
+  await customerSearch.fill("Archived Browser Customer");
+  await page.waitForURL((url) => url.searchParams.get("q") === "Archived Browser Customer");
+  await page
+    .getByRole("heading", { name: "No customers match your search", exact: true })
+    .waitFor();
+  await page.getByLabel("Show archived", { exact: true }).check();
+  await page.waitForURL((url) => url.searchParams.get("archived") === "true");
+  await page.getByRole("link", { name: "Archived Browser Customer", exact: true }).waitFor();
+  await waitForCustomerRange("1–1 of 1 customer");
+
+  await customerSearch.fill("Needle Holdings");
+  await page.waitForURL((url) => url.searchParams.get("q") === "Needle Holdings");
+  const needleRow = customerTable.getByRole("row").filter({ hasText: "Needle Holdings" });
+  const needleMenu = needleRow.getByRole("button", { name: "Row menu", exact: true });
+  const needleMutationUrl = `${origin}${customersApi}/needle-holdings`;
+  let markMutationStarted!: () => void;
+  const mutationStarted = new Promise<void>((resolve) => {
+    markMutationStarted = resolve;
+  });
+  let releaseMutation!: () => void;
+  const mutationRelease = new Promise<void>((resolve) => {
+    releaseMutation = resolve;
+  });
+  await page.route(needleMutationUrl, async (route) => {
+    if (route.request().method() !== "PATCH") {
+      await route.continue();
+      return;
+    }
+    markMutationStarted();
+    await mutationRelease;
+    await route.continue();
+  });
+  const mutationResponse = page.waitForResponse(
+    (response) => response.url() === needleMutationUrl && response.request().method() === "PATCH",
+  );
+  await needleMenu.click();
+  await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
+  await mutationStarted;
+  assert.equal(await needleMenu.isDisabled(), true);
+  releaseMutation();
+  assert.equal((await mutationResponse).status(), 200);
+  await page.unroute(needleMutationUrl);
+  await page.waitForFunction(() => {
+    const row = [...document.querySelectorAll("tbody tr")].find((candidate) =>
+      candidate.textContent?.includes("Needle Holdings"),
+    );
+    return row?.querySelector<HTMLButtonElement>('[aria-label="Row menu"]')?.disabled === false;
+  });
+  await page.screenshot({ path: path.join(output, "customers-search-pagination.png") });
+  record(
+    "Searched and paged Customers with URL state, contacts, navigation, mutations and archives",
+  );
+
+  await page.locator("header").getByRole("button", { name: companyName, exact: true }).click();
+  await page.getByRole("button", { name: "+ New company", exact: true }).click();
+  await page.getByRole("dialog").getByRole("textbox").fill("Second QA Company");
+  await page.getByRole("dialog").getByRole("button", { name: "Create", exact: true }).click();
+  await page.getByRole("heading", { name: "What is your company's Goal?", exact: true }).waitFor();
+  // A company made from the picker has only a name, so the guide asks for its Goal.
+  await page.getByLabel("Your Goal", { exact: true }).fill("Ship 12 product releases this year");
+  await page.getByRole("button", { name: "Save and continue", exact: true }).click();
+  await page.getByRole("heading", { name: "Hire your first AI Employee", exact: true }).waitFor();
+  const secondCompany = (
+    await read<Array<{ id: string; name: string; hasGoal: boolean }>>("/api/companies")
+  ).find((candidate) => candidate.name === "Second QA Company");
+  assert.equal(secondCompany?.hasGoal, true);
+  assert.deepEqual(
+    (
+      await read<Array<{ title: string; targetValue: number; unit: string }>>(
+        `/api/companies/${secondCompany!.id}/goals`,
+      )
+    ).map((row) => [row.title, row.targetValue, row.unit]),
+    [["Ship 12 product releases this year", 12, "product releases"]],
+  );
+  await page
+    .locator("header")
+    .getByRole("button", { name: "Second QA Company", exact: true })
+    .click();
+  await page.getByRole("button", { name: companyName, exact: true }).click();
+  await page.waitForURL(`${origin}/c/${company.slug}`);
+  assert.equal((await read<unknown[]>("/api/companies")).length, 2);
+  record("Created a second company and switched back using the company picker");
+
+  await go(`/c/${company.slug}/settings/members`);
+  await page.getByLabel("Invite by email", { exact: true }).fill("invited-member@example.test");
+  await page.getByRole("button", { name: "Send invite", exact: true }).click();
+  await page.getByText("Invite sent", { exact: true }).waitFor();
+  assert(serverLog.includes("to=invited-member@example.test"));
+  assert(/Accept the invite: http:\/\/127\.0\.0\.1:\d+\/invite\//.test(serverLog));
+  record("Invited a Member through the UI using console email only");
+
+  await logout();
+  await login(password);
+  record("Logout and password login round-trip");
+  await logout();
+  await go("/forgot");
+  await page.getByLabel("Email", { exact: true }).fill(email);
+  await page.getByRole("button", { name: "Send reset link", exact: true }).click();
+  await until(
+    () => /http:\/\/127\.0\.0\.1:\d+\/reset\/[a-f0-9]+/.test(serverLog),
+    "receiving console reset link",
+  );
+  const resetLink = serverLog.match(/http:\/\/127\.0\.0\.1:\d+\/reset\/[a-f0-9]+/)![0];
+  await page.goto(resetLink, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("New password", { exact: true }).fill(nextPassword);
+  await page.getByRole("button", { name: "Reset password", exact: true }).click();
+  await page.getByRole("heading", { name: "Welcome back", exact: true }).waitFor();
+  await login(nextPassword);
+  record("Forgot password, console reset link, password reset and login");
+  assert.deepEqual(consoleErrors, []);
+  await fs.writeFile(
+    path.join(output, "onboarding-fullstack-results.json"),
+    JSON.stringify({ checks, consoleErrors }, null, 2),
+  );
+  console.log(`Passed ${checks.length} fullstack onboarding flows.`);
+} catch (error) {
+  if (page) {
+    await page
+      .screenshot({ path: path.join(output, "onboarding-fullstack-failure.png") })
+      .catch(() => undefined);
+    await fs.writeFile(
+      path.join(output, "onboarding-fullstack-failure.txt"),
+      await page
+        .locator("body")
+        .innerText()
+        .catch(() => ""),
+    );
+  }
+  throw error;
+} finally {
+  await browser?.close();
+  child.kill("SIGTERM");
+  await Promise.race([
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    delay(8000),
+  ]);
+  if (child.exitCode === null) child.kill("SIGKILL");
+  await fs.writeFile(path.join(output, "onboarding-fullstack-server.log"), serverLog);
+  await fs.rm(testRoot, { recursive: true, force: true });
+}

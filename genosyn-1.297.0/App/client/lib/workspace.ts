@@ -1,0 +1,654 @@
+import { api, Notification } from "./api";
+import type { TurnActivitySummary } from "../../shared/chatActivity";
+import { type ChannelHistoryPage, channelHistoryUrl } from "./workspaceHistory";
+
+/**
+ * Client-side types + API helpers + WebSocket client for the workspace-chat
+ * surface. Types here intentionally mirror the server's DTOs in
+ * `services/workspaceChat.ts` so a grep for a field name finds both halves.
+ */
+
+export type WorkspaceAuthorKind = "user" | "ai" | "system";
+/** `group` is a group chat: private, unnamed if you like, and discussed by its AI Employees. */
+export type WorkspaceChannelKind = "public" | "private" | "dm" | "group";
+
+/** What a message is to the group discussion it belongs to. Mirrors the server. */
+export type WorkspaceDiscussionRole =
+  | "question"
+  | "input"
+  | "turn"
+  | "outcome"
+  | "note"
+  | "follow_through";
+
+export type WorkspaceAuthor =
+  | { kind: "user"; id: string; name: string; email: string | null }
+  | { kind: "ai"; id: string; name: string; slug: string; role: string }
+  | { kind: "system"; id: null; name: string };
+
+export type WorkspaceAttachment = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  isImage: boolean;
+};
+
+export type WorkspaceReaction = {
+  emoji: string;
+  count: number;
+  byMe: boolean;
+  actors: { kind: "user" | "ai"; id: string; name: string }[];
+};
+
+export type WorkspaceMessage = {
+  id: string;
+  channelId: string;
+  authorKind: WorkspaceAuthorKind;
+  author: WorkspaceAuthor | null;
+  content: string;
+  parentMessageId: string | null;
+  editedAt: string | null;
+  deletedAt: string | null;
+  createdAt: string;
+  attachments: WorkspaceAttachment[];
+  reactions: WorkspaceReaction[];
+  /** The group discussion this message belongs to; absent on older payloads. */
+  discussionId?: string | null;
+  discussionRole?: WorkspaceDiscussionRole | null;
+  /** The AI turn that wrote it, for a message an AI Employee's turn wrote. */
+  aiTurn?: WorkspaceMessageTurn | null;
+};
+
+/** What kind of turn an AI Employee is taking in a room. Mirrors `ChannelTurnKind`. */
+export type WorkspaceTurnKind = "reply" | "discussion" | "follow_through";
+
+/** Whose access the turn's tools ran with. Mirrors `ChannelTurnAuthority`. */
+export type WorkspaceTurnAuthority = "member" | "employee" | "untrusted";
+
+export type WorkspaceTurnStatus = "working" | "ok" | "error" | "skipped" | "interrupted";
+
+/**
+ * An AI Employee's turn in a room, as the room is told about it — who, for
+ * what, under whose authority, how it stands. Mirrors `ChannelTurnSummary` in
+ * `services/channelTurnViews.ts`; its steps are read from the turn's own
+ * routes, which decide what each reader may see.
+ */
+export type WorkspaceTurn = {
+  id: string;
+  channelId: string;
+  kind: WorkspaceTurnKind;
+  status: WorkspaceTurnStatus;
+  employee: { id: string; name: string; slug: string; role: string } | null;
+  triggerMessageId: string | null;
+  discussionId: string | null;
+  round: number | null;
+  authority: WorkspaceTurnAuthority;
+  requester: { id: string; name: string } | null;
+  /** Why a running reply is not working right now. */
+  waitingFor: "model_unavailable" | "thread_busy" | "model_resuming" | null;
+  attempt: number;
+  startedAt: string;
+  endedAt: string | null;
+  replyMessageId: string | null;
+  activity: TurnActivitySummary | null;
+};
+
+/** What a message carries about the turn that wrote it. */
+export type WorkspaceMessageTurn = Pick<
+  WorkspaceTurn,
+  | "id"
+  | "kind"
+  | "status"
+  | "triggerMessageId"
+  | "discussionId"
+  | "round"
+  | "authority"
+  | "requester"
+  | "activity"
+>;
+
+export type GroupDiscussionStatus = "running" | "concluded" | "stopped" | "failed" | "interrupted";
+
+export type GroupDiscussionEndReason =
+  | "converged"
+  | "max_rounds"
+  | "turn_budget"
+  | "usage_budget"
+  | "time_limit"
+  | "repetition"
+  | "wrapped_up"
+  | "stopped"
+  | "standdown"
+  | "access_changed"
+  | "channel_archived"
+  | "no_participants"
+  | "restart"
+  | "error";
+
+export type DiscussionParticipantState =
+  | "waiting"
+  | "speaking"
+  | "spoke"
+  | "passed"
+  | "skipped"
+  | "benched"
+  | "writing";
+
+export type DiscussionActionItem = {
+  owner:
+    | { kind: "ai"; id: string; name: string; slug: string }
+    | { kind: "user"; id: string; name: string }
+    | null;
+  ownerLabel: string;
+  action: string;
+  /** `waiting`: the owner's AI Model is unavailable; its share starts when it is back. */
+  status?: "queued" | "working" | "waiting" | "done" | "failed" | "skipped";
+  detail?: string;
+};
+
+export type DiscussionOutcome = {
+  summary: string;
+  recommendation: string;
+  openQuestions: string[];
+  actionItems: DiscussionActionItem[];
+  writtenByEmployeeId: string | null;
+};
+
+/** A group discussion as `GET …/discussions/:id` returns it. Mirrors the server DTO. */
+export type GroupDiscussion = {
+  id: string;
+  channelId: string;
+  status: GroupDiscussionStatus;
+  phase: "discussing" | "concluding" | "done";
+  endReason: GroupDiscussionEndReason | null;
+  endDetail: string | null;
+  question: string;
+  questionMessageId: string | null;
+  startedBy: { id: string; name: string } | null;
+  leadEmployeeId: string | null;
+  participants: Array<{
+    id: string;
+    name: string;
+    slug: string;
+    role: string;
+    avatarKey: string | null;
+    state: DiscussionParticipantState;
+  }>;
+  round: number;
+  rounds: number;
+  turnsTaken: number;
+  maxTurns: number;
+  tokensUsed: number;
+  tokenBudget: number;
+  currentEmployeeId: string | null;
+  /** Since when it has waited for an unavailable AI Model; null when not waiting. */
+  waitingForModelSince?: string | null;
+  passes: Array<{ employeeId: string; round: number; reason: "pass" | "agree" | "repeat" }>;
+  skipped: Array<{ employeeId: string; round: number; reason: string; detail?: string }>;
+  outcome: DiscussionOutcome | null;
+  outcomeMessageId: string | null;
+  followThrough: { startedAt: string; byUserId: string | null } | null;
+  createdAt: string;
+  updatedAt: string;
+  endedAt: string | null;
+};
+
+export type WorkspaceChannel = {
+  id: string;
+  companyId: string;
+  kind: WorkspaceChannelKind;
+  name: string | null;
+  slug: string | null;
+  topic: string;
+  archivedAt: string | null;
+  createdByUserId: string | null;
+  createdAt: string;
+  lastMessageAt: string | null;
+  members: WorkspaceAuthor[];
+  unreadCount: number;
+  /** Boundary `unreadCount` is measured from; null when never opened. */
+  lastReadAt: string | null;
+};
+
+export type WorkspaceChannelWebhookSettings = {
+  enabled: boolean;
+  url: string | null;
+};
+
+export type WorkspaceDirectory = {
+  members: {
+    id: string;
+    name: string;
+    email: string;
+    handle: string | null;
+  }[];
+  employees: { id: string; name: string; slug: string; role: string }[];
+};
+
+/**
+ * A single @-mentionable thing in the company — user, AI employee, channel,
+ * base, base table, or connection. The client filters this flat list by
+ * handle prefix as the user types. `href` is the relative URL the clickable
+ * pill in a rendered message should navigate to.
+ */
+export type Mentionable = {
+  kind: "user" | "ai" | "base" | "base_table" | "connection" | "channel";
+  handle: string;
+  label: string;
+  sublabel?: string;
+  href: string;
+  avatarUrl?: string | null;
+};
+
+/** Where a channel lives in the app. Hand-built in six places before this. */
+export function workspaceChannelHref(companySlug: string, channelId: string): string {
+  return `/c/${companySlug}/workspace/${channelId}`;
+}
+
+/**
+ * The closed Advanced line in a channel's settings: whether its incoming
+ * webhook is on, so the one setting tucked away there is never invisible
+ * (AGENTS.md §8). The webhook loads as the settings open, so the line also
+ * says when that is still happening or failed.
+ */
+export function channelWebhookSummary(
+  webhook: Pick<WorkspaceChannelWebhookSettings, "enabled"> | null,
+  loading: boolean,
+  error: string | null,
+): string {
+  if (webhook) return webhook.enabled ? "Incoming webhook on" : "Incoming webhook off";
+  if (loading) return "Incoming webhook · checking…";
+  if (error) return "Incoming webhook couldn’t load";
+  return "Incoming webhook";
+}
+
+// ──────────────────────── REST wrappers ──────────────────────────────────
+
+const base = (companyId: string) => `/api/companies/${companyId}/workspace`;
+
+export const workspaceApi = {
+  directory: (companyId: string) => api.get<WorkspaceDirectory>(`${base(companyId)}/directory`),
+
+  mentionables: (companyId: string) => api.get<Mentionable[]>(`${base(companyId)}/mentionables`),
+
+  listChannels: (companyId: string) => api.get<WorkspaceChannel[]>(`${base(companyId)}/channels`),
+
+  getChannel: (companyId: string, channelId: string) =>
+    api.get<WorkspaceChannel>(`${base(companyId)}/channels/${channelId}`),
+
+  createChannel: (
+    companyId: string,
+    body: {
+      name: string;
+      topic?: string;
+      kind?: "public" | "private";
+      memberUserIds?: string[];
+      employeeIds?: string[];
+    },
+  ) => api.post<WorkspaceChannel>(`${base(companyId)}/channels`, body),
+
+  updateChannel: (companyId: string, channelId: string, body: { name?: string; topic?: string }) =>
+    api.patch<WorkspaceChannel>(`${base(companyId)}/channels/${channelId}`, body),
+
+  archiveChannel: (companyId: string, channelId: string) =>
+    api.post(`${base(companyId)}/channels/${channelId}/archive`),
+
+  getChannelWebhook: (companyId: string, channelId: string) =>
+    api.get<WorkspaceChannelWebhookSettings>(`${base(companyId)}/channels/${channelId}/webhook`),
+
+  updateChannelWebhook: (
+    companyId: string,
+    channelId: string,
+    body: { enabled: boolean; regenerate?: boolean },
+  ) =>
+    api.post<WorkspaceChannelWebhookSettings>(
+      `${base(companyId)}/channels/${channelId}/webhook`,
+      body,
+    ),
+
+  resetContext: (companyId: string, channelId: string) =>
+    api.post<WorkspaceMessage>(`${base(companyId)}/channels/${channelId}/context/reset`, {}),
+
+  addMembers: (
+    companyId: string,
+    channelId: string,
+    body: { userIds?: string[]; employeeIds?: string[] },
+  ) => api.post<WorkspaceChannel>(`${base(companyId)}/channels/${channelId}/members`, body),
+
+  markRead: (companyId: string, channelId: string) =>
+    api.post(`${base(companyId)}/channels/${channelId}/read`),
+
+  openDm: (companyId: string, target: { targetUserId: string } | { targetEmployeeId: string }) =>
+    api.post<WorkspaceChannel>(`${base(companyId)}/dms`, target),
+
+  /**
+   * One page of a channel's history: the newest messages, or with `cursor`
+   * (a page's `nextCursor`) the ones before them. See `workspaceHistory.ts`.
+   */
+  channelHistory: (
+    companyId: string,
+    channelId: string,
+    page: { cursor?: string | null; limit: number },
+  ) => api.get<ChannelHistoryPage>(channelHistoryUrl(companyId, channelId, page)),
+
+  sendMessage: (
+    companyId: string,
+    channelId: string,
+    body: { content: string; attachmentIds?: string[]; parentMessageId?: string | null },
+  ) => api.post<WorkspaceMessage>(`${base(companyId)}/channels/${channelId}/messages`, body),
+
+  editMessage: (companyId: string, messageId: string, content: string) =>
+    api.patch<WorkspaceMessage>(`${base(companyId)}/messages/${messageId}`, { content }),
+
+  deleteMessage: (companyId: string, messageId: string) =>
+    api.del(`${base(companyId)}/messages/${messageId}`),
+
+  toggleReaction: (companyId: string, messageId: string, emoji: string) =>
+    api.post<{ added: boolean }>(`${base(companyId)}/messages/${messageId}/reactions`, { emoji }),
+
+  uploadAttachment: async (companyId: string, file: File): Promise<WorkspaceAttachment> => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${base(companyId)}/attachments`, {
+      method: "POST",
+      credentials: "same-origin",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || res.statusText);
+    }
+    return res.json();
+  },
+
+  attachmentUrl: (companyId: string, attachmentId: string) =>
+    `${base(companyId)}/attachments/${attachmentId}`,
+
+  wsToken: (companyId: string) => api.post<{ token: string }>(`${base(companyId)}/ws-token`),
+
+  // ── Group chats and group discussions ──
+
+  createGroupChat: (
+    companyId: string,
+    body: {
+      employeeIds: string[];
+      memberUserIds?: string[];
+      name?: string;
+      question?: string;
+      maxRounds?: number;
+      attachmentIds?: string[];
+    },
+  ) =>
+    api.post<{ channel: WorkspaceChannel; discussion: GroupDiscussion | null }>(
+      `${base(companyId)}/group-chats`,
+      body,
+    ),
+
+  listDiscussions: (companyId: string, channelId: string) =>
+    api.get<GroupDiscussion[]>(`${base(companyId)}/channels/${channelId}/discussions`),
+
+  getDiscussion: (companyId: string, discussionId: string) =>
+    api.get<GroupDiscussion>(`${base(companyId)}/discussions/${discussionId}`),
+
+  startDiscussion: (
+    companyId: string,
+    channelId: string,
+    body: { question: string; employeeIds?: string[]; maxRounds?: number; attachmentIds?: string[] },
+  ) => api.post<GroupDiscussion>(`${base(companyId)}/channels/${channelId}/discussions`, body),
+
+  stopDiscussion: (companyId: string, discussionId: string) =>
+    api.post<GroupDiscussion>(`${base(companyId)}/discussions/${discussionId}/stop`, {}),
+
+  finishDiscussion: (companyId: string, discussionId: string) =>
+    api.post<GroupDiscussion>(`${base(companyId)}/discussions/${discussionId}/finish`, {}),
+
+  startDiscussionWork: (companyId: string, discussionId: string) =>
+    api.post<GroupDiscussion>(`${base(companyId)}/discussions/${discussionId}/start-work`, {}),
+
+  // ── AI Employees' turns in a room ──
+
+  /** The turns running in a room right now, oldest first. */
+  listTurns: (companyId: string, channelId: string) =>
+    api.get<WorkspaceTurn[]>(`${base(companyId)}/channels/${channelId}/turns`),
+
+  /** A turn's recorded steps, as this Member may see them (paged by `after`). */
+  turnActivityUrl: (companyId: string, channelId: string, turnId: string) =>
+    `${base(companyId)}/channels/${channelId}/turns/${turnId}/activity`,
+
+  /** Follow a turn live from `after` to its end (Server-Sent Events). */
+  turnStreamUrl: (companyId: string, channelId: string, turnId: string, after: number) =>
+    `${base(companyId)}/channels/${channelId}/turns/${turnId}/activity/stream?after=${after}`,
+
+  stopTurn: (companyId: string, channelId: string, turnId: string) =>
+    api.post<{ interrupted: boolean }>(
+      `${base(companyId)}/channels/${channelId}/turns/${turnId}/stop`,
+      {},
+    ),
+
+  retryTurn: (companyId: string, channelId: string, turnId: string) =>
+    api.post<WorkspaceTurn>(`${base(companyId)}/channels/${channelId}/turns/${turnId}/retry`, {}),
+};
+
+// ──────────────────────── WebSocket client ───────────────────────────────
+
+export type WsInboundEvent =
+  | { type: "hello"; userId: string; companyId: string }
+  | { type: "message.new"; channelId: string; message: WorkspaceMessage }
+  | {
+      type: "message.edit";
+      channelId: string;
+      messageId: string;
+      content: string;
+      editedAt: string;
+    }
+  | { type: "message.delete"; channelId: string; messageId: string }
+  | {
+      type: "reaction.add";
+      channelId: string;
+      messageId: string;
+      emoji: string;
+      by: { kind: "user" | "ai"; id: string; name: string };
+    }
+  | {
+      type: "reaction.remove";
+      channelId: string;
+      messageId: string;
+      emoji: string;
+      by: { kind: "user" | "ai"; id: string };
+    }
+  | { type: "channel.new"; channel: WorkspaceChannel }
+  | { type: "channel.update"; channelId: string; channel: WorkspaceChannel }
+  | { type: "channel.archive"; channelId: string }
+  | { type: "discussion.update"; channelId: string; discussion: GroupDiscussion }
+  | {
+      /** An AI Employee's turn here started, began or stopped waiting, or ended. */
+      type: "turn.update";
+      channelId: string;
+      turn: WorkspaceTurn;
+    }
+  | {
+      type: "typing";
+      channelId: string;
+      by: { kind: "user" | "ai"; id: string; name: string };
+    }
+  | { type: "presence"; userId: string; online: boolean }
+  | { type: "mail.updated"; accountId: string; threadsChanged?: boolean }
+  | {
+      type: "notification.new";
+      userId: string;
+      notification: Notification;
+    }
+  | {
+      type: "notification.read";
+      userId: string;
+      notificationIds: string[];
+    }
+  | {
+      /** App-wide "content changed, refetch" signal (mirrors the server's
+       * `resource.changed` in `services/resourceEvents.ts`). `kind` names the
+       * resource family a page listens for; `scopeIds` are the parent ids
+       * touched (empty = refetch regardless). Consume via `useLiveRefetch`. */
+      type: "resource.changed";
+      kind: string;
+      scopeIds: string[];
+    };
+
+export type CompanySocket = {
+  close: () => void;
+  /**
+   * Deliberately unwired. The server accepts and rebroadcasts a human typing
+   * frame (`services/realtime.ts`), and no client calls this — only AI
+   * employees announce that they are composing. Broadcasting every keystroke
+   * a person makes is a product decision, not a loose end; make it once, for
+   * both chat surfaces, rather than wiring the nearest composer to it.
+   */
+  sendTyping: (channelId: string, name: string) => void;
+  /** Register a handler. Returns an unsubscribe function. */
+  subscribe: (handler: (event: WsInboundEvent) => void) => () => void;
+};
+
+/** Backwards-compat alias for the chat surface that was the first consumer. */
+export type WorkspaceSocket = CompanySocket;
+
+/**
+ * Open an authenticated WebSocket for the given company. One physical
+ * connection is shared by every consumer in the page (workspace chat,
+ * notifications, etc.) via the `subscribe` fan-out — opening N sockets
+ * for N features would burn server slots and double-deliver messages.
+ *
+ * Auth is a two-step mint: we first call POST /ws-token to get a short-
+ * lived token, then upgrade with `?token=...`. The socket auto-reconnects
+ * with exponential backoff up to 30 s and re-mints the token each attempt.
+ *
+ * `close()` is final wherever it lands in that sequence — React StrictMode
+ * closes a handle while its first token is still being minted. A closed
+ * handle opens no further socket, hangs up one still connecting as soon as
+ * it opens, and stops calling `onStatus` and reconnecting, so the status a
+ * caller shows is only ever the live connection's.
+ */
+export function connectCompanySocket(
+  companyId: string,
+  onStatus?: (status: "connecting" | "open" | "closed") => void,
+): CompanySocket {
+  let ws: WebSocket | null = null;
+  let closed = false;
+  let attempt = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  const handlers = new Set<(event: WsInboundEvent) => void>();
+
+  function dispatch(event: WsInboundEvent) {
+    // Snapshot so a handler that unsubscribes mid-iteration doesn't skip
+    // its peers.
+    for (const fn of Array.from(handlers)) {
+      try {
+        fn(event);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[ws] handler threw:", err);
+      }
+    }
+  }
+
+  async function open() {
+    if (closed) return;
+    onStatus?.("connecting");
+    let token: string;
+    try {
+      const r = await workspaceApi.wsToken(companyId);
+      token = r.token;
+    } catch {
+      // Session likely expired. Hold off and retry; if the user navigates
+      // away the `closed` flag will break the loop.
+      scheduleReconnect();
+      return;
+    }
+    // Closed while the token was being minted. A socket opened now would be
+    // a live connection nobody listens to, held until the page unloads.
+    if (closed) return;
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${window.location.host}/api/ws?token=${encodeURIComponent(token)}`;
+    const sock = new WebSocket(url);
+    ws = sock;
+
+    sock.addEventListener("open", () => {
+      // Closed while this socket was still connecting. Hanging up here, not
+      // in `close()`, spares the browser's "closed before the connection is
+      // established" warning.
+      if (closed) {
+        sock.close();
+        return;
+      }
+      attempt = 0;
+      onStatus?.("open");
+    });
+    sock.addEventListener("message", (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        dispatch(data as WsInboundEvent);
+      } catch {
+        // Drop malformed frames rather than throwing — the server shouldn't
+        // send them but we don't want one bad frame to kill the channel.
+      }
+    });
+    sock.addEventListener("close", () => {
+      ws = null;
+      // A closed handle's caller has moved on, perhaps to a new handle whose
+      // status this "closed" would overwrite.
+      if (closed) return;
+      onStatus?.("closed");
+      scheduleReconnect();
+    });
+    sock.addEventListener("error", () => {
+      try {
+        sock.close();
+      } catch {
+        // Ignore — close handler already schedules the reconnect.
+      }
+    });
+  }
+
+  function scheduleReconnect() {
+    if (closed) return;
+    attempt += 1;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(attempt, 6));
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      open();
+    }, delay);
+  }
+
+  open();
+
+  return {
+    close: () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      // A socket still connecting hangs up from its own `open` listener.
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      handlers.clear();
+    },
+    sendTyping: (channelId, name) => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "typing", channelId, name }));
+      }
+    },
+    subscribe: (handler) => {
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+      };
+    },
+  };
+}
+
+/** @deprecated Prefer `connectCompanySocket(...).subscribe(handler)`. */
+export function connectWorkspace(
+  companyId: string,
+  onEvent: (event: WsInboundEvent) => void,
+  onStatus?: (status: "connecting" | "open" | "closed") => void,
+): CompanySocket {
+  const sock = connectCompanySocket(companyId, onStatus);
+  sock.subscribe(onEvent);
+  return sock;
+}

@@ -1,0 +1,686 @@
+import React from "react";
+import { Link, NavLink, useLocation, useNavigate, useParams } from "react-router-dom";
+import {
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  CircleUser,
+  Keyboard,
+  LogOut,
+  Monitor,
+  Moon,
+  PanelLeft,
+  Plug,
+  ServerCog,
+  Sparkles,
+  Sun,
+} from "lucide-react";
+import { api, Company, Me } from "../lib/api";
+import { clearAssistantChatSessions } from "@/lib/assistantChatSessions";
+import { createCompanyAndSwitch } from "../lib/companySwitch";
+import { SECTION_BY_KEY, SectionItem, activeSection } from "../lib/sections";
+import { productIntegrationScope, type ProductIntegrationKey } from "../lib/productIntegrations";
+import { useDialog } from "./ui/Dialog";
+import { Avatar, meAvatarUrl } from "./ui/Avatar";
+import { Breadcrumbs, type Crumb } from "./ui/Breadcrumbs";
+import { PageHeader } from "./ui/PageHeader";
+import { ButtonSpinner } from "./ui/Spinner";
+import { CommandPaletteProvider, PALETTE_SHORTCUT, useCommandPalette } from "./CommandPalette";
+import { CommandRegistryProvider } from "./CommandRegistry";
+import { CompanySocketProvider } from "./CompanySocket";
+import { Logo, LogoMark } from "./Logo";
+import { KeyboardShortcutsProvider, useKeyboardShortcuts } from "./KeyboardShortcuts";
+import { NotificationsPanel } from "./NotificationsPanel";
+import { useNavigationGuard } from "./NavigationGuard";
+import { useTheme, Theme } from "./Theme";
+import { ASK_AI_SHORTCUT, AskAiProvider, useAskAi } from "./askAi/AskAiProvider";
+import { AskAiPanel } from "./askAi/AskAiPanel";
+import { GlobalCreateTask } from "./todos/GlobalCreateTask";
+
+/**
+ * App chrome:
+ *   ┌───────────────────────────────────────────────┐
+ *   │ TopNav (company switcher · sections · user)   │
+ *   ├─────────┬─────────────────────────────────────┤
+ *   │         │                                     │
+ *   │ Sidebar │           Main content              │
+ *   │         │                                     │
+ *   └─────────┴─────────────────────────────────────┘
+ *
+ * Sections live in the ⌘K command palette, opened from the top nav's section
+ * pill or from anywhere by keyboard (see `CommandPalette`). The
+ * sidebar is context-specific: the roster on the Employees section, the
+ * roster-as-filter on Routines, or Settings sub-pages on the Settings section.
+ * A selected employee has no rail at all — that page is Chat plus Settings and
+ * nothing else. Each page renders `<ContextualLayout sidebar={...}>{main}</>`
+ * so the sidebar can change route-by-route without remounting the shell.
+ */
+
+type AppShellProps = {
+  me: Me;
+  companies: Company[];
+  current: Company;
+  onCompaniesChanged: () => Promise<void>;
+  children: React.ReactNode;
+};
+
+/**
+ * Lets the global top nav drive the per-section contextual sidebar on mobile.
+ * The sidebar collapses below `md`; the top nav shows a toggle (only when the
+ * current section actually has a sidebar) that opens it as an off-canvas
+ * drawer. `ContextualLayout` registers `hasSidebar` and owns the drawer; the
+ * shared `open` state lives here so it survives route changes.
+ */
+type ContextualSidebarState = {
+  open: boolean;
+  setOpen: (v: boolean) => void;
+  hasSidebar: boolean;
+  setHasSidebar: (v: boolean) => void;
+};
+const ContextualSidebarContext = React.createContext<ContextualSidebarState | null>(null);
+
+export function AppShell({
+  me,
+  companies,
+  current,
+  onCompaniesChanged,
+  children,
+}: AppShellProps) {
+  const [open, setOpen] = React.useState(false);
+  const [hasSidebar, setHasSidebar] = React.useState(false);
+  const sidebarState = React.useMemo<ContextualSidebarState>(
+    () => ({ open, setOpen, hasSidebar, setHasSidebar }),
+    [open, hasSidebar],
+  );
+  // What the palette needs to leave out pages this person can't open.
+  const paletteViewer = React.useMemo(
+    () => ({ role: current.role, financeAccess: current.financeAccess }),
+    [current.role, current.financeAccess],
+  );
+
+  return (
+    <CompanySocketProvider companyId={current.id}>
+      <KeyboardShortcutsProvider
+        companySlug={current.slug}
+        isMasterAdmin={Boolean(me.isMasterAdmin)}
+        viewer={paletteViewer}
+      >
+        {/* Outside the palette so pages can publish contextual actions into it,
+            and the palette can read them, from the same tree. */}
+        <CommandRegistryProvider>
+          {/* Keyed by company: a half-written task stays in the company it was for. */}
+          <GlobalCreateTask key={current.id} company={current} me={me} />
+          <CommandPaletteProvider
+            companyId={current.id}
+            companySlug={current.slug}
+            viewer={paletteViewer}
+          >
+            <ContextualSidebarContext.Provider value={sidebarState}>
+              <AskAiProvider>
+              <div className="flex h-full flex-col">
+                <a
+                  href="#main-content"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    document.getElementById("main-content")?.focus();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    document.getElementById("main-content")?.focus();
+                  }}
+                  className="sr-only z-[80] rounded-md bg-white px-3 py-2 text-sm font-medium text-indigo-700 shadow-lg focus:not-sr-only focus:fixed focus:left-3 focus:top-3 dark:bg-slate-900 dark:text-indigo-300"
+                >
+                  Skip to main content
+                </a>
+                <TopNav
+                  me={me}
+                  companies={companies}
+                  current={current}
+                  onCompaniesChanged={onCompaniesChanged}
+                />
+                <div className="flex min-h-0 flex-1">
+                  {children}
+                  <AskAiDock company={current} />
+                </div>
+              </div>
+              </AskAiProvider>
+            </ContextualSidebarContext.Provider>
+          </CommandPaletteProvider>
+        </CommandRegistryProvider>
+      </KeyboardShortcutsProvider>
+    </CompanySocketProvider>
+  );
+}
+
+/** The Ask AI panel, docked beside whatever page is open. */
+function AskAiDock({ company }: { company: Company }) {
+  const askAi = useAskAi();
+  if (!askAi?.open) return null;
+  // Keyed by company: switching companies starts from that company's own
+  // conversations rather than briefly showing the previous one's.
+  return <AskAiPanel key={company.id} company={company} />;
+}
+
+/**
+ * The top nav's Ask AI button. Opens a chat with any AI Employee — or several
+ * — that already knows what is on screen.
+ */
+function AskAiButton() {
+  const askAi = useAskAi();
+  if (!askAi) return null;
+  return (
+    <button
+      type="button"
+      onClick={askAi.toggle}
+      className={
+        "flex h-8 min-w-8 items-center justify-center gap-1.5 rounded-md px-2 text-sm font-medium sm:px-2.5 " +
+        (askAi.open
+          ? "bg-violet-100 text-violet-800 dark:bg-violet-500/20 dark:text-violet-200"
+          : "text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800")
+      }
+      title={`Ask AI about this page (${ASK_AI_SHORTCUT})`}
+      aria-label="Ask AI"
+      aria-pressed={askAi.open}
+    >
+      <Sparkles size={15} className="text-violet-600 dark:text-violet-300" />
+      <span className="hidden sm:inline">Ask AI</span>
+    </button>
+  );
+}
+
+function TopNav({
+  me,
+  companies,
+  current,
+  onCompaniesChanged,
+}: {
+  me: Me;
+  companies: Company[];
+  current: Company;
+  onCompaniesChanged: () => Promise<void>;
+}) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const dialog = useDialog();
+  const shortcuts = useKeyboardShortcuts();
+  const sidebarCtx = React.useContext(ContextualSidebarContext);
+  const navigationGuard = useNavigationGuard();
+  const [companyOpen, setCompanyOpen] = React.useState(false);
+  const [userOpen, setUserOpen] = React.useState(false);
+  const [loggingOut, setLoggingOut] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!companyOpen && !userOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setCompanyOpen(false);
+      setUserOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [companyOpen, userOpen]);
+
+  async function performLogout() {
+    setLoggingOut(true);
+    try {
+      await api.post("/api/auth/logout");
+    } finally {
+      setLoggingOut(false);
+    }
+    clearAssistantChatSessions();
+    // Tear down the current document so trusted custom JavaScript loaded for
+    // the signed-in App cannot remain resident on the sign-in screen.
+    window.location.assign("/login");
+  }
+
+  function logout() {
+    if (navigationGuard.request("/login", () => void performLogout())) return;
+    void performLogout();
+  }
+
+  const sectionKey = activeSection(location.pathname);
+  const section = SECTION_BY_KEY[sectionKey];
+
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-slate-200 bg-white px-3 sm:gap-3 sm:px-4 dark:border-slate-800 dark:bg-slate-950">
+      {sidebarCtx?.hasSidebar && (
+        <button
+          onClick={() => sidebarCtx.setOpen(true)}
+          className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 md:hidden dark:text-slate-300 dark:hover:bg-slate-800"
+          aria-label="Open sidebar"
+        >
+          <PanelLeft size={18} />
+        </button>
+      )}
+      <Link
+        to={`/c/${current.slug}`}
+        className="flex h-8 min-w-8 shrink-0 items-center justify-center gap-2 rounded-md text-slate-900 dark:text-slate-100"
+      >
+        {/* Phones get the bare mark; the full wordmark would eat half the bar. */}
+        <LogoMark className="h-7 w-7 sm:hidden" />
+        <Logo className="hidden h-7 w-auto sm:block" />
+      </Link>
+
+      <span aria-hidden="true" className="h-5 w-px shrink-0 bg-slate-200 dark:bg-slate-700" />
+
+      {/* min-w-0 + truncate: the company name is the one flexible item in the
+          bar, so it absorbs the squeeze on narrow viewports. */}
+      <div className="relative min-w-0">
+        <button
+          onClick={() => {
+            setUserOpen(false);
+            setCompanyOpen((d) => !d);
+          }}
+          className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-md px-2 text-sm font-medium text-slate-900 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-800"
+          aria-expanded={companyOpen}
+          aria-haspopup="menu"
+        >
+          <span className="truncate">{current.name}</span>
+          <ChevronDown size={14} className="shrink-0 text-slate-400" />
+        </button>
+        {companyOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setCompanyOpen(false)} />
+            <div className="absolute left-0 top-full z-20 mt-1 w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+              {companies.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => {
+                    setCompanyOpen(false);
+                    const destination = `/c/${c.slug}`;
+                    if (!navigationGuard.request(destination)) navigate(destination);
+                  }}
+                  className="block w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  {c.name}
+                </button>
+              ))}
+              <button
+                onClick={async () => {
+                  setCompanyOpen(false);
+                  const name = await dialog.prompt({
+                    title: "New company",
+                    placeholder: "Company name",
+                    confirmLabel: "Create",
+                  });
+                  if (!name) return;
+                  try {
+                    await createCompanyAndSwitch({
+                      createCompany: () =>
+                        api.post<Company>("/api/companies", {
+                          name,
+                          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        }),
+                      refreshCompanies: onCompaniesChanged,
+                      navigate: (destination) => {
+                        if (!navigationGuard.request(destination)) navigate(destination);
+                      },
+                      suffix: "/onboarding",
+                    });
+                  } catch (e) {
+                    void dialog.error(e, { title: "Couldn’t create the company" });
+                  }
+                }}
+                className="block w-full border-t border-slate-100 px-3 py-2 text-left text-sm text-indigo-600 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                + New company
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      <ChevronRight size={14} className="shrink-0 text-slate-300 dark:text-slate-600" />
+
+      <SectionMenu current={section} />
+
+      <div className="ml-auto flex items-center gap-1 sm:gap-2">
+        <AskAiButton />
+        <button
+          onClick={() => {
+            const destination = `/c/${current.slug}/help`;
+            if (!navigationGuard.request(destination)) navigate(destination);
+          }}
+          // Phones reach Help from the section menu; the bar is full there.
+          className={
+            "hidden h-8 w-8 items-center justify-center rounded-md sm:flex " +
+            (sectionKey === "help"
+              ? "bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300"
+              : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800")
+          }
+          title="Help"
+          aria-label="Open Help"
+          aria-current={sectionKey === "help" ? "page" : undefined}
+        >
+          <CircleHelp size={16} />
+        </button>
+        <button
+          onClick={shortcuts.openGuide}
+          className="hidden h-8 w-8 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 sm:flex dark:text-slate-300 dark:hover:bg-slate-800"
+          title="Keyboard shortcuts (?)"
+          aria-label="Show keyboard shortcuts"
+        >
+          <Keyboard size={16} />
+        </button>
+        <NotificationsPanel company={current} meId={me.id} />
+        {/* Phones follow the system theme; the bar has no room for a third
+            icon there once Ask AI sits in it. */}
+        <div className="hidden sm:block">
+          <ThemeToggle />
+        </div>
+        <div className="relative">
+          <button
+            onClick={() => {
+              setCompanyOpen(false);
+              setUserOpen((d) => !d);
+            }}
+            className="flex items-center gap-2 rounded-md px-2 py-1 text-sm hover:bg-slate-50 dark:hover:bg-slate-800"
+            aria-expanded={userOpen}
+            aria-haspopup="menu"
+          >
+            <Avatar name={me.name || me.email} src={meAvatarUrl(me.avatarKey)} size="sm" />
+            <span className="hidden max-w-[12rem] truncate text-slate-700 sm:inline dark:text-slate-200">
+              {me.name || me.email}
+            </span>
+          </button>
+          {userOpen && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setUserOpen(false)} />
+              <div className="absolute right-0 top-full z-20 mt-1 w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+                <div className="px-3 py-2 text-xs text-slate-500 dark:text-slate-400">
+                  <div className="truncate text-slate-900 dark:text-slate-100">{me.name}</div>
+                  <div className="truncate">{me.email}</div>
+                </div>
+                <Link
+                  to={`/c/${current.slug}/account`}
+                  onClick={() => setUserOpen(false)}
+                  className="flex w-full items-center gap-2 border-t border-slate-100 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  <CircleUser size={14} /> Account
+                </Link>
+                {me.isMasterAdmin && (
+                  <Link
+                    to={`/c/${current.slug}/admin`}
+                    onClick={() => setUserOpen(false)}
+                    className="flex w-full items-center gap-2 border-t border-slate-100 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <ServerCog size={14} /> Admin
+                  </Link>
+                )}
+                <button
+                  onClick={logout}
+                  disabled={loggingOut}
+                  aria-busy={loggingOut || undefined}
+                  className="flex w-full items-center gap-2 border-t border-slate-100 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  {loggingOut ? <ButtonSpinner size={14} /> : <LogOut size={14} />} Log out
+                </button>
+                <div
+                  className="border-t border-slate-100 px-3 py-2 text-xs tabular-nums text-slate-500 dark:border-slate-700 dark:text-slate-400"
+                  title="Genosyn version · build commit"
+                >
+                  v{__APP_VERSION__} · <span className="font-mono">{__APP_COMMIT__}</span>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/**
+ * The section pill: shows where you are, and opens the ⌘K palette to go
+ * somewhere else. It used to drop a 56rem mega-menu down from the top nav —
+ * the palette does the same job centred, searchable, and without the mouse, so
+ * the pill is now just its click target for people who never learn shortcuts.
+ */
+function SectionMenu({ current }: { current: SectionItem }) {
+  const palette = useCommandPalette();
+  const Icon = current.icon;
+
+  return (
+    <button
+      onClick={palette.open}
+      className="flex h-8 shrink-0 items-center gap-2 rounded-md px-2 text-sm font-medium text-slate-900 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-800"
+      title={`Search sections and pages (${PALETTE_SHORTCUT})`}
+    >
+      <span className={"flex h-5 w-5 items-center justify-center rounded " + current.iconBg}>
+        <Icon size={12} />
+      </span>
+      <span className="hidden sm:inline">{current.label}</span>
+      {/* The shortcut hint is the affordance on pointer-and-keyboard screens;
+          below sm there's no room and probably no keyboard, so fall back to
+          the chevron that says "this opens something". */}
+      <kbd className="hidden h-5 items-center rounded border border-slate-200 bg-slate-50 px-1 font-sans text-xs font-medium text-slate-500 sm:inline-flex dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400">
+        {PALETTE_SHORTCUT}
+      </kbd>
+      <ChevronDown size={14} className="shrink-0 text-slate-400 sm:hidden" />
+    </button>
+  );
+}
+
+function ThemeToggle() {
+  const { theme, setTheme } = useTheme();
+  const [open, setOpen] = React.useState(false);
+  const options: { value: Theme; label: string; icon: React.ReactNode }[] = [
+    { value: "light", label: "Light", icon: <Sun size={14} /> },
+    { value: "dark", label: "Dark", icon: <Moon size={14} /> },
+    { value: "system", label: "System", icon: <Monitor size={14} /> },
+  ];
+  const current = options.find((o) => o.value === theme) ?? options[2];
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex h-8 w-8 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+        title={`Theme: ${current.label}`}
+        aria-label="Toggle theme"
+        aria-expanded={open}
+        aria-haspopup="menu"
+      >
+        {current.icon}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-full z-20 mt-1 w-40 rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-slate-700 dark:bg-slate-900">
+            {options.map((o) => (
+              <button
+                key={o.value}
+                onClick={() => {
+                  setTheme(o.value);
+                  setOpen(false);
+                }}
+                className={
+                  "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-800 " +
+                  (o.value === theme ? "text-indigo-600" : "text-slate-700 dark:text-slate-200")
+                }
+              >
+                {o.icon} {o.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Two-pane layout mounted inside `<AppShell>` by each section. Pages choose
+ * whether to render a sidebar by passing `sidebar`; pages that want the
+ * whole pane (e.g. an onboarding flow) simply omit it.
+ */
+export function ContextualLayout({
+  sidebar,
+  integrations = true,
+  children,
+}: {
+  sidebar?: React.ReactNode;
+  /**
+   * Product sections get an "Integrations" rail entry for free. A page that
+   * deliberately renders no sidebar at all (the AI Employee page) opts out, so
+   * the freebie doesn't resurrect a one-item rail beside it.
+   */
+  integrations?: boolean;
+  children: React.ReactNode;
+}) {
+  const location = useLocation();
+  const { companySlug } = useParams<{ companySlug: string }>();
+  const sectionKey = activeSection(location.pathname);
+  const integrationScope = productIntegrationScope(sectionKey);
+  const integrationLink =
+    integrations && companySlug && integrationScope ? (
+      <SidebarLink
+        to={`/c/${companySlug}/${sectionKey as ProductIntegrationKey}/integrations`}
+        icon={<Plug size={14} />}
+        label="Integrations"
+      />
+    ) : null;
+  const hasSidebar = sidebar !== undefined || integrationLink !== null;
+  const ctx = React.useContext(ContextualSidebarContext);
+  // useState setters are referentially stable, so depending on them below
+  // won't re-fire these effects when the drawer toggles.
+  const setOpen = ctx?.setOpen;
+  const setHasSidebar = ctx?.setHasSidebar;
+  const open = ctx?.open ?? false;
+
+  // Tell the top nav whether to show the mobile sidebar toggle, for as long as
+  // this layout (with a sidebar) is mounted.
+  React.useEffect(() => {
+    setHasSidebar?.(hasSidebar);
+    return () => setHasSidebar?.(false);
+  }, [setHasSidebar, hasSidebar]);
+
+  // Tapping a sidebar link navigates — close the drawer so it doesn't linger
+  // over the freshly loaded page.
+  React.useEffect(() => {
+    setOpen?.(false);
+  }, [setOpen, location.pathname]);
+
+  // Escape closes the drawer, matching the top-nav dropdown behavior.
+  React.useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen?.(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, setOpen]);
+
+  const sidebarContents = (
+    <>
+      {sidebar !== undefined && <div className="min-h-0 flex-1">{sidebar}</div>}
+      {integrationLink && (
+        <nav
+          aria-label={`${integrationScope?.label ?? "Product"} integrations`}
+          className={
+            "shrink-0 p-2 " +
+            (sidebar !== undefined ? "border-t border-slate-100 dark:border-slate-800" : "")
+          }
+        >
+          {integrationLink}
+        </nav>
+      )}
+    </>
+  );
+
+  return (
+    <>
+      {hasSidebar && (
+        <>
+          {/* Desktop: static sidebar. Hidden on mobile, where it would crush
+              the main pane — reachable there via the top-nav drawer below. */}
+          <aside className="hidden w-64 shrink-0 flex-col overflow-y-auto border-r border-slate-200 bg-white md:flex dark:border-slate-800 dark:bg-slate-950">
+            {sidebarContents}
+          </aside>
+          {/* Mobile: off-canvas drawer + scrim. */}
+          {open && (
+            <div className="fixed inset-0 z-40 md:hidden">
+              <div
+                className="absolute inset-0 bg-slate-900/40"
+                onClick={() => setOpen?.(false)}
+                aria-hidden="true"
+              />
+              <aside className="absolute inset-y-0 left-0 flex w-64 max-w-[85vw] flex-col overflow-y-auto border-r border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-950">
+                {sidebarContents}
+              </aside>
+            </div>
+          )}
+        </>
+      )}
+      <main
+        id="main-content"
+        tabIndex={-1}
+        // Dark mode: the page is slate-950, so slate-900 cards read as raised
+        // rather than as holes in a slate-900 page.
+        className="min-h-0 min-w-0 flex-1 overflow-y-auto bg-slate-50 dark:bg-slate-950"
+      >
+        {children}
+      </main>
+    </>
+  );
+}
+
+/**
+ * A rail link's look, for the rails that draw their own links (a roster, a
+ * folder tree) as well as `SidebarLink`: 32px rows, the accent tint on the
+ * page you are on.
+ */
+export function sidebarLinkClassName(isActive: boolean): string {
+  return (
+    "flex min-h-[2rem] items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm transition-colors " +
+    (isActive
+      ? "bg-indigo-50 font-medium text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-200"
+      : "text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800/70 dark:hover:text-slate-100")
+  );
+}
+
+export function SidebarLink({
+  to,
+  icon,
+  label,
+  end,
+}: {
+  to: string;
+  icon?: React.ReactNode;
+  label: React.ReactNode;
+  end?: boolean;
+}) {
+  return (
+    <NavLink
+      to={to}
+      end={end}
+      className={({ isActive }) => sidebarLinkClassName(isActive)}
+    >
+      {icon}
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+    </NavLink>
+  );
+}
+
+export { Breadcrumbs, type Crumb };
+
+/**
+ * A page's title row, for pages that predate `PageHeader`: the same title and
+ * phone stacking, with a little less room below because these pages follow it
+ * with their own description or toolbar.
+ */
+export function TopBar({ title, right }: { title: string; right?: React.ReactNode }) {
+  return <PageHeader title={title} actions={right} className="mb-4" />;
+}
+
+export { Link };

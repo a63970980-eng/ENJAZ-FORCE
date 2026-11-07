@@ -1,0 +1,814 @@
+import { ParallelWorkerResult } from "../db/entities/ParallelWorkerResult.js";
+import fs from "node:fs";
+import { In } from "typeorm";
+import { AppDataSource } from "../db/datasource.js";
+import {
+  browserPrivateCompanyDir,
+  browserRecordingsCompanyDir,
+  companyDir,
+  meetingRecordingsCompanyDir,
+  dataRoomPrivateCompanyDir,
+  recruitingPrivateCompanyDir,
+  repositoryPrivateCompanyDir,
+  repositoryWorkspaceCompanyDir,
+} from "./paths.js";
+import { emitMembershipAuthorizationChange } from "./resourceEvents.js";
+import { deleteBrowserRecordingsForCompany } from "./browserRecordings.js";
+import { deleteKeyHealth } from "./modelKeyHealth.js";
+import { AIModel } from "../db/entities/AIModel.js";
+import { AIModelOutage } from "../db/entities/AIModelOutage.js";
+import { AIModelWait } from "../db/entities/AIModelWait.js";
+import { EmployeeModel } from "../db/entities/EmployeeModel.js";
+
+import { AIEmployee } from "../db/entities/AIEmployee.js";
+import { Account } from "../db/entities/Account.js";
+import { AccountingPeriod } from "../db/entities/AccountingPeriod.js";
+import { AdSpendEvent } from "../db/entities/AdSpendEvent.js";
+import { ApiKey } from "../db/entities/ApiKey.js";
+import { Approval } from "../db/entities/Approval.js";
+import { Decision } from "../db/entities/Decision.js";
+import { Attachment } from "../db/entities/Attachment.js";
+import { AuditEvent } from "../db/entities/AuditEvent.js";
+import { BankFeed } from "../db/entities/BankFeed.js";
+import { BankTransaction } from "../db/entities/BankTransaction.js";
+import { CardFeed } from "../db/entities/CardFeed.js";
+import { CardTransaction } from "../db/entities/CardTransaction.js";
+import { Base } from "../db/entities/Base.js";
+import { BaseField } from "../db/entities/BaseField.js";
+import { BaseRecord } from "../db/entities/BaseRecord.js";
+import { BaseRecordAttachment } from "../db/entities/BaseRecordAttachment.js";
+import { BaseRecordComment } from "../db/entities/BaseRecordComment.js";
+import { BaseTable } from "../db/entities/BaseTable.js";
+import { BaseView } from "../db/entities/BaseView.js";
+import { BaseForm } from "../db/entities/BaseForm.js";
+import { BaseFormSubmission } from "../db/entities/BaseFormSubmission.js";
+import { BrowserSession } from "../db/entities/BrowserSession.js";
+import { MemberBrowser } from "../db/entities/MemberBrowser.js";
+import { EmployeeMemberBrowserGrant } from "../db/entities/EmployeeMemberBrowserGrant.js";
+import { Bill } from "../db/entities/Bill.js";
+import { BillLineItem } from "../db/entities/BillLineItem.js";
+import { BillPayment } from "../db/entities/BillPayment.js";
+import { Channel } from "../db/entities/Channel.js";
+import { ChannelMember } from "../db/entities/ChannelMember.js";
+import { ChannelMessage } from "../db/entities/ChannelMessage.js";
+import { ChannelTurn } from "../db/entities/ChannelTurn.js";
+import { Chart } from "../db/entities/Chart.js";
+import { Repository } from "../db/entities/Repository.js";
+import { RepositoryWorkSession } from "../db/entities/RepositoryWorkSession.js";
+import { RepositoryWorkSessionTurn } from "../db/entities/RepositoryWorkSessionTurn.js";
+import { RepositoryWorkSessionEvent } from "../db/entities/RepositoryWorkSessionEvent.js";
+import { Company } from "../db/entities/Company.js";
+import { CompanyFinanceSettings } from "../db/entities/CompanyFinanceSettings.js";
+import { ConnectedApp } from "../db/entities/ConnectedApp.js";
+import { ConnectedAppToken } from "../db/entities/ConnectedAppToken.js";
+import { Conversation } from "../db/entities/Conversation.js";
+import { ConversationMessage } from "../db/entities/ConversationMessage.js";
+import { ConversationActivityEvent } from "../db/entities/ConversationActivityEvent.js";
+import { Currency } from "../db/entities/Currency.js";
+import { Customer } from "../db/entities/Customer.js";
+import { CustomerCredit } from "../db/entities/CustomerCredit.js";
+import { CustomerCreditApplication } from "../db/entities/CustomerCreditApplication.js";
+import { CustomerCreditLine } from "../db/entities/CustomerCreditLine.js";
+import { CustomerRefund } from "../db/entities/CustomerRefund.js";
+import { CustomerContact } from "../db/entities/CustomerContact.js";
+import { Contact } from "../db/entities/Contact.js";
+import { DealStage } from "../db/entities/DealStage.js";
+import { Deal } from "../db/entities/Deal.js";
+import { DealContact } from "../db/entities/DealContact.js";
+import { Activity } from "../db/entities/Activity.js";
+import { Suppression } from "../db/entities/Suppression.js";
+import { Sequence } from "../db/entities/Sequence.js";
+import { SequenceStep } from "../db/entities/SequenceStep.js";
+import { SequenceEnrollment } from "../db/entities/SequenceEnrollment.js";
+import { SequenceStepRun } from "../db/entities/SequenceStepRun.js";
+import { Signal } from "../db/entities/Signal.js";
+import { SignalEvent } from "../db/entities/SignalEvent.js";
+import { EmployeeRevenueGrant } from "../db/entities/EmployeeRevenueGrant.js";
+import { RevenueClassification } from "../db/entities/RevenueClassification.js";
+import { RevenueCustomField } from "../db/entities/RevenueCustomField.js";
+import { RevenueCustomValue } from "../db/entities/RevenueCustomValue.js";
+import { Partnership } from "../db/entities/Partnership.js";
+import { PartnershipContact } from "../db/entities/PartnershipContact.js";
+import { RevenueDocument } from "../db/entities/RevenueDocument.js";
+import { RevenueDocumentCandidate } from "../db/entities/RevenueDocumentCandidate.js";
+import { RevenueDuplicateCandidate } from "../db/entities/RevenueDuplicateCandidate.js";
+import { RevenueFieldEvidence } from "../db/entities/RevenueFieldEvidence.js";
+import { RevenueFollowUpView } from "../db/entities/RevenueFollowUpView.js";
+import { RevenueFirmographicLookup } from "../db/entities/RevenueFirmographicLookup.js";
+import { RevenueImportBatch } from "../db/entities/RevenueImportBatch.js";
+import { RevenueImportRow } from "../db/entities/RevenueImportRow.js";
+import { RevenueOperation } from "../db/entities/RevenueOperation.js";
+import { RevenueOperationRow } from "../db/entities/RevenueOperationRow.js";
+import { RevenueRecordAlias } from "../db/entities/RevenueRecordAlias.js";
+import { DealHistoryEvent } from "../db/entities/DealHistoryEvent.js";
+import { CustomerContract } from "../db/entities/CustomerContract.js";
+import { SignatureEnvelope } from "../db/entities/SignatureEnvelope.js";
+import { SignatureEvent } from "../db/entities/SignatureEvent.js";
+import { SignatureField } from "../db/entities/SignatureField.js";
+import { SignatureRecipient } from "../db/entities/SignatureRecipient.js";
+import { EmployeeSigningGrant } from "../db/entities/EmployeeSigningGrant.js";
+import { Dashboard } from "../db/entities/Dashboard.js";
+import { DashboardCard } from "../db/entities/DashboardCard.js";
+import { EmailLog } from "../db/entities/EmailLog.js";
+import { EmployeeMailAccountGrant } from "../db/entities/EmployeeMailAccountGrant.js";
+import { MailAccount } from "../db/entities/MailAccount.js";
+import { CalendarAccount } from "../db/entities/CalendarAccount.js";
+import { CalendarEvent } from "../db/entities/CalendarEvent.js";
+import { EmployeeCalendarGrant } from "../db/entities/EmployeeCalendarGrant.js";
+import { Meeting } from "../db/entities/Meeting.js";
+import { MeetingParticipant } from "../db/entities/MeetingParticipant.js";
+import { MeetingTranscriptSegment } from "../db/entities/MeetingTranscriptSegment.js";
+import { MailChatMessage } from "../db/entities/MailChatMessage.js";
+import { RoutineChatMessage } from "../db/entities/RoutineChatMessage.js";
+import { AskAiConversation } from "../db/entities/AskAiConversation.js";
+import { AskAiMessage } from "../db/entities/AskAiMessage.js";
+import { MailDraftSendBatch } from "../db/entities/MailDraftSendBatch.js";
+import { MailHandover } from "../db/entities/MailHandover.js";
+import { MailLabel } from "../db/entities/MailLabel.js";
+import { MailMessage } from "../db/entities/MailMessage.js";
+import { MailMessageAddress } from "../db/entities/MailMessageAddress.js";
+import { MailAddressIndexState } from "../db/entities/MailAddressIndexState.js";
+import { MailInboundAnalysis } from "../db/entities/MailInboundAnalysis.js";
+import { MailInboundAutomation } from "../db/entities/MailInboundAutomation.js";
+import { MailRule } from "../db/entities/MailRule.js";
+import { MailSavedSearch } from "../db/entities/MailSavedSearch.js";
+import { MailThread } from "../db/entities/MailThread.js";
+import { EmailProvider } from "../db/entities/EmailProvider.js";
+import { EmployeeBaseGrant } from "../db/entities/EmployeeBaseGrant.js";
+import { EmployeeChartGrant } from "../db/entities/EmployeeChartGrant.js";
+import { EmployeeRepositoryGrant } from "../db/entities/EmployeeRepositoryGrant.js";
+import { EmployeeConnectionGrant } from "../db/entities/EmployeeConnectionGrant.js";
+import { ExternalChatIdentity } from "../db/entities/ExternalChatIdentity.js";
+import { CustomerChannel } from "../db/entities/CustomerChannel.js";
+import { CustomerChannelMessage } from "../db/entities/CustomerChannelMessage.js";
+import { EmployeeDashboardGrant } from "../db/entities/EmployeeDashboardGrant.js";
+import { EmployeeFinanceGrant } from "../db/entities/EmployeeFinanceGrant.js";
+import { EmployeeMarketingGrant } from "../db/entities/EmployeeMarketingGrant.js";
+import { EmployeeRecruitingGrant } from "../db/entities/EmployeeRecruitingGrant.js";
+import { RecruitingApplication } from "../db/entities/RecruitingApplication.js";
+import { RecruitingApplicationEvent } from "../db/entities/RecruitingApplicationEvent.js";
+import { RecruitingOpening } from "../db/entities/RecruitingOpening.js";
+import { RecruitingScorecard } from "../db/entities/RecruitingScorecard.js";
+import { RecruitingSettings } from "../db/entities/RecruitingSettings.js";
+import { DataRoom } from "../db/entities/DataRoom.js";
+import { DataRoomDocument } from "../db/entities/DataRoomDocument.js";
+import { DataRoomEvent } from "../db/entities/DataRoomEvent.js";
+import { DataRoomFolder } from "../db/entities/DataRoomFolder.js";
+import { DataRoomGuest } from "../db/entities/DataRoomGuest.js";
+import { DataRoomJob } from "../db/entities/DataRoomJob.js";
+import { DataRoomQuestion } from "../db/entities/DataRoomQuestion.js";
+import { EmployeeDataRoomGrant } from "../db/entities/EmployeeDataRoomGrant.js";
+import { EmployeeSupportGrant } from "../db/entities/EmployeeSupportGrant.js";
+import { SupportArticle } from "../db/entities/SupportArticle.js";
+import { SupportChatVisitor } from "../db/entities/SupportChatVisitor.js";
+import { SupportChatWidget } from "../db/entities/SupportChatWidget.js";
+import { SupportDraft } from "../db/entities/SupportDraft.js";
+import { SupportEvent } from "../db/entities/SupportEvent.js";
+import { SupportInbox } from "../db/entities/SupportInbox.js";
+import { SupportJob } from "../db/entities/SupportJob.js";
+import { SupportMessage } from "../db/entities/SupportMessage.js";
+import { SupportSavedReply } from "../db/entities/SupportSavedReply.js";
+import { SupportSettings } from "../db/entities/SupportSettings.js";
+import { SupportTicket } from "../db/entities/SupportTicket.js";
+import { EmployeeMemory } from "../db/entities/EmployeeMemory.js";
+import { EmployeeNoteGrant } from "../db/entities/EmployeeNoteGrant.js";
+import { EmployeeNotebookGrant } from "../db/entities/EmployeeNotebookGrant.js";
+import { EmployeeResourceGrant } from "../db/entities/EmployeeResourceGrant.js";
+import { EmployeeResourceLibraryGrant } from "../db/entities/EmployeeResourceLibraryGrant.js";
+import { Estimate } from "../db/entities/Estimate.js";
+import { EstimateLineItem } from "../db/entities/EstimateLineItem.js";
+import { ExchangeRate } from "../db/entities/ExchangeRate.js";
+import { FinanceProposal } from "../db/entities/FinanceProposal.js";
+import { Handoff } from "../db/entities/Handoff.js";
+import { IntegrationConnection } from "../db/entities/IntegrationConnection.js";
+import { PhoneCall } from "../db/entities/PhoneCall.js";
+import { PhoneMessage } from "../db/entities/PhoneMessage.js";
+import { PhoneNumber } from "../db/entities/PhoneNumber.js";
+import { Invitation } from "../db/entities/Invitation.js";
+import { Invoice } from "../db/entities/Invoice.js";
+import { Subsidiary } from "../db/entities/Subsidiary.js";
+import { InvoiceLineItem } from "../db/entities/InvoiceLineItem.js";
+import { InvoicePayment } from "../db/entities/InvoicePayment.js";
+import { InvoiceWriteOff } from "../db/entities/InvoiceWriteOff.js";
+import { JournalEntry } from "../db/entities/JournalEntry.js";
+import { LedgerEntry } from "../db/entities/LedgerEntry.js";
+import { LedgerLine } from "../db/entities/LedgerLine.js";
+import { McpServer } from "../db/entities/McpServer.js";
+import { Membership } from "../db/entities/Membership.js";
+import { MessageReaction } from "../db/entities/MessageReaction.js";
+import { GroupDiscussion } from "../db/entities/GroupDiscussion.js";
+import { MarketingCampaign } from "../db/entities/MarketingCampaign.js";
+import { MarketingCreative } from "../db/entities/MarketingCreative.js";
+import { MarketingExperiment } from "../db/entities/MarketingExperiment.js";
+import { MarketingPerformanceSnapshot } from "../db/entities/MarketingPerformanceSnapshot.js";
+import { Note } from "../db/entities/Note.js";
+import { Notebook } from "../db/entities/Notebook.js";
+import { Notification } from "../db/entities/Notification.js";
+import { Pipeline } from "../db/entities/Pipeline.js";
+import { PipelineRun } from "../db/entities/PipelineRun.js";
+import { Product } from "../db/entities/Product.js";
+import { Project } from "../db/entities/Project.js";
+import { ProjectMember } from "../db/entities/ProjectMember.js";
+import { RecurringInvoice } from "../db/entities/RecurringInvoice.js";
+import { RecurringInvoiceLineItem } from "../db/entities/RecurringInvoiceLineItem.js";
+import { RecurringInvoiceRun } from "../db/entities/RecurringInvoiceRun.js";
+import { RealtimeEvent } from "../db/entities/RealtimeEvent.js";
+import { Resource } from "../db/entities/Resource.js";
+import { ResourceFolder } from "../db/entities/ResourceFolder.js";
+import { Routine } from "../db/entities/Routine.js";
+import { RoutineFolder } from "../db/entities/RoutineFolder.js";
+import { EmployeeRoutineGrant } from "../db/entities/EmployeeRoutineGrant.js";
+import { Goal } from "../db/entities/Goal.js";
+import { RunLesson } from "../db/entities/RunLesson.js";
+import { RevisionProposal } from "../db/entities/RevisionProposal.js";
+import { DecisionPolicy } from "../db/entities/DecisionPolicy.js";
+import { AutonomyWaiver } from "../db/entities/AutonomyWaiver.js";
+import { Budget } from "../db/entities/Budget.js";
+import { CompanyPolicy } from "../db/entities/CompanyPolicy.js";
+import { RoutineTrigger } from "../db/entities/RoutineTrigger.js";
+import { EmployeeWakeup } from "../db/entities/EmployeeWakeup.js";
+import { Workstream } from "../db/entities/Workstream.js";
+import { Initiative } from "../db/entities/Initiative.js";
+import { RoutineCheck } from "../db/entities/RoutineCheck.js";
+import { RunCheckResult } from "../db/entities/RunCheckResult.js";
+import { Standdown } from "../db/entities/Standdown.js";
+import { Run } from "../db/entities/Run.js";
+import { Secret } from "../db/entities/Secret.js";
+import { VaultItem } from "../db/entities/VaultItem.js";
+import { VaultItemMemberAccess } from "../db/entities/VaultItemMemberAccess.js";
+import { EmployeeVaultGrant } from "../db/entities/EmployeeVaultGrant.js";
+import { VaultSource } from "../db/entities/VaultSource.js";
+import { Skill } from "../db/entities/Skill.js";
+import { Tag } from "../db/entities/Tag.js";
+import { TagAssignment } from "../db/entities/TagAssignment.js";
+import { TaxRate } from "../db/entities/TaxRate.js";
+import { Team } from "../db/entities/Team.js";
+import { Todo } from "../db/entities/Todo.js";
+import { TodoComment } from "../db/entities/TodoComment.js";
+import { TodoLink } from "../db/entities/TodoLink.js";
+import { TodoPickup } from "../db/entities/TodoPickup.js";
+import { ProjectIntake } from "../db/entities/ProjectIntake.js";
+import { Vendor } from "../db/entities/Vendor.js";
+import { VendorCredit } from "../db/entities/VendorCredit.js";
+import { VendorCreditApplication } from "../db/entities/VendorCreditApplication.js";
+import { VendorCreditLine } from "../db/entities/VendorCreditLine.js";
+import { VendorRefund } from "../db/entities/VendorRefund.js";
+import { WorkloadLease } from "../db/entities/WorkloadLease.js";
+import { Tldr } from "../db/entities/Tldr.js";
+import { TldrDismissal } from "../db/entities/TldrDismissal.js";
+import { TldrQuestion } from "../db/entities/TldrQuestion.js";
+import { TldrQuestionAction } from "../db/entities/TldrQuestionAction.js";
+import { TldrQuestionMessage } from "../db/entities/TldrQuestionMessage.js";
+import { TldrStandingQuestion } from "../db/entities/TldrStandingQuestion.js";
+import { TldrSettings } from "../db/entities/TldrSettings.js";
+import { BoardLetter } from "../db/entities/BoardLetter.js";
+import { BoardLetterSettings } from "../db/entities/BoardLetterSettings.js";
+import { CompanySso } from "../db/entities/CompanySso.js";
+
+/**
+ * Hard-delete a company and every row that hangs off it.
+ *
+ * Runs inside a single transaction so a partial failure leaves the DB
+ * untouched. Each new company-scoped entity needs a line in here — the
+ * compile-time entity imports above are the canary: drop one and TS
+ * yells.
+ *
+ * Order matters for the leaf-first sweep: rows that reference a parent
+ * within the same company (e.g. ChannelMessage→Channel, BaseRecord→
+ * BaseTable→Base) get cleared before their parents. Entities with a
+ * direct `companyId` column then go in any order.
+ *
+ * The on-disk directory at `data/companies/<slug>/` is removed *after*
+ * the transaction commits — if filesystem cleanup fails we log it but
+ * keep the DB delete, since the data dir is gitignored and an admin can
+ * `rm -rf` the leftover later.
+ */
+export async function deleteCompanyCascade(args: {
+  companyId: string;
+  companySlug: string;
+}): Promise<void> {
+  const { companyId, companySlug } = args;
+
+  await deleteBrowserRecordingsForCompany(companyId).catch((err) => {
+    // Continue through the authoritative DB delete; the filesystem sweep below
+    // gets another chance to remove any orphaned bytes.
+    console.warn(
+      `[companyDelete] failed to stop browser recordings for ${companyId}: ${(err as Error).message}`,
+    );
+  });
+
+  await AppDataSource.transaction(async (m) => {
+    // ── 1. Collect parent IDs we'll cascade through ────────────────────
+    const employeeIds = (await m.find(AIEmployee, { where: { companyId }, select: ["id"] })).map(
+      (e) => e.id,
+    );
+    const channelIds = (await m.find(Channel, { where: { companyId }, select: ["id"] })).map(
+      (c) => c.id,
+    );
+    const baseIds = (await m.find(Base, { where: { companyId }, select: ["id"] })).map((b) => b.id);
+    const baseTableIds = baseIds.length
+      ? (
+          await m.find(BaseTable, {
+            where: { baseId: In(baseIds) },
+            select: ["id"],
+          })
+        ).map((t) => t.id)
+      : [];
+    const baseRecordIds = baseTableIds.length
+      ? (
+          await m.find(BaseRecord, {
+            where: { tableId: In(baseTableIds) },
+            select: ["id"],
+          })
+        ).map((r) => r.id)
+      : [];
+    const projectIds = (await m.find(Project, { where: { companyId }, select: ["id"] })).map(
+      (p) => p.id,
+    );
+    const todoIds = projectIds.length
+      ? (
+          await m.find(Todo, {
+            where: { projectId: In(projectIds) },
+            select: ["id"],
+          })
+        ).map((t) => t.id)
+      : [];
+    const billIds = (await m.find(Bill, { where: { companyId }, select: ["id"] })).map((b) => b.id);
+    const invoiceIds = (await m.find(Invoice, { where: { companyId }, select: ["id"] })).map(
+      (i) => i.id,
+    );
+    const pipelineIds = (await m.find(Pipeline, { where: { companyId }, select: ["id"] })).map(
+      (p) => p.id,
+    );
+    const routineIds = employeeIds.length
+      ? (
+          await m.find(Routine, {
+            where: { employeeId: In(employeeIds) },
+            select: ["id"],
+          })
+        ).map((r) => r.id)
+      : [];
+    const conversationIds = employeeIds.length
+      ? (
+          await m.find(Conversation, {
+            where: { employeeId: In(employeeIds) },
+            select: ["id"],
+          })
+        ).map((c) => c.id)
+      : [];
+    const channelMessageIds = channelIds.length
+      ? (
+          await m.find(ChannelMessage, {
+            where: { channelId: In(channelIds) },
+            select: ["id"],
+          })
+        ).map((cm) => cm.id)
+      : [];
+    const dashboardIds = (await m.find(Dashboard, { where: { companyId }, select: ["id"] })).map(
+      (d) => d.id,
+    );
+    const estimateIds = (await m.find(Estimate, { where: { companyId }, select: ["id"] })).map(
+      (e) => e.id,
+    );
+    const recurringInvoiceIds = (
+      await m.find(RecurringInvoice, { where: { companyId }, select: ["id"] })
+    ).map((r) => r.id);
+    const customerCreditIds = (
+      await m.find(CustomerCredit, { where: { companyId }, select: ["id"] })
+    ).map((credit) => credit.id);
+    const vendorCreditIds = (
+      await m.find(VendorCredit, { where: { companyId }, select: ["id"] })
+    ).map((credit) => credit.id);
+    const tagIds = (await m.find(Tag, { where: { companyId }, select: ["id"] })).map(
+      (tag) => tag.id,
+    );
+    const connectedAppIds = (
+      await m.find(ConnectedApp, { where: { companyId }, select: ["id"] })
+    ).map((app) => app.id);
+
+    // ── 2. Leaf rows (references → ids we just collected) ──────────────
+    // A connected app's tokens carry no companyId; they go by the app.
+    if (connectedAppIds.length) {
+      await m.delete(ConnectedAppToken, { connectedAppId: In(connectedAppIds) });
+    }
+    if (channelMessageIds.length) {
+      await m.delete(MessageReaction, { messageId: In(channelMessageIds) });
+    }
+    if (channelIds.length) {
+      await m.delete(ChannelMessage, { channelId: In(channelIds) });
+      await m.delete(ChannelMember, { channelId: In(channelIds) });
+    }
+    if (routineIds.length) {
+      await m.delete(Run, { routineId: In(routineIds) });
+    }
+    if (baseRecordIds.length) {
+      await m.delete(BaseRecordComment, { recordId: In(baseRecordIds) });
+    }
+    // Form submissions point at both the Form and the BaseRecord. Remove the
+    // lineage and its public credential before either parent disappears.
+    await m.delete(BaseFormSubmission, { companyId });
+    await m.delete(BaseForm, { companyId });
+    if (baseTableIds.length) {
+      await m.delete(BaseRecord, { tableId: In(baseTableIds) });
+      await m.delete(BaseField, { tableId: In(baseTableIds) });
+      await m.delete(BaseView, { tableId: In(baseTableIds) });
+    }
+    if (baseIds.length) {
+      await m.delete(BaseTable, { baseId: In(baseIds) });
+    }
+    await m.delete(TodoLink, { companyId });
+    await m.delete(TodoPickup, { companyId });
+    await m.delete(ProjectIntake, { companyId });
+    if (todoIds.length) {
+      await m.delete(TodoComment, { todoId: In(todoIds) });
+      await m.delete(Todo, { id: In(todoIds) });
+    }
+    if (projectIds.length) {
+      await m.delete(ProjectMember, { projectId: In(projectIds) });
+    }
+    if (billIds.length) {
+      await m.delete(BillLineItem, { billId: In(billIds) });
+      await m.delete(BillPayment, { billId: In(billIds) });
+    }
+    if (invoiceIds.length) {
+      await m.delete(InvoiceLineItem, { invoiceId: In(invoiceIds) });
+      await m.delete(InvoicePayment, { invoiceId: In(invoiceIds) });
+    }
+    if (pipelineIds.length) {
+      await m.delete(PipelineRun, { pipelineId: In(pipelineIds) });
+    }
+    if (dashboardIds.length) {
+      await m.delete(DashboardCard, { dashboardId: In(dashboardIds) });
+    }
+    if (estimateIds.length) {
+      await m.delete(EstimateLineItem, { estimateId: In(estimateIds) });
+    }
+    if (recurringInvoiceIds.length) {
+      await m.delete(RecurringInvoiceLineItem, {
+        recurringInvoiceId: In(recurringInvoiceIds),
+      });
+    }
+    if (customerCreditIds.length) {
+      await m.delete(CustomerCreditLine, { creditId: In(customerCreditIds) });
+    }
+    if (vendorCreditIds.length) {
+      await m.delete(VendorCreditLine, { creditId: In(vendorCreditIds) });
+    }
+    if (tagIds.length) {
+      await m.delete(TagAssignment, { tagId: In(tagIds) });
+    }
+    // A chat turn's activity carries its company, so it goes with the company
+    // whichever conversation it belongs to.
+    await m.delete(ConversationActivityEvent, { companyId });
+    if (conversationIds.length) {
+      await m.delete(ConversationMessage, {
+        conversationId: In(conversationIds),
+      });
+    }
+    if (employeeIds.length) {
+      await m.delete(Routine, { employeeId: In(employeeIds) });
+      await m.delete(Skill, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeMemory, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeBaseGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeConnectionGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeNotebookGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeNoteGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeResourceGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeChartGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeRepositoryGrant, { employeeId: In(employeeIds) });
+      await m.delete(EmployeeDashboardGrant, { employeeId: In(employeeIds) });
+      await m.delete(McpServer, { employeeId: In(employeeIds) });
+      await m.delete(JournalEntry, { employeeId: In(employeeIds) });
+      await m.delete(Conversation, { employeeId: In(employeeIds) });
+    }
+
+    // ── 3. Direct companyId rows (order is mostly free now) ────────────
+    // The company's AI Models, their attachments, and their keys' health.
+    const modelIds = (await m.find(AIModel, { where: { companyId }, select: ["id"] })).map(
+      (model) => model.id,
+    );
+    await deleteKeyHealth(modelIds, m);
+    await m.delete(EmployeeModel, { companyId });
+    // Each spell one of them was unavailable goes with the model.
+    await m.delete(AIModelOutage, { companyId });
+    // So does the work that was waiting for one of them to come back.
+    await m.delete(AIModelWait, { companyId });
+    await m.delete(AIModel, { companyId });
+    await m.delete(ParallelWorkerResult, { companyId });
+    await m.delete(TldrQuestionAction, { companyId });
+    await m.delete(TldrQuestionMessage, { companyId });
+    await m.delete(TldrQuestion, { companyId });
+    await m.delete(TldrStandingQuestion, { companyId });
+    await m.delete(TldrDismissal, { companyId });
+    await m.delete(Tldr, { companyId });
+    await m.delete(TldrSettings, { companyId });
+    await m.delete(BoardLetter, { companyId });
+    await m.delete(BoardLetterSettings, { companyId });
+    await m.delete(WorkloadLease, { companyId });
+    await m.delete(RealtimeEvent, { companyId });
+    await m.delete(AdSpendEvent, { companyId });
+    await m.delete(EmployeeFinanceGrant, { companyId });
+    await m.delete(EmployeeResourceLibraryGrant, { companyId });
+    await m.delete(FinanceProposal, { companyId });
+    await m.delete(CustomerCreditApplication, { companyId });
+    await m.delete(CustomerRefund, { companyId });
+    await m.delete(InvoiceWriteOff, { companyId });
+    await m.delete(VendorCreditApplication, { companyId });
+    await m.delete(VendorRefund, { companyId });
+    await m.delete(LedgerLine, { companyId });
+    await m.delete(LedgerEntry, { companyId });
+    await m.delete(CardTransaction, { companyId });
+    await m.delete(CardFeed, { companyId });
+    await m.delete(BaseRecordAttachment, { companyId });
+    await m.delete(Attachment, { companyId });
+    await m.delete(Note, { companyId });
+    await m.delete(Notebook, { companyId });
+    await m.delete(Notification, { companyId });
+    await m.delete(Approval, { companyId });
+    await m.delete(Decision, { companyId });
+    await m.delete(Handoff, { companyId });
+    await m.delete(Project, { companyId });
+    await m.delete(Bill, { companyId });
+    await m.delete(Invoice, { companyId });
+    await m.delete(Subsidiary, { companyId });
+    await m.delete(CustomerCredit, { companyId });
+    await m.delete(VendorCredit, { companyId });
+    await m.delete(Customer, { companyId });
+    await m.delete(Vendor, { companyId });
+    await m.delete(Product, { companyId });
+    await m.delete(TaxRate, { companyId });
+    await m.delete(Account, { companyId });
+    await m.delete(AccountingPeriod, { companyId });
+    await m.delete(BankTransaction, { companyId });
+    await m.delete(BankFeed, { companyId });
+    await m.delete(ExchangeRate, { companyId });
+    await m.delete(Currency, { companyId });
+    await m.delete(CompanyFinanceSettings, { companyId });
+    // The mail-client suite (M25). Grants carry no companyId, so they go by
+    // this company's employees; the rest are direct companyId sweeps,
+    // leaf-first (messages → threads → labels/rules/handovers/chat → accounts).
+    if (employeeIds.length) {
+      await m.delete(EmployeeMailAccountGrant, { employeeId: In(employeeIds) });
+    }
+    await m.delete(MailDraftSendBatch, { companyId });
+    await m.delete(MailSavedSearch, { companyId });
+    await m.delete(MailInboundAutomation, { companyId });
+    await m.delete(MailInboundAnalysis, { companyId });
+    await m.delete(MailMessageAddress, { companyId });
+    await m.delete(MailAddressIndexState, { companyId });
+    await m.delete(MailMessage, { companyId });
+    await m.delete(MailThread, { companyId });
+    await m.delete(MailLabel, { companyId });
+    await m.delete(MailRule, { companyId });
+    await m.delete(MailHandover, { companyId });
+    await m.delete(MailChatMessage, { companyId });
+    await m.delete(RoutineChatMessage, { companyId });
+    // Ask AI conversations are company-scoped, Member-owned transcripts.
+    await m.delete(AskAiMessage, { companyId });
+    await m.delete(AskAiConversation, { companyId });
+    await m.delete(MailAccount, { companyId });
+    // Calendar + Meetings (M44). Same shape as mail: the grant carries no
+    // companyId so it goes by this company's employees, then leaf-first
+    // (segments → participants → meetings → events → calendars). Recordings on
+    // disk are swept after the transaction commits, because a transaction
+    // cannot roll back an unlinked file.
+    if (employeeIds.length) {
+      await m.delete(EmployeeCalendarGrant, { employeeId: In(employeeIds) });
+    }
+    await m.delete(MeetingTranscriptSegment, { companyId });
+    await m.delete(MeetingParticipant, { companyId });
+    await m.delete(Meeting, { companyId });
+    await m.delete(CalendarEvent, { companyId });
+    await m.delete(CalendarAccount, { companyId });
+    // Before the Connections themselves: an `ExternalChatIdentity` is what
+    // turns a sender on Slack or WhatsApp into an authorized Member of *this*
+    // company, so it must not outlive the company it authorized into.
+    await m.delete(ExternalChatIdentity, { companyId });
+    // Customer channels and the messages kept from them, before the Slack
+    // Connections they were heard through.
+    await m.delete(CustomerChannelMessage, { companyId });
+    await m.delete(CustomerChannel, { companyId });
+    // Phone numbers and their texts and calls, before the Twilio Connections
+    // they were reserved through. Twilio itself is not touched here: the
+    // numbers stay on the Twilio account (their webhooks then answer 404), so
+    // an owner who wants them released removes them at Settings → Phone
+    // numbers first.
+    await m.delete(PhoneMessage, { companyId });
+    await m.delete(PhoneCall, { companyId });
+    await m.delete(PhoneNumber, { companyId });
+    await m.delete(IntegrationConnection, { companyId });
+    await m.delete(EmailLog, { companyId });
+    await m.delete(EmailProvider, { companyId });
+    await m.delete(AuditEvent, { companyId });
+    await m.delete(ApiKey, { companyId });
+    await m.delete(ConnectedApp, { companyId });
+    await m.delete(Secret, { companyId });
+    await m.delete(VaultItemMemberAccess, { companyId });
+    await m.delete(EmployeeVaultGrant, { companyId });
+    await m.delete(VaultItem, { companyId });
+    await m.delete(VaultSource, { companyId });
+    await m.delete(Resource, { companyId });
+    await m.delete(ResourceFolder, { companyId });
+    // Newer company-scoped surfaces: sales docs (Estimate / RecurringInvoice +
+    // their line items and CustomerContact / CustomerContract), Explore
+    // (Chart / Dashboard, with DashboardCard + employee grants cleared above),
+    // Repositories, and browser sessions. Line items, dashboard cards,
+    // and the three employee grants were removed in the leaf/employee sweeps.
+    await m.delete(Estimate, { companyId });
+    await m.delete(RecurringInvoiceRun, { companyId });
+    await m.delete(RecurringInvoice, { companyId });
+    // Signing evidence and placed fields are leaves; remove them before their
+    // recipients and envelope. The AI access grant is company-scoped.
+    await m.delete(SignatureEvent, { companyId });
+    await m.delete(SignatureField, { companyId });
+    await m.delete(SignatureRecipient, { companyId });
+    await m.delete(SignatureEnvelope, { companyId });
+    await m.delete(EmployeeSigningGrant, { companyId });
+    await m.delete(CustomerContract, { companyId });
+    await m.delete(CustomerContact, { companyId });
+    // Revenue (M32). Children first so a partial failure never strands a row
+    // whose parent is already gone: step runs → enrollments → steps →
+    // sequences, and signal events → signals.
+    await m.delete(SequenceStepRun, { companyId });
+    await m.delete(SequenceEnrollment, { companyId });
+    await m.delete(SequenceStep, { companyId });
+    await m.delete(Sequence, { companyId });
+    await m.delete(SignalEvent, { companyId });
+    await m.delete(Signal, { companyId });
+    await m.delete(Activity, { companyId });
+    await m.delete(RevenueOperationRow, { companyId });
+    await m.delete(RevenueRecordAlias, { companyId });
+    await m.delete(RevenueOperation, { companyId });
+    await m.delete(RevenueImportRow, { companyId });
+    await m.delete(RevenueDocumentCandidate, { companyId });
+    await m.delete(RevenueDuplicateCandidate, { companyId });
+    await m.delete(RevenueFieldEvidence, { companyId });
+    await m.delete(RevenueFollowUpView, { companyId });
+    await m.delete(RevenueFirmographicLookup, { companyId });
+    await m.delete(RevenueDocument, { companyId });
+    await m.delete(PartnershipContact, { companyId });
+    await m.delete(Partnership, { companyId });
+    await m.delete(RevenueCustomValue, { companyId });
+    await m.delete(RevenueCustomField, { companyId });
+    await m.delete(RevenueClassification, { companyId });
+    await m.delete(RevenueImportBatch, { companyId });
+    await m.delete(DealContact, { companyId });
+    await m.delete(DealHistoryEvent, { companyId });
+    await m.delete(Deal, { companyId });
+    await m.delete(DealStage, { companyId });
+    await m.delete(Contact, { companyId });
+    await m.delete(Suppression, { companyId });
+    await m.delete(EmployeeRevenueGrant, { companyId });
+    await m.delete(MarketingPerformanceSnapshot, { companyId });
+    await m.delete(MarketingExperiment, { companyId });
+    await m.delete(MarketingCreative, { companyId });
+    await m.delete(MarketingCampaign, { companyId });
+    await m.delete(EmployeeMarketingGrant, { companyId });
+    // Applicants' records before the Openings they applied to.
+    await m.delete(RecruitingApplicationEvent, { companyId });
+    await m.delete(RecruitingScorecard, { companyId });
+    await m.delete(RecruitingApplication, { companyId });
+    await m.delete(RecruitingOpening, { companyId });
+    await m.delete(RecruitingSettings, { companyId });
+    await m.delete(EmployeeRecruitingGrant, { companyId });
+    // Data rooms: what guests did and asked before the guests, documents
+    // before their folders, and the rooms last.
+    await m.delete(DataRoomEvent, { companyId });
+    await m.delete(DataRoomQuestion, { companyId });
+    await m.delete(DataRoomGuest, { companyId });
+    await m.delete(DataRoomDocument, { companyId });
+    await m.delete(DataRoomFolder, { companyId });
+    await m.delete(DataRoomJob, { companyId });
+    await m.delete(DataRoom, { companyId });
+    await m.delete(EmployeeDataRoomGrant, { companyId });
+    // Support: a ticket's conversation and timeline before the ticket, tickets
+    // before the inboxes they came through.
+    await m.delete(SupportJob, { companyId });
+    await m.delete(SupportDraft, { companyId });
+    await m.delete(SupportEvent, { companyId });
+    await m.delete(SupportMessage, { companyId });
+    await m.delete(SupportTicket, { companyId });
+    await m.delete(SupportChatVisitor, { companyId });
+    await m.delete(SupportChatWidget, { companyId });
+    await m.delete(SupportInbox, { companyId });
+    await m.delete(SupportArticle, { companyId });
+    await m.delete(SupportSavedReply, { companyId });
+    await m.delete(SupportSettings, { companyId });
+    await m.delete(EmployeeSupportGrant, { companyId });
+    await m.delete(Chart, { companyId });
+    await m.delete(Dashboard, { companyId });
+    // Sessions before the repositories they belong to, so a failure halfway
+    // cannot leave a session row pointing at a repository that is gone.
+    await m.delete(RepositoryWorkSessionEvent, { companyId });
+    await m.delete(RepositoryWorkSessionTurn, { companyId });
+    await m.delete(RepositoryWorkSession, { companyId });
+    await m.delete(Repository, { companyId });
+    await m.delete(BrowserSession, { companyId });
+    // Grants first: the row that authorizes an employee to drive a Member's
+    // computer must never outlive the browser it points at.
+    await m.delete(EmployeeMemberBrowserGrant, { companyId });
+    await m.delete(MemberBrowser, { companyId });
+    await m.delete(Pipeline, { companyId });
+    // After the routines themselves (deleted with their employees above), so a
+    // folder is never removed while something still points at it.
+    await m.delete(RoutineFolder, { companyId });
+    await m.delete(EmployeeRoutineGrant, { companyId });
+    await m.delete(Goal, { companyId });
+    await m.delete(RunLesson, { companyId });
+    await m.delete(RevisionProposal, { companyId });
+    await m.delete(DecisionPolicy, { companyId });
+    await m.delete(AutonomyWaiver, { companyId });
+    await m.delete(Budget, { companyId });
+    await m.delete(CompanyPolicy, { companyId });
+    await m.delete(RoutineTrigger, { companyId });
+    await m.delete(EmployeeWakeup, { companyId });
+    await m.delete(Workstream, { companyId });
+    await m.delete(Initiative, { companyId });
+    // M58. `RunCheckResult` before `RoutineCheck` only for readability — both
+    // carry `companyId` directly, so neither depends on the other surviving.
+    await m.delete(RunCheckResult, { companyId });
+    await m.delete(RoutineCheck, { companyId });
+    await m.delete(Standdown, { companyId });
+    await m.delete(Tag, { companyId });
+    await m.delete(Team, { companyId });
+    await m.delete(GroupDiscussion, { companyId });
+    // AI Employees' turns in its channels; their activity went above.
+    await m.delete(ChannelTurn, { companyId });
+    await m.delete(Channel, { companyId });
+    await m.delete(Base, { companyId });
+    await m.delete(AIEmployee, { companyId });
+    await m.delete(Invitation, { companyId });
+    await m.delete(Membership, { companyId });
+    await m.delete(CompanySso, { companyId });
+    await m.delete(Company, { id: companyId });
+  });
+  emitMembershipAuthorizationChange(companyId);
+
+  // ── 4. Filesystem (best-effort) ──────────────────────────────────────
+  try {
+    fs.rmSync(companyDir(companySlug), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove ${companyDir(companySlug)}: ${(err as Error).message}`,
+    );
+  }
+  try {
+    fs.rmSync(browserPrivateCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove private Browser state for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  try {
+    fs.rmSync(browserRecordingsCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove browser recordings for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  try {
+    fs.rmSync(repositoryPrivateCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove private Repository state for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  // The App-owned repository checkouts. These hold the company's actual source
+  // and documents, so leaving them behind after a deletion would be the worst
+  // kind of orphan.
+  try {
+    fs.rmSync(repositoryWorkspaceCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove Repository checkouts for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  // Meeting recordings (M44). The rawest customer data the app holds — voices
+  // saying names, prices, and whatever got said before anyone remembered they
+  // were being recorded. A deleted company must not leave those on disk.
+  try {
+    fs.rmSync(meetingRecordingsCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove meeting recordings for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  // Applicants' resumes and the careers site's logo. A resume is a stranger's
+  // personal data; it must not outlive the company they applied to.
+  try {
+    fs.rmSync(recruitingPrivateCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove Recruiting files for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+  // Data room documents: the company's books, contracts and cap table, kept
+  // App-private. They must not outlive the company that shared them.
+  try {
+    fs.rmSync(dataRoomPrivateCompanyDir(companyId), { recursive: true, force: true });
+  } catch (err) {
+    console.warn(
+      `[companyDelete] failed to remove data room files for ${companyId}: ${(err as Error).message}`,
+    );
+  }
+}

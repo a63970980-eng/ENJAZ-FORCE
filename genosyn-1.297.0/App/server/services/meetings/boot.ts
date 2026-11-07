@@ -1,0 +1,242 @@
+import { In } from "typeorm";
+import { markModelUnavailable } from "../agent/modelOutage.js";
+
+import { AppDataSource } from "../../db/datasource.js";
+import { CalendarAccount } from "../../db/entities/CalendarAccount.js";
+import { Meeting } from "../../db/entities/Meeting.js";
+import { chatWithEmployee } from "../chat.js";
+import { getMeetingsSettings } from "../runtimeSettings.js";
+import { withSchedulerLease } from "../schedulerLeases.js";
+import { syncCalendarAccount } from "./calendarSync.js";
+import { parseWriteUp, setMeetingWriteUpAuthor } from "./followUps.js";
+import { registerBuiltInMeetingRecorder } from "./googleMeetRecorder.js";
+import { processMeeting } from "./pipeline.js";
+import { dispatchDueMeetings } from "./recorder.js";
+import { armMeetingsForAccount } from "./store.js";
+
+/**
+ * Boot wiring for the Meetings section.
+ *
+ * Three things live here, and all exist to keep a dependency pointing the right
+ * way — the same reason `services/revenue/boot.ts` exists:
+ *
+ * 1. **The heartbeat.** Calendars re-sync, meetings arm themselves for calls
+ *    about to start, and anything sitting in `processing` gets driven to
+ *    `ready`. It takes its own scheduler lease rather than sharing the
+ *    routines one, so a long routine dispatch cannot stall calendar sync and a
+ *    slow calendar cannot stall routines.
+ * 2. **The due dispatcher.** A separate brisk loop claims calls near their
+ *    start time and returns immediately; the recorder never holds its lease.
+ * 3. **The real write-up author.** `followUps.ts` is written against a
+ *    callback precisely so importing the meeting pipeline in a test does not
+ *    drag the agent runtime — and every model provider — in with it. This
+ *    module is the one place that knows both halves, and it is imported only
+ *    at boot.
+ */
+
+/**
+ * The scheduler tick, which is *not* the sync interval.
+ *
+ * Both the master switch and the calendar interval are operator-editable at
+ * Admin → Runtime, so neither can be frozen into a timer at boot the way they
+ * used to be: turning meetings off, or dropping the interval from five minutes
+ * to one, has to take effect without a restart. So the timer runs on a fixed
+ * short tick and every tick re-reads the settings — no-oping while the section
+ * is off, and running the heartbeat only once the configured interval has
+ * actually elapsed.
+ */
+const SCHEDULER_TICK_MS = 20_000;
+const DISPATCH_INTERVAL_MS = 20_000;
+
+/** Meetings driven per pass. Bounds a heartbeat that finds a backlog. */
+const MAX_MEETINGS_PER_PASS = 5;
+
+let heartbeatTimer: NodeJS.Timeout | null = null;
+let dispatchTimer: NodeJS.Timeout | null = null;
+let heartbeatTicking = false;
+let dispatchTicking = false;
+/** When the last heartbeat pass started, so the tick can pace itself. */
+let lastHeartbeatStartedAt = 0;
+
+/** The configured calendar interval, floored so a typo cannot hammer Google. */
+function heartbeatIntervalMs(): number {
+  return Math.max(60, getMeetingsSettings().syncIntervalSeconds) * 1000;
+}
+
+/**
+ * Ask the notetaker employee to write the meeting up.
+ *
+ * `toolAuthority: "employee"` is required and not optional decoration: without
+ * it the turn is "untrusted" — no Soul, no Skills, no company tools — and the
+ * employee would be reading a transcript with none of the context that makes
+ * its judgement worth anything. This is the same seam `draftTouch` and
+ * `handleSignal` use.
+ */
+async function authorWriteUp(args: {
+  employeeId: string;
+  prompt: string;
+  meeting: Meeting;
+}): Promise<ReturnType<typeof parseWriteUp>> {
+  const result = await chatWithEmployee(args.meeting.companyId, args.employeeId, args.prompt, [], {
+    toolAuthority: "employee",
+  });
+  if (result.status !== "ok") {
+    const error = new Error(result.reply || "The AI Employee could not write this meeting up.");
+    throw result.status === "error" && result.unavailable
+      ? markModelUnavailable(error, result.unavailable)
+      : error;
+  }
+  return parseWriteUp(result.reply);
+}
+
+export type MeetingHeartbeatDependencies = {
+  syncAccount: typeof syncCalendarAccount;
+  armAccount: typeof armMeetingsForAccount;
+  process: typeof processMeeting;
+};
+
+const HEARTBEAT_DEPENDENCIES: MeetingHeartbeatDependencies = {
+  syncAccount: syncCalendarAccount,
+  armAccount: armMeetingsForAccount,
+  process: processMeeting,
+};
+
+/** One pass: sync every non-paused calendar, then drain the processing backlog. */
+export async function runMeetingsHeartbeat(
+  dependencies: MeetingHeartbeatDependencies = HEARTBEAT_DEPENDENCIES,
+  assertLeaseHeld: () => void = () => undefined,
+): Promise<void> {
+  const accounts = await AppDataSource.getRepository(CalendarAccount).find({
+    // `error` describes the last attempt, not an operator pause. Retrying it
+    // here is what lets a transient Google failure recover without a human
+    // toggling the calendar off and on again.
+    where: { status: In(["active", "error"]) },
+  });
+
+  for (const account of accounts) {
+    assertLeaseHeld();
+    const repo = AppDataSource.getRepository(CalendarAccount);
+    try {
+      await repo.update({ id: account.id }, { syncState: "running", syncStartedAt: new Date() });
+      await dependencies.syncAccount(account);
+      assertLeaseHeld();
+      await dependencies.armAccount(account);
+      assertLeaseHeld();
+      await repo.update(
+        { id: account.id },
+        {
+          syncState: "succeeded",
+          syncFinishedAt: new Date(),
+          status: "active",
+          statusMessage: "",
+        },
+      );
+    } catch (err) {
+      assertLeaseHeld();
+      const message = err instanceof Error ? err.message : String(err);
+      // One broken calendar must not stop the others, and must not silently
+      // retry forever without saying why — the row carries the reason.
+      await repo.update(
+        { id: account.id },
+        {
+          syncState: "failed",
+          syncFinishedAt: new Date(),
+          status: "error",
+          statusMessage: message.slice(0, 500),
+        },
+      );
+      // eslint-disable-next-line no-console
+      console.warn(`[meetings] calendar sync failed for ${account.id}:`, message);
+    }
+  }
+
+  const pending = await AppDataSource.getRepository(Meeting).find({
+    where: { status: "processing" },
+    order: { updatedAt: "ASC" },
+    take: MAX_MEETINGS_PER_PASS,
+  });
+  for (const meeting of pending) {
+    assertLeaseHeld();
+    try {
+      await dependencies.process(meeting.companyId, meeting.id);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[meetings] processing failed for ${meeting.id}:`, err);
+    }
+  }
+}
+
+/**
+ * One scheduler tick. Exported so a test can drive the pacing and the master
+ * switch without waiting on a timer.
+ */
+export function meetingsHeartbeatTick(): void {
+  if (!getMeetingsSettings().enabled) return;
+  if (heartbeatTicking) return;
+  const intervalMs = heartbeatIntervalMs();
+  if (Date.now() - lastHeartbeatStartedAt < intervalMs) return;
+  lastHeartbeatStartedAt = Date.now();
+  heartbeatTicking = true;
+  void withSchedulerLease("meetings-sync", intervalMs * 3, (lease) =>
+    runMeetingsHeartbeat(HEARTBEAT_DEPENDENCIES, lease.assertHeld))
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[meetings] heartbeat failed:", err);
+    })
+    .finally(() => {
+      heartbeatTicking = false;
+    });
+}
+
+/**
+ * The due dispatcher. Intentionally separate from calendar sync: it runs often
+ * enough to join just before the start time, and its lease ends as soon as each
+ * durable claim is made — never after the call finishes.
+ */
+export function meetingsDispatchTick(): void {
+  if (!getMeetingsSettings().enabled) return;
+  if (dispatchTicking) return;
+  dispatchTicking = true;
+  void withSchedulerLease("meetings-notetaker-dispatch", DISPATCH_INTERVAL_MS * 3, (lease) =>
+    dispatchDueMeetings(new Date(), lease.assertHeld),
+  )
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[meetings] notetaker dispatch failed:", err);
+    })
+    .finally(() => {
+      dispatchTicking = false;
+    });
+}
+
+/** Test seam: forget when the last heartbeat ran, so the next tick is due. */
+export function resetMeetingsHeartbeatPacingForTests(): void {
+  lastHeartbeatStartedAt = 0;
+  heartbeatTicking = false;
+  dispatchTicking = false;
+}
+
+/**
+ * Install the seam and start the timers.
+ *
+ * The timers start whether or not the section is enabled — each tick asks. That
+ * is what lets an operator turn Meetings off (or back on) at Admin → Runtime
+ * and have the heartbeat stop (or resume) without restarting the process.
+ *
+ * The first pass is not awaited: a slow calendar must not gate server startup,
+ * and the tick is written never to reject. The lease keeps two replicas from
+ * doing the same work — see `services/schedulerLeases.ts`.
+ */
+export function bootMeetings(): void {
+  setMeetingWriteUpAuthor(authorWriteUp);
+  registerBuiltInMeetingRecorder();
+
+  meetingsHeartbeatTick();
+  meetingsDispatchTick();
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(meetingsHeartbeatTick, SCHEDULER_TICK_MS);
+  heartbeatTimer.unref();
+  if (dispatchTimer) clearInterval(dispatchTimer);
+  dispatchTimer = setInterval(meetingsDispatchTick, DISPATCH_INTERVAL_MS);
+  dispatchTimer.unref();
+}
